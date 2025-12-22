@@ -3,6 +3,7 @@ services:
         image: mongo:6.0.4
         volumes:
           - ./data/db:/data/db
+          # - ./udata/db/dump/udata:/dump
         expose:
           - "27017"
         ports:

@@ -81,7 +81,7 @@ fs/resources/
 # Local configuration file of udata
 udata.cfg
 
-# Local data directory
-data
+# Local db directory
+db
 
 .env
