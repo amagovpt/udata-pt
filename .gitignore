@@ -84,4 +84,9 @@ udata.cfg
 # Local db directory
 db
 
+# Local environment variables
 .env
+
+# SAML configuration
+udata/auth/saml/*
+!udata/auth/saml/saml_plugin/
