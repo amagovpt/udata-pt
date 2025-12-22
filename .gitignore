@@ -83,3 +83,5 @@ udata.cfg
 
 # Local data directory
 data
+
+.env
