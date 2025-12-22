@@ -1,4 +1,4 @@
-from udata.models import db, Resource, License
+from udata.models import Resource, License
 
 from udata.harvest.backends.base import BaseBackend
 
@@ -12,6 +12,7 @@ from udata.harvest.models import HarvestItem
 from .tools.harvester_utils import normalize_url_slashes
 
 class INEBackend(BaseBackend):
+    name = "ine"
     display_name = 'Instituto nacional de estatística'
 
     def inner_harvest(self):

@@ -93,6 +93,7 @@ dependencies = [
     "wtforms[email]>=3.2.1,<4.0.0",
     "wtforms-json>=0.3.5,<1.0.0",
     "dotenv>=0.9.9",
+    "owslib>=0.31.0,<1.0.0",
 ]
 
 [project.urls]
@@ -111,6 +112,13 @@ csw-iso-19139 = "udata.harvest.backends.dcat:CswIso19139DcatBackend"
 maaf = "udata.harvest.backends.maaf:MaafBackend"
 ckan = "udata.harvest.backends.ckan.harvesters:CkanBackend"
 dkan = "udata.harvest.backends.ckan.harvesters:DkanBackend"
+dgt = "udata.harvest.backends.dgt:DGTBackend"
+apambiente = "udata.harvest.backends.apambiente:PortalAmbienteBackend"
+ckanpt = "udata.harvest.backends.ckanpt:CkanPTBackend"
+ine = "udata.harvest.backends.ine:INEBackend"
+inehvd = "udata.harvest.backends.inehvd:INEHvdBackend"
+odspt = "udata.harvest.backends.odspt:OdsBackendPT"
+ogc = "udata.harvest.backends.ogc:OGCBackend"
 
 [project.entry-points."udata.i18n"]
 udata = "udata.translations"

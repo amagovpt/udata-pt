@@ -1,17 +1,17 @@
-from udata.harvest.backends.base import BaseBackend
-from udata.models import Resource, Dataset, License
+from urllib.parse import parse_qs, urlparse
+
 import requests
-# from urllib.parse import urlparse
-import urllib.parse as urlparse
-from datetime import datetime
 
+from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
-from .tools.harvester_utils import normalize_url_slashes
+from udata.models import License, Resource
 
-# backend = 'https://snig.dgterritorio.gov.pt/rndg/srv/por/q?_content_type=json&fast=index&from=1&resultType=details&sortBy=referenceDateOrd&type=dataset%2Bor%2Bseries&dataPolicy=Dados%20abertos&keyword=DGT'
+from .tools.harvester_utils import normalize_url_slashes
 
 
 class DGTBackend(BaseBackend):
+    name = "dgt"
+    verify_ssl = False
     display_name = 'Harvester DGT'
 
     def __init__(self, *args, **kwargs):
@@ -20,13 +20,12 @@ class DGTBackend(BaseBackend):
         self.logger = logging.getLogger(__name__)
 
     def inner_harvest(self):
-
         headers = {
             'content-type': 'application/json',
             'Accept-Charset': 'utf-8'
         }
         res = requests.get(self.source.url, headers=headers)
-        
+
         res.encoding = 'utf-8'
         data = res.json()
         metadata = data.get("metadata")
@@ -89,10 +88,8 @@ class DGTBackend(BaseBackend):
 
             item['resources'] = links
 
-            # self.add_item(item["remote_id"], item=item)
             self.process_dataset(item["remote_id"], items=item)
 
-    
     def inner_process_dataset(self, item: HarvestItem, **kwargs):
         """Process harvested data into a dataset"""
         dataset = self.get_dataset(item.remote_id)
@@ -102,39 +99,38 @@ class DGTBackend(BaseBackend):
         # - map its content to the dataset fields
         # - store extra significant data in the `extra` attribute
         # - map resources data
-        item = kwargs.get('items')
+        data = kwargs.get('items')
 
         # Set basic dataset fields
-        dataset.title = item['title']
+        dataset.title = data['title']
         dataset.license = License.guess('cc-by')
         dataset.tags = ["snig.dgterritorio.gov.pt"]
-        dataset.description = item['description']
+        dataset.description = data['description']
 
-        if item.get('date'):
-            dataset.created_at = item['date']
+        if data.get('date'):
+            dataset.created_at = data['date']
 
         # Add keywords as tags
-        for keyword in item.get('keywords'):
-            dataset.tags.append(keyword)
+        if data.get('keywords'):
+            for keyword in data.get('keywords'):
+                dataset.tags.append(keyword)
 
         # Recreate all resources
         # Force recreation of all resources
         dataset.resources = []
 
-        for resource in item.get("resources"):
-
-            parsed = urlparse.urlparse(resource['url'])
+        for resource in data.get("resources"):
+            parsed = urlparse(resource['url'])
             try:
-                format = str(urlparse.parse_qs(parsed.query)['service'][0])
+                format = str(parse_qs(parsed.query)['service'][0])
             except KeyError:
                 format = resource['url'].split('.')[-1]
 
-            new_resource = Resource(title=item['title'],
+            new_resource = Resource(title=data['title'],
                                     url=normalize_url_slashes(resource['url']),
                                     filetype='remote',
                                     format=format)
-            
-            
+
             dataset.resources.append(new_resource)
 
         # Add extra metadata

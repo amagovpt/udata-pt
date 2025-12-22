@@ -1436,6 +1436,21 @@ wheels = [
 ]
 
 [[package]]
+name = "owslib"
+version = "0.35.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lxml" },
+    { name = "python-dateutil" },
+    { name = "pyyaml" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bf/03/5df0b995a3a6eefc24cc2320e3fe830d95e76ee6b0b1c6c9d0f1d4040bbe/owslib-0.35.0.tar.gz", hash = "sha256:0182f377bb30d25b78284bbaf82a12dece97902ed844cee88791ff38665b9b00", size = 194282, upload-time = "2025-10-28T15:13:42.594Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/12/74c145b9e273b2b479f1ea578c7778d96d0c34f2d112fd0ec96c905bb792/owslib-0.35.0-py3-none-any.whl", hash = "sha256:01648ea9b2b86502f456ad68a8dd07131d336416c5637f34adb358aafc0ad380", size = 240487, upload-time = "2025-10-28T15:13:41.399Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2438,6 +2453,7 @@ dependencies = [
     { name = "mistune" },
     { name = "mongoengine" },
     { name = "netaddr" },
+    { name = "owslib" },
     { name = "pillow" },
     { name = "pydenticon" },
     { name = "pymongo" },
@@ -2529,6 +2545,7 @@ requires-dist = [
     { name = "mistune", specifier = ">=3.1.3,<4.0.0" },
     { name = "mongoengine", specifier = ">=0.29.1,<1.0.0" },
     { name = "netaddr", specifier = ">=1.3.0,<2.0.0" },
+    { name = "owslib", specifier = ">=0.31.0,<1.0.0" },
     { name = "pillow", specifier = ">=11.0.0,<13.0.0" },
     { name = "pydenticon", specifier = ">=0.3.1,<1.0.0" },
     { name = "pymongo", specifier = ">=4.11.3,<5.0.0" },

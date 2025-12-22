@@ -1,5 +1,5 @@
 from udata.harvest.backends.base import BaseBackend
-from udata.models import Resource, Dataset, License, SpatialCoverage
+from udata.models import Resource, License, SpatialCoverage
 from udata.harvest.models import HarvestItem
 import requests
 import logging
@@ -12,6 +12,7 @@ class OGCBackend(BaseBackend):
     Harvester backend for OGC API - Collections (JSON format).
     Processes collections from OGC API endpoints and creates datasets with resources.
     """
+    name = "ogc"
     display_name = 'Harvester OGC'
 
     def __init__(self, *args, **kwargs):

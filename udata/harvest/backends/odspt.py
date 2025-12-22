@@ -40,6 +40,7 @@ def guess_mimetype(mimetype, url=None):
 
 
 class OdsBackendPT(BaseBackend):
+    name = "odspt"
     display_name = 'OpenDataSoft PT'
     verify_ssl = False
     filters = (

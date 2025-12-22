@@ -21,7 +21,7 @@ import requests
 from urllib.parse import urlparse, urlencode
 
 from udata.harvest.backends.base import BaseBackend
-from udata.models import Resource, Dataset, License
+from udata.models import Resource, License
 from owslib.csw import CatalogueServiceWeb
 
 from udata.harvest.models import HarvestItem
@@ -39,6 +39,7 @@ class PortalAmbienteBackend(BaseBackend):
     and maps them to udata datasets and resources.
     """
 
+    name = "apambiente"
     display_name = 'Harvester Portal do Ambiente'
 
     def inner_harvest(self):
