@@ -93,3 +93,6 @@ udata/auth/saml/*
 
 # Regras de qualidade
 .antigravity
+
+# uwsgi
+uwsgi
