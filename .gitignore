@@ -90,3 +90,6 @@ db
 # SAML configuration
 udata/auth/saml/*
 !udata/auth/saml/saml_plugin/
+
+# Regras de qualidade
+.antigravity
