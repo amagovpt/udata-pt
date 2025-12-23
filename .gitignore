@@ -68,6 +68,7 @@ Procfile
 .cursor
 .idea
 .vscode
+.antigravity
 
 # Python package managers
 .python-version
@@ -83,6 +84,7 @@ udata.cfg
 
 # Local db directory
 db
+dump
 
 # Local environment variables
 .env
@@ -91,8 +93,8 @@ db
 udata/auth/saml/*
 !udata/auth/saml/saml_plugin/
 
-# Regras de qualidade
-.antigravity
-
 # uwsgi
 uwsgi
+
+# Logs configuration
+logs
