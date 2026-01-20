@@ -1,5 +1,49 @@
 # Changelog
 
+## 14.7.2 (2026-01-15)
+
+- chore: add MongoDB 7.0 in CI ([#3593](https://github.com/opendatateam/udata/pull/3593))
+- fix: add default kind to posts in migration ([#3617](https://github.com/opendatateam/udata/pull/3617))
+- fix: allow markdown inside accordions ([#3618](https://github.com/opendatateam/udata/pull/3618))
+
+
+## 14.7.1 (2026-01-13)
+
+- fix: try to fix transfer migration ([#3616](https://github.com/opendatateam/udata/pull/3616))
+
+
+## 14.7.0 (2026-01-13)
+
+- feat: add accordion bloc ([#3608](https://github.com/opendatateam/udata/pull/3608))
+- feat: add blocs body_type to posts ([#3604](https://github.com/opendatateam/udata/pull/3604))
+- feat: add hero bloc ([#3609](https://github.com/opendatateam/udata/pull/3609))
+- feat: add markdown bloc ([#3581](https://github.com/opendatateam/udata/pull/3581))
+- feat: add post kind of news or page ([#3603](https://github.com/opendatateam/udata/pull/3603))
+- feat: add transfer notification ([#3582](https://github.com/opendatateam/udata/pull/3582))
+- feat: deny deletion of page if a post is using it ([#3614](https://github.com/opendatateam/udata/pull/3614))
+- feat: update translations ([#3615](https://github.com/opendatateam/udata/pull/3615))
+- feat: upgrade dependencies ([#3613](https://github.com/opendatateam/udata/pull/3613))
+- fix: parsing dates in RDF ([#3605](https://github.com/opendatateam/udata/pull/3605))
+-  fix: sending wrong params to search endpoints ([#3606](https://github.com/opendatateam/udata/pull/3606))
+- Revert "fix: sending wrong params to search endpoints ([#3585](https://github.com/opendatateam/udata/pull/3585))"
+
+
+## 14.6.0 (2026-01-06)
+
+- chore: add progress bar to old migration for re-run ([#3595](https://github.com/opendatateam/udata/pull/3595))
+- chore(swagger): clean required fields in swagger ([#3596](https://github.com/opendatateam/udata/pull/3596))
+- feat: add appeal mail on delete ([#3576](https://github.com/opendatateam/udata/pull/3576))
+- feat(datasets): add filtering support to datasets Atom feed ([#3578](https://github.com/opendatateam/udata/pull/3578))
+- feat: upgrade dependencies and downgrade werkzeug ([#3598](https://github.com/opendatateam/udata/pull/3598))
+- fix: do not create contact point if dryrun ([#3589](https://github.com/opendatateam/udata/pull/3589))
+- fix: forms always expect dicts ([#3590](https://github.com/opendatateam/udata/pull/3590))
+- fix: import dataservices tasks in init to purge dataservices ([#3602](https://github.com/opendatateam/udata/pull/3602))
+- fix: negative page size in pagination ([#3591](https://github.com/opendatateam/udata/pull/3591))
+- fix: RDF Resource in tags ([#3599](https://github.com/opendatateam/udata/pull/3599))
+- fix: remove dead code in except ([#3586](https://github.com/opendatateam/udata/pull/3586))
+- fix: wrong owner response for post API ([#3601](https://github.com/opendatateam/udata/pull/3601))
+
+
 ## 14.5.0 (2026-01-05)
 
 - chore: add mailpit ([#3575](https://github.com/opendatateam/udata/pull/3575))
