@@ -1,5 +1,6 @@
 from udata.harvest.backends.base import BaseBackend
 from udata.models import Resource, License, SpatialCoverage
+from udata.core.contact_point.models import ContactPoint
 from udata.harvest.models import HarvestItem
 import requests
 import logging
@@ -148,6 +149,33 @@ class OGCBackend(BaseBackend):
         if provider and isinstance(provider, dict):
             dataset.extras['publisher_name'] = provider.get('name')
             dataset.extras['publisher_email'] = provider.get('contactPoint', {}).get('email')
+
+            # Create contact point
+            name = provider.get('name')
+            email = provider.get('contactPoint', {}).get('email') or provider.get('email')
+            if email:
+                email = email.replace('mailto:', '').strip()
+
+            if name or email:
+                org_or_owner = {}
+                if dataset.organization:
+                    org_or_owner = {"organization": dataset.organization}
+                elif dataset.owner:
+                    org_or_owner = {"owner": dataset.owner}
+
+                if org_or_owner:
+                    contact, _ = ContactPoint.objects.get_or_create(
+                        name=name,
+                        email=email,
+                        role='publisher',
+                        **org_or_owner
+                    )
+
+                    if not dataset.contact_points:
+                        dataset.contact_points = []
+                    
+                    if contact not in dataset.contact_points:
+                        dataset.contact_points.append(contact)
 
         return dataset
 
