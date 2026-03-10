@@ -313,7 +313,9 @@ class Defaults(object):
 
     HARVEST_VALIDATION_CONTACT_FORM = None
 
-    HARVEST_MAX_CATALOG_SIZE_IN_MONGO = None  # Defaults to the size of a MongoDB document
+    HARVEST_MAX_CATALOG_SIZE_IN_MONGO = (
+        None  # Defaults to the size of a MongoDB document
+    )
     HARVEST_GRAPHS_S3_BUCKET = None  # If the catalog is bigger than `HARVEST_MAX_CATALOG_SIZE_IN_MONGO` store the graph inside S3 instead of MongoDB
     HARVEST_GRAPHS_S3_FILENAME_PREFIX = ""  # Useful to store the graphs inside a subfolder of the bucket. For example by setting `HARVEST_GRAPHS_S3_FILENAME_PREFIX = 'graphs/'`
 
@@ -560,9 +562,7 @@ class Defaults(object):
     ####################
     SCHEMA_CATALOG_URL = None
 
-    API_DOC_EXTERNAL_LINK = (
-        "https://guides.data.gouv.fr/publier-des-donnees/guide-data.gouv.fr/api/reference"
-    )
+    API_DOC_EXTERNAL_LINK = "https://guides.data.gouv.fr/publier-des-donnees/guide-data.gouv.fr/api/reference"
 
     # Dataset recommendations
     #########################

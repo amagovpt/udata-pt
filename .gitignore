@@ -68,7 +68,6 @@ Procfile
 .cursor
 .idea
 .vscode
-.antigravity
 
 # Python package managers
 .python-version
@@ -82,19 +81,7 @@ fs/resources/
 # Local configuration file of udata
 udata.cfg
 
-# Local db directory
-db
-dump
+# Local data directory
+data
 
-# Local environment variables
 .env
-
-# SAML configuration
-udata/auth/saml/*
-!udata/auth/saml/saml_plugin/
-
-# uwsgi
-uwsgi
-
-# Logs configuration
-logs

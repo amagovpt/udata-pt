@@ -2,6 +2,7 @@ from flask_restx.inputs import boolean
 from mongoengine import NULLIFY
 
 from udata.api_fields import field, generate_fields
+from udata.core.discussions.notifications import DiscussionNotificationDetails
 from udata.core.organization.notifications import MembershipRequestNotificationDetails
 from udata.core.user.api_fields import user_ref_fields
 from udata.core.user.models import User
@@ -53,7 +54,11 @@ class Notification(Datetimed, db.Document):
     )
     details = field(
         db.GenericEmbeddedDocumentField(
-            choices=(MembershipRequestNotificationDetails, TransferRequestNotificationDetails)
+            choices=(
+                DiscussionNotificationDetails,
+                MembershipRequestNotificationDetails,
+                TransferRequestNotificationDetails,
+            )
         ),
         generic=True,
     )

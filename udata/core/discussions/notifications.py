@@ -1,10 +1,39 @@
+import enum
 import logging
 
+from udata.api_fields import field, generate_fields
 from udata.features.notifications.actions import notifier
+from udata.models import db
 
 from .actions import discussions_for
 
 log = logging.getLogger(__name__)
+
+
+class DiscussionStatus(str, enum.Enum):
+    NEW_DISCUSSION = "new_discussion"
+    NEW_COMMENT = "new_comment"
+
+
+@generate_fields()
+class DiscussionNotificationDetails(db.EmbeddedDocument):
+    discussion = field(
+        db.ReferenceField("Discussion"),
+        readonly=True,
+        auditable=False,
+        allow_null=True,
+        filterable={},
+    )
+    status = field(
+        db.StringField(choices=[s.value for s in DiscussionStatus]),
+        readonly=True,
+        auditable=False,
+    )
+    message_id = field(
+        db.StringField(),
+        readonly=True,
+        auditable=False,
+    )
 
 
 @notifier("discussion")

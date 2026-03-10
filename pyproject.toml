@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "udata"
-dynamic = ["version"]
+version = "15.1.0"
+# dynamic = ["version"]  # disabled: setuptools-scm needs .git at package root
 description = "Open data portal"
 readme = "README.md"
 license = { text = "MIT" }
@@ -76,7 +77,6 @@ dependencies = [
     "pydenticon>=0.3.1,<1.0.0",
     "pymongo>=4.11.3,<5.0.0",
     "python-dateutil>=2.9.0.post0,<3.0.0",
-    "pytz",
     "rdflib>=7.1.3,<8.0.0",
     "redis>=5.0.0,<8.0.0",
     "requests>=2.32.4,<3.0.0",
@@ -92,8 +92,8 @@ dependencies = [
     "werkzeug>=3.0.0,<4.0.0",
     "wtforms[email]>=3.2.1,<4.0.0",
     "wtforms-json>=0.3.5,<1.0.0",
+    "qrcode>=8.2,<9.0",
     "dotenv>=0.9.9",
-    "owslib>=0.31.0,<1.0.0",
 ]
 
 [project.urls]
@@ -112,13 +112,6 @@ csw-iso-19139 = "udata.harvest.backends.dcat:CswIso19139DcatBackend"
 maaf = "udata.harvest.backends.maaf:MaafBackend"
 ckan = "udata.harvest.backends.ckan.harvesters:CkanBackend"
 dkan = "udata.harvest.backends.ckan.harvesters:DkanBackend"
-dgt = "udata.harvest.backends.dgt:DGTBackend"
-apambiente = "udata.harvest.backends.apambiente:PortalAmbienteBackend"
-ckanpt = "udata.harvest.backends.ckanpt:CkanPTBackend"
-ine = "udata.harvest.backends.ine:INEBackend"
-inehvd = "udata.harvest.backends.inehvd:INEHvdBackend"
-odspt = "udata.harvest.backends.odspt:OdsBackendPT"
-ogc = "udata.harvest.backends.ogc:OGCBackend"
 
 [project.entry-points."udata.i18n"]
 udata = "udata.translations"
@@ -145,6 +138,7 @@ dev = [
     "pytest-flask >= 1.3.0, < 2.0",
     "pytest-mock >= 3.14.0, < 4.0",
     "pytest-sugar >= 1.0.0, < 2.0",
+    "pytest-xdist>=3.5.0,<4.0",
     "requests-mock >= 1.12.1, < 2.0",
     "ruff >= 0.11.0, < 1.0",
 ]
@@ -194,7 +188,7 @@ line-length = 100
 packages = ["udata"]
 
 [tool.setuptools.package-data]
-udata = ["templates/*", "translations/*"]
+udata = ["templates/*", "translations/*", "fixtures/*"]
 
 [tool.wheel]
 universal = true
