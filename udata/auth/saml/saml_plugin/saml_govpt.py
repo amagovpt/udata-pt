@@ -169,25 +169,27 @@ def idp_initiated():
             #return "Erro: Assinatura ausente ou inválida na resposta SAML", 400
             break
     
-    #if root is None:
-        # Se não foi possível obter a raiz do XML, retornar um erro ou fazer qualquer ação necessária
-    #    return "Erro: Não foi possível obter a raiz do XML", 400
+    if root is None:
+        current_app.logger.error("Erro: Não foi possível obter a raiz do XML da resposta SAML")
+        return "Erro: Não foi possível processar a resposta SAML", 400
 
     ns = {'assertion': 'urn:oasis:names:tc:SAML:2.0:assertion',
           'atributos': 'http://autenticacao.cartaodecidadao.pt/atributos'}
 
-    for child in root.find('.//assertion:AttributeStatement', ns):
-        try:
-            if child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
-                user_email = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NIC':
-                user_nic = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
-                first_name = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
-                last_name = child.find('.//assertion:AttributeValue', ns).text
-        except AttributeError:
-            pass
+    attribute_statement = root.find('.//assertion:AttributeStatement', ns)
+    if attribute_statement is not None:
+        for child in attribute_statement:
+            try:
+                if child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
+                    user_email = child.find('.//assertion:AttributeValue', ns).text
+                elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NIC':
+                    user_nic = child.find('.//assertion:AttributeValue', ns).text
+                elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
+                    first_name = child.find('.//assertion:AttributeValue', ns).text
+                elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
+                    last_name = child.find('.//assertion:AttributeValue', ns).text
+            except AttributeError:
+                pass
 
     data = {'email': user_email}
     extras = {'extras': {'auth_nic': user_nic}}
@@ -416,25 +418,27 @@ def idp_eidas_initiated():
             #return "Erro: Assinatura ausente ou inválida na resposta SAML", 400
             break
     
-    #if root is None:
-        # Se não foi possível obter a raiz do XML, retornar um erro ou fazer qualquer ação necessária
-    #    return "Erro: Não foi possível obter a raiz do XML", 400
+    if root is None:
+        current_app.logger.error("Erro: Não foi possível obter a raiz do XML da resposta eIDAS")
+        return "Erro: Não foi possível processar a resposta eIDAS", 400
 
     ns = {'assertion': 'urn:oasis:names:tc:SAML:2.0:assertion',
           'atributos': 'http://autenticacao.cartaodecidadao.pt/atributos'}
 
-    for child in root.find('.//assertion:AttributeStatement', ns):
-        try:
-            if child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
-                user_email = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NIC':
-                user_nic = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
-                first_name = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
-                last_name = child.find('.//assertion:AttributeValue', ns).text
-        except AttributeError:
-            pass
+    attribute_statement = root.find('.//assertion:AttributeStatement', ns)
+    if attribute_statement is not None:
+        for child in attribute_statement:
+            try:
+                if child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
+                    user_email = child.find('.//assertion:AttributeValue', ns).text
+                elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NIC':
+                    user_nic = child.find('.//assertion:AttributeValue', ns).text
+                elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
+                    first_name = child.find('.//assertion:AttributeValue', ns).text
+                elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
+                    last_name = child.find('.//assertion:AttributeValue', ns).text
+            except AttributeError:
+                pass
 
     data = {'email': user_email}
     extras = {'extras': {'auth_nic': user_nic}}
