@@ -3,7 +3,7 @@
 # Handle PasswordLess User Registration
 ##
 
-from flask import url_for, request, session, redirect
+from flask import url_for, request, session, redirect, render_template
 
 from flask_security.forms import Form
 from flask_security.confirmable import send_confirmation_instructions
@@ -16,7 +16,6 @@ from wtforms import StringField, SubmitField
 from wtforms.validators import DataRequired
 
 from udata.models import datastore
-from udata_front import theme
 
 from .saml_govpt import autenticacao_gov
 
@@ -68,4 +67,4 @@ def register():
         form.last_name.data = session.get('last_name')
         form.user_nic.data = session.get('user_nic')
 
-        return theme.render('security/register_saml.html', form=form)
+        return render_template('security/register_saml.html', form=form)
