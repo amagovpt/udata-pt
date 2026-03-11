@@ -19,11 +19,20 @@ from saml2.saml import NameID, NAMEID_FORMAT_UNSPECIFIED
 from saml2.pack import http_form_post_message
 from saml2.sigver import SignatureError
 
+import os
 import base64
 import xml.etree.ElementTree as ET
 
 from .faa_level import FAAALevel, LogoutUrl
 from .requested_atributes import RequestedAttributes, RequestedAttribute
+
+
+def _resolve_path(path):
+    """Resolve a config path relative to the backend root directory."""
+    if os.path.isabs(path):
+        return path
+    backend_root = os.path.dirname(current_app.root_path)
+    return os.path.join(backend_root, path)
 
 autenticacao_gov = Blueprint('saml', __name__)
 
@@ -41,10 +50,10 @@ def saml_client_for(metadata_file):
     settings = {
         'entityid': current_app.config.get('SECURITY_SAML_ENTITY_ID'),
         'name': current_app.config.get('SECURITY_SAML_ENTITY_NAME'),
-        'key_file': current_app.config.get('SECURITY_SAML_KEY_FILE'),
-        'cert_file': current_app.config.get('SECURITY_SAML_CERT_FILE'),
+        'key_file': _resolve_path(current_app.config.get('SECURITY_SAML_KEY_FILE')),
+        'cert_file': _resolve_path(current_app.config.get('SECURITY_SAML_CERT_FILE')),
         'metadata': {
-            "local": [metadata_file]
+            "local": [_resolve_path(metadata_file)]
         },
         'accepted_time_diff': 60,
         'service': {
@@ -285,10 +294,10 @@ def eidas_client_for(metadata_file):
     settings = {
         'entityid': current_app.config.get('SECURITY_SAML_ENTITY_ID'),
         'name': current_app.config.get('SECURITY_SAML_ENTITY_NAME'),
-        'key_file': current_app.config.get('SECURITY_SAML_KEY_FILE'),
-        'cert_file': current_app.config.get('SECURITY_SAML_CERT_FILE'),
+        'key_file': _resolve_path(current_app.config.get('SECURITY_SAML_KEY_FILE')),
+        'cert_file': _resolve_path(current_app.config.get('SECURITY_SAML_CERT_FILE')),
         'metadata': {
-            "local": [metadata_file]
+            "local": [_resolve_path(metadata_file)]
         },
         'accepted_time_diff': 60,
         'service': {
