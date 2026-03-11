@@ -633,6 +633,23 @@ class Defaults(object):
     ###########################################################################
     METRICS_API = None
 
+    # SAML / Autenticação.gov settings
+    ###########################################################################
+    # SP (Service Provider) entity identifier
+    SECURITY_SAML_ENTITY_ID = ""
+    # SP display name
+    SECURITY_SAML_ENTITY_NAME = ""
+    # Path to the SP private key file
+    SECURITY_SAML_KEY_FILE = ""
+    # Path to the SP public certificate file
+    SECURITY_SAML_CERT_FILE = ""
+    # Comma-separated paths to IdP metadata XML files
+    SECURITY_SAML_IDP_METADATA = ""
+    # Level of Assurance (FAALevel) — 1, 2 or 3
+    SECURITY_SAML_FAAALEVEL = 3
+    # Destination URL for logout requests sent to Autenticação.gov
+    SECURITY_SAML_FA_URL = ""
+
 
 class Testing(object):
     """Sane values for testing. Should be applied as override"""
