@@ -85,3 +85,5 @@ udata.cfg
 data
 
 .env
+
+node_modules/
