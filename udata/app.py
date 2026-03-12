@@ -171,6 +171,11 @@ def create_app(config="udata.settings.Defaults", override=None, init_logging=ini
 
     app.debug = app.config["DEBUG"] and not app.config["TESTING"]
 
+    # Disable strict trailing-slash matching to prevent 308 redirect loops
+    # when behind a reverse proxy (nginx → Next.js → Flask) that strips
+    # trailing slashes. Without this, /api/1/me → 308 → /api/1/me/ → loop.
+    app.url_map.strict_slashes = False
+
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
     init_logging(app)
