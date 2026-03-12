@@ -7,7 +7,9 @@ import xml.etree.ElementTree as ET
 
 from flask import Blueprint, current_app, redirect, request, session, url_for
 from flask_login import login_user, logout_user
-from flask_security.confirmable import requires_confirmation, send_confirmation_instructions
+from datetime import datetime
+
+from flask_security.confirmable import requires_confirmation
 from flask_security.decorators import anonymous_user_required
 from flask_security.utils import do_flash, get_message
 from saml2 import (
@@ -90,8 +92,10 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
             user_data['extras'] = {'auth_nic': user_nic}
 
         user = datastore.create_user(**user_data)
+        # Auto-confirm users created via SAML — they were already verified
+        # by autenticação.gov, so no email confirmation is needed.
+        user.confirmed_at = datetime.utcnow()
         datastore.commit()
-        send_confirmation_instructions(user)
 
     return user
 
@@ -105,8 +109,9 @@ def _handle_saml_user_login(user):
         return redirect(f"{frontend_url}/pages/login")
 
     if requires_confirmation(user):
-        do_flash(*get_message('CONFIRMATION_REQUIRED'))
-        return redirect(f"{frontend_url}/pages/login")
+        # Auto-confirm on SAML login — autenticação.gov already verified the user.
+        user.confirmed_at = datetime.utcnow()
+        datastore.commit()
 
     if user.deleted:
         do_flash(*get_message('DISABLED_ACCOUNT'))
@@ -412,25 +417,31 @@ def idp_initiated():
 #################################################################
 # Receives SAML Logout
 #################################################################
-@autenticacao_gov.route('/saml/sso_logout', methods=['POST'])
+@autenticacao_gov.route('/saml/sso_logout', methods=['GET', 'POST'])
 @csrf.exempt
 def saml_logout_postback():
+    frontend_url = current_app.config.get('CDATA_BASE_URL') or ''
+    saml_response = request.form.get('SAMLResponse') or request.args.get('SAMLResponse')
 
-    auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+    if saml_response:
+        auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+        binding = entity.BINDING_HTTP_POST if request.method == 'POST' else BINDING_HTTP_REDIRECT
 
-    for server in auth_servers:
-        saml_client = saml_client_for(server)
-        try:
-            authn_response = saml_client.parse_logout_request_response(
-                request.form['SAMLResponse'], entity.BINDING_HTTP_POST)
-        except sigver.MissingKey:
-            continue
-        else:
-            break
+        for server in auth_servers:
+            saml_client = saml_client_for(server)
+            try:
+                saml_client.parse_logout_request_response(saml_response, binding)
+            except sigver.MissingKey:
+                continue
+            except Exception as e:
+                current_app.logger.warning(f"SAML logout parse error: {e}")
+                break
+            else:
+                break
 
     session.pop('saml_login', None)
     logout_user()
-    return redirect(url_for('site.home'))
+    return redirect(frontend_url or '/')
 
 
 #################################################################
@@ -644,21 +655,26 @@ def idp_eidas_initiated():
 #################################################################
 # Receives eIDAS Logout
 #################################################################
-@autenticacao_gov.route('/saml/eidas/sso_logout', methods=['POST'])
+@autenticacao_gov.route('/saml/eidas/sso_logout', methods=['GET', 'POST'])
 @csrf.exempt
 def eidas_logout_postback():
+    saml_response = request.form.get('SAMLResponse') or request.args.get('SAMLResponse')
 
-    auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+    if saml_response:
+        auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+        binding = entity.BINDING_HTTP_POST if request.method == 'POST' else BINDING_HTTP_REDIRECT
 
-    for server in auth_servers:
-        saml_client = eidas_client_for(server)
-        try:
-            authn_response = saml_client.parse_logout_request_response(
-                request.form['SAMLResponse'], entity.BINDING_HTTP_POST)
-        except sigver.MissingKey:
-            continue
-        else:
-            break
+        for server in auth_servers:
+            saml_client = eidas_client_for(server)
+            try:
+                saml_client.parse_logout_request_response(saml_response, binding)
+            except sigver.MissingKey:
+                continue
+            except Exception as e:
+                current_app.logger.warning(f"eIDAS logout parse error: {e}")
+                break
+            else:
+                break
 
     session.pop('saml_login', None)
     logout_user()
