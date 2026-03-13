@@ -85,3 +85,6 @@ udata.cfg
 data
 
 .env
+
+node_modules/
+udata/auth/saml/credentials/

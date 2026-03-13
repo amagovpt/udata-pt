@@ -100,3 +100,7 @@ def init_app(app):
     security_bp = create_security_blueprint(app, app.extensions["security"], "security_blueprint")
 
     app.register_blueprint(security_bp)
+
+    from .saml.saml_plugin import blueprint as saml_blueprint
+
+    app.register_blueprint(saml_blueprint)

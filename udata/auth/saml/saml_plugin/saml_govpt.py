@@ -1,31 +1,126 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
-from flask import current_app, Blueprint, url_for, request, redirect, session
+import base64
+import os
+import xml.etree.ElementTree as ET
+
+from flask import Blueprint, current_app, redirect, request, session, url_for
 from flask_login import login_user, logout_user
-from flask_security.utils import get_message, do_flash
-from flask_security.decorators import anonymous_user_required
+from datetime import datetime
+
 from flask_security.confirmable import requires_confirmation
+from flask_security.decorators import anonymous_user_required
+from flask_security.utils import do_flash, get_message
+from saml2 import (
+    BINDING_HTTP_POST,
+    BINDING_HTTP_REDIRECT,
+    element_to_extension_element,
+    entity,
+    sigver,
+)
+from saml2.client import Saml2Client
+from saml2.config import Config as Saml2Config
+from saml2.pack import http_form_post_message
+from saml2.saml import NAMEID_FORMAT_UNSPECIFIED, NameID
+from saml2.samlp import Extensions
+from saml2.sigver import SignatureError
+from saml2 import xmldsig as ds
+
+# autenticacao.gov uses C14N 1.0 (http://www.w3.org/TR/2001/REC-xml-c14n-20010315)
+# but pysaml2 only allows Exclusive C14N by default. Add C14N 1.0 to allowed sets.
+_C14N_INCLUSIVE = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
+_C14N_INCLUSIVE_WITH_COMMENTS = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE)
+ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
+ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
+ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
 from udata.app import csrf
 from udata.models import datastore
 
-from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT
-from saml2 import entity, element_to_extension_element, sigver
-from saml2.samlp import Extensions
-from saml2.client import Saml2Client
-from saml2.config import Config as Saml2Config
-from saml2.saml import NameID, NAMEID_FORMAT_UNSPECIFIED
-from saml2.pack import http_form_post_message
-from saml2.sigver import SignatureError
-
-import base64
-import xml.etree.ElementTree as ET
-
 from .faa_level import FAAALevel, LogoutUrl
-from .requested_atributes import RequestedAttributes, RequestedAttribute
+from .requested_atributes import RequestedAttribute, RequestedAttributes
+
+
+def _resolve_path(path):
+    """Resolve a config path relative to the backend root directory."""
+    if os.path.isabs(path):
+        return path
+    backend_root = os.path.dirname(current_app.root_path)
+    return os.path.join(backend_root, path)
 
 autenticacao_gov = Blueprint('saml', __name__)
+
+
+def _first_value(identity, key):
+    """Extract the first value for a key from pysaml2 identity dict."""
+    values = identity.get(key, [])
+    if isinstance(values, list) and values:
+        return values[0]
+    if isinstance(values, str) and values:
+        return values
+    return None
+
+
+def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
+    """Find an existing user by email/NIC or auto-create from SAML data."""
+    user = None
+    if user_email:
+        user = datastore.find_user(email=user_email)
+    if not user and user_nic:
+        user = datastore.find_user(extras={'auth_nic': user_nic})
+
+    if not user:
+        if not user_email and not user_nic:
+            current_app.logger.error(
+                "SAML: Cannot create user without email or NIC"
+            )
+            return None
+
+        # Generate a placeholder email when the IdP does not provide one.
+        if not user_email:
+            import uuid
+            user_email = f"saml-{user_nic or uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
+
+        user_data = {
+            'first_name': (first_name or '').title(),
+            'last_name': (last_name or '').title(),
+            'email': user_email,
+        }
+        if user_nic:
+            user_data['extras'] = {'auth_nic': user_nic}
+
+        user = datastore.create_user(**user_data)
+        # Auto-confirm users created via SAML — they were already verified
+        # by autenticação.gov, so no email confirmation is needed.
+        user.confirmed_at = datetime.utcnow()
+        datastore.commit()
+
+    return user
+
+
+def _handle_saml_user_login(user):
+    """Handle login/redirect after SAML authentication."""
+    frontend_url = current_app.config.get('CDATA_BASE_URL') or ''
+
+    if user is None:
+        do_flash(*get_message('CONFIRMATION_REQUIRED'))
+        return redirect(f"{frontend_url}/pages/login")
+
+    if requires_confirmation(user):
+        # Auto-confirm on SAML login — autenticação.gov already verified the user.
+        user.confirmed_at = datetime.utcnow()
+        datastore.commit()
+
+    if user.deleted:
+        do_flash(*get_message('DISABLED_ACCOUNT'))
+        return redirect(frontend_url or url_for('site.home'))
+
+    login_user(user)
+    session['saml_login'] = True
+    return redirect(frontend_url or url_for('site.home'))
+
 
 #################################################################
 # Given the name of an IdP, return a configuation.
@@ -33,18 +128,28 @@ autenticacao_gov = Blueprint('saml', __name__)
 #################################################################
 
 
-def saml_client_for(metadata_file):
+def _build_sp_settings(acs_url, out_url, metadata_file):
+    """Build pysaml2 SP settings with encryption support."""
+    key_file = _resolve_path(current_app.config.get('SECURITY_SAML_KEY_FILE'))
+    cert_file = _resolve_path(current_app.config.get('SECURITY_SAML_CERT_FILE'))
 
-    acs_url = url_for("saml.idp_initiated", _external=True)
-    out_url = url_for("saml.saml_logout_postback", _external=True)
-
-    settings = {
+    return {
         'entityid': current_app.config.get('SECURITY_SAML_ENTITY_ID'),
         'name': current_app.config.get('SECURITY_SAML_ENTITY_NAME'),
-        'key_file': current_app.config.get('SECURITY_SAML_KEY_FILE'),
-        'cert_file': current_app.config.get('SECURITY_SAML_CERT_FILE'),
+        'key_file': key_file,
+        'cert_file': cert_file,
+        # Use SHA256 — this xmlsec1 build does not support rsa-sha1
+        'signing_algorithm': 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256',
+        'digest_algorithm': 'http://www.w3.org/2001/04/xmlenc#sha256',
+        # Keypair for decrypting encrypted assertions from autenticacao.gov
+        'encryption_keypairs': [
+            {
+                'key_file': key_file,
+                'cert_file': cert_file,
+            },
+        ],
         'metadata': {
-            "local": [metadata_file]
+            "local": [_resolve_path(metadata_file)]
         },
         'accepted_time_diff': 60,
         'service': {
@@ -70,6 +175,26 @@ def saml_client_for(metadata_file):
             },
         },
     }
+
+
+def _force_scheme(url):
+    """Force the URL scheme to match PREFERRED_URL_SCHEME config.
+
+    Next.js rewrites proxy requests to the backend over plain HTTP,
+    so Flask sees http:// even when the real client uses https://.
+    """
+    scheme = current_app.config.get('PREFERRED_URL_SCHEME')
+    if scheme and url.startswith('http://') and scheme == 'https':
+        return 'https://' + url[len('http://'):]
+    return url
+
+
+def saml_client_for(metadata_file):
+
+    acs_url = _force_scheme(url_for("saml.idp_initiated", _external=True))
+    out_url = _force_scheme(url_for("saml.saml_logout_postback", _external=True))
+
+    settings = _build_sp_settings(acs_url, out_url, metadata_file)
     spConfig = Saml2Config()
     spConfig.load(settings)
     saml_client = Saml2Client(config=spConfig)
@@ -131,114 +256,192 @@ def idp_initiated():
     user_nic = None
     first_name = None
     last_name = None
-    root = None  # Inicialize root para evitar UnboundLocalError
+    authn_response = None
+
+    raw_saml_response = request.form.get('SAMLResponse')
+    if not raw_saml_response:
+        return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
 
+    # 0. Verificar se o IdP rejeitou o pedido (antes de tentar pysaml2)
+    try:
+        decoded_xml = base64.b64decode(raw_saml_response)
+        xml_str = None
+        for codec in ['utf-8', 'ISO-8859-1']:
+            try:
+                xml_str = decoded_xml.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+        if xml_str:
+            status_root = ET.fromstring(xml_str)
+            ns = {'samlp': 'urn:oasis:names:tc:SAML:2.0:protocol'}
+            status_code = status_root.find('.//samlp:StatusCode', ns)
+            status_msg = status_root.find('.//samlp:StatusMessage', ns)
+            if status_code is not None:
+                status_value = status_code.attrib.get('Value', '')
+                if 'Success' not in status_value:
+                    msg = status_msg.text if status_msg is not None else status_value
+                    current_app.logger.error(f"SAML: IdP rejeitou o pedido: {msg}")
+                    frontend_url = current_app.config.get('CDATA_BASE_URL') or ''
+                    do_flash(f"Autenticação rejeitada: {msg}", "error")
+                    return redirect(f"{frontend_url}/pages/login")
+    except Exception as e:
+        current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
+
+    # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta)
     for server in auth_servers:
-        saml_client = saml_client_for(server)
         try:
-            #decoded_response = base64.b64decode(request.form['SAMLResponse']).decode('utf-8')
-            decoded_response = base64.b64decode(request.form['SAMLResponse'])
-            root = None
-            for codec in ['utf-8', 'ISO-8859-1']:  # Diferentes codecs
-                try:
-                    decoded_response_str = decoded_response.decode(codec)
-                    root = ET.fromstring(decoded_response_str)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if root is None:
-                raise ValueError("Não foi possível decodificar o XML com codecs disponíveis.")
-            authn_response = saml_client.parse_authn_request_response(decoded_response, entity.BINDING_HTTP_POST)
-            root = ET.fromstring(decoded_response)  # Analisar a resposta decodificada para diagnóstico
-        except sigver.MissingKey:
+            saml_client = saml_client_for(server)
+            authn_response = saml_client.parse_authn_request_response(
+                raw_saml_response, entity.BINDING_HTTP_POST
+            )
+            current_app.logger.info(f"SAML: pysaml2 processou com sucesso via {server}")
+        except sigver.MissingKey as e:
+            current_app.logger.warning(f"SAML MissingKey para {server}: {e}")
             continue
         except SignatureError as se:
-            current_app.logger.error(f"SignatureError: {se}")
-            # Adicione qualquer ação necessária em caso de erro na assinatura
-        except ET.ParseError as pe:
-            current_app.logger.error(f"XML Parse Error: {pe}")
-            current_app.logger.error(f"Invalid XML: {decoded_response}")
-            # Adicione qualquer ação necessária em caso de erro de análise XML
+            current_app.logger.error(f"SAML SignatureError para {server}: {se}")
+            continue
         except Exception as e:
-            current_app.logger.error(f"Error processing XML: {e}")
-            # Adicione qualquer ação necessária em caso de outros erros relacionados ao XML
+            current_app.logger.error(
+                f"SAML Erro ao processar resposta com {server}: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            continue
         else:
-            # Se nenhum servidor com assinatura válida for encontrado, retornar um erro
-            #return "Erro: Assinatura ausente ou inválida na resposta SAML", 400
             break
-    
-    #if root is None:
-        # Se não foi possível obter a raiz do XML, retornar um erro ou fazer qualquer ação necessária
-    #    return "Erro: Não foi possível obter a raiz do XML", 400
 
-    ns = {'assertion': 'urn:oasis:names:tc:SAML:2.0:assertion',
-          'atributos': 'http://autenticacao.cartaodecidadao.pt/atributos'}
-
-    for child in root.find('.//assertion:AttributeStatement', ns):
+    # 2. Extrair atributos — primeiro do pysaml2, depois fallback para XML manual
+    if authn_response is not None:
+        # pysaml2 desencriptou e validou — extrair atributos do objeto
         try:
-            if child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
-                user_email = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NIC':
-                user_nic = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
-                first_name = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
-                last_name = child.find('.//assertion:AttributeValue', ns).text
-        except AttributeError:
-            pass
+            identity = authn_response.get_identity()
+            current_app.logger.info(f"SAML pysaml2 identity: {identity}")
 
-    data = {'email': user_email}
-    extras = {'extras': {'auth_nic': user_nic}}
-    #userUdata = datastore.find_user(**extras) or datastore.find_user(**data)
-    userUdata = datastore.find_user(**data) or datastore.find_user(**extras)
+            # Também tentar ava (attribute value assertions) como alternativa
+            if not identity:
+                try:
+                    ava = authn_response.ava
+                    current_app.logger.info(f"SAML pysaml2 ava: {ava}")
+                    if ava:
+                        identity = ava
+                except AttributeError:
+                    pass
 
-    if not userUdata:
-        # Redirects to new custom registration form
-        session['user_email'] = user_email
-        session['user_nic'] = user_nic
-        session['first_name'] = first_name
-        session['last_name'] = last_name
-        return redirect(url_for('saml.register'))
-
-    elif requires_confirmation(userUdata):
-        do_flash(*get_message('CONFIRMATION_REQUIRED'))
-        return redirect(url_for('security.login'))
-
-    elif userUdata.deleted:
-        do_flash(*get_message('DISABLED_ACCOUNT'))
-        return redirect(url_for('site.home'))
-
+            if identity:
+                user_email = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico')
+                user_nic = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/NIC')
+                first_name = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/NomeProprio')
+                last_name = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/NomeApelido')
+                current_app.logger.info(
+                    f"SAML atributos extraídos: email={user_email}, nic={user_nic}, "
+                    f"nome={first_name} {last_name}"
+                )
+            else:
+                # Log debug info para diagnosticar
+                current_app.logger.warning(
+                    f"SAML pysaml2: identity vazio. "
+                    f"response type={type(authn_response).__name__}, "
+                    f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
+                    f"encrypted_assertions="
+                    f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
+                )
+        except Exception as e:
+            current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
     else:
-        login_user(userUdata)
-        session['saml_login'] = True
-        # do_flash(*get_message('PASSWORDLESS_LOGIN_SUCCESSFUL'))
-        return redirect(url_for('site.home'))
+        current_app.logger.error("SAML: pysaml2 não conseguiu processar a resposta de nenhum servidor")
+
+    # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
+    if not user_email and not user_nic:
+        current_app.logger.info("pysaml2 não extraiu atributos, a tentar parsing manual do XML")
+        try:
+            decoded_response = base64.b64decode(raw_saml_response)
+            root = None
+            for codec in ['utf-8', 'ISO-8859-1']:
+                try:
+                    decoded_str = decoded_response.decode(codec)
+                    root = ET.fromstring(decoded_str)
+                    break
+                except (UnicodeDecodeError, ET.ParseError):
+                    continue
+
+            if root is not None:
+                ns = {
+                    'assertion': 'urn:oasis:names:tc:SAML:2.0:assertion',
+                    'atributos': 'http://autenticacao.cartaodecidadao.pt/atributos',
+                }
+                attribute_statement = root.find('.//assertion:AttributeStatement', ns)
+                if attribute_statement is not None:
+                    for child in attribute_statement:
+                        try:
+                            attr_name = child.attrib.get('Name', '')
+                            value = child.find('.//assertion:AttributeValue', ns)
+                            if value is None or value.text is None:
+                                continue
+                            if attr_name == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
+                                user_email = value.text
+                            elif attr_name == 'http://interop.gov.pt/MDC/Cidadao/NIC':
+                                user_nic = value.text
+                            elif attr_name == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
+                                first_name = value.text
+                            elif attr_name == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
+                                last_name = value.text
+                        except (AttributeError, KeyError):
+                            pass
+                    current_app.logger.info(
+                        f"SAML atributos via XML manual: email={user_email}, nic={user_nic}, "
+                        f"nome={first_name} {last_name}"
+                    )
+                else:
+                    current_app.logger.warning(
+                        "AttributeStatement não encontrado no XML — "
+                        "as assertions podem estar encriptadas"
+                    )
+        except Exception as e:
+            current_app.logger.error(f"Erro no parsing manual do XML: {e}")
+
+    if not user_email and not user_nic:
+        current_app.logger.error(
+            "SAML SSO: nenhum atributo extraído (email/NIC). "
+            "Verificar se as assertions estão encriptadas e se o pysaml2 "
+            "tem acesso à chave privada para desencriptar."
+        )
+
+    userUdata = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    return _handle_saml_user_login(userUdata)
 
 
 #################################################################
 # Receives SAML Logout
 #################################################################
-@autenticacao_gov.route('/saml/sso_logout', methods=['POST'])
+@autenticacao_gov.route('/saml/sso_logout', methods=['GET', 'POST'])
 @csrf.exempt
 def saml_logout_postback():
+    frontend_url = current_app.config.get('CDATA_BASE_URL') or ''
+    saml_response = request.form.get('SAMLResponse') or request.args.get('SAMLResponse')
 
-    auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+    if saml_response:
+        auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+        binding = entity.BINDING_HTTP_POST if request.method == 'POST' else BINDING_HTTP_REDIRECT
 
-    for server in auth_servers:
-        saml_client = saml_client_for(server)
-        try:
-            authn_response = saml_client.parse_logout_request_response(
-                request.form['SAMLResponse'], entity.BINDING_HTTP_POST)
-        except sigver.MissingKey:
-            continue
-        else:
-            break
+        for server in auth_servers:
+            saml_client = saml_client_for(server)
+            try:
+                saml_client.parse_logout_request_response(saml_response, binding)
+            except sigver.MissingKey:
+                continue
+            except Exception as e:
+                current_app.logger.warning(f"SAML logout parse error: {e}")
+                break
+            else:
+                break
 
     session.pop('saml_login', None)
     logout_user()
-    return redirect(url_for('site.home'))
+    return redirect(frontend_url or '/')
 
 
 #################################################################
@@ -251,7 +454,7 @@ def saml_logout():
     nid = NameID(format=NAMEID_FORMAT_UNSPECIFIED,
                  text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified")
 
-    logout_url = LogoutUrl(text=url_for("saml.saml_logout_postback", _external=True))
+    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.saml_logout_postback", _external=True)))
     destination = current_app.config.get('SECURITY_SAML_FA_URL')
 
     extensions = Extensions(extension_elements=[logout_url])
@@ -277,41 +480,10 @@ def saml_logout():
 
 def eidas_client_for(metadata_file):
 
-    acs_url = url_for("saml.idp_eidas_initiated", _external=True)
-    out_url = url_for("saml.eidas_logout_postback", _external=True)
+    acs_url = _force_scheme(url_for("saml.idp_eidas_initiated", _external=True))
+    out_url = _force_scheme(url_for("saml.eidas_logout_postback", _external=True))
 
-    settings = {
-        'entityid': current_app.config.get('SECURITY_SAML_ENTITY_ID'),
-        'name': current_app.config.get('SECURITY_SAML_ENTITY_NAME'),
-        'key_file': current_app.config.get('SECURITY_SAML_KEY_FILE'),
-        'cert_file': current_app.config.get('SECURITY_SAML_CERT_FILE'),
-        'metadata': {
-            "local": [metadata_file]
-        },
-        'accepted_time_diff': 60,
-        'service': {
-            'sp': {
-                'endpoints': {
-                    'assertion_consumer_service': [
-                        (acs_url, BINDING_HTTP_REDIRECT),
-                        (acs_url, BINDING_HTTP_POST)
-                    ],
-                    'single_logout_service': [
-                        (out_url, BINDING_HTTP_REDIRECT),
-                        (out_url, BINDING_HTTP_POST),
-                    ],
-                },
-                # Don't verify that the incoming requests originate from us via
-                # the built-in cache for authn request ids in pysaml2
-                'allow_unsolicited': True,
-                # Sign authn requests
-                'authn_requests_signed': True,
-                'logout_requests_signed': True,
-                'want_assertions_signed': True,
-                'want_response_signed': True,
-            },
-        },
-    }
+    settings = _build_sp_settings(acs_url, out_url, metadata_file)
     spConfig = Saml2Config()
     spConfig.load(settings)
     saml_client = Saml2Client(config=spConfig)
@@ -378,110 +550,131 @@ def idp_eidas_initiated():
     user_nic = None
     first_name = None
     last_name = None
-    root = None  # Inicialize root para evitar UnboundLocalError
+    authn_response = None
+
+    raw_saml_response = request.form.get('SAMLResponse')
+    if not raw_saml_response:
+        return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
 
+    # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta)
     for server in auth_servers:
         saml_client = eidas_client_for(server)
         try:
-            #decoded_response = base64.b64decode(request.form['SAMLResponse']).decode('utf-8')
-            decoded_response = base64.b64decode(request.form['SAMLResponse'])
-            root = None
-            for codec in ['utf-8', 'ISO-8859-1']:  # Diferentes codecs
-                try:
-                    decoded_response_str = decoded_response.decode(codec)
-                    root = ET.fromstring(decoded_response_str)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if root is None:
-                raise ValueError("Não foi possível decodificar o XML com codecs disponíveis.")
-            authn_response = saml_client.parse_authn_request_response(decoded_response, entity.BINDING_HTTP_POST)
-            root = ET.fromstring(decoded_response)  # Analisar a resposta decodificada para diagnóstico
+            authn_response = saml_client.parse_authn_request_response(
+                raw_saml_response, entity.BINDING_HTTP_POST
+            )
         except sigver.MissingKey:
             continue
         except SignatureError as se:
-            current_app.logger.error(f"SignatureError: {se}")
-            # Adicione qualquer ação necessária em caso de erro na assinatura
-        except ET.ParseError as pe:
-            current_app.logger.error(f"XML Parse Error: {pe}")
-            current_app.logger.error(f"Invalid XML: {decoded_response}")
-            # Adicione qualquer ação necessária em caso de erro de análise XML
+            current_app.logger.error(f"eIDAS SignatureError para {server}: {se}")
+            continue
         except Exception as e:
-            current_app.logger.error(f"Error processing XML: {e}")
-            # Adicione qualquer ação necessária em caso de outros erros relacionados ao XML
+            current_app.logger.error(f"Erro ao processar resposta eIDAS com {server}: {e}")
+            continue
         else:
-            # Se nenhum servidor com assinatura válida for encontrado, retornar um erro
-            #return "Erro: Assinatura ausente ou inválida na resposta SAML", 400
             break
-    
-    #if root is None:
-        # Se não foi possível obter a raiz do XML, retornar um erro ou fazer qualquer ação necessária
-    #    return "Erro: Não foi possível obter a raiz do XML", 400
 
-    ns = {'assertion': 'urn:oasis:names:tc:SAML:2.0:assertion',
-          'atributos': 'http://autenticacao.cartaodecidadao.pt/atributos'}
-
-    for child in root.find('.//assertion:AttributeStatement', ns):
+    # 2. Extrair atributos — primeiro do pysaml2, depois fallback para XML manual
+    if authn_response is not None:
         try:
-            if child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
-                user_email = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NIC':
-                user_nic = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
-                first_name = child.find('.//assertion:AttributeValue', ns).text
-            elif child.attrib['Name'] == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
-                last_name = child.find('.//assertion:AttributeValue', ns).text
-        except AttributeError:
-            pass
+            identity = authn_response.get_identity()
+            if identity:
+                user_email = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico')
+                user_nic = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/NIC')
+                first_name = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/NomeProprio')
+                last_name = _first_value(identity, 'http://interop.gov.pt/MDC/Cidadao/NomeApelido')
+                current_app.logger.info(
+                    f"eIDAS atributos via pysaml2: email={user_email}, nic={user_nic}, "
+                    f"nome={first_name} {last_name}"
+                )
+        except Exception as e:
+            current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
 
-    data = {'email': user_email}
-    extras = {'extras': {'auth_nic': user_nic}}
-    #userUdata = datastore.find_user(**extras) or datastore.find_user(**data)
-    userUdata = datastore.find_user(**data) or datastore.find_user(**extras)
+    # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
+    if not user_email and not user_nic:
+        current_app.logger.info("eIDAS: pysaml2 não extraiu atributos, a tentar parsing manual")
+        try:
+            decoded_response = base64.b64decode(raw_saml_response)
+            root = None
+            for codec in ['utf-8', 'ISO-8859-1']:
+                try:
+                    decoded_str = decoded_response.decode(codec)
+                    root = ET.fromstring(decoded_str)
+                    break
+                except (UnicodeDecodeError, ET.ParseError):
+                    continue
 
-    if not userUdata:
-        # Redirects to new custom registration form
-        session['user_email'] = user_email
-        session['user_nic'] = user_nic
-        session['first_name'] = first_name
-        session['last_name'] = last_name
-        return redirect(url_for('saml.register'))
+            if root is not None:
+                ns = {
+                    'assertion': 'urn:oasis:names:tc:SAML:2.0:assertion',
+                    'atributos': 'http://autenticacao.cartaodecidadao.pt/atributos',
+                }
+                attribute_statement = root.find('.//assertion:AttributeStatement', ns)
+                if attribute_statement is not None:
+                    for child in attribute_statement:
+                        try:
+                            attr_name = child.attrib.get('Name', '')
+                            value = child.find('.//assertion:AttributeValue', ns)
+                            if value is None or value.text is None:
+                                continue
+                            if attr_name == 'http://interop.gov.pt/MDC/Cidadao/CorreioElectronico':
+                                user_email = value.text
+                            elif attr_name == 'http://interop.gov.pt/MDC/Cidadao/NIC':
+                                user_nic = value.text
+                            elif attr_name == 'http://interop.gov.pt/MDC/Cidadao/NomeProprio':
+                                first_name = value.text
+                            elif attr_name == 'http://interop.gov.pt/MDC/Cidadao/NomeApelido':
+                                last_name = value.text
+                        except (AttributeError, KeyError):
+                            pass
+                    current_app.logger.info(
+                        f"eIDAS atributos via XML manual: email={user_email}, nic={user_nic}, "
+                        f"nome={first_name} {last_name}"
+                    )
+                else:
+                    current_app.logger.warning(
+                        "eIDAS: AttributeStatement não encontrado no XML — "
+                        "as assertions podem estar encriptadas"
+                    )
+        except Exception as e:
+            current_app.logger.error(f"eIDAS: Erro no parsing manual do XML: {e}")
 
-    elif requires_confirmation(userUdata):
-        do_flash(*get_message('CONFIRMATION_REQUIRED'))
-        return redirect(url_for('security.login'))
+    if not user_email and not user_nic:
+        current_app.logger.error(
+            "eIDAS SSO: nenhum atributo extraído (email/NIC). "
+            "Verificar se as assertions estão encriptadas e se o pysaml2 "
+            "tem acesso à chave privada para desencriptar."
+        )
 
-    elif userUdata.deleted:
-        do_flash(*get_message('DISABLED_ACCOUNT'))
-        return redirect(url_for('site.home'))
-
-    else:
-        login_user(userUdata)
-        session['saml_login'] = True
-        # do_flash(*get_message('PASSWORDLESS_LOGIN_SUCCESSFUL'))
-        return redirect(url_for('site.home'))
+    userUdata = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    return _handle_saml_user_login(userUdata)
 
 
 #################################################################
 # Receives eIDAS Logout
 #################################################################
-@autenticacao_gov.route('/saml/eidas/sso_logout', methods=['POST'])
+@autenticacao_gov.route('/saml/eidas/sso_logout', methods=['GET', 'POST'])
 @csrf.exempt
 def eidas_logout_postback():
+    saml_response = request.form.get('SAMLResponse') or request.args.get('SAMLResponse')
 
-    auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+    if saml_response:
+        auth_servers = current_app.config.get('SECURITY_SAML_IDP_METADATA').split(',')
+        binding = entity.BINDING_HTTP_POST if request.method == 'POST' else BINDING_HTTP_REDIRECT
 
-    for server in auth_servers:
-        saml_client = eidas_client_for(server)
-        try:
-            authn_response = saml_client.parse_logout_request_response(
-                request.form['SAMLResponse'], entity.BINDING_HTTP_POST)
-        except sigver.MissingKey:
-            continue
-        else:
-            break
+        for server in auth_servers:
+            saml_client = eidas_client_for(server)
+            try:
+                saml_client.parse_logout_request_response(saml_response, binding)
+            except sigver.MissingKey:
+                continue
+            except Exception as e:
+                current_app.logger.warning(f"eIDAS logout parse error: {e}")
+                break
+            else:
+                break
 
     session.pop('saml_login', None)
     logout_user()
@@ -498,7 +691,7 @@ def eidas_logout():
     nid = NameID(format=NAMEID_FORMAT_UNSPECIFIED,
                  text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified")
 
-    logout_url = LogoutUrl(text=url_for("saml.eidas_logout_postback", _external=True))
+    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.eidas_logout_postback", _external=True)))
     destination = current_app.config.get('SECURITY_SAML_FA_URL')
 
     extensions = Extensions(extension_elements=[logout_url])
