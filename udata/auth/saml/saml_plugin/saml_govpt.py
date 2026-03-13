@@ -115,11 +115,11 @@ def _handle_saml_user_login(user):
 
     if user.deleted:
         do_flash(*get_message('DISABLED_ACCOUNT'))
-        return redirect(frontend_url or url_for('site.home'))
+        return redirect(frontend_url or '/')
 
     login_user(user)
     session['saml_login'] = True
-    return redirect(frontend_url or url_for('site.home'))
+    return redirect(frontend_url or '/')
 
 
 #################################################################
@@ -678,7 +678,8 @@ def eidas_logout_postback():
 
     session.pop('saml_login', None)
     logout_user()
-    return redirect(url_for('site.home'))
+    frontend_url = current_app.config.get('CDATA_BASE_URL') or '/'
+    return redirect(frontend_url)
 
 
 #################################################################
