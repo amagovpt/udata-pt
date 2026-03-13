@@ -37,6 +37,7 @@ bower
 *.rdb
 venv
 .venv
+.env
 
 # Installer logs
 pip-log.txt
@@ -79,12 +80,10 @@ Procfile
 fs/resources/
 
 # Local configuration file of udata
-udata.cfg
+# udata.cfg
 
 # Local data directory
 data
-
-.env
 
 node_modules/
 udata/auth/saml/credentials/
