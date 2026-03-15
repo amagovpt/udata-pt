@@ -40,6 +40,7 @@ class CSWUdataBackend(BaseBackend):
     and maps them to udata datasets.
     """
 
+    name = "cswudata"
     display_name = "CSW Harvester"
 
     def inner_harvest(self):

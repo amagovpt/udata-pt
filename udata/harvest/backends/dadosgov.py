@@ -25,6 +25,7 @@ DOWNLOADFILEPATH = '/home/dev/udata/fs/%s' % (DADOSGOVPATH)
 DADOSGOVURL = 'servico.dados.gov.pt'
 
 class DGBackend(DGBaseBackend):
+    name = "dadosGov"
     display_name = 'Dados Gov'
 
     def initialize(self):

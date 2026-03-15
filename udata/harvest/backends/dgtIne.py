@@ -9,6 +9,7 @@ import re
 
 from .tools.harvester_utils import normalize_url_slashes
 class DGTINEBackend(BaseBackend):
+    name = "dgtIne"
     display_name = 'INE Harvester'
 
     def __init__(self, *args, **kwargs):
