@@ -1,7 +1,14 @@
+from flask import session
+
 from udata.api import api, base_reference, fields
 from udata.auth.helpers import current_user_is_admin_or_self
 
 from .constants import BIGGEST_AVATAR_SIZE
+
+
+def _get_saml_login():
+    """Return True if the current session was authenticated via SAML."""
+    return session.get("saml_login", False)
 
 user_ref_fields = api.inherit(
     "UserReference",
@@ -87,6 +94,11 @@ me_fields = api.inherit(
     user_fields,
     {
         "apikey": fields.String(description="The user API Key", readonly=True),
+        "saml_login": fields.Boolean(
+            attribute=lambda o: _get_saml_login(),
+            description="Whether the current session was authenticated via SAML",
+            readonly=True,
+        ),
     },
 )
 
