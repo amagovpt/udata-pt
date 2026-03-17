@@ -507,7 +507,7 @@ def idp_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate":
+    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
         return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
     return _handle_saml_user_login(user)
@@ -781,7 +781,7 @@ def idp_eidas_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate":
+    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
         return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
     return _handle_saml_user_login(user)
@@ -855,10 +855,18 @@ def eidas_logout():
 #################################################################
 
 
+def _migration_enabled():
+    """Check if the migration mode is enabled in config."""
+    return current_app.config.get("MIGRATION_MODE_ENABLED", False)
+
+
 @autenticacao_gov.route("/saml/migration/check", methods=["GET"])
 @csrf.exempt
 def migration_check():
     """Check if the currently authenticated user is a legacy user that needs migration."""
+    if not _migration_enabled():
+        return jsonify({"needs_migration": False})
+
     from flask_login import current_user
 
     if not current_user.is_authenticated:
@@ -873,6 +881,9 @@ def migration_check():
 @csrf.exempt
 def migration_pending():
     """Check if there is a pending migration in the session."""
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"pending": False})
@@ -907,6 +918,9 @@ def migration_pending():
 @csrf.exempt
 def migration_search():
     """Search for a legacy account when SAML did not return an email."""
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
@@ -937,6 +951,9 @@ def migration_search():
 @csrf.exempt
 def migration_send_code():
     """Generate and send a 6-digit verification code to the legacy user's email."""
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
@@ -975,6 +992,9 @@ def migration_send_code():
 @csrf.exempt
 def migration_confirm():
     """Confirm migration via verification code or old password."""
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
@@ -1054,6 +1074,9 @@ def migration_confirm():
 @csrf.exempt
 def migration_skip():
     """Skip migration and create a new account from SAML data."""
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
