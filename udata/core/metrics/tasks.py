@@ -1,11 +1,14 @@
 import logging
 import time
+from datetime import datetime, timedelta
 from functools import wraps
 
 import requests
 from flask import current_app
 
 from udata.core.dataservices.models import Dataservice
+from udata.core.metrics.aggregations import MetricAggregation
+from udata.core.metrics.events import MetricEvent
 from udata.core.metrics.signals import on_site_metrics_computed
 from udata.models import CommunityResource, Dataset, Organization, Reuse, Site, db
 from udata.tasks import job
@@ -136,13 +139,151 @@ def update_metrics_for_models():
     update_organizations()
 
 
+def save_model_by_id_or_slug(model: db.Document, identifier: str, metrics: dict[str, int]) -> None:
+    """Update model metrics, looking up by ObjectId first, then by slug."""
+    update_kwargs = {f"set__metrics__{key}": value for key, value in metrics.items()}
+    try:
+        # Try by ObjectId first
+        result = model.objects(id=identifier).update(**update_kwargs)
+        if result:
+            return
+    except Exception:
+        pass
+
+    # Try by slug
+    try:
+        result = model.objects(slug=identifier).update(**update_kwargs)
+        if result is None:
+            log.debug(f"{model.__name__} not found for '{identifier}'")
+    except Exception as e:
+        log.debug(f"Could not update {model.__name__} '{identifier}': {e}")
+
+
+@log_timing
+def update_metrics_from_internal():
+    """Update model metrics from internal MetricEvent data.
+
+    Only "view" events count as page views (sent once per page visit from the frontend).
+    "api_call" events are excluded from view counts because a single page visit
+    triggers multiple API calls, which would inflate the numbers.
+    """
+    # Aggregate views per dataset
+    pipeline = [
+        {"$match": {"event_type": "view", "object_type": "dataset"}},
+        {"$group": {"_id": "$object_id", "views": {"$sum": 1}}},
+    ]
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        if row["_id"]:
+            save_model_by_id_or_slug(Dataset, row["_id"], {"views": row["views"]})
+
+    # Aggregate downloads per dataset
+    pipeline = [
+        {"$match": {"event_type": "download", "object_type": "resource"}},
+        {"$group": {"_id": "$extra.dataset_id", "downloads": {"$sum": 1}}},
+    ]
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        if row["_id"]:
+            save_model_by_id_or_slug(Dataset, row["_id"], {"resources_downloads": row["downloads"]})
+
+    # Aggregate views per reuse
+    pipeline = [
+        {"$match": {"event_type": "view", "object_type": "reuse"}},
+        {"$group": {"_id": "$object_id", "views": {"$sum": 1}}},
+    ]
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        if row["_id"]:
+            save_model_by_id_or_slug(Reuse, row["_id"], {"views": row["views"]})
+
+    # Aggregate views per organization
+    pipeline = [
+        {"$match": {"event_type": "view", "object_type": "organization"}},
+        {"$group": {"_id": "$object_id", "views": {"$sum": 1}}},
+    ]
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        if row["_id"]:
+            save_model_by_id_or_slug(Organization, row["_id"], {"views": row["views"]})
+
+    # Aggregate views per dataservice
+    pipeline = [
+        {"$match": {"event_type": "view", "object_type": "dataservice"}},
+        {"$group": {"_id": "$object_id", "views": {"$sum": 1}}},
+    ]
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        if row["_id"]:
+            save_model_by_id_or_slug(Dataservice, row["_id"], {"views": row["views"]})
+
+
+@job("aggregate-metrics", route="low.metrics")
+def aggregate_metrics(self):
+    """Aggregate raw MetricEvent data into MetricAggregation documents."""
+    yesterday = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=1
+    )
+    day_start = yesterday
+    day_end = yesterday + timedelta(days=1)
+    day_str = yesterday.strftime("%Y-%m-%d")
+    month_str = yesterday.strftime("%Y-%m")
+
+    event_type_to_field = {
+        "view": "views",
+        "api_call": "api_calls",
+        "download": "downloads",
+    }
+
+    pipeline = [
+        {"$match": {"created_at": {"$gte": day_start, "$lt": day_end}}},
+        {
+            "$group": {
+                "_id": {
+                    "object_type": "$object_type",
+                    "object_id": "$object_id",
+                    "event_type": "$event_type",
+                },
+                "count": {"$sum": 1},
+            }
+        },
+    ]
+
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        obj_type = row["_id"].get("object_type")
+        obj_id = row["_id"].get("object_id")
+        event_type = row["_id"].get("event_type")
+
+        if not obj_type or not obj_id:
+            continue
+
+        field_name = event_type_to_field.get(event_type)
+        if not field_name:
+            continue
+
+        # Upsert daily aggregation
+        MetricAggregation.objects(
+            object_type=obj_type,
+            object_id=obj_id,
+            period_type="daily",
+            period=day_str,
+        ).update_one(**{f"inc__{field_name}": row["count"]}, upsert=True)
+
+        # Upsert monthly aggregation
+        MetricAggregation.objects(
+            object_type=obj_type,
+            object_id=obj_id,
+            period_type="monthly",
+            period=month_str,
+        ).update_one(**{f"inc__{field_name}": row["count"]}, upsert=True)
+
+    log.info(f"Aggregated metrics for {day_str}")
+
+
 @job("update-metrics", route="low.metrics")
 def update_metrics(self):
-    """Update udata objects metrics"""
-    if not current_app.config["METRICS_API"]:
-        log.error("You need to set METRICS_API to run update-metrics")
-        exit(1)
-    update_metrics_for_models()
+    """Update udata objects metrics."""
+    if current_app.config.get("METRICS_API"):
+        # Legacy external metrics API
+        update_metrics_for_models()
+    else:
+        # Use internal tracking data
+        update_metrics_from_internal()
 
 
 @job("compute-site-metrics")
