@@ -43,6 +43,7 @@ class TrackingEvent(db.Document):
 
     object_type = db.StringField(required=True, choices=["dataset", "organization", "reuse", "dataservice"])
     object_id = db.StringField(required=True)
+    resource_id = db.StringField()  # Set for download events — identifies the specific resource
     event_type = db.StringField(required=True, choices=["view", "download"])
     visitor_ip = db.StringField()
     created_at = db.DateTimeField(default=datetime.utcnow)
@@ -53,6 +54,7 @@ class TrackingEvent(db.Document):
             ("object_type", "event_type"),
             ("object_type", "object_id"),
             ("object_id", "event_type", "visitor_ip", "created_at"),
+            ("resource_id", "event_type"),
             {"fields": ["created_at"], "expireAfterSeconds": 90 * 86400},  # TTL: 90 days
         ],
         "ordering": ["-created_at"],
@@ -87,6 +89,7 @@ def _track_resource_download(response):
     TrackingEvent(
         object_type="dataset",
         object_id=str(dataset.id),
+        resource_id=str(resource_id),
         event_type="download",
         visitor_ip=request.remote_addr or "unknown",
     ).save()
