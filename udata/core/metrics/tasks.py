@@ -1,6 +1,7 @@
 import logging
 import time
 from functools import wraps
+from urllib.parse import urlparse
 
 import requests
 from flask import current_app
@@ -40,6 +41,16 @@ def save_model(model: db.Document, model_id: str, metrics: dict[str, int]) -> No
         log.exception(e)
 
 
+def _rebase_url(next_url: str | None, base: str) -> str | None:
+    """Replace the host/port in a pagination URL with our configured METRICS_API base."""
+    if not next_url:
+        return None
+    parsed_next = urlparse(next_url)
+    parsed_base = urlparse(base)
+    rebased = parsed_next._replace(scheme=parsed_base.scheme, netloc=parsed_base.netloc)
+    return rebased.geturl()
+
+
 def iterate_on_metrics(target: str, value_keys: list[str], page_size: int = 50) -> dict:
     """
     Yield all elements with not zero values for the keys inside `value_keys`.
@@ -47,9 +58,10 @@ def iterate_on_metrics(target: str, value_keys: list[str], page_size: int = 50) 
     metrics with one of the two values not zero.
     """
     yielded = set()
+    metrics_api = current_app.config["METRICS_API"]
 
     for value_key in value_keys:
-        url = f"{current_app.config['METRICS_API']}/{target}_total/data/"
+        url = f"{metrics_api}/{target}_total/data/"
         url += f"?{value_key}__greater=1&page_size={page_size}"
 
         with requests.Session() as session:
@@ -63,7 +75,7 @@ def iterate_on_metrics(target: str, value_keys: list[str], page_size: int = 50) 
                         yielded.add(row["__id"])
                         yield row
 
-                url = data["links"].get("next")
+                url = _rebase_url(data["links"].get("next"), metrics_api)
 
 
 @log_timing

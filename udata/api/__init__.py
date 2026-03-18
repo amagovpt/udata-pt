@@ -226,6 +226,10 @@ def collect_stats(response):
             "action_name": urllib.parse.quote(action_name),
         }
         tracking.send_signal(on_api_call, request, current_user, **extras)
+    # Internal view tracking (replaces Matomo)
+    from udata.core.metrics.tracking import track_view
+
+    track_view(response)
     return response
 
 
