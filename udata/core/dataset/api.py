@@ -579,10 +579,8 @@ class UploadMixin(object):
     def handle_upload(self, dataset):
         prefix = "/".join((dataset.slug, datetime.utcnow().strftime("%Y%m%d-%H%M%S")))
         infos = handle_upload(storages.resources, prefix)
-        if "html" in infos["mime"]:
-            api.abort(415, "Incorrect file content type: HTML")
-        if infos["mime"] == "image/svg+xml" or infos.get("format", "").lower() in ("svg", "svgz"):
-            self._validate_svg(storages.resources.path(infos["fs_filename"]))
+        # Content validation (HTML, XML/XXE, image magic bytes, script scanning)
+        # is handled centrally in storages.api.handle_upload() via validate_upload()
         infos["title"] = os.path.basename(infos["filename"])
         checksum_type = next(
             checksum_type for checksum_type in CHECKSUM_TYPES if checksum_type in infos
@@ -591,34 +589,6 @@ class UploadMixin(object):
         infos["filesize"] = infos.pop("size")
         del infos["filename"]
         return infos
-
-    @staticmethod
-    def _validate_svg(filepath):
-        """Reject SVG files containing scripts or event handlers."""
-        import re
-
-        try:
-            with open(filepath, "r", errors="ignore") as f:
-                content = f.read().lower()
-        except OSError:
-            api.abort(415, "Could not validate SVG file")
-
-        dangerous_patterns = [
-            r"<script",
-            r"javascript:",
-            r"on\w+\s*=",
-            r"<iframe",
-            r"<object",
-            r"<embed",
-            r"<foreignobject",
-        ]
-        for pattern in dangerous_patterns:
-            if re.search(pattern, content):
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
-                api.abort(415, "SVG files with active content are not allowed")
 
 
 @ns.route("/<dataset:dataset>/upload/", endpoint="upload_new_dataset_resource")
