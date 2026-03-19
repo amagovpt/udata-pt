@@ -119,6 +119,13 @@ class Defaults(object):
 
     SECURITY_SPA_ON_SAME_DOMAIN = False
 
+    # CORS: list of allowed origins for credentialed cross-origin requests.
+    # If empty, no origin is allowed (CORS with credentials is disabled).
+    CORS_ALLOWED_ORIGINS = []
+
+    # Rate limiting storage URI ("memory://" for dev, "redis://..." for production)
+    RATELIMIT_STORAGE_URI = "memory://"
+
     SECURITY_PASSWORD_SALT = "Default uData secret password salt"
     SECURITY_CONFIRM_SALT = "Default uData secret confirm salt"
     SECURITY_RESET_SALT = "Default uData secret reset salt"
@@ -133,7 +140,7 @@ class Defaults(object):
     SECURITY_EMAIL_SUBJECT_PASSWORD_CHANGE_NOTICE = _("Your password has been changed")
     SECURITY_EMAIL_SUBJECT_PASSWORD_RESET = _("Password reset instructions")
 
-    SECURITY_RETURN_GENERIC_RESPONSES = False
+    SECURITY_RETURN_GENERIC_RESPONSES = True
 
     # Inactive users settings
     YEARS_OF_INACTIVITY_BEFORE_DELETION = None
@@ -313,9 +320,7 @@ class Defaults(object):
 
     HARVEST_VALIDATION_CONTACT_FORM = None
 
-    HARVEST_MAX_CATALOG_SIZE_IN_MONGO = (
-        None  # Defaults to the size of a MongoDB document
-    )
+    HARVEST_MAX_CATALOG_SIZE_IN_MONGO = None  # Defaults to the size of a MongoDB document
     HARVEST_GRAPHS_S3_BUCKET = None  # If the catalog is bigger than `HARVEST_MAX_CATALOG_SIZE_IN_MONGO` store the graph inside S3 instead of MongoDB
     HARVEST_GRAPHS_S3_FILENAME_PREFIX = ""  # Useful to store the graphs inside a subfolder of the bucket. For example by setting `HARVEST_GRAPHS_S3_FILENAME_PREFIX = 'graphs/'`
 
@@ -562,7 +567,9 @@ class Defaults(object):
     ####################
     SCHEMA_CATALOG_URL = None
 
-    API_DOC_EXTERNAL_LINK = "https://guides.data.gouv.fr/publier-des-donnees/guide-data.gouv.fr/api/reference"
+    API_DOC_EXTERNAL_LINK = (
+        "https://guides.data.gouv.fr/publier-des-donnees/guide-data.gouv.fr/api/reference"
+    )
 
     # Dataset recommendations
     #########################
