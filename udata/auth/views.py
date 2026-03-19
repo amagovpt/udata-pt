@@ -23,12 +23,16 @@ from flask_security.views import (
 from flask_wtf.csrf import generate_csrf
 from werkzeug.local import LocalProxy
 
+from udata.app import limiter
 from udata.auth.proconnect import get_logout_url
 from udata.uris import homepage_url
 from udata.utils import wants_json
 
 from . import mails
 from .forms import ChangeEmailForm
+
+# Rate limit for auth endpoints: 5 attempts per minute
+auth_rate_limit = limiter.shared_limit("5 per minute", scope="auth")
 
 _security = LocalProxy(lambda: current_app.extensions["security"])
 _datastore = LocalProxy(lambda: _security.datastore)
@@ -160,7 +164,7 @@ def create_security_blueprint(app, state, import_name):
 
     if state.passwordless:
         bp.route(app.config["SECURITY_LOGIN_URL"], methods=["GET", "POST"], endpoint="login")(
-            send_login
+            auth_rate_limit(send_login)
         )
         bp.route(
             app.config["SECURITY_LOGIN_URL"]
@@ -168,23 +172,25 @@ def create_security_blueprint(app, state, import_name):
             endpoint="token_login",
         )(token_login)
     else:
-        bp.route(app.config["SECURITY_LOGIN_URL"], methods=["GET", "POST"], endpoint="login")(login)
+        bp.route(app.config["SECURITY_LOGIN_URL"], methods=["GET", "POST"], endpoint="login")(
+            auth_rate_limit(login)
+        )
 
     if state.registerable:
         bp.route(app.config["SECURITY_REGISTER_URL"], methods=["GET", "POST"], endpoint="register")(
-            register
+            auth_rate_limit(register)
         )
 
     if state.recoverable:
         bp.route(
             app.config["SECURITY_RESET_URL"], methods=["GET", "POST"], endpoint="forgot_password"
-        )(forgot_password)
+        )(auth_rate_limit(forgot_password))
         bp.route(
             app.config["SECURITY_RESET_URL"]
             + slash_url_suffix(app.config["SECURITY_RESET_URL"], "<token>"),
             methods=["GET", "POST"],
             endpoint="reset_password",
-        )(reset_password)
+        )(auth_rate_limit(reset_password))
 
     if state.changeable:
         bp.route(

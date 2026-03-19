@@ -13,11 +13,17 @@ def add_vary(headers: Headers, header: str):
     headers.set("Vary", ", ".join(values))
 
 
+def _is_origin_allowed(origin: str) -> bool:
+    """Check if the given origin is in the CORS_ALLOWED_ORIGINS whitelist."""
+    allowed_origins = current_app.config.get("CORS_ALLOWED_ORIGINS", [])
+    return origin in allowed_origins
+
+
 def add_actual_request_headers(headers: Headers) -> Headers:
     origin = request.headers.get("Origin", None)
     add_vary(headers, "Origin")
 
-    if origin:
+    if origin and _is_origin_allowed(origin):
         headers.set("Access-Control-Allow-Origin", origin)
         headers.set("Access-Control-Allow-Credentials", "true")
 
@@ -62,7 +68,7 @@ def add_preflight_request_headers(headers: Headers) -> Headers:
     origin = request.headers.get("Origin", None)
     add_vary(headers, "Origin")
 
-    if origin:
+    if origin and _is_origin_allowed(origin):
         headers.set("Access-Control-Allow-Origin", origin)
         headers.set("Access-Control-Allow-Credentials", "true")
 

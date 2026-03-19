@@ -579,8 +579,8 @@ class UploadMixin(object):
     def handle_upload(self, dataset):
         prefix = "/".join((dataset.slug, datetime.utcnow().strftime("%Y%m%d-%H%M%S")))
         infos = handle_upload(storages.resources, prefix)
-        if "html" in infos["mime"]:
-            api.abort(415, "Incorrect file content type: HTML")
+        # Content validation (HTML, XML/XXE, image magic bytes, script scanning)
+        # is handled centrally in storages.api.handle_upload() via validate_upload()
         infos["title"] = os.path.basename(infos["filename"])
         checksum_type = next(
             checksum_type for checksum_type in CHECKSUM_TYPES if checksum_type in infos

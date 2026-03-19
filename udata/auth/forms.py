@@ -145,4 +145,4 @@ def check_captchetat(id: str, code: str) -> bool:
         return resp.text == "true"
     except requests.exceptions.RequestException as err:
         log.error(f"Failed to query CaptchEtat: {err}")
-        return True
+        return False

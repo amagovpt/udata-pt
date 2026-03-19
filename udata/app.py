@@ -20,6 +20,8 @@ from flask import (
 )
 from flask.json.provider import DefaultJSONProvider
 from flask_caching import Cache
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 from mongoengine import EmbeddedDocument
 from mongoengine.base import BaseDocument
@@ -35,13 +37,17 @@ log = logging.getLogger(__name__)
 
 cache = Cache()
 csrf = CSRFProtect()
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
 
 
 def send_static(directory, filename, cache_timeout):
     out = send_from_directory(directory, filename, cache_timeout=cache_timeout)
     response = make_response(out)
     response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
 
@@ -228,14 +234,29 @@ def register_extensions(app):
     auth.init_app(app)
     cache.init_app(app)
     csrf.init_app(app)
+    limiter.init_app(app)
     mail.init_app(app)
     search.init_app(app)
     sentry.init_app(app)
     proconnect.init_app(app)
 
+    app.after_request(add_security_headers)
     app.after_request(return_404_html_if_requested)
     app.register_error_handler(NotFound, page_not_found)
     return app
+
+
+def add_security_headers(response):
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; font-src 'self'; frame-ancestors 'self'",
+    )
+    return response
 
 
 def return_404_html_if_requested(response):

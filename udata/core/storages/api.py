@@ -7,6 +7,7 @@ from werkzeug.datastructures import FileStorage
 from udata.api import api, fields
 
 from . import chunks, utils
+from .validation import validate_image_stream, validate_upload
 
 META = "meta.json"
 
@@ -156,6 +157,13 @@ def handle_upload(storage, prefix=None):
     algo, checksum = checksum.split(":", 1)
     metadata[algo] = checksum
     metadata["format"] = utils.extension(fs_filename)
+
+    # Validate file content against malicious payloads
+    filepath = storage.path(fs_filename)
+    error = validate_upload(filepath, metadata.get("mime", ""), metadata.get("format", ""))
+    if error:
+        api.abort(415, error)
+
     return metadata
 
 
@@ -166,6 +174,12 @@ def parse_uploaded_image(field):
     image = args["file"]
     if image.mimetype not in IMAGES_MIMETYPES:
         api.abort(400, "Unsupported image format")
+
+    # Validate file content: magic bytes, Pillow parsing, script scanning
+    error = validate_image_stream(image)
+    if error:
+        api.abort(415, error)
+
     bbox = args.get("bbox", None)
     if bbox:
         bbox = [int(float(c)) for c in bbox.split(",")]

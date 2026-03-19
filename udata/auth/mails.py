@@ -77,10 +77,10 @@ def welcome_existing(recovery_link: str, **kwargs) -> MailMessage:
     from udata.i18n import lazy_gettext as _
 
     return MailMessage(
-        subject=_("Your email address is already associated with an account"),
+        subject=_("Account information"),
         paragraphs=[
             _(
-                "Someone (you?) tried to create an account on %(site)s with your email.",
+                "You received this email because a registration was attempted on %(site)s with your email address.",
                 site=current_app.config["SITE_TITLE"],
             ),
             _("If you forgot your password, you can reset it."),
