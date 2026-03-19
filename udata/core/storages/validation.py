@@ -33,23 +33,25 @@ XML_MIME_TYPES = {
 
 XML_EXTENSIONS = {"xml", "svg", "svgz", "xhtml", "rdf"}
 
-# Patterns that indicate active/dangerous content in any file
-DANGEROUS_CONTENT_PATTERNS = [
-    r"<script",
-    r"javascript:",
-    r"on\w+\s*=",
-    r"<iframe",
-    r"<object",
-    r"<embed",
-    r"<foreignobject",
-]
+# Patterns that indicate active/dangerous content, mapped to human-readable descriptions
+DANGEROUS_CONTENT_PATTERNS = {
+    r"<script": "embedded script tag (<script>)",
+    r"javascript:": "JavaScript URI (javascript:)",
+    r"on\w+\s*=": "inline event handler (e.g. onclick, onerror)",
+    r"<iframe": "embedded iframe tag (<iframe>)",
+    r"<object": "embedded object tag (<object>)",
+    r"<embed": "embedded embed tag (<embed>)",
+    r"<foreignobject": "SVG foreignObject element (<foreignObject>)",
+}
 
 # Additional patterns specific to XML files (XXE)
-XML_DANGEROUS_PATTERNS = DANGEROUS_CONTENT_PATTERNS + [
-    r"<!entity\s",
-    r"<!doctype\s[^>]*\[",
-    r"system\s+[\"']",
-]
+XXE_PATTERNS = {
+    r"<!entity\s": "XML entity declaration (<!ENTITY>)",
+    r"<!doctype\s[^>]*\[": "DOCTYPE with internal subset (potential XXE)",
+    r"system\s+[\"']": "external entity reference (SYSTEM)",
+}
+
+XML_DANGEROUS_PATTERNS = {**DANGEROUS_CONTENT_PATTERNS, **XXE_PATTERNS}
 
 # Image MIME types where we should verify magic bytes
 IMAGE_MIME_TYPES = {
@@ -91,16 +93,19 @@ def _check_magic_bytes(filepath, expected_mime):
 
 
 def _scan_for_dangerous_content(filepath, patterns):
-    """Scan file content for dangerous patterns (scripts, XXE, etc.)."""
+    """Scan file content for dangerous patterns (scripts, XXE, etc.).
+
+    Returns a tuple (pattern, description) if a match is found, or None if clean.
+    """
     try:
         with open(filepath, "r", errors="ignore") as f:
             content = f.read().lower()
     except OSError:
         return None
 
-    for pattern in patterns:
+    for pattern, description in patterns.items():
         if re.search(pattern, content):
-            return pattern
+            return (pattern, description)
     return None
 
 
@@ -125,43 +130,70 @@ def validate_upload(filepath, mime, extension):
     """
     mime = (mime or "").lower()
     extension = (extension or "").lower()
+    filename = os.path.basename(filepath)
 
     # 1. Block HTML MIME types
     if "html" in mime:
         _remove_file(filepath)
-        return "Incorrect file content type: HTML"
+        return (
+            f"Upload rejected: '{filename}' has content type '{mime}' which is not allowed. "
+            "HTML files cannot be uploaded as they may contain executable code."
+        )
 
     # 2. For image files: verify magic bytes match claimed type
     if mime in IMAGE_MIME_TYPES or extension in IMAGE_EXTENSIONS:
         if not _check_magic_bytes(filepath, mime):
             _remove_file(filepath)
-            return "File content does not match the claimed image format"
+            return (
+                f"Upload rejected: '{filename}' claims to be a '{mime}' image but its "
+                "binary content does not match that format. The file may be corrupted "
+                "or disguised as an image."
+            )
 
         # Verify Pillow can parse it (catches polyglot files)
         if not _validate_image_is_parseable(filepath, mime):
             _remove_file(filepath)
-            return "File is not a valid image"
+            return (
+                f"Upload rejected: '{filename}' could not be parsed as a valid image. "
+                "The file may be corrupted or contain non-image data."
+            )
 
         # Even for valid images, scan for embedded script content
         # (polyglot files can be valid images AND contain scripts in metadata)
         match = _scan_for_dangerous_content(filepath, DANGEROUS_CONTENT_PATTERNS)
         if match:
+            _, description = match
             _remove_file(filepath)
-            return "Image file contains suspicious active content"
+            return (
+                f"Upload rejected: '{filename}' is an image file but contains "
+                f"dangerous embedded content: {description}. "
+                "Files with active content hidden inside images are not allowed."
+            )
 
     # 3. For XML-based files: scan for XSS + XXE patterns
     elif mime in XML_MIME_TYPES or extension in XML_EXTENSIONS:
         match = _scan_for_dangerous_content(filepath, XML_DANGEROUS_PATTERNS)
         if match:
+            _, description = match
             _remove_file(filepath)
-            return "XML-based files with active content or entity declarations are not allowed"
+            return (
+                f"Upload rejected: '{filename}' (type: {mime or extension}) contains "
+                f"dangerous content: {description}. "
+                "XML-based files with scripts, event handlers, or external entity "
+                "declarations are not allowed."
+            )
 
     # 4. For all other files: scan for HTML/script injection
     else:
         match = _scan_for_dangerous_content(filepath, DANGEROUS_CONTENT_PATTERNS)
         if match:
+            _, description = match
             _remove_file(filepath)
-            return "File contains suspicious active content"
+            return (
+                f"Upload rejected: '{filename}' (type: {mime or extension}) contains "
+                f"dangerous embedded content: {description}. "
+                "Files with executable code or script injection are not allowed."
+            )
 
     return None
 
@@ -175,24 +207,31 @@ def validate_image_stream(file_storage):
     The stream position is reset after validation.
     """
     mime = (file_storage.mimetype or "").lower()
+    filename = getattr(file_storage, "filename", "unknown") or "unknown"
 
     # 1. Check magic bytes from the stream
     header = file_storage.stream.read(16)
     file_storage.stream.seek(0)
 
     if not header:
-        return "Uploaded file is empty"
+        return f"Upload rejected: '{filename}' is empty. Please select a valid image file."
 
     magic = IMAGE_MAGIC.get(mime)
     if magic is not None:
+        mismatch = False
         if isinstance(magic, tuple):
-            if not any(header.startswith(m) for m in magic):
-                return "File content does not match the claimed image format"
+            mismatch = not any(header.startswith(m) for m in magic)
         elif mime == "image/webp":
-            if header[:4] != b"RIFF" or header[8:12] != b"WEBP":
-                return "File content does not match the claimed image format"
-        elif not header.startswith(magic):
-            return "File content does not match the claimed image format"
+            mismatch = header[:4] != b"RIFF" or header[8:12] != b"WEBP"
+        else:
+            mismatch = not header.startswith(magic)
+
+        if mismatch:
+            return (
+                f"Upload rejected: '{filename}' claims to be a '{mime}' image but its "
+                "binary content does not match that format. The file may be corrupted "
+                "or disguised as an image."
+            )
 
     # 2. Verify Pillow can parse it
     try:
@@ -203,7 +242,10 @@ def validate_image_stream(file_storage):
             img.verify()
     except Exception:
         file_storage.stream.seek(0)
-        return "File is not a valid image"
+        return (
+            f"Upload rejected: '{filename}' could not be parsed as a valid image. "
+            "The file may be corrupted or contain non-image data."
+        )
 
     # 3. Scan raw bytes for embedded script content
     file_storage.stream.seek(0)
@@ -216,9 +258,13 @@ def validate_image_stream(file_storage):
     except Exception:
         text = raw.decode("latin-1", errors="ignore")
 
-    for pattern in DANGEROUS_CONTENT_PATTERNS:
+    for pattern, description in DANGEROUS_CONTENT_PATTERNS.items():
         if re.search(pattern, text):
-            return "Image file contains suspicious active content"
+            return (
+                f"Upload rejected: '{filename}' is an image file but contains "
+                f"dangerous embedded content: {description}. "
+                "Files with active content hidden inside images are not allowed."
+            )
 
     return None
 
