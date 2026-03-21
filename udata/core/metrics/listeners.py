@@ -12,17 +12,17 @@ log = logging.getLogger(__name__)
 _SLUG_OR_OID = r"(?:[a-z0-9]+-[a-z0-9-]*[a-z0-9]|[0-9a-f]{24})"
 
 # Patterns to extract object_type and object_id from API URL paths.
-# Only match real object identifiers (slugs with hyphens or ObjectIds),
-# which avoids false positives on sub-endpoints like "badges", "licenses", etc.
+# Only match direct object access (the identifier must be the last path segment),
+# so sub-endpoints like /organizations/<slug>/datasets/ are NOT counted as views.
 _RESOURCE_DL = re.compile(
-    rf"/api/[12]/datasets/r/({_SLUG_OR_OID})(?:/|$)"
+    rf"/api/[12]/datasets/r/({_SLUG_OR_OID})/?$"
 )
 
 URL_PATTERNS = [
-    (re.compile(rf"/api/[12]/datasets/({_SLUG_OR_OID})(?:/|$)"), "dataset"),
-    (re.compile(rf"/api/[12]/reuses/({_SLUG_OR_OID})(?:/|$)"), "reuse"),
-    (re.compile(rf"/api/[12]/organizations/({_SLUG_OR_OID})(?:/|$)"), "organization"),
-    (re.compile(rf"/api/[12]/dataservices/({_SLUG_OR_OID})(?:/|$)"), "dataservice"),
+    (re.compile(rf"/api/[12]/datasets/({_SLUG_OR_OID})/?$"), "dataset"),
+    (re.compile(rf"/api/[12]/reuses/({_SLUG_OR_OID})/?$"), "reuse"),
+    (re.compile(rf"/api/[12]/organizations/({_SLUG_OR_OID})/?$"), "organization"),
+    (re.compile(rf"/api/[12]/dataservices/({_SLUG_OR_OID})/?$"), "dataservice"),
 ]
 
 
