@@ -639,6 +639,8 @@ class Defaults(object):
     # Metrics settings
     ###########################################################################
     METRICS_API = None
+    TRACKING_ENABLED = True
+    TRACKING_EVENT_TTL_DAYS = 90
 
 
 class Testing(object):

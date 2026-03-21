@@ -43,16 +43,43 @@ def metrics_by_label(monthly_metrics: dict, metrics_labels: list[str]) -> list[O
     return metrics_by_label
 
 
+def _get_metrics_from_internal(
+    model: str, id: str | ObjectId | None, metrics_labels: list[str]
+) -> list[OrderedDict]:
+    """Get metrics from internal MetricAggregation data."""
+    from udata.core.metrics.aggregations import MetricAggregation
+
+    months = get_last_13_months()
+    monthly_metrics = OrderedDict(
+        (month, {label: 0 for label in metrics_labels}) for month in months
+    )
+
+    filters = {"object_type": model, "period_type": "monthly"}
+    if id:
+        filters["object_id"] = str(id)
+
+    for agg in MetricAggregation.objects(**filters):
+        if agg.period in monthly_metrics:
+            # Map aggregation fields to metric labels
+            field_map = {"visit": "views", "download_resource": "downloads"}
+            for label in metrics_labels:
+                agg_field = field_map.get(label, label)
+                value = getattr(agg, agg_field, 0) or 0
+                monthly_metrics[agg.period][label] += value
+
+    return metrics_by_label(monthly_metrics, metrics_labels)
+
+
 def get_metrics_for_model(
     model: str, id: str | ObjectId | None, metrics_labels: list[str]
 ) -> list[OrderedDict]:
     """
-    Get distant metrics for a particular model object
+    Get metrics for a particular model object.
+    Uses external METRICS_API if configured, otherwise falls back to internal data.
     """
-    if not current_app.config["METRICS_API"]:
-        # TODO: How to best deal with no METRICS_API, prevent calling or return empty?
-        # raise ValueError("missing config METRICS_API to use this function")
-        return [{} for _ in range(len(metrics_labels))]
+    if not current_app.config.get("METRICS_API"):
+        return _get_metrics_from_internal(model, id, metrics_labels)
+
     models = model + "s" if id else model  # TODO: not clean of a hack
     model_metrics_api = f"{current_app.config['METRICS_API']}/{models}/data/"
     try:
