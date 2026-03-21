@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 @cli.command(short_help="Runs a development server.")
-@click.option("--host", "-h", default="127.0.0.1", help="The interface to bind to.")
+@click.option("--host", "-h", default="0.0.0.0", help="The interface to bind to.")
 @click.option("--port", "-p", default=7000, help="The port to bind to.")
 @click.option(
     "-r/-nr",

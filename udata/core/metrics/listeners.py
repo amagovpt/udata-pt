@@ -14,6 +14,10 @@ _SLUG_OR_OID = r"(?:[a-z0-9]+-[a-z0-9-]*[a-z0-9]|[0-9a-f]{24})"
 # Patterns to extract object_type and object_id from API URL paths.
 # Only match real object identifiers (slugs with hyphens or ObjectIds),
 # which avoids false positives on sub-endpoints like "badges", "licenses", etc.
+_RESOURCE_DL = re.compile(
+    rf"/api/[12]/datasets/r/({_SLUG_OR_OID})(?:/|$)"
+)
+
 URL_PATTERNS = [
     (re.compile(rf"/api/[12]/datasets/({_SLUG_OR_OID})(?:/|$)"), "dataset"),
     (re.compile(rf"/api/[12]/reuses/({_SLUG_OR_OID})(?:/|$)"), "reuse"),
@@ -22,26 +26,38 @@ URL_PATTERNS = [
 ]
 
 
-def _extract_object_info(url):
-    """Extract object_type and object_id from an API URL path (ignoring query string)."""
+def _extract_event_info(url):
+    """Extract event_type, object_type, object_id, and optional resource_id from URL."""
     path = urlparse(url).path
+
+    # Resource download: /api/1/datasets/r/<resource_id>/
+    match = _RESOURCE_DL.search(path)
+    if match:
+        return "download", "dataset", None, match.group(1)
+
+    # Object views
     for pattern, object_type in URL_PATTERNS:
         match = pattern.search(path)
         if match:
-            return object_type, match.group(1)
-    return None, None
+            return "view", object_type, match.group(1), None
+
+    return "api_call", None, None, None
 
 
 def on_api_call_handler(sender, **kwargs):
     """Record API calls as metric events."""
     try:
-        object_type, object_id = _extract_object_info(sender)
+        event_type, object_type, object_id, resource_id = _extract_event_info(sender)
+        extra = {}
+        if resource_id:
+            extra["resource_id"] = resource_id
         MetricEvent.create_event(
-            event_type="api_call",
+            event_type=event_type,
             object_type=object_type,
             object_id=object_id,
             user_id=kwargs.get("uid"),
             ip=kwargs.get("user_ip"),
+            extra=extra,
         )
     except Exception:
         log.exception("Failed to record API call metric")
