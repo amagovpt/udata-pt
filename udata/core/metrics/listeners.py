@@ -45,9 +45,16 @@ def _extract_event_info(url):
 
 
 def on_api_call_handler(sender, **kwargs):
-    """Record API calls as metric events."""
+    """Record API calls as metric events.
+
+    Only record views (single object access) and downloads.
+    Generic API calls (listings, search) are ignored to avoid inflating metrics.
+    """
     try:
         event_type, object_type, object_id, resource_id = _extract_event_info(sender)
+        # Skip generic API calls (no specific object targeted)
+        if event_type == "api_call":
+            return
         extra = {}
         if resource_id:
             extra["resource_id"] = resource_id
