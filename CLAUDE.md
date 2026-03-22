@@ -56,7 +56,7 @@ uv run ruff format .
 ## Key Conventions
 
 - Pre-commit hooks: ruff check, ruff format, trailing whitespace, end-of-file fixer
-- Commit messages: readable, detailed, include `(fix #XXX)` to auto-close issues
+- Commit messages: readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
 - Update CHANGELOG.md when making notable changes
 - Tests use pytest with MongoDB (port 27018 via docker-compose.test.yml)
 - Coverage config in `coverage.rc` (branch coverage, excludes test dirs)
