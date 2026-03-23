@@ -87,3 +87,6 @@ data
 
 node_modules/
 udata/auth/saml/credentials/
+
+# TestSprite / Security testing (contains API keys, credentials, and vulnerability reports)
+/testsprite_tests/

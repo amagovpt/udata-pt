@@ -256,6 +256,8 @@ def add_security_headers(response):
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: https:; font-src 'self'; frame-ancestors 'self'",
     )
+    # Hide server version to prevent information leakage
+    response.headers["Server"] = "dados.gov"
     return response
 
 
