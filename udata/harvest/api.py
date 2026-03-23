@@ -271,6 +271,9 @@ source_parser.add_argument(
     "owner", type=str, location="args", help="The organization or user ID to filter on"
 )
 source_parser.add_argument(
+    "organization", type=str, location="args", help="Filter by organization ID"
+)
+source_parser.add_argument(
     "deleted", type=bool, location="args", default=False, help="Include sources flaggued as deleted"
 )
 source_parser.add_argument("q", type=str, location="args", help="The search query")
@@ -292,6 +295,9 @@ class SourcesAPI(API):
 
         if args["owner"]:
             sources = sources.owned_by(args["owner"])
+
+        if args["organization"]:
+            sources = sources(organization=args["organization"])
 
         if args["q"]:
             phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
