@@ -4,10 +4,20 @@ from __future__ import unicode_literals
 import base64
 import os
 import random
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-from flask import Blueprint, current_app, jsonify, redirect, request, session, url_for
+from flask import (
+    Blueprint,
+    current_app,
+    jsonify,
+    make_response,
+    redirect,
+    request,
+    session,
+    url_for,
+)
 from flask_login import login_user, logout_user
 from flask_security.confirmable import requires_confirmation
 from flask_security.decorators import anonymous_user_required
@@ -43,6 +53,43 @@ from udata.models import datastore
 
 from .faa_level import FAAALevel, LogoutUrl
 from .requested_atributes import RequestedAttribute, RequestedAttributes
+
+
+def _saml_form_response(html_body):
+    """Wrap a pysaml2 HTML form in a Response with a CSP that allows inline scripts.
+
+    pysaml2 generates HTML with inline <script> for auto-submitting SAML forms.
+    The default CSP (script-src 'self') blocks these inline scripts, so we set
+    a permissive CSP on these specific responses. This is safe because the HTML
+    is server-generated, not user-supplied.
+    """
+    response = make_response(html_body)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; font-src 'self'; frame-ancestors 'self'"
+    )
+    return response
+
+
+def _extract_saml_form_data(html_body):
+    """Extract action URL and hidden fields from a pysaml2 HTML form.
+
+    The frontend submits the SAML form via JavaScript instead of relying on
+    pysaml2's inline auto-submit script (which is blocked by CSP).
+    Returns a JSON response with action, SAMLRequest, and RelayState.
+    """
+    action_match = re.search(r'action="([^"]+)"', html_body)
+    saml_match = re.search(r'name="SAMLRequest"\s+value="([^"]+)"', html_body)
+    relay_match = re.search(r'name="RelayState"\s+value="([^"]+)"', html_body)
+
+    return jsonify(
+        {
+            "action": action_match.group(1) if action_match else "",
+            "SAMLRequest": saml_match.group(1) if saml_match else "",
+            "RelayState": relay_match.group(1) if relay_match else "",
+        }
+    )
 
 
 def _resolve_path(path):
@@ -331,8 +378,7 @@ def sp_initiated():
     }
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
-    response = info["data"]
-    return response
+    return _extract_saml_form_data(info["data"])
 
 
 #################################################################
@@ -571,7 +617,7 @@ def saml_logout():
     )
 
     post_message = http_form_post_message(message=logout_request, location=destination)
-    return post_message["data"]
+    return _saml_form_response(post_message["data"])
 
 
 #################################################################
@@ -662,8 +708,7 @@ def sp_eidas_initiated():
     }
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
-    response = info["data"]
-    return response
+    return _extract_saml_form_data(info["data"])
 
 
 #################################################################
@@ -847,7 +892,7 @@ def eidas_logout():
     )
 
     post_message = http_form_post_message(message=logout_request, location=destination)
-    return post_message["data"]
+    return _saml_form_response(post_message["data"])
 
 
 #################################################################
