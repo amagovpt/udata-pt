@@ -18,6 +18,7 @@ from udata.core.followers.api import FollowAPI
 from udata.core.legal.mails import add_send_legal_notice_argument, send_legal_notice_on_deletion
 from udata.core.organization.models import Organization
 from udata.core.reuse.constants import REUSE_TOPICS, REUSE_TYPES
+from udata.core.reuse.tasks import notify_new_reuse
 from udata.core.storages.api import (
     image_parser,
     parse_uploaded_image,
@@ -130,8 +131,12 @@ class ReuseListAPI(API):
             reuse.owner = current_user._get_current_object()
 
         reuse.save()
+        reuse = patch_and_save(reuse, request)
 
-        return patch_and_save(reuse, request), 201
+        if reuse.datasets:
+            notify_new_reuse.delay(str(reuse.id))
+
+        return reuse, 201
 
 
 @ns.route("/recent.atom", endpoint="recent_reuses_atom_feed")
