@@ -1,7 +1,10 @@
 from flask import current_app, json, make_response, redirect, request, url_for
+from flask_restx import fields as restx_fields
 
 from udata.api import API, api
+from udata.api.fields import ImageField, ISODateTime
 from udata.api_fields import patch
+from udata.app import cache
 from udata.auth import admin_permission
 from udata.core import csv
 from udata.core.dataservices.csv import DataserviceCsvAdapter
@@ -13,6 +16,7 @@ from udata.core.dataset.tasks import get_queryset as get_csv_queryset
 from udata.core.organization.api import OrgApiParser
 from udata.core.organization.csv import OrganizationCsvAdapter
 from udata.core.organization.models import Organization
+from udata.core.post.models import Post
 from udata.core.reuse.api import ReuseApiParser
 from udata.core.reuse.csv import ReuseCsvAdapter
 from udata.core.tags.csv import TagCsvAdapter
@@ -25,6 +29,71 @@ from udata.utils import multi_to_dict
 
 from .models import Site, current_site
 from .rdf import build_catalog
+
+# Lightweight models for the aggregated homepage endpoint
+home_org_ref = api.model(
+    "HomeOrgRef",
+    {
+        "name": restx_fields.String(),
+    },
+)
+
+home_dataset_fields = api.model(
+    "HomeDataset",
+    {
+        "id": restx_fields.String(),
+        "title": restx_fields.String(),
+        "slug": restx_fields.String(),
+        "description": restx_fields.String(),
+        "last_modified": ISODateTime(),
+        "organization": restx_fields.Nested(home_org_ref, allow_null=True),
+        "metrics": restx_fields.Raw(),
+    },
+)
+
+home_reuse_fields = api.model(
+    "HomeReuse",
+    {
+        "id": restx_fields.String(),
+        "title": restx_fields.String(),
+        "slug": restx_fields.String(),
+        "image": ImageField(size=500, attribute="image"),
+        "image_thumbnail": ImageField(size=100, attribute="image"),
+        "created_at": ISODateTime(),
+    },
+)
+
+home_post_fields = api.model(
+    "HomePost",
+    {
+        "id": restx_fields.String(),
+        "name": restx_fields.String(),
+        "slug": restx_fields.String(),
+        "image": ImageField(size=400, attribute="image"),
+        "image_thumbnail": ImageField(size=100, attribute="image"),
+        "created_at": ISODateTime(),
+    },
+)
+
+home_metrics_fields = api.model(
+    "HomeMetrics",
+    {
+        "datasets": restx_fields.Integer(),
+        "organizations": restx_fields.Integer(),
+        "reuses": restx_fields.Integer(),
+        "users": restx_fields.Integer(),
+    },
+)
+
+home_fields = api.model(
+    "HomeData",
+    {
+        "site_metrics": restx_fields.Nested(home_metrics_fields),
+        "latest_datasets": restx_fields.List(restx_fields.Nested(home_dataset_fields)),
+        "latest_reuses": restx_fields.List(restx_fields.Nested(home_reuse_fields)),
+        "latest_posts": restx_fields.List(restx_fields.Nested(home_post_fields)),
+    },
+)
 
 
 @api.route("/site/", endpoint="site")
@@ -45,6 +114,25 @@ class SiteAPI(API):
         current_site.save()
         current_site.reload()
         return current_site
+
+
+@api.route("/site/home/", endpoint="site_home")
+class SiteHomeAPI(API):
+    @api.doc(id="get_site_home")
+    @api.marshal_with(home_fields)
+    @cache.cached(timeout=300, key_prefix="site_home")
+    def get(self):
+        """Aggregated homepage data with lightweight serialization"""
+        site = current_site
+        datasets = list(Dataset.objects.visible().order_by("-created_at_internal")[:3])
+        reuses = list(Reuse.objects.visible().order_by("-created_at")[:3])
+        posts = list(Post.objects.published()[:3])
+        return {
+            "site_metrics": site.metrics,
+            "latest_datasets": datasets,
+            "latest_reuses": reuses,
+            "latest_posts": posts,
+        }
 
 
 @api.route("/site/data.<_format>", endpoint="site_dataportal")
