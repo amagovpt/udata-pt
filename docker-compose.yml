@@ -1,31 +1,82 @@
 services:
-    db:
-        image: mongo:7.0.28
-        volumes:
-          - ./data/db:/data/db
-        expose:
-          - "27017"
+    app:
+        build: .
+        command: uv run uwsgi --ini uwsgi/front.ini
         ports:
-        - "27017:27017"
-        ulimits:
-          nofile:
-            soft: 4096
-            hard: 4096
+            - "7000:7000"
+        volumes:
+            - ./udata.cfg:/app/udata.cfg:ro
+            - udata-fs:/udata/fs
+            - app-logs:/logs
+        env_file:
+            - .env
+        environment:
+            UDATA_SETTINGS: /app/udata.cfg
+            SERVER_REDIS: broker
+            MAIL_SERVER: mailpit
+            MAIL_PORT: 1025
+            MAIL_USE_TLS: "False"
+            MAIL_USE_SSL: "False"
+        depends_on:
+            - broker
+            - mailpit
+        restart: unless-stopped
+
+    worker:
+        build: .
+        command: uv run celery -A udata.worker worker --events --concurrency=4 -l info
+        volumes:
+            - ./udata.cfg:/app/udata.cfg:ro
+            - udata-fs:/udata/fs
+            - app-logs:/logs
+        env_file:
+            - .env
+        environment:
+            UDATA_SETTINGS: /app/udata.cfg
+            SERVER_REDIS: broker
+            MAIL_SERVER: mailpit
+            MAIL_PORT: 1025
+            MAIL_USE_TLS: "False"
+            MAIL_USE_SSL: "False"
+        depends_on:
+            - broker
+            - mailpit
+        restart: unless-stopped
+
+    beat:
+        build: .
+        command: uv run celery -A udata.worker beat -l info
+        volumes:
+            - ./udata.cfg:/app/udata.cfg:ro
+            - app-logs:/logs
+        env_file:
+            - .env
+        environment:
+            UDATA_SETTINGS: /app/udata.cfg
+            SERVER_REDIS: broker
+        depends_on:
+            - broker
+        restart: unless-stopped
 
     broker:
-        image: redis
+        image: redis:7-alpine
         volumes:
-          - ./data/broker:/data
-        expose:
-          - "6379"
+            - redis-data:/data
         ports:
-          - "6379:6379"
+            - "6379:6379"
+        restart: unless-stopped
 
     mailpit:
         image: axllent/mailpit
         ports:
-            - 8025:8025
-            - 1025:1025
+            - "8025:8025"
+            - "1025:1025"
         environment:
             MP_SMTP_AUTH_ACCEPT_ANY: 1
             MP_SMTP_AUTH_ALLOW_INSECURE: 1
+        restart: unless-stopped
+
+volumes:
+    redis-data:
+    udata-fs:
+    app-logs:
