@@ -2,6 +2,7 @@ from flask import current_app, json, make_response, redirect, request, url_for
 
 from udata.api import API, api
 from udata.api_fields import patch
+from udata.app import cache
 from udata.auth import admin_permission
 from udata.core import csv
 from udata.core.dataservices.csv import DataserviceCsvAdapter
@@ -13,6 +14,7 @@ from udata.core.dataset.tasks import get_queryset as get_csv_queryset
 from udata.core.organization.api import OrgApiParser
 from udata.core.organization.csv import OrganizationCsvAdapter
 from udata.core.organization.models import Organization
+from udata.core.post.models import Post
 from udata.core.reuse.api import ReuseApiParser
 from udata.core.reuse.csv import ReuseCsvAdapter
 from udata.core.tags.csv import TagCsvAdapter
@@ -25,6 +27,58 @@ from udata.utils import multi_to_dict
 
 from .models import Site, current_site
 from .rdf import build_catalog
+
+
+def _serialize_image(image_field, size):
+    """Safely extract image URL from a MongoEngine ImageField."""
+    if not image_field:
+        return None
+    try:
+        return image_field(size, external=True)
+    except Exception:
+        try:
+            return image_field.fs.url(image_field.filename, external=True)
+        except Exception:
+            return None
+
+
+def _serialize_dataset(dataset):
+    """Serialize a Dataset to lightweight homepage dict."""
+    org = dataset.organization
+    return {
+        "id": str(dataset.id),
+        "title": dataset.title,
+        "slug": dataset.slug,
+        "description": dataset.description,
+        "last_modified": dataset.last_modified.isoformat() if dataset.last_modified else None,
+        "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
+        "organization": {"name": org.name} if org else None,
+        "metrics": dataset.metrics or {},
+    }
+
+
+def _serialize_reuse(reuse):
+    """Serialize a Reuse to lightweight homepage dict."""
+    return {
+        "id": str(reuse.id),
+        "title": reuse.title,
+        "slug": reuse.slug,
+        "image": _serialize_image(reuse.image, 500),
+        "image_thumbnail": _serialize_image(reuse.image, 100),
+        "created_at": reuse.created_at.isoformat() if reuse.created_at else None,
+    }
+
+
+def _serialize_post(post):
+    """Serialize a Post to lightweight homepage dict."""
+    return {
+        "id": str(post.id),
+        "name": post.name,
+        "slug": post.slug,
+        "image": _serialize_image(post.image, 400),
+        "image_thumbnail": _serialize_image(post.image, 100),
+        "created_at": post.created_at.isoformat() if post.created_at else None,
+    }
 
 
 @api.route("/site/", endpoint="site")
@@ -45,6 +99,30 @@ class SiteAPI(API):
         current_site.save()
         current_site.reload()
         return current_site
+
+
+@api.route("/site/home/", endpoint="site_home")
+class SiteHomeAPI(API):
+    @api.doc(id="get_site_home")
+    @cache.cached(timeout=300, key_prefix="site_home")
+    def get(self):
+        """Aggregated homepage data with lightweight serialization"""
+        site = current_site
+        metrics = site.metrics or {}
+        datasets = Dataset.objects.visible().order_by("-created_at_internal")[:3]
+        reuses = Reuse.objects.visible().order_by("-created_at")[:3]
+        posts = Post.objects.published()[:3]
+        return {
+            "site_metrics": {
+                "datasets": metrics.get("datasets", 0),
+                "organizations": metrics.get("organizations", 0),
+                "reuses": metrics.get("reuses", 0),
+                "users": metrics.get("users", 0),
+            },
+            "latest_datasets": [_serialize_dataset(d) for d in datasets],
+            "latest_reuses": [_serialize_reuse(r) for r in reuses],
+            "latest_posts": [_serialize_post(p) for p in posts],
+        }
 
 
 @api.route("/site/data.<_format>", endpoint="site_dataportal")
