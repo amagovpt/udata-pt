@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libssl-dev \
     git \
+    xmlsec1 \
+    libxmlsec1-dev \
+    libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast dependency management

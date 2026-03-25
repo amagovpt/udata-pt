@@ -109,13 +109,14 @@ class SAMLAutoRegistrationTest(APITestCase):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
-            user = _find_or_create_saml_user(
+            user, status = _find_or_create_saml_user(
                 user_email="saml_new@example.com",
                 user_nic="12345678",
                 first_name="João",
                 last_name="Silva",
             )
 
+            assert status == "new"
             assert user is not None
             assert user.email == "saml_new@example.com"
             assert user.first_name == "João"
@@ -128,7 +129,7 @@ class SAMLAutoRegistrationTest(APITestCase):
         with self.app.app_context():
             existing = UserFactory(email="existing@example.com")
 
-            user = _find_or_create_saml_user(
+            user, status = _find_or_create_saml_user(
                 user_email="existing@example.com",
                 user_nic="99999999",
                 first_name="Another",
@@ -143,26 +144,28 @@ class SAMLAutoRegistrationTest(APITestCase):
         with self.app.app_context():
             existing = UserFactory(extras={"auth_nic": "11111111"})
 
-            user = _find_or_create_saml_user(
+            user, status = _find_or_create_saml_user(
                 user_email=None,
                 user_nic="11111111",
                 first_name="Test",
                 last_name="User",
             )
 
+            assert status == "existing_saml"
             assert user.id == existing.id
 
     def test_handles_missing_nic(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
-            user = _find_or_create_saml_user(
+            user, status = _find_or_create_saml_user(
                 user_email="no_nic@example.com",
                 user_nic=None,
                 first_name="Maria",
                 last_name="Santos",
             )
 
+            assert status == "new"
             assert user is not None
             assert user.email == "no_nic@example.com"
             assert not user.extras.get("auth_nic")
@@ -172,13 +175,14 @@ class SAMLAutoRegistrationTest(APITestCase):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
-            user = _find_or_create_saml_user(
+            user, status = _find_or_create_saml_user(
                 user_email=None,
                 user_nic="77777777",
                 first_name="Carlos",
                 last_name="Ferreira",
             )
 
+            assert status == "new"
             assert user is not None
             assert user.email == "saml-77777777@autenticacao.gov.pt"
             assert user.extras.get("auth_nic") == "77777777"
@@ -188,13 +192,14 @@ class SAMLAutoRegistrationTest(APITestCase):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
-            user = _find_or_create_saml_user(
+            user, status = _find_or_create_saml_user(
                 user_email=None,
                 user_nic=None,
                 first_name="Unknown",
                 last_name="User",
             )
 
+            assert status == "error"
             assert user is None
 
 
@@ -213,16 +218,19 @@ class SAMLLoginFlowTest(APITestCase):
             assert response.status_code == 302
             assert "login" not in response.location.lower()
 
-    def test_unconfirmed_user_redirects_to_login(self):
+    def test_unconfirmed_user_is_auto_confirmed_and_logged_in(self):
+        """SAML users are auto-confirmed since autenticacao.gov already verified them."""
         from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
 
         with self.app.test_request_context():
+            self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
             user = UserFactory(confirmed_at=None)
 
             response = _handle_saml_user_login(user)
 
             assert response.status_code == 302
-            assert "login" in response.location.lower()
+            assert user.confirmed_at is not None
+            assert "login" not in response.location.lower()
 
     def test_deleted_user_redirects_home(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
