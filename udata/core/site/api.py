@@ -1,8 +1,6 @@
 from flask import current_app, json, make_response, redirect, request, url_for
-from flask_restx import fields as restx_fields
 
 from udata.api import API, api
-from udata.api.fields import ImageField, ISODateTime
 from udata.api_fields import patch
 from udata.app import cache
 from udata.auth import admin_permission
@@ -30,70 +28,57 @@ from udata.utils import multi_to_dict
 from .models import Site, current_site
 from .rdf import build_catalog
 
-# Lightweight models for the aggregated homepage endpoint
-home_org_ref = api.model(
-    "HomeOrgRef",
-    {
-        "name": restx_fields.String(),
-    },
-)
 
-home_dataset_fields = api.model(
-    "HomeDataset",
-    {
-        "id": restx_fields.String(),
-        "title": restx_fields.String(),
-        "slug": restx_fields.String(),
-        "description": restx_fields.String(),
-        "last_modified": ISODateTime(),
-        "organization": restx_fields.Nested(home_org_ref, allow_null=True),
-        "metrics": restx_fields.Raw(),
-    },
-)
+def _serialize_image(image_field, size):
+    """Safely extract image URL from a MongoEngine ImageField."""
+    if not image_field:
+        return None
+    try:
+        return image_field(size, external=True)
+    except Exception:
+        try:
+            return image_field.fs.url(image_field.filename, external=True)
+        except Exception:
+            return None
 
-home_reuse_fields = api.model(
-    "HomeReuse",
-    {
-        "id": restx_fields.String(),
-        "title": restx_fields.String(),
-        "slug": restx_fields.String(),
-        "image": ImageField(size=500, attribute="image"),
-        "image_thumbnail": ImageField(size=100, attribute="image"),
-        "created_at": ISODateTime(),
-    },
-)
 
-home_post_fields = api.model(
-    "HomePost",
-    {
-        "id": restx_fields.String(),
-        "name": restx_fields.String(),
-        "slug": restx_fields.String(),
-        "image": ImageField(size=400, attribute="image"),
-        "image_thumbnail": ImageField(size=100, attribute="image"),
-        "created_at": ISODateTime(),
-    },
-)
+def _serialize_dataset(dataset):
+    """Serialize a Dataset to lightweight homepage dict."""
+    org = dataset.organization
+    return {
+        "id": str(dataset.id),
+        "title": dataset.title,
+        "slug": dataset.slug,
+        "description": dataset.description,
+        "last_modified": dataset.last_modified.isoformat() if dataset.last_modified else None,
+        "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
+        "organization": {"name": org.name} if org else None,
+        "metrics": dataset.metrics or {},
+    }
 
-home_metrics_fields = api.model(
-    "HomeMetrics",
-    {
-        "datasets": restx_fields.Integer(),
-        "organizations": restx_fields.Integer(),
-        "reuses": restx_fields.Integer(),
-        "users": restx_fields.Integer(),
-    },
-)
 
-home_fields = api.model(
-    "HomeData",
-    {
-        "site_metrics": restx_fields.Nested(home_metrics_fields),
-        "latest_datasets": restx_fields.List(restx_fields.Nested(home_dataset_fields)),
-        "latest_reuses": restx_fields.List(restx_fields.Nested(home_reuse_fields)),
-        "latest_posts": restx_fields.List(restx_fields.Nested(home_post_fields)),
-    },
-)
+def _serialize_reuse(reuse):
+    """Serialize a Reuse to lightweight homepage dict."""
+    return {
+        "id": str(reuse.id),
+        "title": reuse.title,
+        "slug": reuse.slug,
+        "image": _serialize_image(reuse.image, 500),
+        "image_thumbnail": _serialize_image(reuse.image, 100),
+        "created_at": reuse.created_at.isoformat() if reuse.created_at else None,
+    }
+
+
+def _serialize_post(post):
+    """Serialize a Post to lightweight homepage dict."""
+    return {
+        "id": str(post.id),
+        "name": post.name,
+        "slug": post.slug,
+        "image": _serialize_image(post.image, 400),
+        "image_thumbnail": _serialize_image(post.image, 100),
+        "created_at": post.created_at.isoformat() if post.created_at else None,
+    }
 
 
 @api.route("/site/", endpoint="site")
@@ -119,19 +104,24 @@ class SiteAPI(API):
 @api.route("/site/home/", endpoint="site_home")
 class SiteHomeAPI(API):
     @api.doc(id="get_site_home")
-    @api.marshal_with(home_fields)
     @cache.cached(timeout=300, key_prefix="site_home")
     def get(self):
         """Aggregated homepage data with lightweight serialization"""
         site = current_site
-        datasets = list(Dataset.objects.visible().order_by("-created_at_internal")[:3])
-        reuses = list(Reuse.objects.visible().order_by("-created_at")[:3])
-        posts = list(Post.objects.published()[:3])
+        metrics = site.metrics or {}
+        datasets = Dataset.objects.visible().order_by("-created_at_internal")[:3]
+        reuses = Reuse.objects.visible().order_by("-created_at")[:3]
+        posts = Post.objects.published()[:3]
         return {
-            "site_metrics": site.metrics,
-            "latest_datasets": datasets,
-            "latest_reuses": reuses,
-            "latest_posts": posts,
+            "site_metrics": {
+                "datasets": metrics.get("datasets", 0),
+                "organizations": metrics.get("organizations", 0),
+                "reuses": metrics.get("reuses", 0),
+                "users": metrics.get("users", 0),
+            },
+            "latest_datasets": [_serialize_dataset(d) for d in datasets],
+            "latest_reuses": [_serialize_reuse(r) for r in reuses],
+            "latest_posts": [_serialize_post(p) for p in posts],
         }
 
 
