@@ -79,6 +79,9 @@ Procfile
 # Project specific
 fs/resources/
 
+# Docker Compose local overrides
+docker-compose.override.yml
+
 # Local configuration file of udata
 # udata.cfg
 

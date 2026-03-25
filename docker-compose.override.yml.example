@@ -1,0 +1,22 @@
+# Overrides for local development (MongoDB and Redis on host machine).
+# Copy this file to docker-compose.override.yml and adjust as needed.
+# docker-compose.override.yml is automatically merged by docker compose.
+#
+# Usage:
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#
+services:
+  app:
+    environment:
+      SERVER_MONGO: host.docker.internal
+      SERVER_REDIS: host.docker.internal
+
+  worker:
+    environment:
+      SERVER_MONGO: host.docker.internal
+      SERVER_REDIS: host.docker.internal
+
+  beat:
+    environment:
+      SERVER_MONGO: host.docker.internal
+      SERVER_REDIS: host.docker.internal
