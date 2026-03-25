@@ -144,6 +144,36 @@ def work(ctx, loglevel="info"):
 
 
 @task
+def dev(ctx, host="localhost", port="7000", loglevel="info"):
+    """Run development server and Celery worker together"""
+    import subprocess
+    import signal
+    import sys
+
+    with ctx.cd(ROOT):
+        server_cmd = f"python manage.py serve -d -r -h {host} -p {port}"
+        worker_cmd = "celery -A udata.worker worker --purge -l %s" % loglevel
+
+        server = subprocess.Popen(server_cmd, shell=True)
+        worker = subprocess.Popen(worker_cmd, shell=True)
+
+        def shutdown(signum, frame):
+            server.terminate()
+            worker.terminate()
+            server.wait()
+            worker.wait()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, shutdown)
+        signal.signal(signal.SIGTERM, shutdown)
+
+        try:
+            server.wait()
+        finally:
+            shutdown(None, None)
+
+
+@task
 def beat(ctx, loglevel="info"):
     """Run celery beat process"""
     ctx.run("celery -A udata.worker beat -l %s" % loglevel)

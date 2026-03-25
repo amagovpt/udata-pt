@@ -98,6 +98,8 @@ dependencies = [
     "dotenv>=0.9.9",
     "pysaml2>=7.4.2",
     "defusedxml>=0.7.1",
+    "pyuwsgi>=2.0.30.post1",
+    "gunicorn>=25.2.0",
 ]
 
 [project.urls]
