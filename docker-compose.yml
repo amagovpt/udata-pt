@@ -15,12 +15,6 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       UDATA_SETTINGS: /app/udata.cfg
-      MAIL_SERVER: mailpit
-      MAIL_PORT: 1025
-      MAIL_USE_TLS: 'False'
-      MAIL_USE_SSL: 'False'
-    depends_on:
-      - mailpit
     restart: unless-stopped
 
   worker:
@@ -38,12 +32,6 @@ services:
     environment:
       UDATA_SETTINGS: /app/udata.cfg
       C_FORCE_ROOT: 'true'
-      MAIL_SERVER: mailpit
-      MAIL_PORT: 1025
-      MAIL_USE_TLS: 'False'
-      MAIL_USE_SSL: 'False'
-    depends_on:
-      - mailpit
     restart: unless-stopped
 
   beat:
@@ -59,16 +47,6 @@ services:
     environment:
       UDATA_SETTINGS: /app/udata.cfg
       C_FORCE_ROOT: 'true'
-    restart: unless-stopped
-
-  mailpit:
-    image: axllent/mailpit
-    ports:
-      - '8025:8025'
-      - '1025:1025'
-    environment:
-      MP_SMTP_AUTH_ACCEPT_ANY: 1
-      MP_SMTP_AUTH_ALLOW_INSECURE: 1
     restart: unless-stopped
 
 volumes:
