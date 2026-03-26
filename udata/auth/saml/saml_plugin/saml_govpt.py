@@ -345,7 +345,7 @@ def _frontend_saml_url(endpoint_func_name):
 
 def saml_client_for(metadata_file):
     acs_url = _frontend_saml_url("saml.idp_initiated")
-    out_url = _frontend_saml_url("saml.saml_logout_postback")
+    out_url = _force_scheme(url_for("saml.saml_logout_postback", _external=True))
 
     settings = _build_sp_settings(acs_url, out_url, metadata_file)
     spConfig = Saml2Config()
@@ -634,7 +634,7 @@ def saml_logout():
         text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
     )
 
-    logout_url = LogoutUrl(text=_frontend_saml_url("saml.saml_logout_postback"))
+    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.saml_logout_postback", _external=True)))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
     extensions = Extensions(extension_elements=[logout_url])
@@ -660,7 +660,7 @@ def saml_logout():
 
 def eidas_client_for(metadata_file):
     acs_url = _frontend_saml_url("saml.idp_eidas_initiated")
-    out_url = _frontend_saml_url("saml.eidas_logout_postback")
+    out_url = _force_scheme(url_for("saml.eidas_logout_postback", _external=True))
 
     settings = _build_sp_settings(acs_url, out_url, metadata_file)
     spConfig = Saml2Config()
@@ -908,7 +908,7 @@ def eidas_logout():
     )
 
     logout_url = LogoutUrl(
-        text=_frontend_saml_url("saml.eidas_logout_postback")
+        text=_force_scheme(url_for("saml.eidas_logout_postback", _external=True))
     )
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
