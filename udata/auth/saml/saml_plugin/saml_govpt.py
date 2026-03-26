@@ -311,9 +311,26 @@ def _force_scheme(url):
     return url
 
 
+def _frontend_saml_url(endpoint_func_name):
+    """Build a SAML callback URL routed through the frontend proxy.
+
+    When the frontend runs separately (e.g. Next.js on port 3000), the SAML
+    callback must point to the frontend origin so that session cookies are set
+    on the same domain the browser uses.  The frontend proxies /saml/* to the
+    backend via its rewrite rules.
+
+    Falls back to Flask's url_for when CDATA_BASE_URL is not configured.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL", "").rstrip("/")
+    if frontend_url:
+        path = url_for(endpoint_func_name)
+        return _force_scheme(f"{frontend_url}{path}")
+    return _force_scheme(url_for(endpoint_func_name, _external=True))
+
+
 def saml_client_for(metadata_file):
-    acs_url = _force_scheme(url_for("saml.idp_initiated", _external=True))
-    out_url = _force_scheme(url_for("saml.saml_logout_postback", _external=True))
+    acs_url = _frontend_saml_url("saml.idp_initiated")
+    out_url = _frontend_saml_url("saml.saml_logout_postback")
 
     settings = _build_sp_settings(acs_url, out_url, metadata_file)
     spConfig = Saml2Config()
@@ -602,7 +619,7 @@ def saml_logout():
         text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
     )
 
-    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.saml_logout_postback", _external=True)))
+    logout_url = LogoutUrl(text=_frontend_saml_url("saml.saml_logout_postback"))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
     extensions = Extensions(extension_elements=[logout_url])
@@ -627,8 +644,8 @@ def saml_logout():
 
 
 def eidas_client_for(metadata_file):
-    acs_url = _force_scheme(url_for("saml.idp_eidas_initiated", _external=True))
-    out_url = _force_scheme(url_for("saml.eidas_logout_postback", _external=True))
+    acs_url = _frontend_saml_url("saml.idp_eidas_initiated")
+    out_url = _frontend_saml_url("saml.eidas_logout_postback")
 
     settings = _build_sp_settings(acs_url, out_url, metadata_file)
     spConfig = Saml2Config()
@@ -876,7 +893,7 @@ def eidas_logout():
     )
 
     logout_url = LogoutUrl(
-        text=_force_scheme(url_for("saml.eidas_logout_postback", _external=True))
+        text=_frontend_saml_url("saml.eidas_logout_postback")
     )
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
