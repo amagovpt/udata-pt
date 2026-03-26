@@ -113,25 +113,69 @@ def _first_value(identity, key):
     return None
 
 
+def _merge_nic_into_user(user, user_nic):
+    """Add the SAML NIC to an existing user account (auto-merge)."""
+    if not user_nic:
+        return
+    if not user.extras:
+        user.extras = {}
+    user.extras["auth_nic"] = user_nic
+    user.save()
+    current_app.logger.info(
+        f"SAML: NIC {user_nic} merged into existing account {user.email} (id={user.id})"
+    )
+
+
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
-    """Find an existing user by email/NIC or auto-create from SAML data.
+    """Find an existing user by email/NIC/name or auto-create from SAML data.
+
+    Lookup order:
+    1. By email (exact match)
+    2. By NIC (already linked via previous SAML login)
+    3. By first_name + last_name (fallback for legacy accounts)
+
+    When a legacy account (password, no NIC) is found, the NIC is
+    automatically merged so future CMD logins resolve instantly.
 
     Returns a tuple (user, status) where status is one of:
     - "existing_saml" — user already has NIC, normal login
-    - "migration_candidate" — legacy user with password and no NIC
+    - "merged" — legacy account found and NIC auto-merged
     - "new" — newly created user
     """
+    from udata.core.user.models import User
+
     user = None
+
+    # 1. Match by email
     if user_email:
         user = datastore.find_user(email=user_email)
+
+    # 2. Match by NIC
     if not user and user_nic:
         user = datastore.find_user(extras={"auth_nic": user_nic})
 
+    # 3. Match by name (fallback for legacy accounts without NIC)
+    if not user and first_name and last_name:
+        candidates = User.objects(
+            first_name__iexact=first_name,
+            last_name__iexact=last_name,
+            deleted=None,
+        )
+        # Only auto-merge when the name matches exactly one account
+        if candidates.count() == 1:
+            user = candidates.first()
+            current_app.logger.info(
+                f"SAML: matched legacy account by name: "
+                f"{first_name} {last_name} → {user.email}"
+            )
+
     if user:
         has_nic = user.extras and user.extras.get("auth_nic")
-        if not has_nic and user.password:
-            return user, "migration_candidate"
-        return user, "existing_saml"
+        if has_nic:
+            return user, "existing_saml"
+        # Legacy account — auto-merge NIC so future logins resolve directly
+        _merge_nic_into_user(user, user_nic)
+        return user, "merged"
 
     if not user_email and not user_nic:
         current_app.logger.error("SAML: Cannot create user without email or NIC")
