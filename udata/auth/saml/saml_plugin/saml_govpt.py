@@ -121,31 +121,17 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     - "migration_candidate" — legacy user with password and no NIC
     - "new" — newly created user
     """
-    current_app.logger.info(
-        f"SAML _find_or_create: email={user_email!r}, nic={user_nic!r}, "
-        f"name={first_name!r} {last_name!r}"
-    )
-
     user = None
     if user_email:
         user = datastore.find_user(email=user_email)
-        current_app.logger.info(f"SAML lookup by email={user_email!r}: {'FOUND ' + str(user.id) if user else 'NOT FOUND'}")
     if not user and user_nic:
         user = datastore.find_user(extras={"auth_nic": user_nic})
-        current_app.logger.info(f"SAML lookup by NIC={user_nic!r}: {'FOUND ' + str(user.id) if user else 'NOT FOUND'}")
 
     if user:
         has_nic = user.extras and user.extras.get("auth_nic")
-        current_app.logger.info(
-            f"SAML user found: id={user.id}, email={user.email}, "
-            f"roles={[r.name for r in user.roles]}, has_nic={has_nic}, "
-            f"has_password={bool(user.password)}"
-        )
         if not has_nic and user.password:
             return user, "migration_candidate"
         return user, "existing_saml"
-
-    current_app.logger.warning(f"SAML: no existing user found for email={user_email!r} nic={user_nic!r}")
 
     if not user_email and not user_nic:
         current_app.logger.error("SAML: Cannot create user without email or NIC")
@@ -171,7 +157,6 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     user.confirmed_at = datetime.utcnow()
     datastore.commit()
 
-    current_app.logger.info(f"SAML: created new user id={user.id}, email={user_email}")
     return user, "new"
 
 
@@ -326,25 +311,8 @@ def _force_scheme(url):
     return url
 
 
-def _frontend_saml_url(endpoint_func_name):
-    """Build a SAML callback URL routed through the frontend proxy.
-
-    When the frontend runs separately (e.g. Next.js on port 3000), the SAML
-    callback must point to the frontend origin so that session cookies are set
-    on the same domain the browser uses.  The frontend proxies /saml/* to the
-    backend via its rewrite rules.
-
-    Falls back to Flask's url_for when CDATA_BASE_URL is not configured.
-    """
-    frontend_url = current_app.config.get("CDATA_BASE_URL", "").rstrip("/")
-    if frontend_url:
-        path = url_for(endpoint_func_name)
-        return _force_scheme(f"{frontend_url}{path}")
-    return _force_scheme(url_for(endpoint_func_name, _external=True))
-
-
 def saml_client_for(metadata_file):
-    acs_url = _frontend_saml_url("saml.idp_initiated")
+    acs_url = _force_scheme(url_for("saml.idp_initiated", _external=True))
     out_url = _force_scheme(url_for("saml.saml_logout_postback", _external=True))
 
     settings = _build_sp_settings(acs_url, out_url, metadata_file)
@@ -659,7 +627,7 @@ def saml_logout():
 
 
 def eidas_client_for(metadata_file):
-    acs_url = _frontend_saml_url("saml.idp_eidas_initiated")
+    acs_url = _force_scheme(url_for("saml.idp_eidas_initiated", _external=True))
     out_url = _force_scheme(url_for("saml.eidas_logout_postback", _external=True))
 
     settings = _build_sp_settings(acs_url, out_url, metadata_file)
