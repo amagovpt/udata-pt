@@ -108,3 +108,102 @@ def rotate_password(email):
     user.save()
     # Reset ongoing sessions by uniquifier
     datastore.set_uniquifier(user)
+
+
+@grp.command()
+@click.option(
+    "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
+)
+def fix_duplicates(dry_run):
+    """Find and merge duplicate SAML accounts into their traditional counterparts.
+
+    Identifies users with placeholder SAML emails (saml-*@autenticacao.gov.pt),
+    finds the matching traditional account by first_name + last_name, merges the
+    NIC into the traditional account, and deletes the duplicate.
+    """
+    import re
+
+    duplicates = list(User.objects(email__startswith="saml-"))
+    if not duplicates:
+        success("No duplicate SAML accounts found")
+        return
+
+    log.info("Found %d duplicate SAML account(s)", len(duplicates))
+    merged = 0
+    skipped = 0
+
+    for dup in duplicates:
+        nic = (dup.extras or {}).get("auth_nic")
+        fname = dup.first_name or ""
+        lname = dup.last_name or ""
+
+        if not nic:
+            log.warning("SKIP %s — no NIC to merge", dup.email)
+            skipped += 1
+            continue
+
+        # Find traditional account by name (case-insensitive, exact match)
+        candidates = list(
+            User.objects(
+                first_name=re.compile(f"^{re.escape(fname)}$", re.IGNORECASE),
+                last_name=re.compile(f"^{re.escape(lname)}$", re.IGNORECASE),
+                email__not__startswith="saml-",
+            )
+        )
+
+        if len(candidates) == 0:
+            log.warning(
+                "SKIP %s (%s %s) — no traditional account found",
+                dup.email,
+                fname,
+                lname,
+            )
+            skipped += 1
+            continue
+
+        if len(candidates) > 1:
+            emails = [c.email for c in candidates]
+            log.warning(
+                "SKIP %s (%s %s) — multiple matches: %s",
+                dup.email,
+                fname,
+                lname,
+                emails,
+            )
+            skipped += 1
+            continue
+
+        target = candidates[0]
+        existing_nic = (target.extras or {}).get("auth_nic")
+        if existing_nic:
+            log.warning(
+                "SKIP %s — already has NIC %s",
+                target.email,
+                existing_nic,
+            )
+            skipped += 1
+            continue
+
+        if dry_run:
+            log.info(
+                "WOULD MERGE NIC %s into %s | delete %s",
+                nic,
+                target.email,
+                dup.email,
+            )
+        else:
+            if not target.extras:
+                target.extras = {}
+            target.extras["auth_nic"] = nic
+            target.save()
+            dup.delete()
+            log.info(
+                "MERGED NIC %s into %s | deleted %s",
+                nic,
+                target.email,
+                dup.email,
+            )
+        merged += 1
+
+    action = "Would merge" if dry_run else "Merged"
+    success(f"{action} {merged} account(s), skipped {skipped}")
