@@ -53,6 +53,12 @@ uv run ruff format .
 - **Migrations** in `udata/migrations/` (date-prefixed scripts)
 - **Tests** in `udata/tests/` and within each module's `tests/` dir
 
+## Performance
+
+- **Aggregated endpoints** — For pages that need data from multiple models, create a single endpoint returning everything in one response (e.g., `/api/1/site/home/`). Use manual dict serialization with helper functions (`_serialize_dataset()`, `_serialize_reuse()`) including only the fields the frontend needs, instead of full Flask-RestX marshalling.
+- **Server-side caching** — Use `@cache.cached(timeout=N, key_prefix="...")` from Flask-Caching on aggregated/read-heavy endpoints (e.g., `timeout=300` for homepage data).
+- **Query limiting** — Always limit querysets with `[:N]` slicing when only a fixed number of results is needed, instead of fetching all and truncating.
+
 ## Key Conventions
 
 - Pre-commit hooks: ruff check, ruff format, trailing whitespace, end-of-file fixer
