@@ -2,6 +2,8 @@
 from __future__ import unicode_literals
 
 import base64
+import hashlib
+import hmac
 import os
 import random
 import re
@@ -113,17 +115,35 @@ def _first_value(identity, key):
     return None
 
 
+def _hash_nic(nic):
+    """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY.
+
+    Returns a hex digest that is deterministic (same NIC → same hash)
+    but not reversible. Used for storing and matching NIC values
+    without exposing the raw personal identifier in the database.
+    """
+    secret = current_app.config["SECRET_KEY"]
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    return hmac.new(secret, nic.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _is_nic_hashed(nic_value):
+    """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
+    return bool(
+        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
+    )
+
+
 def _merge_nic_into_user(user, user_nic):
-    """Add the SAML NIC to an existing user account (auto-merge)."""
+    """Add the hashed SAML NIC to an existing user account (auto-merge)."""
     if not user_nic:
         return
     if not user.extras:
         user.extras = {}
-    user.extras["auth_nic"] = user_nic
+    user.extras["auth_nic"] = _hash_nic(user_nic)
     user.save()
-    current_app.logger.info(
-        f"SAML: NIC {user_nic} merged into existing account {user.email} (id={user.id})"
-    )
+    current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
 
 
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
@@ -150,9 +170,11 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     if user_email:
         user = datastore.find_user(email=user_email)
 
-    # 2. Match by NIC
+    # 2. Match by hashed NIC (use MongoEngine nested dict syntax, not find_user,
+    #    because find_user(extras={...}) matches the entire dict exactly)
     if not user and user_nic:
-        user = datastore.find_user(extras={"auth_nic": user_nic})
+        hashed_nic = _hash_nic(user_nic)
+        user = User.objects(extras__auth_nic=hashed_nic).first()
 
     # 3. Match by name (fallback for legacy accounts without NIC)
     if not user and first_name and last_name:
@@ -165,15 +187,15 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         if candidates.count() == 1:
             user = candidates.first()
             current_app.logger.info(
-                f"SAML: matched legacy account by name: "
-                f"{first_name} {last_name} → {user.email}"
+                f"SAML: matched legacy account by name: {first_name} {last_name} → {user.email}"
             )
 
     if user:
-        has_nic = user.extras and user.extras.get("auth_nic")
-        if has_nic:
+        stored_nic = user.extras.get("auth_nic") if user.extras else None
+        hashed_nic = _hash_nic(user_nic) if user_nic else None
+        if stored_nic and stored_nic == hashed_nic:
             return user, "existing_saml"
-        # Legacy account — auto-merge NIC so future logins resolve directly
+        # No NIC, legacy encrypted NIC, or unhashed NIC — update with hashed value.
         _merge_nic_into_user(user, user_nic)
         return user, "merged"
 
@@ -185,7 +207,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     if not user_email:
         import uuid
 
-        user_email = f"saml-{user_nic or uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
+        user_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -193,7 +215,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         "email": user_email,
     }
     if user_nic:
-        user_data["extras"] = {"auth_nic": user_nic}
+        user_data["extras"] = {"auth_nic": _hash_nic(user_nic)}
 
     user = datastore.create_user(**user_data)
     # Auto-confirm users created via SAML — they were already verified
@@ -528,7 +550,7 @@ def idp_initiated():
                 first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
                 last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
                 current_app.logger.info(
-                    f"SAML atributos extraídos: email={user_email}, nic={user_nic}, "
+                    f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
                     f"nome={first_name} {last_name}"
                 )
             else:
@@ -585,7 +607,7 @@ def idp_initiated():
                         except (AttributeError, KeyError):
                             pass
                     current_app.logger.info(
-                        f"SAML atributos via XML manual: email={user_email}, nic={user_nic}, "
+                        f"SAML atributos via XML manual: email={user_email}, nic={'***' if user_nic else None}, "
                         f"nome={first_name} {last_name}"
                     )
                 else:
@@ -814,7 +836,7 @@ def idp_eidas_initiated():
                 first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
                 last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
                 current_app.logger.info(
-                    f"eIDAS atributos via pysaml2: email={user_email}, nic={user_nic}, "
+                    f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
                     f"nome={first_name} {last_name}"
                 )
         except Exception as e:
@@ -858,7 +880,7 @@ def idp_eidas_initiated():
                         except (AttributeError, KeyError):
                             pass
                     current_app.logger.info(
-                        f"eIDAS atributos via XML manual: email={user_email}, nic={user_nic}, "
+                        f"eIDAS atributos via XML manual: email={user_email}, nic={'***' if user_nic else None}, "
                         f"nome={first_name} {last_name}"
                     )
                 else:
@@ -1144,7 +1166,7 @@ def migration_confirm():
     if not user.extras:
         user.extras = {}
     if saml_nic:
-        user.extras["auth_nic"] = saml_nic
+        user.extras["auth_nic"] = _hash_nic(saml_nic)
     user.password = None
     if saml_first_name:
         user.first_name = saml_first_name.title()
@@ -1185,7 +1207,7 @@ def migration_skip():
     # Generate a unique email to avoid conflicts with the legacy account
     import uuid
 
-    saml_email = f"saml-{saml_nic or uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
+    saml_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
 
     user_data = {
         "first_name": (saml_first_name or "").title(),
@@ -1193,7 +1215,7 @@ def migration_skip():
         "email": saml_email,
     }
     if saml_nic:
-        user_data["extras"] = {"auth_nic": saml_nic}
+        user_data["extras"] = {"auth_nic": _hash_nic(saml_nic)}
 
     user = datastore.create_user(**user_data)
     user.confirmed_at = datetime.utcnow()

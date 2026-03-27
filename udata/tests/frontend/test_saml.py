@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from flask import session, url_for
 
+from udata.auth.saml.saml_plugin.saml_govpt import _hash_nic
 from udata.core.user.factories import UserFactory
 from udata.models import datastore
 from udata.tests.api import APITestCase
@@ -121,7 +122,7 @@ class SAMLAutoRegistrationTest(APITestCase):
             assert user.email == "saml_new@example.com"
             assert user.first_name == "João"
             assert user.last_name == "Silva"
-            assert user.extras.get("auth_nic") == "12345678"
+            assert user.extras.get("auth_nic") == _hash_nic("12345678")
 
     def test_finds_existing_user_by_email(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
@@ -142,7 +143,7 @@ class SAMLAutoRegistrationTest(APITestCase):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
-            existing = UserFactory(extras={"auth_nic": "11111111"})
+            existing = UserFactory(extras={"auth_nic": _hash_nic("11111111")})
 
             user, status = _find_or_create_saml_user(
                 user_email=None,
@@ -185,7 +186,7 @@ class SAMLAutoRegistrationTest(APITestCase):
             assert status == "new"
             assert user is not None
             assert user.email == "saml-77777777@autenticacao.gov.pt"
-            assert user.extras.get("auth_nic") == "77777777"
+            assert user.extras.get("auth_nic") == _hash_nic("77777777")
 
     def test_returns_none_when_no_email_and_no_nic(self):
         """When IdP provides neither email nor NIC, return None."""
@@ -361,7 +362,7 @@ class SAMLSSOCallbackTest(APITestCase):
         mock_client_for.return_value = mock_saml_client
 
         existing = UserFactory(
-            confirmed_at="2024-01-01", extras={"auth_nic": "55555555"}
+            confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic("55555555")}
         )
 
         xml = _build_saml_response_xml(
@@ -437,7 +438,7 @@ class SAMLSSOCallbackTest(APITestCase):
                 call_order.append("login_user")
                 # Verify user was created with correct SAML attributes
                 assert user.email == "order_test@example.pt"
-                assert user.extras.get("auth_nic") == "33333333"
+                assert user.extras.get("auth_nic") == _hash_nic("33333333")
                 return True
 
             mock_login.side_effect = track_login
@@ -548,7 +549,7 @@ class SAMLSSOCallbackTest(APITestCase):
             assert mock_login.call_count == 1
             logged_in_user = mock_login.call_args[0][0]
             assert logged_in_user.email == "saml-88888888@autenticacao.gov.pt"
-            assert logged_in_user.extras.get("auth_nic") == "88888888"
+            assert logged_in_user.extras.get("auth_nic") == _hash_nic("88888888")
 
     def test_sso_rejects_missing_saml_response(self):
         """POST to /saml/sso without SAMLResponse should fail."""
