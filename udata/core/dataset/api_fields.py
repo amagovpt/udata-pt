@@ -400,6 +400,9 @@ dataset_fields = api.model(
         "license": fields.String(
             attribute="license.id", default=DEFAULT_LICENSE["id"], description="The dataset license"
         ),
+        "license_url": fields.String(
+            attribute="license.url", description="The dataset license URL"
+        ),
         "access_type": fields.String(allow_null=True),
         "access_audiences": fields.List(fields.Nested(AccessAudience.__read_fields__)),
         "authorization_request_url": fields.String(allow_null=True),
@@ -513,3 +516,4 @@ catalog_schema_fields = api.model(
         ),
     },
 )
+ 
