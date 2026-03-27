@@ -96,3 +96,6 @@ udata/auth/saml/credentials/
 
 # Resources
 udata-fs
+
+# Database dump
+udata/db/dump
