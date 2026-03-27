@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 from datetime import datetime
 
@@ -11,6 +13,21 @@ from udata.commands import cli, exit_with_error, success
 from udata.models import User, datastore
 
 log = logging.getLogger(__name__)
+
+
+def _hash_nic(nic):
+    """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY."""
+    secret = current_app.config["SECRET_KEY"]
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    return hmac.new(secret, nic.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _is_nic_hashed(nic_value):
+    """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
+    return bool(
+        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
+    )
 
 
 @cli.group("user")
@@ -114,7 +131,7 @@ def rotate_password(email):
 @click.option(
     "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
 )
-def fix_duplicates(dry_run):
+def fix_cmd_duplicates(dry_run):
     """Find and merge duplicate SAML accounts into their traditional counterparts.
 
     Identifies users with placeholder SAML emails (saml-*@autenticacao.gov.pt),
@@ -175,31 +192,30 @@ def fix_duplicates(dry_run):
 
         target = candidates[0]
         existing_nic = (target.extras or {}).get("auth_nic")
-        if existing_nic:
-            log.warning(
-                "SKIP %s — already has NIC %s",
-                target.email,
-                existing_nic,
-            )
-            skipped += 1
-            continue
+
+        hashed_nic = _hash_nic(nic)
 
         if dry_run:
-            log.info(
-                "WOULD MERGE NIC %s into %s | delete %s",
-                nic,
-                target.email,
-                dup.email,
-            )
+            if existing_nic == hashed_nic:
+                log.info(
+                    "WOULD DELETE duplicate %s (target %s already has hashed NIC)",
+                    dup.email,
+                    target.email,
+                )
+            else:
+                log.info(
+                    "WOULD MERGE hashed NIC into %s | delete %s",
+                    target.email,
+                    dup.email,
+                )
         else:
             if not target.extras:
                 target.extras = {}
-            target.extras["auth_nic"] = nic
+            target.extras["auth_nic"] = hashed_nic
             target.save()
-            dup.delete()
+            dup._delete()
             log.info(
-                "MERGED NIC %s into %s | deleted %s",
-                nic,
+                "MERGED hashed NIC into %s | deleted %s",
                 target.email,
                 dup.email,
             )
@@ -207,3 +223,90 @@ def fix_duplicates(dry_run):
 
     action = "Would merge" if dry_run else "Merged"
     success(f"{action} {merged} account(s), skipped {skipped}")
+
+
+@grp.command()
+@click.argument("saml_email")
+@click.argument("target_email")
+@click.option(
+    "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
+)
+def merge_saml(saml_email, target_email, dry_run):
+    """Manually merge a SAML duplicate account into a target account.
+
+    Use this when fix-cmd-duplicates cannot auto-resolve (e.g. multiple name matches).
+    Copies the NIC from the SAML account into the target and deletes the duplicate.
+
+    Example: udata user merge-saml saml-12345@autenticacao.gov.pt user@example.com
+    """
+    dup = User.objects(email=saml_email).first()
+    if not dup:
+        exit_with_error(f"SAML account not found: {saml_email}")
+
+    target = User.objects(email=target_email).first()
+    if not target:
+        exit_with_error(f"Target account not found: {target_email}")
+
+    nic = (dup.extras or {}).get("auth_nic")
+    if not nic:
+        exit_with_error(f"SAML account {saml_email} has no NIC to merge")
+
+    log.info(
+        "SAML: %s (%s %s) → Target: %s (%s %s) roles=%s",
+        dup.email,
+        dup.first_name,
+        dup.last_name,
+        target.email,
+        target.first_name,
+        target.last_name,
+        [r.name for r in target.roles],
+    )
+
+    # Hash the NIC if it's still in plain/numeric form
+    hashed_nic = nic if _is_nic_hashed(nic) else _hash_nic(nic)
+
+    if dry_run:
+        success(f"Would merge hashed NIC into {target.email} and delete {dup.email}")
+        return
+
+    if not target.extras:
+        target.extras = {}
+    target.extras["auth_nic"] = hashed_nic
+    target.save()
+    dup._delete()
+    success(f"Merged hashed NIC into {target.email} | deleted {dup.email}")
+
+
+@grp.command()
+@click.option(
+    "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
+)
+def hash_nics(dry_run):
+    """Hash all unhashed NIC values stored in extras.auth_nic.
+
+    Finds users with plain-text (numeric) NIC values and replaces them
+    with HMAC-SHA256 hashes. Already-hashed values (64 hex chars) are skipped.
+    """
+    users_with_nic = User.objects(extras__auth_nic__exists=True)
+    hashed = 0
+    skipped = 0
+
+    for user in users_with_nic:
+        nic = (user.extras or {}).get("auth_nic")
+        if not nic:
+            continue
+
+        if _is_nic_hashed(nic):
+            skipped += 1
+            continue
+
+        if dry_run:
+            log.info("WOULD HASH NIC for %s (id=%s)", user.email, user.id)
+        else:
+            user.extras["auth_nic"] = _hash_nic(nic)
+            user.save()
+            log.info("HASHED NIC for %s (id=%s)", user.email, user.id)
+        hashed += 1
+
+    action = "Would hash" if dry_run else "Hashed"
+    success(f"{action} {hashed} NIC(s), skipped {skipped} (already hashed)")
