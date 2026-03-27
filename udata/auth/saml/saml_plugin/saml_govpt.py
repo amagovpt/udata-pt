@@ -464,10 +464,18 @@ def idp_initiated():
             if status_code is not None:
                 status_value = status_code.attrib.get("Value", "")
                 if "Success" not in status_value:
-                    msg = status_msg.text if status_msg is not None else status_value
-                    current_app.logger.error(f"SAML: IdP rejeitou o pedido: {msg}")
+                    # Extract human-readable message; fall back to status URI
+                    msg_text = status_msg.text if status_msg is not None else None
+                    # Also check for a nested sub-status code (e.g. RequestDenied)
+                    sub_code = status_code.find("samlp:StatusCode", ns)
+                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
+                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
+                    current_app.logger.error(
+                        f"SAML: IdP rejeitou o pedido: "
+                        f"status={status_value}, sub={sub_value}, msg={msg_text}"
+                    )
                     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-                    do_flash(f"Autenticação rejeitada: {msg}", "error")
+                    do_flash(f"Autenticação rejeitada: {display_msg}", "error")
                     return redirect(f"{frontend_url}/pages/login")
     except Exception as e:
         current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
