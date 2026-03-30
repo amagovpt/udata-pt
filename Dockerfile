@@ -8,13 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libssl-dev \
     git \
+    curl \
     xmlsec1 \
     libxmlsec1-dev \
     libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast dependency management
-RUN pip install --no-cache-dir uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
