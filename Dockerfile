@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     git \
     curl \
+    openssl \
     xmlsec1 \
     libxmlsec1-dev \
     libxmlsec1-openssl \
@@ -35,10 +36,15 @@ RUN uv sync --no-dev
 # Create directories for logs, uploads, and uwsgi socket
 RUN mkdir -p /logs /udata/fs /var/run/uwsgi
 
+# Entrypoint: generates self-signed SAML credentials if not mounted
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
 # Default environment
 ENV UDATA_SETTINGS=/app/udata.cfg
 
 EXPOSE 7000
 
+ENTRYPOINT ["/docker-entrypoint.sh"]
 # Default command: run the web server via uWSGI
 CMD ["uv", "run", "uwsgi", "--ini", "uwsgi/front.ini"]
