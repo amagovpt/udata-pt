@@ -1,5 +1,6 @@
 services:
   app:
+    container_name: udata-backend-app
     build: .
     command: uv run gunicorn udata.wsgi:app --bind 0.0.0.0:7000 --workers 4 --threads 2 --timeout 120
     ports:
@@ -17,6 +18,7 @@ services:
     restart: unless-stopped
 
   worker:
+    container_name: udata-backend-worker
     build: .
     command: uv run celery -A udata.worker worker --events --concurrency=4 -l info
     volumes:
@@ -33,6 +35,7 @@ services:
     restart: unless-stopped
 
   beat:
+    container_name: udata-backend-beat
     build: .
     command: uv run celery -A udata.worker beat -l info
     volumes:
