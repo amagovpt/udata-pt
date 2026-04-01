@@ -45,6 +45,7 @@ RUN chmod +x /docker-entrypoint.sh
 
 # Default environment
 ENV UDATA_SETTINGS=/app/udata.cfg
+ENV PYTHONPATH=/app
 
 EXPOSE 7000
 
