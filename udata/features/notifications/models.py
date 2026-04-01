@@ -9,6 +9,7 @@ from udata.core.user.models import User
 from udata.features.transfer.notifications import TransferRequestNotificationDetails
 from udata.models import db
 from udata.mongo.datetime_fields import Datetimed
+from udata.mongo.uuid_fields import AutoUUIDField
 from udata.mongo.queryset import UDataQuerySet
 
 
@@ -37,7 +38,7 @@ class Notification(Datetimed, db.Document):
         "queryset_class": NotificationQuerySet,
     }
 
-    id = field(db.AutoUUIDField(primary_key=True))
+    id = field(AutoUUIDField(primary_key=True))
     handled_at = field(
         db.DateTimeField(),
         sortable=True,
