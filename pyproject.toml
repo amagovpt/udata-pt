@@ -100,6 +100,7 @@ dependencies = [
     "defusedxml>=0.7.1",
     "pyuwsgi>=2.0.30.post1",
     "gunicorn>=25.2.0",
+    "elasticsearch>=9.3.0",
 ]
 
 [project.urls]
