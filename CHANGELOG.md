@@ -1,5 +1,145 @@
 # Changelog
 
+## 16.0.0 (2026-03-24)
+
+- **feat!: new api key system ([#3636](https://github.com/opendatateam/udata/pull/3636))**
+  - Replace the single User.apikey (JWS token stored on the user document)
+  with a dedicated ApiToken collection supporting multiple tokens per
+  user, HMAC-SHA256 hashed storage, revocation, expiration, and tracking
+  - New API endpoints: POST /api/1/me/api_tokens/ (create), GET
+  /api/1/me/api_tokens/ (list active), DELETE /api/1/me/api_tokens/<id>/ (revoke)
+  — the plaintext token is returned only once at creation
+  - Remove the apikey field from the User model and the me_fields /
+  apikey_fields API serializers, along with the old /me/apikey/ endpoint
+  - Add an idempotent migration that hashes existing JWS apikeys with
+  HMAC-SHA256 into the new api_token collection, preserving backward
+  compatibility for existing consumers
+  - Introduce API_TOKEN_SECRET and API_TOKEN_PREFIX settings for token
+  hashing and secret-scanning tool integration
+- chore(harvest): add harvest job dataservice index ([#3701](https://github.com/opendatateam/udata/pull/3701))
+- feat: allow editing the changelog before pushing ([#3705](https://github.com/opendatateam/udata/pull/3705))
+- feat: prevent calling tag-version.sh --help ([#3704](https://github.com/opendatateam/udata/pull/3704))
+- feat(search): add clean-es commands ([#3700](https://github.com/opendatateam/udata/pull/3700))
+- refactor: remove SpamInfo in profit of Report ([#3556](https://github.com/opendatateam/udata/pull/3556))
+
+
+## 15.4.1 (2026-03-19)
+
+- fix: sending int for daterange ([#3693](https://github.com/opendatateam/udata/pull/3693))
+- fix: topic search sort ([#3689](https://github.com/opendatateam/udata/pull/3689))
+
+
+## 15.4.0 (2026-03-19)
+
+- feat: partial editors ([#3668](https://github.com/opendatateam/udata/pull/3668))
+- feat: update translations for partial editor ([#3696](https://github.com/opendatateam/udata/pull/3696))
+- fix: circular imports in tests ([#3690](https://github.com/opendatateam/udata/pull/3690))
+- fix: import-fixture broken following partial editors change ([#3692](https://github.com/opendatateam/udata/pull/3692))
+- fix: shadowing translation function ([#3698](https://github.com/opendatateam/udata/pull/3698))
+- test: update ElasticSearch version in CI ([#3697](https://github.com/opendatateam/udata/pull/3697))
+
+
+## 15.3.0 (2026-03-16)
+
+- chore: working on types ([#3677](https://github.com/opendatateam/udata/pull/3677))
+- feat: create notification when matching invitation after account creation ([#3686](https://github.com/opendatateam/udata/pull/3686))
+- feat: include `udata-search-service` inside `udata` ([#3679](https://github.com/opendatateam/udata/pull/3679))
+- feat(storage): upgrade flask storage to add S3 extra args ([#3687](https://github.com/opendatateam/udata/pull/3687))
+- fix(topics): do not index private topics ([#3688](https://github.com/opendatateam/udata/pull/3688))
+
+
+## 15.2.0 (2026-03-09)
+
+- chore(deps): update dependencies ([#3685](https://github.com/opendatateam/udata/pull/3685))
+- chore: add hostname resolve in uri validate ([#3682](https://github.com/opendatateam/udata/pull/3682))
+- chore: disallow redirects in harvest actions and dataservice search ([#3683](https://github.com/opendatateam/udata/pull/3683))
+- feat(api): extend Atom feed filters support ([#3676](https://github.com/opendatateam/udata/pull/3676))
+- feat(catalog): add badges in dataset catalog ([#3681](https://github.com/opendatateam/udata/pull/3681))
+- fix: remove datetime.utcnow() deprecation warnings ([#3635](https://github.com/opendatateam/udata/pull/3635))
+
+
+## 15.1.0 (2026-02-19)
+
+- chore: add types to api fields ([#3670](https://github.com/opendatateam/udata/pull/3670))
+- chore: parallel pytest ([#3672](https://github.com/opendatateam/udata/pull/3672))
+- chore(test): add empty testing values to prevent conflict in tests ([#3678](https://github.com/opendatateam/udata/pull/3678))
+- feat: add translations ([#3664](https://github.com/opendatateam/udata/pull/3664))
+- feat(notifications): add membership response notifications ([#3655](https://github.com/opendatateam/udata/pull/3655))
+- feat(notifications): prevent integrity issues and add harvest related notifications ([#3665](https://github.com/opendatateam/udata/pull/3665))
+- fix: missing producer type attribute ([#3674](https://github.com/opendatateam/udata/pull/3674))
+- fix: mongo crash in CI during tests ([#3675](https://github.com/opendatateam/udata/pull/3675))
+- fix: test assertion and types ([#3669](https://github.com/opendatateam/udata/pull/3669))
+- refactor: use read permission instead of can for get endpoints ([#3671](https://github.com/opendatateam/udata/pull/3671))
+
+
+## 15.0.0 (2026-02-12)
+
+- **feat!: add MembershipRequest from org ([#3570](https://github.com/opendatateam/udata/pull/3570))**
+- chore: add breaking change override for `tag-version.sh` ([#3657](https://github.com/opendatateam/udata/pull/3657))
+- feat: expose organization permissions ([#3656](https://github.com/opendatateam/udata/pull/3656))
+- fix: missing new line between breaking and non breaking ([#3663](https://github.com/opendatateam/udata/pull/3663))
+- fix: new line in tag-version with breaking changes ([#3662](https://github.com/opendatateam/udata/pull/3662))
+- fix: remove dead code for site form ([#3658](https://github.com/opendatateam/udata/pull/3658))
+
+
+## 14.13.0 (2026-02-10)
+
+- feat: allow badges filtering with settings ([#3649](https://github.com/opendatateam/udata/pull/3649))
+- fix: last_update dates missing in indexing ([#3653](https://github.com/opendatateam/udata/pull/3653))
+
+
+## 14.12.0 (2026-02-10)
+
+- feat(harvest): add GeoDCAT-AP option to csw-dcat backend ([#3648](https://github.com/opendatateam/udata/pull/3648))
+- fix(notifications): comment notification ([#3651](https://github.com/opendatateam/udata/pull/3651))
+
+
+## 14.11.0 (2026-02-09)
+
+- feat(harvest): add remote URL prefix option to csw-dcat harvester ([#3466](https://github.com/opendatateam/udata/pull/3466))
+- feat: move fixtures to udata ([#3637](https://github.com/opendatateam/udata/pull/3637))
+- feat(notifications): add discussions notifications ([#3640](https://github.com/opendatateam/udata/pull/3640))
+- feat(security): add security verify route ([#3644](https://github.com/opendatateam/udata/pull/3644))
+- fix: add missing @api.secure ([#3646](https://github.com/opendatateam/udata/pull/3646))
+- fix(dataservice): purge dataservice related activities ([#3647](https://github.com/opendatateam/udata/pull/3647))
+- fix: docs ([#3641](https://github.com/opendatateam/udata/pull/3641))
+- fix: permissions on reuses ([#3650](https://github.com/opendatateam/udata/pull/3650))
+- test: add producer_type test on reuses ([#3643](https://github.com/opendatateam/udata/pull/3643))
+
+
+## 14.10.0 (2026-01-29)
+
+- chore: remove docker compose testing ([#3633](https://github.com/opendatateam/udata/pull/3633))
+- feat(2fa): add two factor authentification ([#3620](https://github.com/opendatateam/udata/pull/3620))
+- feat: search improvements ([#3583](https://github.com/opendatateam/udata/pull/3583))
+- fix: remove reindex topic ([#3639](https://github.com/opendatateam/udata/pull/3639))
+
+
+## 14.9.0 (2026-01-27)
+
+- docs: fix documentation for outdated instructions and typos ([#3634](https://github.com/opendatateam/udata/pull/3634))
+- docs: fix formatting issue
+- feat: add AGENTS.md ([#3623](https://github.com/opendatateam/udata/pull/3623))
+- feat: add CTA to HeroBloc ([#3630](https://github.com/opendatateam/udata/pull/3630))
+- feat: use MongoDB 7 in docker compose files to be consistent ([#3632](https://github.com/opendatateam/udata/pull/3632))
+- fix: deduplicate endpoint id in swagger ([#3631](https://github.com/opendatateam/udata/pull/3631))
+- fix: pagination URLs should not forward all arguments to url_for() ([#3584](https://github.com/opendatateam/udata/pull/3584))
+- test: use before/after timestamps instead of exact date comparison for flaky harvest tests ([#3587](https://github.com/opendatateam/udata/pull/3587))
+
+
+## 14.8.0 (2026-01-22)
+
+- chore: add vscode configs for debug and tests ([#3624](https://github.com/opendatateam/udata/pull/3624))
+- chore(CI): remove mongo 6 in CI ([#3622](https://github.com/opendatateam/udata/pull/3622))
+- chore: remove trailing slashes in changelog entries ([#3594](https://github.com/opendatateam/udata/pull/3594))
+- feat: add progress bar to search index command ([#3625](https://github.com/opendatateam/udata/pull/3625))
+- feat: add transfer notification handling ([#3619](https://github.com/opendatateam/udata/pull/3619))
+- feat(notification): add organization badges notifications ([#3628](https://github.com/opendatateam/udata/pull/3628))
+- feat(storage): upgrade flask storage to use S3 backend ([#3629](https://github.com/opendatateam/udata/pull/3629))
+- fix(search): forward is_restricted filter in dataservices search ([#3627](https://github.com/opendatateam/udata/pull/3627))
+- fix: search org by badge ([#3607](https://github.com/opendatateam/udata/pull/3607))
+
+
 ## 14.7.2 (2026-01-15)
 
 - chore: add MongoDB 7.0 in CI ([#3593](https://github.com/opendatateam/udata/pull/3593))

@@ -19,6 +19,7 @@ class Defaults(object):
         "de": "Deutsch",
     }
     DEFAULT_LANGUAGE = "en"
+    DEFAULT_COUNTRY_CODE = "fr"
     SECRET_KEY = "Default uData secret key"
     CONTACT_EMAIL = "contact@example.org"
 
@@ -27,9 +28,9 @@ class Defaults(object):
     MONGODB_HOST = "mongodb://localhost:27017/udata"
     MONGODB_CONNECT = False  # Lazy connexion for Fork-safe usage
 
-    # Search service configuration
-    SEARCH_SERVICE_API_URL = None
-    SEARCH_SERVICE_REQUEST_TIMEOUT = 20
+    # Search configuration
+    ELASTICSEARCH_URL = None
+    ELASTICSEARCH_INDEX_BASENAME = None
 
     # BROKER_TRANSPORT = 'redis'
     CELERY_BROKER_URL = "redis://localhost:6379"
@@ -99,7 +100,8 @@ class Defaults(object):
     SECURITY_CONFIRM_URL = "/confirm/"
     SECURITY_CHANGE_URL = "/change/"
     SECURITY_RESET_URL = "/reset/"
-    SECURITY_CHANGE_EMAIL_URL = "/change-email/"
+    SECURITY_CHANGE_EMAIL_URL = "/change-email"
+    SECURITY_GET_CSRF = "/get-csrf"
 
     # See https://flask-security.readthedocs.io/en/stable/configuration.html#SECURITY_REDIRECT_BEHAVIOR
     # We do not define all the URLs requested in the documentation because most of the time we do JSON requests in cdata
@@ -141,6 +143,19 @@ class Defaults(object):
     SECURITY_EMAIL_SUBJECT_PASSWORD_RESET = _("Password reset instructions")
 
     SECURITY_RETURN_GENERIC_RESPONSES = True
+
+    # Two-Factor Authentication settings
+    SECURITY_TWO_FACTOR = False
+    SECURITY_TWO_FACTOR_REQUIRED = False  # Not required by default
+    SECURITY_TWO_FACTOR_ENABLED_METHODS = ["authenticator"]
+    SECURITY_TOTP_SECRETS = {"1": "the udata totp secret"}
+    SECURITY_TOTP_ISSUER = "udata"
+    SECURITY_TWO_FACTOR_AUTHENTICATOR_VALIDITY = 30
+    SECURITY_TWO_FACTOR_ALWAYS_VALIDATE = True
+    SECURITY_TWO_FACTOR_RESCUE_EMAIL = False  # We won't send a rescue code by mail
+    SECURITY_TWO_FACTOR_RESCUE_MAIL = (
+        "no-reply@data.gouv.fr"  # Should be a contact email for account rescue
+    )
 
     # Inactive users settings
     YEARS_OF_INACTIVITY_BEFORE_DELETION = None
@@ -185,12 +200,16 @@ class Defaults(object):
     TERMS_OF_USE_DELETION_ARTICLE = None
     TELERECOURS_URL = None
 
-    UDATA_INSTANCE_NAME = "udata"
+    DATASET_HIDDEN_BADGES = []
 
     HARVESTER_BACKENDS = []
     THEME = None
 
     STATIC_DIRS = []
+
+    # API Token settings
+    API_TOKEN_PREFIX = "udata_"
+    API_TOKEN_SECRET = ""
 
     # OAuth 2 settings
     OAUTH2_PROVIDER_ERROR_ENDPOINT = "oauth.oauth_error"
@@ -519,6 +538,8 @@ class Defaults(object):
     URLS_ALLOW_PRIVATE = False
     # Whether or not to allow local URLs (localhost...) submission.
     URLS_ALLOW_LOCAL = False
+    # Wheter or not to resolve hostname to verify for private or local IP.
+    URLS_RESOLVE_HOSTNAME = True
     # Whether or not to allow credentials in URLs submission.
     URLS_ALLOW_CREDENTIALS = True
     # List of allowed URL schemes.
@@ -642,6 +663,30 @@ class Defaults(object):
     TRACKING_ENABLED = True
     TRACKING_EVENT_TTL_DAYS = 90
 
+    # Format families for search filtering
+    ###########################################################################
+    TABULAR_FORMATS = frozenset({"csv", "parquet", "xls", "xlsx", "ods", "tsv", "csv.gz"})
+    MACHINE_READABLE_FORMATS = frozenset({"json", "xml", "rdf", "sql", "jsonl", "ndjson"})
+    GEOGRAPHICAL_FORMATS = frozenset(
+        {
+            "shp",
+            "kml",
+            "kmz",
+            "gpx",
+            "shx",
+            "ovr",
+            "geojson",
+            "gpkg",
+            "pmtiles",
+            "mbtiles",
+            "wms",
+            "wfs",
+            "ogc:wms",
+            "ogc:wfs",
+        }
+    )
+    DOCUMENTS_FORMATS = frozenset({"pdf", "doc", "docx", "md", "txt", "html", "htm", "rtf", "odt"})
+
 
 class Testing(object):
     """Sane values for testing. Should be applied as override"""
@@ -667,17 +712,24 @@ class Testing(object):
     LOGGER_HANDLER_POLICY = "never"
     CELERYD_HIJACK_ROOT_LOGGER = False
     URLS_ALLOW_LOCAL = True  # Test server URL is local.test
+    URLS_RESOLVE_HOSTNAME = False
     URLS_ALLOWED_TLDS = tld_set | set(["test"])
     URLS_ALLOW_PRIVATE = False
     FS_IMAGES_OPTIMIZE = True
     SECURITY_EMAIL_VALIDATOR_ARGS = {
         "check_deliverability": False
     }  # Disables deliverability for email domain name
+    SECURITY_TWO_FACTOR = True  # should be set before security init_app for views to be loaded
     PUBLISH_ON_RESOURCE_EVENTS = False
     HARVEST_ACTIVITY_USER_ID = None
-    SEARCH_SERVICE_API_URL = None
     CDATA_BASE_URL = None
     SCHEMA_CATALOG_URL = None
+    API_TOKEN_SECRET = "test-secret"
+    SPAM_WORDS = []
+    SPAM_ALLOWED_LANGS = []
+    DATASET_HIDDEN_BADGES = []
+    ELASTICSEARCH_URL = None
+    ELASTICSEARCH_INDEX_BASENAME = "udata-test"
 
 
 class Debug(Defaults):

@@ -3,6 +3,7 @@ from udata.i18n import lazy_gettext as _
 ORG_ROLES = {
     "admin": _("Administrator"),
     "editor": _("Editor"),
+    "partial_editor": _("Partial editor"),
 }
 DEFAULT_ROLE = "editor"
 
@@ -11,6 +12,12 @@ MEMBERSHIP_STATUS = {
     "pending": _("Pending"),
     "accepted": _("Accepted"),
     "refused": _("Refused"),
+    "canceled": _("Canceled"),
+}
+
+REQUEST_TYPES = {
+    "request": _("Request"),
+    "invitation": _("Invitation"),
 }
 
 LOGO_MAX_SIZE = 500
@@ -22,6 +29,23 @@ CERTIFIED = "certified"
 ASSOCIATION = "association"
 COMPANY = "company"
 LOCAL_AUTHORITY = "local-authority"
+
+# Special value for content published by individual users (not organizations)
+USER = "user"
+
+# Special value for content published by organizations without producer badges
+NOT_SPECIFIED = "not-specified"
+
+# Badge types that are producer types (used for filtering in get_producer_type)
+PRODUCER_BADGE_TYPES = frozenset({PUBLIC_SERVICE, ASSOCIATION, COMPANY, LOCAL_AUTHORITY})
+
+# All producer types for filtering (includes USER and NOT_SPECIFIED)
+PRODUCER_TYPES = frozenset(
+    {PUBLIC_SERVICE, ASSOCIATION, COMPANY, LOCAL_AUTHORITY, USER, NOT_SPECIFIED}
+)
+
+
+ASSIGNABLE_OBJECT_TYPES = {"Dataset", "Dataservice", "Reuse"}
 
 TITLE_SIZE_LIMIT = 350
 DESCRIPTION_SIZE_LIMIT = 100000

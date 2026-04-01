@@ -2,9 +2,12 @@ import datetime
 
 from udata import search
 from udata.core.organization.api import DEFAULT_SORTING, OrgApiParser
+from udata.core.organization.constants import PRODUCER_BADGE_TYPES, PRODUCER_TYPES, USER
 from udata.models import Organization
-from udata.search.fields import ModelTermsFilter
+from udata.search.fields import Filter, ModelTermsFilter
 from udata.utils import to_iso_datetime
+from udata_search_service.consumers import OrganizationConsumer
+from udata_search_service.services import OrganizationService
 
 __all__ = ("OrganizationSearch",)
 
@@ -12,7 +15,8 @@ __all__ = ("OrganizationSearch",)
 @search.register
 class OrganizationSearch(search.ModelSearchAdapter):
     model = Organization
-    search_url = "organizations/"
+    service_class = OrganizationService
+    consumer_class = OrganizationConsumer
 
     sorts = {
         "reuses": "metrics.reuses",
@@ -22,10 +26,13 @@ class OrganizationSearch(search.ModelSearchAdapter):
         "created": "created_at",
     }
 
+    # Uses __badges__ (not available_badges) so that users can still filter
+    # by any existing badge, even hidden ones.
     filters = {
         "badge": ModelTermsFilter(
             model=Organization, field_name="badges", choices=list(Organization.__badges__)
         ),
+        "producer_type": Filter(choices=list(PRODUCER_TYPES - {USER})),
     }
 
     @classmethod
@@ -49,6 +56,13 @@ class OrganizationSearch(search.ModelSearchAdapter):
         extras = {}
         for key, value in organization.extras.items():
             extras[key] = to_iso_datetime(value) if isinstance(value, datetime.datetime) else value
+
+        producer_types = []
+        if hasattr(organization, "badges") and organization.badges:
+            producer_types = [
+                badge.kind for badge in organization.badges if badge.kind in PRODUCER_BADGE_TYPES
+            ]
+
         return {
             "id": str(organization.id),
             "name": organization.name,
@@ -56,6 +70,7 @@ class OrganizationSearch(search.ModelSearchAdapter):
             "description": organization.description,
             "url": organization.url,
             "badges": [badge.kind for badge in organization.badges],
+            "producer_type": producer_types,
             "created_at": to_iso_datetime(organization.created_at),
             "orga_sp": 1 if organization.public_service else 0,
             "followers": organization.metrics.get("followers", 0),

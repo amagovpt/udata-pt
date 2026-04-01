@@ -72,7 +72,7 @@ def _get_metrics_from_internal(
 
 def get_metrics_for_model(
     model: str, id: str | ObjectId | None, metrics_labels: list[str]
-) -> list[OrderedDict]:
+) -> list[OrderedDict | dict]:
     """
     Get metrics for a particular model object.
     Uses external METRICS_API if configured, otherwise falls back to internal data.

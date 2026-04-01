@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from bson import ObjectId
 from flask_restx.inputs import boolean
@@ -11,8 +11,6 @@ from udata.core.legal.mails import add_send_legal_notice_argument, send_legal_no
 from udata.core.organization.api_fields import org_ref_fields
 from udata.core.organization.models import Organization
 from udata.core.reuse.models import Reuse
-from udata.core.spam.api import SpamAPIMixin
-from udata.core.spam.fields import spam_fields
 from udata.core.user.api_fields import user_ref_fields
 from udata.utils import id_or_404
 
@@ -23,7 +21,6 @@ from .forms import (
     DiscussionEditForm,
 )
 from .models import Discussion, Message
-from .signals import on_discussion_deleted
 
 ns = api.namespace("discussions", "Discussion related operations")
 
@@ -36,6 +33,7 @@ message_permissions_fields = api.model(
 message_fields = api.model(
     "DiscussionMessage",
     {
+        "id": fields.String(description="The message identifier"),
         "content": fields.String(description="The message body"),
         "posted_by": fields.Nested(user_ref_fields, description="The message author"),
         "posted_by_organization": fields.Nested(
@@ -43,7 +41,6 @@ message_fields = api.model(
         ),
         "posted_on": fields.ISODateTime(description="The message posting date"),
         "last_modified_at": fields.ISODateTime(description="The message last edit date"),
-        "spam": fields.Nested(spam_fields),
         "permissions": fields.Nested(message_permissions_fields),
     },
 )
@@ -82,7 +79,6 @@ discussion_fields = api.model(
             attribute=lambda d: d.self_web_url(), description="The discussion web URL"
         ),
         "extras": fields.Raw(description="Extra attributes as key-value pairs"),
-        "spam": fields.Nested(spam_fields),
         "permissions": fields.Nested(discussion_permissions_fields),
     },
 )
@@ -159,12 +155,6 @@ parser.add_argument(
 )
 
 
-@ns.route("/<id>/spam/", endpoint="discussion_spam")
-@ns.doc(delete={"id": "unspam"})
-class DiscussionSpamAPI(SpamAPIMixin):
-    model = Discussion
-
-
 discussion_delete_parser = add_send_legal_notice_argument(api.parser())
 
 
@@ -216,7 +206,7 @@ class DiscussionAPI(API):
             discussion.permissions["close"].test()
             discussion.closed_by = current_user._get_current_object()
             discussion.closed_by_organization = form.organization.data
-            discussion.closed = datetime.utcnow()
+            discussion.closed = datetime.now(UTC)
 
         discussion.save()
         if close:
@@ -225,6 +215,7 @@ class DiscussionAPI(API):
             discussion.signal_comment(message=message_idx)
         return discussion
 
+    @api.secure
     @api.doc("update_discussion")
     @api.response(403, "Not allowed to update this discussion")
     @api.expect(edit_comment_discussion_fields)
@@ -239,6 +230,7 @@ class DiscussionAPI(API):
 
         return discussion
 
+    @api.secure
     @api.doc("delete_discussion")
     @api.expect(discussion_delete_parser)
     @api.response(403, "Not allowed to delete this discussion")
@@ -250,20 +242,7 @@ class DiscussionAPI(API):
         send_legal_notice_on_deletion(discussion, args)
 
         discussion.delete()
-        on_discussion_deleted.send(discussion)
         return "", 204
-
-
-@ns.route("/<id>/comments/<int:cidx>/spam/", endpoint="discussion_comment_spam")
-@ns.doc(delete={"id": "unspam"})
-class DiscussionCommentSpamAPI(SpamAPIMixin):
-    def get_model(self, id, cidx):
-        discussion = Discussion.objects.get_or_404(id=id_or_404(id))
-        if len(discussion.discussion) <= cidx:
-            api.abort(404, "Comment does not exist")
-        elif cidx == 0:
-            api.abort(400, "You cannot unspam the first comment of a discussion")
-        return discussion, discussion.discussion[cidx]
 
 
 message_delete_parser = add_send_legal_notice_argument(api.parser())
@@ -275,6 +254,7 @@ class DiscussionCommentAPI(API):
     Base class for a comment in a discussion thread.
     """
 
+    @api.secure
     @api.doc("edit_discussion_comment")
     @api.response(403, "Not allowed to edit this comment")
     @api.expect(edit_comment_discussion_fields)
@@ -291,10 +271,11 @@ class DiscussionCommentAPI(API):
         form = api.validate(DiscussionEditCommentForm)
 
         discussion.discussion[cidx].content = form.comment.data
-        discussion.discussion[cidx].last_modified_at = datetime.utcnow()
+        discussion.discussion[cidx].last_modified_at = datetime.now(UTC)
         discussion.save()
         return discussion
 
+    @api.secure
     @api.doc("delete_discussion_comment")
     @api.expect(message_delete_parser)
     @api.response(403, "Not allowed to delete this comment")
@@ -311,8 +292,7 @@ class DiscussionCommentAPI(API):
         message.permissions["delete"].test()
         send_legal_notice_on_deletion(message, args)
 
-        discussion.discussion.pop(cidx)
-        discussion.save()
+        discussion.remove_message(cidx)
         return "", 204
 
 

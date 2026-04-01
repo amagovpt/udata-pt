@@ -1,6 +1,6 @@
 import csv
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from tempfile import NamedTemporaryFile
 
 import pytest
@@ -19,7 +19,7 @@ from udata.harvest.backends import get_enabled_backends
 from udata.harvest.backends.base import BaseBackend
 from udata.models import Dataset, PeriodicTask
 from udata.tests.api import PytestOnlyDBTestCase
-from udata.tests.helpers import assert_emit, assert_equal_dates, assert_not_emit
+from udata.tests.helpers import assert_emit, assert_not_emit
 from udata.utils import faker
 
 from .. import actions, signals
@@ -63,7 +63,7 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
     def test_list_sources_exclude_deleted(self):
         assert actions.list_sources() == []
 
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         sources = HarvestSourceFactory.create_batch(3)
         deleted_sources = HarvestSourceFactory.create_batch(2, deleted=now)
 
@@ -79,7 +79,7 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
     def test_list_sources_include_deleted(self):
         assert actions.list_sources() == []
 
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         sources = HarvestSourceFactory.create_batch(3)
         sources.extend(HarvestSourceFactory.create_batch(2, deleted=now))
 
@@ -343,9 +343,9 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
             enabled=True,
             crontab=PeriodicTask.Crontab(),
         )
-        now = datetime.utcnow()
-        to_delete = HarvestSourceFactory.create_batch(2, deleted=now)
-        to_delete.append(HarvestSourceFactory(periodic_task=periodic_task, deleted=now))
+        deleted_at = datetime.now(UTC)
+        to_delete = HarvestSourceFactory.create_batch(2, deleted=deleted_at)
+        to_delete.append(HarvestSourceFactory(periodic_task=periodic_task, deleted=deleted_at))
         to_keep = HarvestSourceFactory.create_batch(2)
         harvest_job = HarvestJobFactory(source=to_delete[0])
         dataset_to_archive = DatasetFactory(
@@ -355,7 +355,9 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
             harvest=HarvestDataserviceMetadata(source_id=str(to_delete[0].id))
         )
 
+        before = datetime.now(UTC)
         result = actions.purge_sources()
+        after = datetime.now(UTC)
         dataset_to_archive.reload()
         dataservice_to_archive.reload()
 
@@ -365,16 +367,39 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
         assert HarvestJob.objects(id=harvest_job.id).count() == 0
 
         assert dataset_to_archive.harvest.archived == "harvester-deleted"
-        assert_equal_dates(dataset_to_archive.harvest.archived_at, now)
-        assert_equal_dates(dataset_to_archive.archived, now)
+        # MongoEngine returns naive datetimes, so normalize before comparison
+        archived_at_naive = (
+            dataset_to_archive.harvest.archived_at.replace(tzinfo=None)
+            if dataset_to_archive.harvest.archived_at.tzinfo
+            else dataset_to_archive.harvest.archived_at
+        )
+        archived_naive = (
+            dataset_to_archive.archived.replace(tzinfo=None)
+            if dataset_to_archive.archived and dataset_to_archive.archived.tzinfo
+            else dataset_to_archive.archived
+        )
+        before_naive = before.replace(tzinfo=None)
+        after_naive = after.replace(tzinfo=None)
+        assert before_naive <= archived_at_naive <= after_naive
+        assert before_naive <= archived_naive <= after_naive
 
         assert dataservice_to_archive.harvest.archived_reason == "harvester-deleted"
-        assert_equal_dates(dataservice_to_archive.harvest.archived_at, now)
-        assert_equal_dates(dataservice_to_archive.archived_at, now)
+        dataservice_archived_at_naive = (
+            dataservice_to_archive.harvest.archived_at.replace(tzinfo=None)
+            if dataservice_to_archive.harvest.archived_at.tzinfo
+            else dataservice_to_archive.harvest.archived_at
+        )
+        assert before_naive <= dataservice_archived_at_naive <= after_naive
+        dataservice_archived_naive = (
+            dataservice_to_archive.archived_at.replace(tzinfo=None)
+            if dataservice_to_archive.archived_at and dataservice_to_archive.archived_at.tzinfo
+            else dataservice_to_archive.archived_at
+        )
+        assert before_naive <= dataservice_archived_naive <= after_naive
 
     @pytest.mark.options(HARVEST_JOBS_RETENTION_DAYS=2)
     def test_purge_jobs(self):
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         retention = now - timedelta(days=2)
         too_old = retention - timedelta(days=1)
         to_delete = HarvestJobFactory.create_batch(3, created=too_old)
@@ -415,7 +440,7 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
         for i in range(2):
             dataset = DatasetFactory.build()
             dataset.harvest = HarvestDatasetMetadata(domain="test.org", remote_id=str(i))
-            dataset.last_modified_internal = datetime.utcnow()
+            dataset.last_modified_internal = datetime.now(UTC)
             dataset.save()
             attached_datasets.append(dataset)
 

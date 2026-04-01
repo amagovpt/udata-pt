@@ -1,9 +1,11 @@
 from celery.utils.log import get_task_logger
 from flask import current_app
 
+from udata.core.activity.models import Activity
 from udata.core.badges import tasks as badge_tasks
 from udata.core.constants import HVD
 from udata.core.dataservices.models import Dataservice
+from udata.core.organization.assignment import Assignment
 from udata.core.organization.constants import CERTIFIED, PUBLIC_SERVICE
 from udata.core.organization.models import Organization
 from udata.core.pages.models import Page
@@ -29,8 +31,12 @@ def purge_dataservices(self):
             {"$set": {"items.$[item].dataservice": None}},
             array_filters=[{"item.dataservice": dataservice.id}],
         )
+        # Remove activity
+        Activity.objects(related_to=dataservice).delete()
         # Remove associated Transfers
         Transfer.objects(subject=dataservice).delete()
+        # Remove assignments
+        Assignment.objects(subject=dataservice).delete()
         # Remove dataservices references in Topics
         TopicElement.objects(element=dataservice).update(element=None)
         # Remove dataservices in pages (mongoengine doesn't support updating a field in a generic embed)
