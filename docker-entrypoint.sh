@@ -20,4 +20,20 @@ if [ ! -f "$PRIVATE_KEY" ]; then
     fi
 fi
 
+MONGO_HOST="${SERVER_MONGO:-localhost}"
+MONGO_PORT=27017
+echo "[entrypoint] Waiting for MongoDB at $MONGO_HOST:$MONGO_PORT..."
+MAX_RETRIES=30
+RETRY=0
+while ! nc -z "$MONGO_HOST" "$MONGO_PORT" 2>/dev/null; do
+    RETRY=$((RETRY + 1))
+    if [ "$RETRY" -ge "$MAX_RETRIES" ]; then
+        echo "[entrypoint] ERROR: MongoDB not reachable after ${MAX_RETRIES}s. Skipping migrations."
+        exec "$@"
+    fi
+    sleep 1
+done
+echo "[entrypoint] MongoDB is up. Running database migrations..."
+uv run udata db migrate
+
 exec "$@"

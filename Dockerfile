@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     git \
     curl \
+    netcat-openbsd \
     openssl \
     xmlsec1 \
     libxmlsec1-dev \
