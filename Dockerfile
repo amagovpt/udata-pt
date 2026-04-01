@@ -21,6 +21,9 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
+# Trust the /app directory for git (setuptools-scm needs it for versioning)
+RUN git config --global --add safe.directory /app
+
 # Copy dependency files first for better layer caching
 COPY pyproject.toml uv.lock ./
 
