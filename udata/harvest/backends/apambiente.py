@@ -21,7 +21,7 @@ import requests
 from urllib.parse import urlparse, urlencode
 
 from udata.harvest.backends.base import BaseBackend
-from udata.models import Resource, License
+from udata.models import Resource, Dataset, License
 from owslib.csw import CatalogueServiceWeb
 
 from udata.harvest.models import HarvestItem

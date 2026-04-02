@@ -1,4 +1,4 @@
-from udata.models import Resource, License
+from udata.models import db, Resource, License
 from udata.harvest.backends.base import BaseBackend
 from datetime import datetime
 from xml.dom import minidom, Node
