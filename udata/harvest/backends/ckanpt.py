@@ -16,7 +16,6 @@ from udata.harvest.models import HarvestItem
 from voluptuous import (
     Schema, All, Any, Lower, Coerce, DefaultTo, Optional
 )
-from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.models import HarvestDatasetMetadata, HarvestResourceMetadata
 from udata.core.dataset.rdf import frequency_from_rdf
 from udata.frontend.markdown import parse_html
@@ -33,6 +32,7 @@ from udata.harvest.filters import (
     is_url, empty_none, hash
 )
 from .tools.harvester_utils import missing_datasets_warning, normalize_url_slashes
+
 from .ckan.schemas.ckan import schema as ckan_schema
 from .ckan.schemas.dkan import schema as dkan_schema
 
