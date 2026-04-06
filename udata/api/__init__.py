@@ -16,6 +16,7 @@ from flask import (
 from flask_restx import Api, Resource
 from flask_restx.reqparse import RequestParser
 from flask_storage import UnauthorizedFileType
+from flask_storage.errors import FileExists
 
 from udata import tracking
 from udata.app import csrf
@@ -261,6 +262,13 @@ def handle_unauthorized_file_type(error):
         url=url
     )
     return {"message": msg}, 400
+
+
+@api.errorhandler(FileExists)
+@api.marshal_with(default_error, code=409)
+def handle_file_exists(error):
+    """Error occuring when a file with the same name already exists in the storage"""
+    return {"message": "A file with this name already exists. Please rename the file and try again."}, 409
 
 
 validation_error_fields = api.model(
