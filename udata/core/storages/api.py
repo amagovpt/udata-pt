@@ -133,7 +133,7 @@ def combine_chunks(storage, args, prefix=None):
     return target
 
 
-def handle_upload(storage, prefix=None):
+def handle_upload(storage, prefix=None, overwrite=False):
     args = upload_parser.parse_args()
     is_chunk = args["totalparts"] and args["totalparts"] > 1
     uploaded_file = args["file"]
@@ -148,7 +148,7 @@ def handle_upload(storage, prefix=None):
     else:
         # Normalize filename including extension
         filename = utils.normalize(uploaded_file.filename)
-        fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename)
+        fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename, overwrite=overwrite)
 
     metadata = storage.metadata(fs_filename)
     metadata["last_modified_internal"] = metadata.pop("modified")

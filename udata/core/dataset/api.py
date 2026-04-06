@@ -592,7 +592,7 @@ class ResourcesAPI(API):
 class UploadMixin(object):
     def handle_upload(self, dataset):
         prefix = "/".join((dataset.slug, datetime.now(UTC).strftime("%Y%m%d-%H%M%S")))
-        infos = handle_upload(storages.resources, prefix)
+        infos = handle_upload(storages.resources, prefix, overwrite=True)
         # Content validation (HTML, XML/XXE, image magic bytes, script scanning)
         # is handled centrally in storages.api.handle_upload() via validate_upload()
         infos["title"] = os.path.basename(infos["filename"])
