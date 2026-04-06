@@ -597,8 +597,15 @@ class UploadMixin(object):
         # is handled centrally in storages.api.handle_upload() via validate_upload()
         infos["title"] = os.path.basename(infos["filename"])
         checksum_type = next(
-            checksum_type for checksum_type in CHECKSUM_TYPES if checksum_type in infos
+            (ct for ct in CHECKSUM_TYPES if ct in infos),
+            None,
         )
+        if checksum_type is None:
+            log.error(
+                "No checksum found in upload metadata. Available keys: %s",
+                list(infos.keys()),
+            )
+            api.abort(400, "Upload metadata is missing checksum information.")
         infos["checksum"] = Checksum(type=checksum_type, value=infos.pop(checksum_type))
         infos["filesize"] = infos.pop("size")
         del infos["filename"]
@@ -618,9 +625,15 @@ class UploadNewDatasetResource(UploadMixin, API):
     def post(self, dataset):
         """Upload a file for a new dataset resource"""
         dataset.permissions["edit_resources"].test()
-        infos = self.handle_upload(dataset)
-        resource = Resource(**infos)
-        dataset.add_resource(resource)
+        try:
+            infos = self.handle_upload(dataset)
+            resource = Resource(**infos)
+            dataset.add_resource(resource)
+        except Exception:
+            log.exception(
+                "Unexpected error while uploading resource to dataset %s", dataset.id
+            )
+            raise
         return resource, 201
 
 
