@@ -258,3 +258,30 @@ def remove_from_home_reuses(reuse):
     if reuse in current_site.settings.home_reuses:
         current_site.settings.home_reuses.remove(reuse)
         current_site.save()
+
+
+def _invalidate_homepage_cache():
+    """Clear the cached homepage data so changes are reflected immediately."""
+    from udata.app import cache
+
+    cache.delete("site_home")
+
+
+@Dataset.after_save.connect
+def invalidate_homepage_on_dataset_save(dataset, **kwargs):
+    _invalidate_homepage_cache()
+
+
+@Dataset.on_delete.connect
+def invalidate_homepage_on_dataset_delete(dataset, **kwargs):
+    _invalidate_homepage_cache()
+
+
+@Reuse.after_save.connect
+def invalidate_homepage_on_reuse_save(reuse, **kwargs):
+    _invalidate_homepage_cache()
+
+
+@Reuse.on_delete.connect
+def invalidate_homepage_on_reuse_delete(reuse, **kwargs):
+    _invalidate_homepage_cache()
