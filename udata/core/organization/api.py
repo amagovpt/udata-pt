@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 from flask import make_response, redirect, request, url_for
+from flask_restx import marshal
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
@@ -430,16 +431,13 @@ class MembershipAcceptAPI(MembershipAPI):
         org.permissions["members"].test()
         membership_request = self.get_or_404(org, id)
 
-        if membership_request.kind == "invitation":
-            api.abort(400, "Use the cancel endpoint for invitations")
-
         if org.is_member(membership_request.user):
             return org.member(membership_request.user), 409
 
         membership_request.status = "accepted"
         membership_request.handled_by = current_user._get_current_object()
         membership_request.handled_on = datetime.now(UTC)
-        member = Member(user=membership_request.user, role="editor")
+        member = Member(user=membership_request.user, role=membership_request.role or "editor")
 
         org.members.append(member)
         org.count_members()
@@ -510,12 +508,12 @@ class MembershipCancelAPI(MembershipAPI):
 class MemberInviteAPI(API):
     @api.secure
     @api.expect(invite_fields)
-    @api.marshal_with(request_fields, code=201)
     @api.doc("invite_organization_member")
+    @api.response(201, "Member added or invitation sent")
     @api.response(403, "Not Authorized")
     @api.response(400, "Bad Request")
     def post(self, org):
-        """Invite a user or email to join the organization."""
+        """Add a user directly as a member, or invite an email to join the organization."""
         from udata.core.user.models import User
 
         org.permissions["members"].test()
@@ -565,7 +563,7 @@ class MemberInviteAPI(API):
                     field="email", message="An invitation is already pending for this email"
                 )
 
-        # Resolve assignments for partial_editor invitations
+        # Resolve assignments for partial_editor role
         raw_assignments = request.json.get("assignments", []) or []
         assignment_subjects = []
         if raw_assignments:
@@ -597,11 +595,24 @@ class MemberInviteAPI(API):
                     )
                 assignment_subjects.append(obj)
 
-        # Create invitation
+        # When a known user is being added, directly add them as a member (no invitation needed)
+        if user:
+            member = Member(user=user, role=role)
+            org.members.append(member)
+            org.count_members()
+            org.save()
+
+            if role == "partial_editor" and assignment_subjects:
+                for obj in assignment_subjects:
+                    Assignment(user=user, organization=org, subject=obj).save()
+
+            return marshal(member, member_fields), 201
+
+        # For email-only (non-registered user), create an invitation
         invitation = MembershipRequest(
             kind="invitation",
-            user=user,
-            email=email.lower() if email else None,
+            user=None,
+            email=email_lower,
             created_by=current_user._get_current_object(),
             role=role,
             comment=comment,
@@ -613,7 +624,7 @@ class MemberInviteAPI(API):
 
         notify_membership_invitation.delay(str(org.id), str(invitation.id))
 
-        return invitation, 201
+        return marshal(invitation, request_fields), 201
 
 
 @ns.route("/<org:org>/member/<user:user>/", endpoint="member", doc=common_doc)
