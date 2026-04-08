@@ -109,7 +109,7 @@ class SiteHomeAPI(API):
         """Aggregated homepage data with lightweight serialization"""
         site = current_site
         metrics = site.metrics or {}
-        datasets = Dataset.objects.visible().order_by("-created_at_internal")[:3]
+        datasets = Dataset.objects.visible().order_by("-created_at_internal")[:6]
         reuses = Reuse.objects.visible().order_by("-created_at")[:3]
         posts = Post.objects.published()[:3]
         return {
