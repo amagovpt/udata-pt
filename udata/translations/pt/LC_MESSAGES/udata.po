@@ -515,7 +515,7 @@ msgstr "criou um dataset"
 
 #: udata/core/dataset/activities.py:31
 msgid "updated a dataset"
-msgstr "atualizou um dataset"
+msgstr "atualizou um conjunto de dados"
 
 #: udata/core/dataset/activities.py:38
 msgid "deleted a dataset"
