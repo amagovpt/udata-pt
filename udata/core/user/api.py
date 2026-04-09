@@ -52,6 +52,13 @@ ns = api.namespace("users", "User related operations")
 me = api.namespace("me", "Connected user related operations")
 
 user_parser = UserApiParser()
+user_parser.parser.add_argument(
+    "role",
+    type=str,
+    location="args",
+    help="Filter by profile role: 'admin' or 'editor'",
+    required=False,
+)
 
 filter_parser = api.parser()
 filter_parser.add_argument(
@@ -440,6 +447,16 @@ class UserListAPI(API):
         """List all users"""
         args = user_parser.parse()
         users = User.objects(deleted=None)
+
+        role_filter = args.get("role")
+        if role_filter in ("admin", "editor"):
+            admin_role = Role.objects(name="admin").first()
+            if admin_role:
+                if role_filter == "admin":
+                    users = users.filter(roles=admin_role)
+                else:
+                    users = users.filter(roles__nin=[admin_role])
+
         if args["q"]:
             search_users = users.search_text(args["q"])
             if args["sort"]:
