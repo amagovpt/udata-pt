@@ -821,6 +821,8 @@ class CommunityResourceAPI(API):
         if community.filetype == "file":
             form._fields.get("url").data = community.url
         form.populate_obj(community)
+        if "checksum" in request.get_json() and form._fields.get("checksum").data is None:
+            community.checksum = None
         if not community.organization and not community.owner:
             community.owner = current_user._get_current_object()
         community.last_modified_internal = datetime.now(UTC)
