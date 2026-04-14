@@ -6,6 +6,7 @@ from udata.api import API, api, fields
 from udata.auth import admin_permission
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api_fields import dataset_fields, dataset_ref_fields
+from udata.core.dataset.models import Dataset
 from udata.core.organization.api_fields import org_ref_fields
 from udata.core.user.api_fields import user_ref_fields
 from udata.harvest.backends import get_enabled_backends
@@ -161,6 +162,11 @@ source_fields = api.model(
             org_ref_fields, allow_null=True, description="The producer organization"
         ),
         "deleted": fields.ISODateTime(description="The source deletion date", readonly=True),
+        "datasets_count": fields.Integer(
+            description="Number of datasets harvested by this source",
+            readonly=True,
+            attribute=lambda s: Dataset.objects.filter(harvest__source_id=str(s.id)).count(),
+        ),
         "schedule": fields.String(
             description="The source schedule (interval or cron expression)", readonly=True
         ),
