@@ -288,6 +288,7 @@ DEFAULT_MASK = ",".join(
         "temporal_coverage",
         "spatial",
         "license",
+        "license_title",
         "access_type",
         "access_audiences",
         "authorization_request_url",
@@ -399,6 +400,11 @@ dataset_fields = api.model(
         ),
         "license": fields.String(
             attribute="license.id", default=DEFAULT_LICENSE["id"], description="The dataset license"
+        ),
+        "license_title": fields.String(
+            attribute="license.title",
+            default=DEFAULT_LICENSE["title"],
+            description="The dataset license human-readable title",
         ),
         "license_url": fields.String(
             attribute="license.url", description="The dataset license URL"
