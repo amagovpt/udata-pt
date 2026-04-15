@@ -163,6 +163,12 @@ class DatasetApiParser(ModelApiParser):
             location="args",
             help="If set to true, it will filter on private datasets only. If set to false, it will exclude private datasets. User must be authenticated and results are limited to user visibility",
         )
+        self.parser.add_argument(
+            "modified_since",
+            type=str,
+            location="args",
+            help="Filter datasets modified since this ISO date (e.g. 2024-01-01)",
+        )
 
     @staticmethod
     def parse_filters(datasets, args):
@@ -264,6 +270,12 @@ class DatasetApiParser(ModelApiParser):
             if current_user.is_anonymous:
                 abort(401)
             datasets = datasets.filter(private=args["private"])
+        if args.get("modified_since"):
+            try:
+                since = datetime.fromisoformat(args["modified_since"]).replace(tzinfo=UTC)
+                datasets = datasets.filter(last_modified_internal__gte=since)
+            except ValueError:
+                api.abort(400, "modified_since must be a valid ISO date (e.g. 2024-01-01)")
         return datasets
 
 
