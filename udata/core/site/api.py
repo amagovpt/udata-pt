@@ -109,7 +109,11 @@ class SiteHomeAPI(API):
         """Aggregated homepage data with lightweight serialization"""
         site = current_site
         metrics = site.metrics or {}
-        datasets = Dataset.objects.visible().order_by("-created_at_internal")[:6]
+        featured = [d for d in (site.settings.home_datasets or []) if d is not None]
+        if featured:
+            datasets = featured[:6]
+        else:
+            datasets = Dataset.objects.visible().order_by("-created_at_internal")[:6]
         reuses = Reuse.objects.visible().order_by("-created_at")[:3]
         posts = Post.objects.published()[:3]
         return {
@@ -123,6 +127,49 @@ class SiteHomeAPI(API):
             "latest_reuses": [_serialize_reuse(r) for r in reuses],
             "latest_posts": [_serialize_post(p) for p in posts],
         }
+
+
+@api.route("/site/home/datasets/", endpoint="site_home_datasets")
+class SiteHomeDatasetsAPI(API):
+    @api.doc(id="get_home_featured_datasets")
+    def get(self):
+        """Return the editorially selected featured datasets for the homepage."""
+        datasets = current_site.settings.home_datasets or []
+        return [_serialize_dataset(d) for d in datasets if d is not None]
+
+    @api.secure(admin_permission)
+    @api.doc(id="set_home_featured_datasets")
+    def put(self):
+        """Replace the list of featured homepage datasets with the given IDs."""
+        ids = request.get_json(force=True)
+        if not isinstance(ids, list):
+            api.abort(400, "Expected a JSON array of dataset IDs")
+        datasets = [Dataset.objects.get_or_404(id=dataset_id) for dataset_id in ids]
+        current_site.settings.home_datasets = datasets
+        current_site.save()
+        cache.delete("site_home")
+        return [_serialize_dataset(d) for d in datasets]
+
+
+@api.route("/site/home/reuses/", endpoint="site_home_reuses")
+class SiteHomeReusesAPI(API):
+    @api.doc(id="get_home_featured_reuses")
+    def get(self):
+        """Return the editorially selected featured reuses for the homepage."""
+        reuses = current_site.settings.home_reuses or []
+        return [_serialize_reuse(r) for r in reuses if r is not None]
+
+    @api.secure(admin_permission)
+    @api.doc(id="set_home_featured_reuses")
+    def put(self):
+        """Replace the list of featured homepage reuses with the given IDs."""
+        ids = request.get_json(force=True)
+        if not isinstance(ids, list):
+            api.abort(400, "Expected a JSON array of reuse IDs")
+        reuses = [Reuse.objects.get_or_404(id=reuse_id) for reuse_id in ids]
+        current_site.settings.home_reuses = reuses
+        current_site.save()
+        return [_serialize_reuse(r) for r in reuses]
 
 
 @api.route("/site/data.<_format>", endpoint="site_dataportal")
