@@ -67,6 +67,12 @@ class ReuseApiParser(ModelApiParser):
         self.parser.add_argument("type", type=str, location="args")
         self.parser.add_argument("topic", type=str, location="args")
         self.parser.add_argument("featured", type=bool, location="args")
+        self.parser.add_argument(
+            "modified_since",
+            type=str,
+            location="args",
+            help="Filter reuses modified since this ISO date (e.g. 2024-01-01)",
+        )
 
     @staticmethod
     def parse_filters(reuses, args):
@@ -100,6 +106,12 @@ class ReuseApiParser(ModelApiParser):
             if not ObjectId.is_valid(args["owner"]):
                 api.abort(400, "Owner arg must be an identifier")
             reuses = reuses.filter(owner=args["owner"])
+        if args.get("modified_since"):
+            try:
+                since = datetime.fromisoformat(args["modified_since"]).replace(tzinfo=UTC)
+                reuses = reuses.filter(last_modified__gte=since)
+            except ValueError:
+                api.abort(400, "modified_since must be a valid ISO date (e.g. 2024-01-01)")
         return reuses
 
 
@@ -119,7 +131,15 @@ class ReuseListAPI(API):
         query = Reuse.objects.visible_by_user(
             current_user, mongoengine.Q(private__ne=True, deleted=None)
         )
-        return Reuse.apply_pagination(Reuse.apply_sort_filters(query))
+        query = Reuse.apply_sort_filters(query)
+        modified_since = request.args.get("modified_since")
+        if modified_since:
+            try:
+                since = datetime.fromisoformat(modified_since).replace(tzinfo=UTC)
+                query = query.filter(last_modified__gte=since)
+            except ValueError:
+                api.abort(400, "modified_since must be a valid ISO date (e.g. 2024-01-01)")
+        return Reuse.apply_pagination(query)
 
     @api.secure
     @api.doc("create_reuse")
