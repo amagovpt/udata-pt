@@ -578,6 +578,78 @@ class OrgContactAPI(API):
         return contact_points.paginate(args["page"], args["page_size"])
 
 
+@ns.route("/<user:user>/following/", endpoint="user_following")
+@api.response(404, "User not found")
+class UserFollowingAPI(API):
+    @api.doc("user_following")
+    def get(self, user):
+        """List all objects followed by a given user"""
+        page = flask_request.args.get("page", 1, type=int)
+        page_size = flask_request.args.get("page_size", 20, type=int)
+
+        qs = Follow.objects.following(user.id)
+        total = qs.count()
+
+        offset = (page - 1) * page_size
+        follows = list(qs.skip(offset).limit(page_size))
+
+        data = []
+        for follow in follows:
+            following_obj = follow.following
+            if following_obj is None:
+                continue
+
+            cls_name = type(following_obj).__name__
+            following_data = {"id": str(following_obj.id), "class": cls_name}
+
+            if isinstance(following_obj, (Dataset, Reuse)):
+                following_data["title"] = following_obj.title
+                following_data["slug"] = following_obj.slug
+            elif isinstance(following_obj, Organization):
+                following_data["name"] = following_obj.name
+                following_data["slug"] = following_obj.slug
+                if following_obj.logo:
+                    following_data["image_thumbnail"] = following_obj.logo(100, external=True)
+            elif isinstance(following_obj, User):
+                following_data["name"] = (
+                    f"{following_obj.first_name or ''} {following_obj.last_name or ''}".strip()
+                )
+                following_data["slug"] = following_obj.slug
+                if following_obj.avatar:
+                    following_data["avatar_thumbnail"] = following_obj.avatar(100, external=True)
+            else:
+                if hasattr(following_obj, "title"):
+                    following_data["title"] = following_obj.title
+                if hasattr(following_obj, "name"):
+                    following_data["name"] = following_obj.name
+                if hasattr(following_obj, "slug"):
+                    following_data["slug"] = following_obj.slug
+
+            data.append(
+                {
+                    "id": str(follow.id),
+                    "follower": {"id": str(follow.follower.id), "slug": follow.follower.slug},
+                    "following": following_data,
+                    "since": follow.since.isoformat() if follow.since else None,
+                }
+            )
+
+        has_next = (offset + page_size) < total
+        has_prev = page > 1
+        base_url = flask_request.base_url
+
+        return {
+            "data": data,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "next_page": f"{base_url}?page={page + 1}&page_size={page_size}" if has_next else None,
+            "previous_page": (
+                f"{base_url}?page={page - 1}&page_size={page_size}" if has_prev else None
+            ),
+        }
+
+
 @ns.route("/<id>/followers/", endpoint="user_followers")
 @ns.doc(
     get={"id": "list_user_followers"}, post={"id": "follow_user"}, delete={"id": "unfollow_user"}
