@@ -148,7 +148,7 @@ def handle_upload(storage, prefix=None):
     else:
         # Normalize filename including extension
         filename = utils.normalize(uploaded_file.filename)
-        fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename)
+        fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename, overwrite=True)
 
     metadata = storage.metadata(fs_filename)
     metadata["last_modified_internal"] = metadata.pop("modified")
