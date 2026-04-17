@@ -30,7 +30,6 @@ services:
       - .env
     environment:
       UDATA_SETTINGS: /app/udata.cfg
-      C_FORCE_ROOT: 'true'
       FS_ROOT: /udata/fs
     restart: unless-stopped
 
@@ -45,7 +44,6 @@ services:
       - .env
     environment:
       UDATA_SETTINGS: /app/udata.cfg
-      C_FORCE_ROOT: 'true'
     restart: unless-stopped
 
 volumes:
