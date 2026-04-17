@@ -8,7 +8,7 @@ services:
     volumes:
       - ./udata.cfg:/app/udata.cfg:ro
       - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials:ro
-      - ${FS_ROOT:-/home/adbrum/workspace/babel/udata-front-pt/udata-fs}:/udata/fs
+      - ${FS_ROOT:-/opt/udata/fs}:/udata/fs
       - app-logs:/logs
     env_file:
       - .env
@@ -24,7 +24,7 @@ services:
     volumes:
       - ./udata.cfg:/app/udata.cfg:ro
       - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials:ro
-      - ${FS_ROOT:-/home/adbrum/workspace/babel/udata-front-pt/udata-fs}:/udata/fs
+      - ${FS_ROOT:-/opt/udata/fs}:/udata/fs
       - app-logs:/logs
     env_file:
       - .env
