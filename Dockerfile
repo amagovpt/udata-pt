@@ -16,14 +16,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast dependency management
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+# Install uv for fast dependency management (system-wide so it is accessible
+# to the non-root runtime user)
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/usr/local/bin sh
+
+# Non-root runtime user. Fixed UID/GID so bind-mounted volumes
+# (FS_ROOT, logs, SAML credentials) can be chown'ed predictably on the host.
+ARG UDATA_UID=10001
+ARG UDATA_GID=10001
+RUN groupadd --system --gid ${UDATA_GID} udata \
+    && useradd --system --uid ${UDATA_UID} --gid ${UDATA_GID} \
+       --home-dir /app --shell /sbin/nologin udata
 
 WORKDIR /app
 
-# Trust the /app directory for git (setuptools-scm needs it for versioning)
-RUN git config --global --add safe.directory /app
+# Trust the /app directory for git (setuptools-scm needs it for versioning).
+# --system makes it visible to both root (at build time) and udata (at runtime).
+RUN git config --system --add safe.directory /app
 
 # Copy dependency files first for better layer caching
 COPY pyproject.toml uv.lock ./
@@ -44,11 +54,18 @@ RUN mkdir -p /logs /udata/fs /var/run/uwsgi
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
+# Hand ownership of every path the runtime needs to read/write to the
+# non-root user (application code + generated .venv, logs, FS_ROOT mount
+# point and uwsgi runtime dir).
+RUN chown -R udata:udata /app /logs /udata /var/run/uwsgi
+
 # Default environment
 ENV UDATA_SETTINGS=/app/udata.cfg
 ENV PYTHONPATH=/app
 
 EXPOSE 7000
+
+USER udata
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # Default command: run the web server via uWSGI
