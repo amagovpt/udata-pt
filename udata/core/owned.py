@@ -96,7 +96,7 @@ class Owned(object):
         description="Only present if owner is not set. Can only be set to an organization of the current authenticated user.",
         checks=[check_organization_is_valid_for_current_user, only_creation],
         allow_null=True,
-        filterable={},
+        filterable={"multi": True},
     )
 
     on_owner_change = signal("Owned.on_owner_change")

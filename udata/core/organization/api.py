@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 
+from bson.objectid import ObjectId
 from flask import make_response, redirect, request, url_for
 from flask_restx import marshal
 from mongoengine.queryset.visitor import Q
@@ -84,6 +85,7 @@ class OrgApiParser(ModelApiParser):
             type=str,
             choices=list(Organization.__badges__),
             location="args",
+            action="append",
         )
         self.parser.add_argument(
             "name",
@@ -94,6 +96,13 @@ class OrgApiParser(ModelApiParser):
             "business_number_id",
             type=str,
             location="args",
+        )
+        self.parser.add_argument(
+            "organization",
+            type=str,
+            location="args",
+            action="append",
+            help="Filter by organization id(s)",
         )
 
     @staticmethod
@@ -106,11 +115,16 @@ class OrgApiParser(ModelApiParser):
             phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
             organizations = organizations.search_text(phrase_query)
         if args.get("badge"):
-            organizations = organizations.with_badge(args["badge"])
+            organizations = organizations.filter(badges__kind__in=args["badge"])
         if args.get("name"):
             organizations = organizations.filter(name__iexact=args["name"])
         if args.get("business_number_id"):
             organizations = organizations.filter(business_number_id=args["business_number_id"])
+        if args.get("organization"):
+            for org_id in args["organization"]:
+                if not ObjectId.is_valid(org_id):
+                    api.abort(400, "Organization arg must be an identifier")
+            organizations = organizations.filter(id__in=args["organization"])
         return organizations
 
 

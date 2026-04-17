@@ -552,6 +552,7 @@ def generate_fields(**kwargs) -> Callable:
                 type=filterable["type"],
                 location="args",
                 choices=filterable.get("choices", None),
+                action="append" if filterable.get("multi") else None,
             )
 
         cls.__index_parser__ = parser
@@ -587,18 +588,23 @@ def generate_fields(**kwargs) -> Callable:
                 filter = args.get(filterable.get("label", filterable["key"]))
                 if filter is not None:
                     for constraint in filterable.get("constraints", []):
-                        if constraint == "objectid" and not ObjectId.is_valid(
-                            args[filterable["key"]]
-                        ):
-                            api.abort(400, f"`{filterable['key']}` must be an identifier")
+                        if constraint == "objectid":
+                            values = filter if isinstance(filter, list) else [filter]
+                            if not all(ObjectId.is_valid(v) for v in values):
+                                api.abort(
+                                    400, f"`{filterable['key']}` must be an identifier"
+                                )
 
                     query = filterable.get("query", None)
                     if query:
                         base_query = filterable["query"](base_query, filter)
                     else:
+                        column = filterable["column"]
+                        if filterable.get("multi") and isinstance(filter, list):
+                            column = f"{column}__in"
                         base_query = base_query.filter(
                             **{
-                                filterable["column"]: filter,
+                                column: filter,
                             }
                         )
 
