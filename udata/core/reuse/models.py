@@ -151,6 +151,7 @@ class Reuse(
         TagListField(),
         filterable={
             "key": "tag",
+            "multi": True,
         },
     )
     topic = field(

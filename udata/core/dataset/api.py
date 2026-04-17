@@ -103,17 +103,17 @@ class DatasetApiParser(ModelApiParser):
     def __init__(self):
         super().__init__()
         self.parser.add_argument("tag", type=str, location="args", action="append")
-        self.parser.add_argument("license", type=str, location="args")
+        self.parser.add_argument("license", type=str, location="args", action="append")
         self.parser.add_argument(
             "featured",
             type=boolean,
             location="args",
             help="If set to true, it will filter on featured datasets only. If set to false, it will exclude featured datasets.",
         )
-        self.parser.add_argument("geozone", type=str, location="args")
-        self.parser.add_argument("granularity", type=str, location="args")
+        self.parser.add_argument("geozone", type=str, location="args", action="append")
+        self.parser.add_argument("granularity", type=str, location="args", action="append")
         self.parser.add_argument("temporal_coverage", type=str, location="args")
-        self.parser.add_argument("organization", type=str, location="args")
+        self.parser.add_argument("organization", type=str, location="args", action="append")
         # Uses __badges__ (not available_badges) so that users can still filter
         # by any existing badge, even hidden ones.
         self.parser.add_argument(
@@ -121,6 +121,7 @@ class DatasetApiParser(ModelApiParser):
             type=str,
             choices=list(Dataset.__badges__),
             location="args",
+            action="append",
         )
         self.parser.add_argument(
             "organization_badge",
@@ -135,7 +136,7 @@ class DatasetApiParser(ModelApiParser):
             location="args",
             help="(beta, subject to change/be removed)",
         )
-        self.parser.add_argument("format", type=str, location="args")
+        self.parser.add_argument("format", type=str, location="args", action="append")
         self.parser.add_argument("schema", type=str, location="args")
         self.parser.add_argument("schema_version", type=str, location="args")
         self.parser.add_argument(
@@ -182,11 +183,11 @@ class DatasetApiParser(ModelApiParser):
         if args.get("tag"):
             datasets = datasets.filter(tags__all=args["tag"])
         if args.get("license"):
-            datasets = datasets.filter(license__in=License.objects.filter(id=args["license"]))
+            datasets = datasets.filter(license__in=License.objects.filter(id__in=args["license"]))
         if args.get("geozone"):
-            datasets = datasets.filter(spatial__zones=args["geozone"])
+            datasets = datasets.filter(spatial__zones__in=args["geozone"])
         if args.get("granularity"):
-            datasets = datasets.filter(spatial__granularity=args["granularity"])
+            datasets = datasets.filter(spatial__granularity__in=args["granularity"])
         if args.get("temporal_coverage"):
             datasets = datasets.filter(
                 temporal_coverage__start__gte=args["temporal_coverage"][:9],
@@ -195,11 +196,12 @@ class DatasetApiParser(ModelApiParser):
         if args.get("featured") is not None:
             datasets = datasets.filter(featured=args["featured"])
         if args.get("badge"):
-            datasets = datasets.with_badge(args["badge"])
+            datasets = datasets.filter(badges__kind__in=args["badge"])
         if args.get("organization"):
-            if not ObjectId.is_valid(args["organization"]):
-                api.abort(400, "Organization arg must be an identifier")
-            datasets = datasets.filter(organization=args["organization"])
+            for org_id in args["organization"]:
+                if not ObjectId.is_valid(org_id):
+                    api.abort(400, "Organization arg must be an identifier")
+            datasets = datasets.filter(organization__in=args["organization"])
         if args.get("organization_badge"):
             orgs = Organization.objects.with_badge(args["organization_badge"]).only("id")
             datasets = datasets.filter(organization__in=orgs)
@@ -218,7 +220,7 @@ class DatasetApiParser(ModelApiParser):
             ]
             datasets = datasets.filter(id__in=ids)
         if args.get("format"):
-            datasets = datasets.filter(resources__format=args["format"])
+            datasets = datasets.filter(resources__format__in=args["format"])
         if args.get("schema"):
             datasets = datasets.filter(resources__schema__name=args["schema"])
         if args.get("schema_version"):
