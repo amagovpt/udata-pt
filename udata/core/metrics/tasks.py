@@ -153,6 +153,23 @@ def update_organizations():
         )
 
 
+@log_timing
+def aggregate_org_downloads():
+    """Aggregate resource downloads from datasets into their parent organizations.
+
+    The external metrics API tracks downloads per resource/dataset but does not
+    aggregate them at the organization level.  This function sums
+    ``metrics.resources_downloads`` across all datasets of each organization and
+    stores the total in ``metrics.resource_downloads`` on the organization.
+    """
+    pipeline = [
+        {"$match": {"organization": {"$ne": None}, "metrics.resources_downloads": {"$gt": 0}}},
+        {"$group": {"_id": "$organization", "total": {"$sum": "$metrics.resources_downloads"}}},
+    ]
+    for row in Dataset.objects.aggregate(*pipeline):
+        Organization.objects(id=row["_id"]).update(set__metrics__resource_downloads=row["total"])
+
+
 def update_metrics_for_models():
     log.info("Starting…")
     update_datasets()
@@ -160,6 +177,7 @@ def update_metrics_for_models():
     update_dataservices()
     update_reuses()
     update_organizations()
+    aggregate_org_downloads()
 
 
 def save_model_by_id_or_slug(model: db.Document, identifier: str, metrics: dict[str, int]) -> None:
