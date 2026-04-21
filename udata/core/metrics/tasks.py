@@ -43,6 +43,24 @@ def save_model(model: db.Document, model_id: str, metrics: dict[str, int]) -> No
         log.exception(e)
 
 
+def _fix_pagination_url(next_url: str | None, base_url: str) -> str | None:
+    """Replace the host in pagination URLs returned by the external metrics API.
+
+    The external service may return ``next``/``prev`` links pointing to an
+    internal address (e.g. ``http://localhost:8005/…``) that is unreachable
+    from the udata worker.  We keep the path and query string but swap the
+    scheme + host to match the configured ``METRICS_API`` base URL.
+    """
+    if not next_url:
+        return None
+    from urllib.parse import urlparse, urlunparse
+
+    parsed_next = urlparse(next_url)
+    parsed_base = urlparse(base_url)
+    fixed = parsed_next._replace(scheme=parsed_base.scheme, netloc=parsed_base.netloc)
+    return urlunparse(fixed)
+
+
 def iterate_on_metrics(target: str, value_keys: list[str], page_size: int = 50) -> dict:
     """
     Yield all elements with not zero values for the keys inside `value_keys`.
@@ -50,9 +68,10 @@ def iterate_on_metrics(target: str, value_keys: list[str], page_size: int = 50) 
     metrics with one of the two values not zero.
     """
     yielded = set()
+    metrics_api = current_app.config["METRICS_API"]
 
     for value_key in value_keys:
-        url = f"{current_app.config['METRICS_API']}/{target}_total/data/"
+        url = f"{metrics_api}/{target}_total/data/"
         url += f"?{value_key}__greater=1&page_size={page_size}"
 
         with requests.Session() as session:
@@ -66,14 +85,14 @@ def iterate_on_metrics(target: str, value_keys: list[str], page_size: int = 50) 
                         yielded.add(row["__id"])
                         yield row
 
-                url = data["links"].get("next")
+                url = _fix_pagination_url(data["links"].get("next"), metrics_api)
 
 
 @log_timing
 def update_resources_and_community_resources():
     for data in iterate_on_metrics("resources", ["download_resource"]):
         if data["dataset_id"] is None:
-            save_model(
+            save_model_by_id_or_slug(
                 CommunityResource,
                 data["resource_id"],
                 {
@@ -89,7 +108,7 @@ def update_resources_and_community_resources():
 @log_timing
 def update_datasets():
     for data in iterate_on_metrics("datasets", ["visit", "download_resource"]):
-        save_model(
+        save_model_by_id_or_slug(
             Dataset,
             data["dataset_id"],
             {
@@ -102,7 +121,7 @@ def update_datasets():
 @log_timing
 def update_dataservices():
     for data in iterate_on_metrics("dataservices", ["visit"]):
-        save_model(
+        save_model_by_id_or_slug(
             Dataservice,
             data["dataservice_id"],
             {
@@ -114,18 +133,22 @@ def update_dataservices():
 @log_timing
 def update_reuses():
     for data in iterate_on_metrics("reuses", ["visit"]):
-        save_model(Reuse, data["reuse_id"], {"views": data["visit"]})
+        save_model_by_id_or_slug(Reuse, data["reuse_id"], {"views": data["visit"]})
 
 
 @log_timing
 def update_organizations():
-    # We're currently using visit_dataset as global metric for an orga
-    for data in iterate_on_metrics("organizations", ["visit_dataset"]):
-        save_model(
+    for data in iterate_on_metrics(
+        "organizations", ["visit_dataset", "download_resource", "visit_reuse", "visit_dataservice"]
+    ):
+        save_model_by_id_or_slug(
             Organization,
             data["organization_id"],
             {
-                "views": data["visit_dataset"],
+                "views": data.get("visit_dataset") or 0,
+                "resource_downloads": data.get("download_resource") or 0,
+                "reuse_views": data.get("visit_reuse") or 0,
+                "dataservice_views": data.get("visit_dataservice") or 0,
             },
         )
 
