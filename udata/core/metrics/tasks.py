@@ -138,13 +138,17 @@ def update_reuses():
 
 @log_timing
 def update_organizations():
-    # We're currently using visit_dataset as global metric for an orga
-    for data in iterate_on_metrics("organizations", ["visit_dataset"]):
+    for data in iterate_on_metrics(
+        "organizations", ["visit_dataset", "download_resource", "visit_reuse", "visit_dataservice"]
+    ):
         save_model_by_id_or_slug(
             Organization,
             data["organization_id"],
             {
-                "views": data["visit_dataset"],
+                "views": data.get("visit_dataset") or 0,
+                "resource_downloads": data.get("download_resource") or 0,
+                "reuse_views": data.get("visit_reuse") or 0,
+                "dataservice_views": data.get("visit_dataservice") or 0,
             },
         )
 

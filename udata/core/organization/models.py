@@ -254,9 +254,11 @@ class Organization(
         "reuses",
         "reuses_by_months",
         "reuses_followers_by_months",
-        "dataservices",
         "followers",
         "views",
+        "resource_downloads",
+        "reuse_views",
+        "dataservice_views",
     ]
 
     before_save = Signal()
