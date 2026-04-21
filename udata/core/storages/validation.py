@@ -33,7 +33,11 @@ XML_MIME_TYPES = {
 
 XML_EXTENSIONS = {"xml", "svg", "svgz", "xhtml", "rdf"}
 
-# Patterns that indicate active/dangerous content, mapped to human-readable descriptions
+# Patterns that indicate active/dangerous HTML/script content in files that
+# could be interpreted by a browser. Images and XML are always scanned with
+# this full set. Plain non-HTML files (CSV, TXT, JSON, etc.) use the more
+# restricted PLAIN_TEXT_DANGEROUS_PATTERNS to avoid false positives on
+# legitimate data (e.g. an "onclick" column value in a CSV).
 DANGEROUS_CONTENT_PATTERNS = {
     r"<script": "embedded script tag (<script>)",
     r"javascript:": "JavaScript URI (javascript:)",
@@ -42,6 +46,18 @@ DANGEROUS_CONTENT_PATTERNS = {
     r"<object": "embedded object tag (<object>)",
     r"<embed": "embedded embed tag (<embed>)",
     r"<foreignobject": "SVG foreignObject element (<foreignObject>)",
+}
+
+# Patterns applied to arbitrary (non-image, non-XML) uploaded files. We only
+# block clear HTML/JS injection vectors here. The `on\w+=` event-handler
+# pattern is intentionally omitted because it matches too often on legitimate
+# text data (e.g. a CSV cell with the word "onclick=").
+PLAIN_TEXT_DANGEROUS_PATTERNS = {
+    r"<script": "embedded script tag (<script>)",
+    r"javascript:": "JavaScript URI (javascript:)",
+    r"<iframe": "embedded iframe tag (<iframe>)",
+    r"<object": "embedded object tag (<object>)",
+    r"<embed": "embedded embed tag (<embed>)",
 }
 
 # Additional patterns specific to XML files (XXE)
@@ -183,9 +199,10 @@ def validate_upload(filepath, mime, extension):
                 "declarations are not allowed."
             )
 
-    # 4. For all other files: scan for HTML/script injection
+    # 4. For all other files: scan for HTML/script injection only (no event
+    # handler heuristic — too many false positives on legitimate text data).
     else:
-        match = _scan_for_dangerous_content(filepath, DANGEROUS_CONTENT_PATTERNS)
+        match = _scan_for_dangerous_content(filepath, PLAIN_TEXT_DANGEROUS_PATTERNS)
         if match:
             _, description = match
             _remove_file(filepath)
