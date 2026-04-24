@@ -131,6 +131,24 @@ class UserAPITest(APITestCase):
         self.assert200(response)
         self.assertEqual(len(response.json), 0)
 
+    def test_suggest_users_api_email(self):
+        """It should suggest users based on email"""
+        user = UserFactory(email="alice@example.pt")
+        UserFactory(email="bob@other.pt")
+
+        response = self.get(url_for("api.suggest_users", q="example.pt", size=5))
+        self.assert200(response)
+        self.assertEqual(len(response.json), 1)
+        self.assertEqual(response.json[0]["id"], str(user.id))
+
+    def test_suggest_users_api_empty_query_returns_recent(self):
+        """Empty query should return the most recent users"""
+        UserFactory.create_batch(3)
+
+        response = self.get(url_for("api.suggest_users", size=5))
+        self.assert200(response)
+        self.assertEqual(len(response.json), 3)
+
     def test_suggest_users_api_no_dedup(self):
         """It should suggest users without deduplicating homonyms"""
         UserFactory.create_batch(2, first_name="test", last_name="homonym")
@@ -145,15 +163,15 @@ class UserAPITest(APITestCase):
             self.assertEqual(suggestion["last_name"], "homonym")
 
     def test_suggest_users_api_size_validation(self):
-        """It should validate that the size parameter is between 1 and 20."""
+        """It should validate that the size parameter is between 1 and 50."""
         response = self.get(url_for("api.suggest_users", q="foobar", size=0))
         self.assert400(response)
-        self.assertIn("between 1 and 20", response.json["errors"]["size"])
+        self.assertIn("between 1 and 50", response.json["errors"]["size"])
 
-        response = self.get(url_for("api.suggest_users", q="foobar", size=21))
+        response = self.get(url_for("api.suggest_users", q="foobar", size=51))
 
         self.assert400(response)
-        self.assertIn("between 1 and 20", response.json["errors"]["size"])
+        self.assertIn("between 1 and 50", response.json["errors"]["size"])
 
     def test_user_api_full_text_search_first_name(self):
         """It should find users based on first name"""

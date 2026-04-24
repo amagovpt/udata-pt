@@ -2,6 +2,7 @@ from datetime import datetime
 
 from flask import request as flask_request
 from flask_security import current_user, logout_user
+from mongoengine.queryset.visitor import Q
 from slugify import slugify
 
 from udata.api import API, api
@@ -669,19 +670,23 @@ class FollowUserAPI(FollowAPI):
 
 suggest_parser = api.parser()
 suggest_parser.add_argument(
-    "q", help="The string to autocomplete/suggest", location="args", required=True
+    "q",
+    help="The string to autocomplete/suggest. Empty returns the most recent users.",
+    location="args",
+    required=False,
+    default="",
 )
 
 
 def suggest_size(value: str) -> int | None:
-    """Parse an integer that must be between 1 and 20."""
-    help_message = "The size must be an integer between 1 and 20."
+    """Parse an integer that must be between 1 and 50."""
+    help_message = "The size must be an integer between 1 and 50."
     try:
         parsed = int(value)
     except ValueError:
         raise ValueError(help_message)
 
-    if parsed < 1 or parsed > 20:
+    if parsed < 1 or parsed > 50:
         raise ValueError(help_message)
     return parsed
 
@@ -689,7 +694,7 @@ def suggest_size(value: str) -> int | None:
 suggest_parser.add_argument(
     "size",
     type=suggest_size,
-    help="The amount of suggestion to fetch (between 1 and 20)",
+    help="The amount of suggestion to fetch (between 1 and 50)",
     location="args",
     default=10,
 )
@@ -701,11 +706,18 @@ class SuggestUsersAPI(API):
     @api.expect(suggest_parser)
     @api.marshal_list_with(user_suggestion_fields)
     def get(self):
-        """Suggest users"""
+        """Suggest users by name, email or slug. Empty query lists recent users."""
         args = suggest_parser.parse_args()
-        users = User.objects(
-            deleted=None, slug__icontains=slugify(args["q"], separator="-", to_lower=True)
-        )
+        query = (args["q"] or "").strip()
+        users = User.objects(deleted=None)
+        if query:
+            slug_query = slugify(query, separator="-", to_lower=True)
+            users = users.filter(
+                Q(first_name__icontains=query)
+                | Q(last_name__icontains=query)
+                | Q(email__icontains=query)
+                | Q(slug__icontains=slug_query)
+            )
         return [
             {
                 "id": user.id,
