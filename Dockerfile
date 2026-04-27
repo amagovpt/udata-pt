@@ -48,7 +48,7 @@ COPY . .
 RUN uv sync --no-dev
 
 # Create directories for logs, uploads, and uwsgi socket
-RUN mkdir -p /logs /udata/fs /var/run/uwsgi
+RUN mkdir -p /logs /dadosgov/fs /var/run/uwsgi
 
 # Entrypoint: generates self-signed SAML credentials if not mounted
 COPY docker-entrypoint.sh /docker-entrypoint.sh
@@ -57,7 +57,7 @@ RUN chmod +x /docker-entrypoint.sh
 # Hand ownership of every path the runtime needs to read/write to the
 # non-root user (application code + generated .venv, logs, FS_ROOT mount
 # point and uwsgi runtime dir).
-RUN chown -R udata:udata /app /logs /udata /var/run/uwsgi
+RUN chown -R dadosgov:dadosgov /app /logs /dadosgov /var/run/uwsgi
 
 # Default environment
 ENV UDATA_SETTINGS=/app/udata.cfg
@@ -65,7 +65,7 @@ ENV PYTHONPATH=/app
 
 EXPOSE 7000
 
-USER udata
+USER dadosgov
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # Default command: run the web server via uWSGI
