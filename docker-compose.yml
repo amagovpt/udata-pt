@@ -2,19 +2,19 @@ services:
   app:
     container_name: udata-backend-app
     build: .
-    command: uv run gunicorn udata.wsgi:app --bind 0.0.0.0:7000 --workers 4 --threads 2 --timeout 120
+    command: uv run uwsgi --ini uwsgi/front.ini
     ports:
       - '7000:7000'
     volumes:
       - ./udata.cfg:/app/udata.cfg:ro
-      - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials:ro
-      - ${FS_ROOT:-/opt/udata/fs}:/udata/fs
+      - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials
+      - ${FS_ROOT:-/opt/dadosgov/fs}:/dadosgov/fs
       - app-logs:/logs
     env_file:
       - .env
     environment:
       UDATA_SETTINGS: /app/udata.cfg
-      FS_ROOT: /udata/fs
+      FS_ROOT: /dadosgov/fs
     restart: unless-stopped
 
   worker:
@@ -23,14 +23,14 @@ services:
     command: uv run celery -A udata.worker worker --events --concurrency=4 -l info
     volumes:
       - ./udata.cfg:/app/udata.cfg:ro
-      - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials:ro
-      - ${FS_ROOT:-/opt/udata/fs}:/udata/fs
+      - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials
+      - ${FS_ROOT:-/opt/dadosgov/fs}:/dadosgov/fs
       - app-logs:/logs
     env_file:
       - .env
     environment:
       UDATA_SETTINGS: /app/udata.cfg
-      FS_ROOT: /udata/fs
+      FS_ROOT: /dadosgov/fs
     restart: unless-stopped
 
   beat:
