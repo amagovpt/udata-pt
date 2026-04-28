@@ -1,0 +1,39 @@
+# Disposable test stack for E2E destructive tests.
+#
+# Spins up an isolated MongoDB + Redis on non-standard ports so the dev/prod
+# stack on 27017/6379 stays untouched. Use `inv test` for pytest (port 27018)
+# or the helpers in scripts/test_db.sh for Playwright destructive runs.
+#
+# Run:
+#   docker compose -f docker-compose.test.yml up -d
+#   docker compose -f docker-compose.test.yml down -v   # -v wipes volumes
+services:
+  mongodb-test:
+    image: mongo:7.0.4
+    container_name: udata-mongodb-test
+    ports:
+      - "127.0.0.1:27019:27017"
+    tmpfs:
+      # Mongo data lives in tmpfs — every restart starts clean. No volume
+      # bind-mounts intentionally; this DB is meant to be disposable.
+      - /data/db
+    command: ["--bind_ip_all", "--quiet"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis-test:
+    image: redis:7-alpine
+    container_name: udata-redis-test
+    ports:
+      - "127.0.0.1:6380:6379"
+    tmpfs:
+      - /data
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
