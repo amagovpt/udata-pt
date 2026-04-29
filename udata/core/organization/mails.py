@@ -127,6 +127,21 @@ def badge_added_association(org: Organization) -> MailMessage:
     )
 
 
+def welcome_new_member(org: Organization) -> MailMessage:
+    return MailMessage(
+        subject=_("You are now a member of an organization"),
+        paragraphs=[
+            ParagraphWithLinks(
+                _(
+                    "Welcome! You have been added as a member of the organization %(org)s.",
+                    org=org,
+                )
+            ),
+            MailCTA(_("View the organization"), org.self_web_url()),
+        ],
+    )
+
+
 def membership_invitation_canceled(org: Organization) -> MailMessage:
     return MailMessage(
         subject=_("An organization invitation has been canceled"),

@@ -3,7 +3,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version:  udata\n"
 "Report-Msgid-Bugs-To: i18n@opendata.team\n"
-"POT-Creation-Date: 2026-03-17 17:29+0100\n"
+"POT-Creation-Date: 2026-04-29 16:44+0100\n"
 "PO-Revision-Date: 2025-11-19 12:59+0000\n"
 "Last-Translator: Open Data Team <i18n@opendata.team>\n"
 "Language: ar\n"
@@ -13,33 +13,33 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.18.0\n"
+"Generated-By: Babel 2.17.0\n"
 
-#: udata/settings.py:130
+#: udata/settings.py:138
 msgid "Welcome"
 msgstr "مرحبًا"
 
-#: udata/settings.py:131
+#: udata/settings.py:139
 msgid "Please confirm your email"
 msgstr "الرجاء التأكد من البريد الإلكتروني الخاص بك"
 
-#: udata/settings.py:132
+#: udata/settings.py:140
 msgid "Login instructions"
 msgstr "تعليمات تسجيل الدخول"
 
-#: udata/auth/mails.py:127 udata/settings.py:133
+#: udata/auth/mails.py:127 udata/settings.py:141
 msgid "Your password has been reset"
 msgstr "لقد تم إعادة تعيين كلمة المرور الخاصة بك"
 
-#: udata/auth/mails.py:139 udata/settings.py:134
+#: udata/auth/mails.py:139 udata/settings.py:142
 msgid "Your password has been changed"
 msgstr "تم تغيير كلمة المرور الخاصه بك"
 
-#: udata/settings.py:135
+#: udata/settings.py:143
 msgid "Password reset instructions"
 msgstr "إرشادات إعادة تعيين كلمة المرور"
 
-#: udata/settings.py:569
+#: udata/settings.py:581
 msgid "This dataset has been archived"
 msgstr ""
 
@@ -48,7 +48,7 @@ msgstr ""
 msgid "Invalid URL \"{url}\": {reason}"
 msgstr ""
 
-#: udata/tests/api/test_datasets_api.py:1188 udata/tests/test_model.py:417
+#: udata/tests/api/test_datasets_api.py:1201 udata/tests/test_model.py:417
 #: udata/uris.py:62
 #, python-brace-format
 msgid "Invalid URL \"{url}\""
@@ -127,7 +127,7 @@ msgid "First name is required"
 msgstr ""
 
 #: udata/auth/forms.py:39 udata/auth/forms.py:46
-#: udata/core/contact_point/forms.py:13 udata/core/user/forms.py:15
+#: udata/core/contact_point/models.py:38 udata/core/user/forms.py:15
 #: udata/core/user/forms.py:19
 msgid "URLs not allowed in this field"
 msgstr ""
@@ -184,12 +184,14 @@ msgid "Please confirm your email address."
 msgstr ""
 
 #: udata/auth/mails.py:82
-msgid "Your email address is already associated with an account"
+msgid "Account information"
 msgstr ""
 
 #: udata/auth/mails.py:85
 #, python-format
-msgid "Someone (you?) tried to create an account on %(site)s with your email."
+msgid ""
+"You received this email because a registration was attempted on %(site)s "
+"with your email address."
 msgstr ""
 
 #: udata/auth/mails.py:88
@@ -253,6 +255,28 @@ msgstr ""
 msgid "Password must contain symbols"
 msgstr ""
 
+#: udata/auth/saml/saml_plugin/saml_govpt.py:281
+msgid "Account migration verification code"
+msgstr ""
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:284
+#, python-format
+msgid "Someone is linking a CMD identity to your %(site)s account."
+msgstr ""
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:287
+#, python-format
+msgid "Your verification code is: %(code)s"
+msgstr ""
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:288
+msgid "This code expires in 10 minutes."
+msgstr ""
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:289
+msgid "If you did not request this, ignore this email."
+msgstr ""
+
 #: udata/commands/init.py:32
 msgid "Do you want to create a superadmin user?"
 msgstr "هل تريد إنشاء مستخدم (superadmin)؟"
@@ -273,7 +297,7 @@ msgstr "هل تريد إنشاء بعض نماذج البيانات؟"
 msgid "Your udata instance is ready!"
 msgstr ""
 
-#: udata/core/owned.py:63 udata/forms/fields.py:771
+#: udata/core/owned.py:63 udata/forms/fields.py:775
 #: udata/tests/api/test_dataservices_api.py:569
 msgid "You can only set yourself as owner"
 msgstr "يمكنك تعيين نفسك فقط كمالك"
@@ -282,57 +306,37 @@ msgstr "يمكنك تعيين نفسك فقط كمالك"
 msgid "Unknown organization"
 msgstr ""
 
-#: udata/core/owned.py:76 udata/forms/fields.py:803
+#: udata/core/owned.py:76 udata/forms/fields.py:807
 #: udata/tests/api/test_dataservices_api.py:582
 msgid "Permission denied for this organization"
 msgstr "تم رفض الإذن لهذه المؤسسة"
 
-#: udata/core/access_type/constants.py:42
+#: udata/core/access_type/constants.py:46
 msgid "Confidentiality of public authorities proceedings"
 msgstr ""
 
-#: udata/core/access_type/constants.py:44
-msgid "International relations, public security or national defence"
-msgstr ""
-
-#: udata/core/access_type/constants.py:46
-msgid "Course of justice"
-msgstr ""
-
-#: udata/core/access_type/constants.py:48
-msgid "Commercial or industrial confidentiality"
-msgstr ""
-
-#: udata/core/access_type/constants.py:50
-msgid "Intellectual property rights"
-msgstr ""
-
 #: udata/core/access_type/constants.py:52
-msgid "Personal data confidentiality"
-msgstr ""
-
-#: udata/core/access_type/constants.py:54
-msgid "Protection of voluntary information suppliers"
-msgstr ""
-
-#: udata/core/access_type/constants.py:56
-msgid "Environmental protection"
-msgstr ""
-
-#: udata/core/access_type/constants.py:66
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of the proceedings of public authorities, where such "
 "confidentiality is provided for by law."
 msgstr ""
 
-#: udata/core/access_type/constants.py:70
+#: udata/core/access_type/constants.py:58
+msgid "International relations, public security or national defence"
+msgstr ""
+
+#: udata/core/access_type/constants.py:64
 msgid ""
 "Public access to datasets and services would adversely affect "
 "international relations, public security or national defence."
 msgstr ""
 
-#: udata/core/access_type/constants.py:74
+#: udata/core/access_type/constants.py:70
+msgid "Course of justice"
+msgstr ""
+
+#: udata/core/access_type/constants.py:76
 msgid ""
 "Public access to datasets and services would adversely affect the course "
 "of justice, the ability of any person to receive a fair trial or the "
@@ -340,7 +344,11 @@ msgid ""
 "disciplinary nature."
 msgstr ""
 
-#: udata/core/access_type/constants.py:78
+#: udata/core/access_type/constants.py:82
+msgid "Commercial or industrial confidentiality"
+msgstr ""
+
+#: udata/core/access_type/constants.py:88
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of commercial or industrial information, where such "
@@ -349,13 +357,21 @@ msgid ""
 "maintaining statistical confidentiality and tax secrecy."
 msgstr ""
 
-#: udata/core/access_type/constants.py:82
+#: udata/core/access_type/constants.py:94
+msgid "Intellectual property rights"
+msgstr ""
+
+#: udata/core/access_type/constants.py:100
 msgid ""
 "Public access to datasets and services would adversely affect "
 "intellectual property rights."
 msgstr ""
 
-#: udata/core/access_type/constants.py:86
+#: udata/core/access_type/constants.py:106
+msgid "Personal data confidentiality"
+msgstr ""
+
+#: udata/core/access_type/constants.py:112
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of personal data and/or files relating to a natural "
@@ -364,7 +380,11 @@ msgid ""
 "national or Community law."
 msgstr ""
 
-#: udata/core/access_type/constants.py:90
+#: udata/core/access_type/constants.py:118
+msgid "Protection of voluntary information suppliers"
+msgstr ""
+
+#: udata/core/access_type/constants.py:124
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "interests or protection of any person who supplied the information "
@@ -373,7 +393,11 @@ msgid ""
 "to the release of the information concerned."
 msgstr ""
 
-#: udata/core/access_type/constants.py:94
+#: udata/core/access_type/constants.py:130
+msgid "Environmental protection"
+msgstr ""
+
+#: udata/core/access_type/constants.py:136
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "protection of the environment to which such information relates, such as "
@@ -384,94 +408,59 @@ msgstr ""
 msgid "You can only set one condition for a given access audience role"
 msgstr ""
 
-#: udata/core/badges/forms.py:12
-msgid "Kind"
-msgstr "نوع"
-
-#: udata/core/badges/forms.py:15
-msgid "Kind of badge (certified, etc)"
-msgstr "نوع من شارة (معتمد، الى آخره)"
-
-#: udata/core/contact_point/api.py:62
+#: udata/core/contact_point/api.py:60
 msgid "An existing contact point already exists with these informations."
 msgstr ""
 
-#: udata/core/contact_point/forms.py:12 udata/core/jobs/forms.py:27
-#: udata/core/organization/forms.py:47 udata/core/topic/forms.py:37
-#: udata/harvest/forms.py:80
-msgid "Name"
-msgstr "اسم"
-
-#: udata/core/contact_point/forms.py:15 udata/core/organization/forms.py:104
-#: udata/core/user/forms.py:21
-msgid "Email"
-msgstr ""
-
-#: udata/core/contact_point/forms.py:17
-msgid "Contact form"
-msgstr ""
-
-#: udata/core/contact_point/forms.py:17
-msgid "The organization web contact form"
-msgstr ""
-
-#: udata/core/contact_point/forms.py:20 udata/core/dataset/forms.py:122
-#: udata/core/dataset/forms.py:218 udata/core/discussions/forms.py:13
-#: udata/core/discussions/forms.py:29 udata/core/topic/forms.py:35
-#: udata/harvest/forms.py:90
-msgid "Publish as"
-msgstr "نشر بإسم"
-
-#: udata/core/contact_point/forms.py:21 udata/core/organization/forms.py:95
-#: udata/core/organization/forms.py:106
-msgid "Role"
-msgstr "دور"
-
-#: udata/core/contact_point/models.py:13
+#: udata/core/contact_point/models.py:18
 msgid "Contact"
 msgstr ""
 
-#: udata/core/contact_point/models.py:14
+#: udata/core/contact_point/models.py:19
 msgid "Creator"
 msgstr ""
 
-#: udata/core/contact_point/models.py:15
+#: udata/core/contact_point/models.py:20 udata/harvest/backends/odspt.py:48
 msgid "Publisher"
 msgstr ""
 
-#: udata/core/contact_point/models.py:16
+#: udata/core/contact_point/models.py:21
 msgid "Rights Holder"
 msgstr ""
 
-#: udata/core/contact_point/models.py:17
+#: udata/core/contact_point/models.py:22
 msgid "Custodian"
 msgstr ""
 
-#: udata/core/contact_point/models.py:18
+#: udata/core/contact_point/models.py:23
 msgid "Distributor"
 msgstr ""
 
-#: udata/core/contact_point/models.py:19
+#: udata/core/contact_point/models.py:24
 msgid "Originator"
 msgstr ""
 
-#: udata/core/contact_point/models.py:20
+#: udata/core/contact_point/models.py:25
 msgid "Principal Investigator"
 msgstr ""
 
-#: udata/core/contact_point/models.py:21
+#: udata/core/contact_point/models.py:26
 msgid "Processor"
 msgstr ""
 
-#: udata/core/contact_point/models.py:22
+#: udata/core/contact_point/models.py:27
 msgid "Resource Provider"
 msgstr ""
 
-#: udata/core/contact_point/models.py:23
+#: udata/core/contact_point/models.py:28
 msgid "User"
 msgstr ""
 
-#: udata/core/contact_point/models.py:38
+#: udata/core/contact_point/models.py:47
+msgid "Invalid email address"
+msgstr ""
+
+#: udata/core/contact_point/models.py:62
 #: udata/tests/api/test_contact_points.py:136
 msgid "At least an email or a contact form is required for a contact point"
 msgstr ""
@@ -492,20 +481,20 @@ msgstr ""
 msgid "Latest APIs"
 msgstr ""
 
-#: udata/core/dataservices/models.py:43
+#: udata/core/dataservices/models.py:45
 msgid "Dataservice serving high value datasets"
 msgstr ""
 
-#: udata/core/dataservices/models.py:211
+#: udata/core/dataservices/models.py:213
 msgid "dataservice"
 msgstr ""
 
-#: udata/core/dataservices/models.py:294 udata/core/dataset/models.py:622
+#: udata/core/dataservices/models.py:296 udata/core/dataset/models.py:622
 #: udata/mongo/datetime_fields.py:61
 msgid "Creation date"
 msgstr "تاريخ الإنشاء"
 
-#: udata/core/dataservices/models.py:301 udata/core/dataset/models.py:628
+#: udata/core/dataservices/models.py:303 udata/core/dataset/models.py:628
 #: udata/mongo/datetime_fields.py:68
 msgid "Last modification date"
 msgstr "تاريخ التعديل الأخير"
@@ -534,16 +523,16 @@ msgstr ""
 msgid "removed a resource from a dataset"
 msgstr ""
 
-#: udata/core/dataset/api.py:346
+#: udata/core/dataset/api.py:366
 #, python-brace-format
 msgid "Datasets search: {q}"
 msgstr ""
 
-#: udata/core/dataset/api.py:348
+#: udata/core/dataset/api.py:368
 msgid "Filtered datasets"
 msgstr ""
 
-#: udata/core/dataset/api.py:350
+#: udata/core/dataset/api.py:370
 msgid "Latest datasets"
 msgstr ""
 
@@ -757,7 +746,7 @@ msgid "Version of the schema"
 msgstr ""
 
 #: udata/core/dataset/forms.py:71 udata/core/dataset/forms.py:162
-#: udata/core/discussions/forms.py:14 udata/core/discussions/forms.py:25
+#: udata/core/discussions/forms.py:23 udata/core/discussions/forms.py:39
 #: udata/core/topic/forms.py:13
 msgid "Title"
 msgstr "عنوان"
@@ -813,7 +802,13 @@ msgstr "حجم الملف بالبايت"
 msgid "Related dataset"
 msgstr "مجموعة البيانات متعلقة"
 
-#: udata/core/dataset/forms.py:147 udata/tests/api/test_datasets_api.py:1100
+#: udata/core/dataset/forms.py:122 udata/core/dataset/forms.py:218
+#: udata/core/discussions/forms.py:22 udata/core/discussions/forms.py:47
+#: udata/core/topic/forms.py:35 udata/harvest/forms.py:90
+msgid "Publish as"
+msgstr "نشر بإسم"
+
+#: udata/core/dataset/forms.py:147 udata/tests/api/test_datasets_api.py:1113
 msgid "Wrong contact point id or contact point ownership mismatch"
 msgstr ""
 
@@ -927,22 +922,22 @@ msgstr ""
 msgid "A schema must contains a name or an URL when a version is provided."
 msgstr ""
 
-#: udata/core/dataset/models.py:215 udata/tests/api/test_datasets_api.py:1196
-#: udata/tests/api/test_datasets_api.py:1207
+#: udata/core/dataset/models.py:215 udata/tests/api/test_datasets_api.py:1209
+#: udata/tests/api/test_datasets_api.py:1220
 #, python-brace-format
 msgid "Schema name \"{schema}\" is not an allowed value. Allowed values: {values}"
 msgstr ""
 
-#: udata/core/dataset/models.py:234 udata/tests/api/test_datasets_api.py:1219
+#: udata/core/dataset/models.py:234 udata/tests/api/test_datasets_api.py:1232
 #, python-brace-format
 msgid ""
 "Version \"{version}\" is not an allowed value for the schema \"{name}\". "
 "Allowed versions: {values}"
 msgstr ""
 
-#: udata/core/dataset/models.py:478 udata/core/dataset/rdf.py:596
-#: udata/tests/dataset/test_dataset_rdf.py:1007
-#: udata/tests/dataset/test_dataset_rdf.py:1020
+#: udata/core/dataset/models.py:478 udata/core/dataset/rdf.py:646
+#: udata/tests/dataset/test_dataset_rdf.py:1010
+#: udata/tests/dataset/test_dataset_rdf.py:1023
 msgid "Nameless resource"
 msgstr "مورد مجهول"
 
@@ -958,20 +953,20 @@ msgstr ""
 msgid "dataset"
 msgstr "مجموعة البيانات"
 
-#: udata/core/dataset/rdf.py:594 udata/tests/dataset/test_dataset_rdf.py:977
-#: udata/tests/dataset/test_dataset_rdf.py:994
+#: udata/core/dataset/rdf.py:644 udata/tests/dataset/test_dataset_rdf.py:980
+#: udata/tests/dataset/test_dataset_rdf.py:997
 #, python-brace-format
 msgid "{format} resource"
 msgstr ""
 
-#: udata/core/discussions/forms.py:16 udata/core/discussions/forms.py:31
-#: udata/core/discussions/forms.py:37 udata/core/organization/forms.py:84
+#: udata/core/discussions/forms.py:25 udata/core/discussions/forms.py:49
+#: udata/core/discussions/forms.py:59 udata/core/organization/forms.py:84
 #: udata/core/organization/forms.py:88 udata/core/organization/forms.py:110
 #: udata/harvest/forms.py:100
 msgid "Comment"
 msgstr "تعليق"
 
-#: udata/core/discussions/forms.py:18
+#: udata/core/discussions/forms.py:27
 msgid "Subject"
 msgstr "موضوع"
 
@@ -1023,13 +1018,18 @@ msgstr ""
 msgid "View the discussion"
 msgstr ""
 
-#: udata/core/discussions/models.py:35
+#: udata/core/discussions/models.py:36
 msgid "message"
 msgstr ""
 
-#: udata/core/discussions/models.py:93
+#: udata/core/discussions/models.py:94
 msgid "discussion"
 msgstr ""
+
+#: udata/core/jobs/forms.py:27 udata/core/organization/forms.py:47
+#: udata/core/topic/forms.py:37 udata/harvest/forms.py:80
+msgid "Name"
+msgstr "اسم"
 
 #: udata/core/jobs/forms.py:29
 msgid "Tasks"
@@ -1199,8 +1199,16 @@ msgstr ""
 msgid "Business identification number"
 msgstr ""
 
+#: udata/core/organization/forms.py:95 udata/core/organization/forms.py:106
+msgid "Role"
+msgstr "دور"
+
 #: udata/core/organization/forms.py:103
 msgid "User ID"
+msgstr ""
+
+#: udata/core/organization/forms.py:104 udata/core/user/forms.py:21
+msgid "Email"
 msgstr ""
 
 #: udata/core/organization/mails.py:9
@@ -1245,7 +1253,7 @@ msgstr ""
 #: udata/core/organization/mails.py:49 udata/core/organization/mails.py:65
 #: udata/core/organization/mails.py:80 udata/core/organization/mails.py:95
 #: udata/core/organization/mails.py:110 udata/core/organization/mails.py:125
-#: udata/core/organization/mails.py:156
+#: udata/core/organization/mails.py:140 udata/core/organization/mails.py:171
 msgid "View the organization"
 msgstr ""
 
@@ -1305,46 +1313,55 @@ msgid ""
 msgstr ""
 
 #: udata/core/organization/mails.py:132
-msgid "An organization invitation has been canceled"
+msgid "You are now a member of an organization"
 msgstr ""
 
 #: udata/core/organization/mails.py:136
 #, python-format
+msgid "Welcome! You have been added as a member of the organization %(org)s."
+msgstr ""
+
+#: udata/core/organization/mails.py:147
+msgid "An organization invitation has been canceled"
+msgstr ""
+
+#: udata/core/organization/mails.py:151
+#, python-format
 msgid "The invitation to join the organization %(org)s has been canceled."
 msgstr ""
 
-#: udata/core/organization/mails.py:146
+#: udata/core/organization/mails.py:161
 msgid "An invitation to join your organization has been accepted"
 msgstr ""
 
-#: udata/core/organization/mails.py:150
+#: udata/core/organization/mails.py:165
 #, python-format
 msgid "%(user)s has accepted the invitation to join the organization %(org)s."
 msgstr ""
 
-#: udata/core/organization/mails.py:164
+#: udata/core/organization/mails.py:179
 msgid "An invitation to join your organization has been refused"
-msgstr ""
-
-#: udata/core/organization/mails.py:168
-#, python-format
-msgid "%(user)s has refused the invitation to join the organization %(org)s."
 msgstr ""
 
 #: udata/core/organization/mails.py:183
 #, python-format
-msgid "You have been invited to join the organization %(org)s."
-msgstr ""
-
-#: udata/core/organization/mails.py:189
-msgid "Message:"
-msgstr ""
-
-#: udata/core/organization/mails.py:196
-msgid "View and respond to invitation"
+msgid "%(user)s has refused the invitation to join the organization %(org)s."
 msgstr ""
 
 #: udata/core/organization/mails.py:198
+#, python-format
+msgid "You have been invited to join the organization %(org)s."
+msgstr ""
+
+#: udata/core/organization/mails.py:204
+msgid "Message:"
+msgstr ""
+
+#: udata/core/organization/mails.py:211
+msgid "View and respond to invitation"
+msgstr ""
+
+#: udata/core/organization/mails.py:213
 msgid "You have been invited to join an organization"
 msgstr ""
 
@@ -1400,27 +1417,31 @@ msgstr ""
 msgid "post"
 msgstr ""
 
-#: udata/core/reports/constants.py:22
+#: udata/core/reports/constants.py:23
+msgid "Auto-detected spam"
+msgstr ""
+
+#: udata/core/reports/constants.py:24
 msgid "Explicit content"
 msgstr ""
 
-#: udata/core/reports/constants.py:23
+#: udata/core/reports/constants.py:25
 msgid "Illegal content"
 msgstr ""
 
-#: udata/core/reports/constants.py:24 udata/core/reuse/constants.py:29
+#: udata/core/reports/constants.py:26 udata/core/reuse/constants.py:29
 msgid "Others"
 msgstr ""
 
-#: udata/core/reports/constants.py:25
+#: udata/core/reports/constants.py:27
 msgid "Personal data"
 msgstr ""
 
-#: udata/core/reports/constants.py:26
+#: udata/core/reports/constants.py:28
 msgid "Security"
 msgstr ""
 
-#: udata/core/reports/constants.py:27
+#: udata/core/reports/constants.py:29
 msgid "Spam"
 msgstr ""
 
@@ -1436,7 +1457,7 @@ msgstr "قام بتحديث استخدام"
 msgid "deleted a reuse"
 msgstr "قام بحذف استخدام"
 
-#: udata/core/reuse/api.py:144
+#: udata/core/reuse/api.py:169
 msgid "Latests reuses"
 msgstr ""
 
@@ -1543,11 +1564,11 @@ msgstr ""
 msgid "View the reuse"
 msgstr ""
 
-#: udata/core/reuse/models.py:58
+#: udata/core/reuse/models.py:59
 msgid "This URL is already registered"
 msgstr "هذا العنوان الإلكتروني مسجل من قبل"
 
-#: udata/core/reuse/models.py:215
+#: udata/core/reuse/models.py:217
 msgid "reuse"
 msgstr "استخدام"
 
@@ -1664,7 +1685,7 @@ msgstr ""
 msgid "Element"
 msgstr ""
 
-#: udata/core/topic/forms.py:26 udata/tests/apiv2/test_topics.py:720
+#: udata/core/topic/forms.py:26 udata/tests/apiv2/test_topics.py:735
 msgid "A topic element must have a title or an element."
 msgstr ""
 
@@ -1716,7 +1737,7 @@ msgstr "حول"
 msgid "Roles"
 msgstr "الأدوار"
 
-#: udata/core/user/mails.py:10 udata/tests/api/test_me_api.py:295
+#: udata/core/user/mails.py:10 udata/tests/api/test_me_api.py:372
 msgid "Account deletion"
 msgstr "حذف الحساب"
 
@@ -1765,7 +1786,7 @@ msgid ""
 "can always re-create an account on the %(site)s platform if necessary."
 msgstr ""
 
-#: udata/core/user/models.py:154
+#: udata/core/user/models.py:148
 msgid "account"
 msgstr ""
 
@@ -1837,16 +1858,20 @@ msgstr ""
 msgid "Unknown identifiers: {identifiers}"
 msgstr ""
 
-#: udata/forms/fields.py:732
+#: udata/forms/fields.py:724 udata/forms/fields.py:727
+msgid "Date must be a string"
+msgstr ""
+
+#: udata/forms/fields.py:736
 msgid "Unable to parse date range"
 msgstr ""
 
-#: udata/forms/fields.py:764 udata/forms/fields.py:796
+#: udata/forms/fields.py:768 udata/forms/fields.py:800
 #: udata/tests/forms/test_publish_as_field.py:214
 msgid "Cannot change owner after creation. Please use transfer feature."
 msgstr ""
 
-#: udata/forms/fields.py:769 udata/forms/fields.py:801
+#: udata/forms/fields.py:773 udata/forms/fields.py:805
 msgid "You must be authenticated"
 msgstr "يجب ان تكون موثق"
 
@@ -1907,6 +1932,26 @@ msgstr "تم تخطيه"
 msgid "Archived"
 msgstr ""
 
+#: udata/harvest/backends/ckan/harvesters.py:35
+#: udata/harvest/backends/ckanpt.py:49
+msgid "Organization"
+msgstr ""
+
+#: udata/harvest/backends/ckan/harvesters.py:35
+#: udata/harvest/backends/ckanpt.py:50
+msgid "A CKAN Organization name"
+msgstr ""
+
+#: udata/harvest/backends/ckan/harvesters.py:36
+#: udata/harvest/backends/ckanpt.py:51 udata/harvest/backends/odspt.py:47
+msgid "Tag"
+msgstr ""
+
+#: udata/harvest/backends/ckan/harvesters.py:36
+#: udata/harvest/backends/ckanpt.py:51
+msgid "A CKAN tag name"
+msgstr ""
+
 #: udata/harvest/backends/dcat.py:268
 msgid "Remote URL prefix"
 msgstr ""
@@ -1923,20 +1968,25 @@ msgstr ""
 msgid "Request GeoDCAT-AP to the CSW server (must be supported by the server)."
 msgstr ""
 
-#: udata/harvest/backends/ckan/harvesters.py:35
-msgid "Organization"
+#: udata/harvest/backends/odspt.py:47
+msgid "A tag name"
 msgstr ""
 
-#: udata/harvest/backends/ckan/harvesters.py:35
-msgid "A CKAN Organization name"
+#: udata/harvest/backends/odspt.py:48
+msgid "A publisher name"
 msgstr ""
 
-#: udata/harvest/backends/ckan/harvesters.py:36
-msgid "Tag"
+#: udata/harvest/backends/odspt.py:51
+msgid "Harvest Inspire datasets"
 msgstr ""
 
-#: udata/harvest/backends/ckan/harvesters.py:36
-msgid "A CKAN tag name"
+#: udata/harvest/backends/odspt.py:52
+msgid "Whether this harvester should import datasets coming from Inspire"
+msgstr ""
+
+#: udata/harvest/backends/odspt.py:256
+#, python-brace-format
+msgid "Export to {format}"
 msgstr ""
 
 #: udata/templates/404.html:6 udata/tests/frontend/test_error_handlers.py:22
@@ -2208,4 +2258,22 @@ msgstr ""
 
 #~ msgid "Number of elements in feeds"
 #~ msgstr "عدد العناصر في الخلاصات"
+
+#~ msgid "Your email address is already associated with an account"
+#~ msgstr ""
+
+#~ msgid "Someone (you?) tried to create an account on %(site)s with your email."
+#~ msgstr ""
+
+#~ msgid "Kind"
+#~ msgstr "نوع"
+
+#~ msgid "Kind of badge (certified, etc)"
+#~ msgstr "نوع من شارة (معتمد، الى آخره)"
+
+#~ msgid "Contact form"
+#~ msgstr ""
+
+#~ msgid "The organization web contact form"
+#~ msgstr ""
 

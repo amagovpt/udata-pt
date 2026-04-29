@@ -103,6 +103,20 @@ def notify_membership_response(org_id, request_id):
 
 
 @task(route="high.mail")
+def notify_new_member(org_id, email):
+    org = Organization.objects.get(pk=org_id)
+    member = next(
+        (m for m in org.members if m.user and m.user.email == email),
+        None,
+    )
+
+    if member is None:
+        return
+
+    mails.welcome_new_member(org).send(member.user)
+
+
+@task(route="high.mail")
 def notify_membership_invitation(org_id, invitation_id):
     org = Organization.objects.get(pk=org_id)
     invitation = next((r for r in org.requests if str(r.id) == invitation_id), None)
