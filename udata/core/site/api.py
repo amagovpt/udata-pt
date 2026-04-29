@@ -1,6 +1,6 @@
 from flask import current_app, json, make_response, redirect, request, url_for
 
-from udata.api import API, api
+from udata.api import API, api, fields
 from udata.api_fields import patch
 from udata.app import cache
 from udata.auth import admin_permission
@@ -21,10 +21,13 @@ from udata.core.tags.csv import TagCsvAdapter
 from udata.core.tags.models import Tag
 from udata.harvest.csv import HarvestSourceCsvAdapter
 from udata.harvest.models import HarvestSource
+from udata.mail import send_mail
 from udata.models import Dataset, Reuse
 from udata.rdf import CONTEXT, RDF_EXTENSIONS, graph_response, negociate_content
 from udata.utils import multi_to_dict
 
+from .forms import SupportContactForm
+from .mails import support_contact
 from .models import Site, current_site
 from .rdf import build_catalog
 
@@ -99,6 +102,48 @@ class SiteAPI(API):
         current_site.save()
         current_site.reload()
         return current_site
+
+
+support_contact_fields = api.model(
+    "SupportContact",
+    {
+        "topic": fields.String(
+            description="Topic of the support request",
+            required=True,
+            enum=["question", "bug", "feedback"],
+        ),
+        "email": fields.String(description="Sender email address", required=True),
+        "subject": fields.String(description="Subject line", required=True),
+        "message": fields.String(description="Body of the support request", required=True),
+    },
+)
+
+
+@api.route("/site/contact/", endpoint="site_contact")
+class SiteContactAPI(API):
+    @api.doc("submit_support_contact")
+    @api.expect(support_contact_fields)
+    @api.response(204, "Email sent")
+    @api.response(400, "Validation error")
+    @api.response(503, "Mail recipient not configured")
+    def post(self):
+        """Send a support email composed from the public support form."""
+        form = api.validate(SupportContactForm)
+
+        recipient = current_app.config.get("MAIL_DEFAULT_RECEIVER") or current_app.config.get(
+            "CONTACT_EMAIL"
+        )
+        if not recipient:
+            api.abort(503, "Support recipient is not configured")
+
+        message = support_contact(
+            topic=form.topic.data,
+            sender_email=form.email.data,
+            subject=form.subject.data,
+            message=form.message.data,
+        )
+        send_mail(recipient, message, reply_to=form.email.data)
+        return "", 204
 
 
 @api.route("/site/home/", endpoint="site_home")
