@@ -95,15 +95,19 @@ class MailMessage:
             recipient=recipient,
         )
 
-    def send(self, recipients):
-        send_mail(recipients, self)
+    def send(self, recipients, reply_to: str | None = None):
+        send_mail(recipients, self, reply_to=reply_to)
 
 
 def init_app(app):
     mail.init_app(app)
 
 
-def send_mail(recipients: object | list, message: MailMessage):
+def send_mail(
+    recipients: object | list,
+    message: MailMessage,
+    reply_to: str | None = None,
+):
     # Security mails are sent via the Flask-Security package and not
     # from this function. Disabling mail sending logic is duplicated
     # in :DisableMail.
@@ -123,6 +127,7 @@ def send_mail(recipients: object | list, message: MailMessage):
                 body=message.text(recipient),
                 html=message.html(recipient),
                 recipients=[to],
+                reply_to=reply_to,
             )
 
         if send_mail:

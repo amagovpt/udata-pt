@@ -70,6 +70,9 @@ class Defaults(object):
     # Flask mail settings
 
     MAIL_DEFAULT_SENDER = "webmaster@udata"
+    # Inbox that receives portal-originated user contact emails (support form,
+    # feedback). Falls back to CONTACT_EMAIL when unset.
+    MAIL_DEFAULT_RECEIVER = None
     MAIL_LOGO_URL = "https://www.data.gouv.fr/nuxt_images/udata_mails_external_logo.png"
 
     # Flask security settings
