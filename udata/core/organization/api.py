@@ -59,6 +59,7 @@ from .tasks import (
     notify_membership_invitation_canceled,
     notify_membership_request,
     notify_membership_response,
+    notify_new_member,
 )
 
 DEFAULT_SORTING = "-created_at"
@@ -619,6 +620,8 @@ class MemberInviteAPI(API):
             if role == "partial_editor" and assignment_subjects:
                 for obj in assignment_subjects:
                     Assignment(user=user, organization=org, subject=obj).save()
+
+            notify_new_member.delay(str(org.id), user.email)
 
             return marshal(member, member_fields), 201
 
