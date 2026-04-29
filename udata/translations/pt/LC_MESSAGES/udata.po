@@ -1,97 +1,97 @@
-
+#
 msgid ""
 msgstr ""
-"Project-Id-Version:  udata\n"
+"Project-Id-Version: udata\n"
 "Report-Msgid-Bugs-To: i18n@opendata.team\n"
-"POT-Creation-Date: 2026-03-17 17:29+0100\n"
-"PO-Revision-Date: 2025-11-19 12:59+0000\n"
+"POT-Creation-Date: 2026-03-24 11:44+0100\n"
+"PO-Revision-Date: 2025-10-08 14:00+0000\n"
 "Last-Translator: Open Data Team <i18n@opendata.team>\n"
-"Language: pt\n"
 "Language-Team: Portuguese\n"
-"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"Language: pt\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.18.0\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"Generated-By: Babel 2.17.0\n"
 
-#: udata/settings.py:130
+#: udata/settings.py:131
 msgid "Welcome"
 msgstr "Bem-vindo"
 
-#: udata/settings.py:131
+#: udata/settings.py:132
 msgid "Please confirm your email"
 msgstr "Por favor confirme o seu e-mail"
 
-#: udata/settings.py:132
+#: udata/settings.py:133
 msgid "Login instructions"
 msgstr "Instruções de login"
 
-#: udata/auth/mails.py:127 udata/settings.py:133
+#: udata/auth/mails.py:127 udata/settings.py:134
 msgid "Your password has been reset"
 msgstr "A sua palavra-passe foi redefinida"
 
-#: udata/auth/mails.py:139 udata/settings.py:134
+#: udata/auth/mails.py:139 udata/settings.py:135
 msgid "Your password has been changed"
 msgstr "A sua palavra-passe foi alterada"
 
-#: udata/settings.py:135
+#: udata/settings.py:136
 msgid "Password reset instructions"
 msgstr "Instruções para recuperação da palavra-passe"
 
-#: udata/settings.py:569
+#: udata/settings.py:574
 msgid "This dataset has been archived"
 msgstr "O seu conjunto de dados foi arquivado"
 
 #: udata/uris.py:60
 #, python-brace-format
 msgid "Invalid URL \"{url}\": {reason}"
-msgstr ""
+msgstr "URL inválido \"{url}\": {reason}"
 
-#: udata/tests/api/test_datasets_api.py:1188 udata/tests/test_model.py:417
+#: udata/tests/api/test_datasets_api.py:1201 udata/tests/test_model.py:417
 #: udata/uris.py:62
 #, python-brace-format
 msgid "Invalid URL \"{url}\""
-msgstr ""
+msgstr "URL inválido \"{url}\""
 
 #: udata/uris.py:150
 #, python-brace-format
 msgid "Invalid scheme {0}, allowed schemes: {1}"
-msgstr ""
+msgstr "Esquema {0} inválido, esquemas permitidos: {1}"
 
 #: udata/uris.py:153
 msgid "Credentials in URL are not allowed"
-msgstr ""
+msgstr "Credenciais no URL não são permitidas"
 
 #: udata/uris.py:157
 #, python-brace-format
 msgid "Invalid TLD {0}"
-msgstr ""
+msgstr "TLD inválido {0}"
 
 #: udata/uris.py:167 udata/uris.py:181
 msgid "is a local URL"
-msgstr ""
+msgstr "é um URL local"
 
 #: udata/uris.py:177
 #, python-brace-format
 msgid "{0} is a multicast IP"
-msgstr ""
+msgstr "{0} é um IP de multicast"
 
 #: udata/uris.py:179
 #, python-brace-format
 msgid "{0} is a mask IP"
-msgstr ""
+msgstr "{0} é um IP de máscara"
 
 #: udata/tests/test_model.py:435 udata/uris.py:185
 msgid "is a private URL"
-msgstr ""
+msgstr "é um URL privado"
 
 #: udata/api/errors.py:4
 msgid ""
-"Validation error: your data cannot be updated for now, we have been "
-"notified of the error and we will fix it as soon as possible."
+"Validation error: your data cannot be updated for now, we have been notified"
+" of the error and we will fix it as soon as possible."
 msgstr ""
-"Erro de validação: Os seus dados não podem ser atualizados de momento, "
-"fomos notificados do erro e vamos corrigir logo que possível."
+"Erro de validação: Os seus dados não podem ser atualizados de momento, fomos"
+" notificados do erro e vamos corrigir logo que possível."
 
 #: udata/api/oauth2.py:67
 msgid "Bearer Token"
@@ -107,15 +107,15 @@ msgstr "Direitos do administrador de sistema"
 
 #: udata/auth/forms.py:23
 msgid "Captcha code"
-msgstr ""
+msgstr "Código do Captcha"
 
 #: udata/auth/forms.py:24
 msgid "Captcha ID"
-msgstr ""
+msgstr "ID do Captcha"
 
 #: udata/auth/forms.py:30
 msgid "Invalid Captcha"
-msgstr ""
+msgstr "Captcha inválido"
 
 #: udata/auth/forms.py:36 udata/core/user/forms.py:14
 msgid "First name"
@@ -141,11 +141,11 @@ msgstr "O último nome é obrigatório"
 
 #: udata/auth/forms.py:50
 msgid "J'accepte les conditions générales d'utilisation"
-msgstr ""
+msgstr "Aceito os Termos e Condições de Utilização"
 
 #: udata/auth/forms.py:52
 msgid "You must accept the terms of use to continue."
-msgstr ""
+msgstr "Tem de aceitar os Termos de Utilização para continuar."
 
 #: udata/auth/forms.py:75 udata/tests/forms/test_current_user_field.py:194
 msgid "Password must be changed for security reasons"
@@ -153,25 +153,25 @@ msgstr "A senha deve ser alterada por razões de segurança"
 
 #: udata/auth/forms.py:106
 msgid "New email"
-msgstr ""
+msgstr "Novo e-mail"
 
 #: udata/auth/forms.py:108
 msgid "Retype email"
-msgstr ""
+msgstr "Reintroduza o e-mail"
 
 #: udata/auth/forms.py:109
 msgid "Email does not match"
-msgstr ""
+msgstr "O e-mail não coincide"
 
 #: udata/auth/forms.py:111 udata/templates/security/change_email.html:10
 #: udata/templates/security/change_email.html:16
 msgid "Change email"
-msgstr ""
+msgstr "Alterar e-mail"
 
 #: udata/auth/mails.py:69 udata/auth/mails.py:73 udata/auth/mails.py:98
 #: udata/auth/mails.py:101 udata/tests/api/test_security_api.py:109
 msgid "Confirm your email address"
-msgstr ""
+msgstr "Confirme o seu endereço de e-mail"
 
 #: udata/auth/mails.py:71
 #, python-format
@@ -180,61 +180,62 @@ msgstr "Bem-vindo a %(site)s!"
 
 #: udata/auth/mails.py:72 udata/auth/mails.py:100
 msgid "Please confirm your email address."
-msgstr ""
+msgstr "Por favor, confirme o seu endereço de e-mail."
 
 #: udata/auth/mails.py:82
 msgid "Your email address is already associated with an account"
-msgstr ""
+msgstr "O seu endereço de e-mail já está associado a uma conta"
 
 #: udata/auth/mails.py:85
 #, python-format
 msgid "Someone (you?) tried to create an account on %(site)s with your email."
-msgstr ""
+msgstr "Alguém (você?) tentou criar uma conta em %(site)s com o seu e-mail."
 
 #: udata/auth/mails.py:88
 msgid "If you forgot your password, you can reset it."
-msgstr ""
+msgstr "Se esqueceu a sua palavra-passe, pode redefini-la."
 
 #: udata/auth/mails.py:89 udata/auth/mails.py:111 udata/auth/mails.py:118
 #: udata/auth/mails.py:146
 msgid "Reset your password"
-msgstr ""
+msgstr "Redefinir a sua palavra-passe"
 
 #: udata/auth/mails.py:114
 #, python-format
 msgid "Someone requested a password reset for your %(site)s account."
 msgstr ""
+"Alguém pediu uma redefinição de palavra-passe para a sua conta em %(site)s."
 
 #: udata/auth/mails.py:117
 msgid "If this wasn't you, please ignore this email."
-msgstr ""
+msgstr "Se não foi você, por favor ignore este e-mail."
 
 #: udata/auth/mails.py:129
 msgid "Your data.gouv.fr password has been reset."
-msgstr ""
+msgstr "A palavra-passe da sua conta foi redefinida."
 
 #: udata/auth/mails.py:142
 #, python-format
 msgid "Your %(site)s account password has been changed."
-msgstr ""
+msgstr "A palavra-passe da sua conta em %(site)s foi alterada."
 
 #: udata/auth/mails.py:145
 msgid "If you did not change your password, please reset it."
-msgstr ""
+msgstr "Se não alterou a sua palavra-passe, por favor redefina-a."
 
 #: udata/auth/mails.py:155
 msgid "User can't access mail account"
-msgstr ""
+msgstr "O utilizador não consegue aceder à conta de e-mail"
 
 #: udata/auth/mails.py:157
 #, python-format
 msgid "%(email)s can not access mail account"
-msgstr ""
+msgstr "%(email)s não consegue aceder à conta de e-mail"
 
 #: udata/auth/password_validation.py:26
 #, python-brace-format
 msgid "Password must be at least {pass_length} characters long"
-msgstr ""
+msgstr "A palavra-passe tem de ter, no mínimo, {pass_length} caracteres"
 
 #: udata/auth/password_validation.py:33
 msgid "Password must contain lowercases"
@@ -272,116 +273,145 @@ msgstr "Quer criar alguns dados de exemplo?"
 msgid "Your udata instance is ready!"
 msgstr "O uData foi iniciado com sucesso!"
 
-#: udata/core/owned.py:63 udata/forms/fields.py:771
+#: udata/core/owned.py:63 udata/forms/fields.py:775
 #: udata/tests/api/test_dataservices_api.py:569
 msgid "You can only set yourself as owner"
 msgstr "Apenas pode definir-se como proprietário"
 
 #: udata/core/owned.py:72
 msgid "Unknown organization"
-msgstr ""
+msgstr "Organização desconhecida"
 
-#: udata/core/owned.py:76 udata/forms/fields.py:803
+#: udata/core/owned.py:76 udata/forms/fields.py:807
 #: udata/tests/api/test_dataservices_api.py:582
 msgid "Permission denied for this organization"
 msgstr "Permissão recusada para esta organização"
 
-#: udata/core/access_type/constants.py:42
-msgid "Confidentiality of public authorities proceedings"
-msgstr ""
-
-#: udata/core/access_type/constants.py:44
-msgid "International relations, public security or national defence"
-msgstr ""
-
 #: udata/core/access_type/constants.py:46
-msgid "Course of justice"
-msgstr ""
-
-#: udata/core/access_type/constants.py:48
-msgid "Commercial or industrial confidentiality"
-msgstr ""
-
-#: udata/core/access_type/constants.py:50
-msgid "Intellectual property rights"
-msgstr ""
+msgid "Confidentiality of public authorities proceedings"
+msgstr "Confidencialidade dos processos das autoridades públicas"
 
 #: udata/core/access_type/constants.py:52
-msgid "Personal data confidentiality"
-msgstr ""
-
-#: udata/core/access_type/constants.py:54
-msgid "Protection of voluntary information suppliers"
-msgstr ""
-
-#: udata/core/access_type/constants.py:56
-msgid "Environmental protection"
-msgstr ""
-
-#: udata/core/access_type/constants.py:66
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of the proceedings of public authorities, where such "
 "confidentiality is provided for by law."
 msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria a "
+"confidencialidade dos processos das autoridades públicas, sempre que essa "
+"confidencialidade esteja prevista na lei."
+
+#: udata/core/access_type/constants.py:58
+msgid "International relations, public security or national defence"
+msgstr "Relações internacionais, segurança pública ou defesa nacional"
+
+#: udata/core/access_type/constants.py:64
+msgid ""
+"Public access to datasets and services would adversely affect international "
+"relations, public security or national defence."
+msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria as relações "
+"internacionais, a segurança pública ou a defesa nacional."
 
 #: udata/core/access_type/constants.py:70
-msgid ""
-"Public access to datasets and services would adversely affect "
-"international relations, public security or national defence."
-msgstr ""
+msgid "Course of justice"
+msgstr "Curso da justiça"
 
-#: udata/core/access_type/constants.py:74
+#: udata/core/access_type/constants.py:76
 msgid ""
-"Public access to datasets and services would adversely affect the course "
-"of justice, the ability of any person to receive a fair trial or the "
-"ability of a public authority to conduct an enquiry of a criminal or "
-"disciplinary nature."
+"Public access to datasets and services would adversely affect the course of "
+"justice, the ability of any person to receive a fair trial or the ability of"
+" a public authority to conduct an enquiry of a criminal or disciplinary "
+"nature."
 msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria o curso da "
+"justiça, a possibilidade de qualquer pessoa ter um julgamento justo ou a "
+"capacidade de uma autoridade pública para conduzir um inquérito de natureza "
+"criminal ou disciplinar."
 
-#: udata/core/access_type/constants.py:78
+#: udata/core/access_type/constants.py:82
+msgid "Commercial or industrial confidentiality"
+msgstr "Confidencialidade comercial ou industrial"
+
+#: udata/core/access_type/constants.py:88
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of commercial or industrial information, where such "
-"confidentiality is provided for by national or Community law to protect a"
-" legitimate economic interest, including the public interest in "
-"maintaining statistical confidentiality and tax secrecy."
+"confidentiality is provided for by national or Community law to protect a "
+"legitimate economic interest, including the public interest in maintaining "
+"statistical confidentiality and tax secrecy."
 msgstr ""
-
-#: udata/core/access_type/constants.py:82
-msgid ""
-"Public access to datasets and services would adversely affect "
-"intellectual property rights."
-msgstr ""
-
-#: udata/core/access_type/constants.py:86
-msgid ""
-"Public access to datasets and services would adversely affect the "
-"confidentiality of personal data and/or files relating to a natural "
-"person where that person has not consented to the disclosure of the "
-"information to the public, where such confidentiality is provided for by "
-"national or Community law."
-msgstr ""
-
-#: udata/core/access_type/constants.py:90
-msgid ""
-"Public access to datasets and services would adversely affect the "
-"interests or protection of any person who supplied the information "
-"requested on a voluntary basis without being under, or capable of being "
-"put under, a legal obligation to do so, unless that person has consented "
-"to the release of the information concerned."
-msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria a "
+"confidencialidade da informação comercial ou industrial, sempre que essa "
+"confidencialidade esteja prevista na legislação nacional ou comunitária para"
+" proteger um interesse económico legítimo, incluindo o interesse público em "
+"manter a confidencialidade estatística e o sigilo fiscal."
 
 #: udata/core/access_type/constants.py:94
+msgid "Intellectual property rights"
+msgstr "Direitos de propriedade intelectual"
+
+#: udata/core/access_type/constants.py:100
+msgid ""
+"Public access to datasets and services would adversely affect intellectual "
+"property rights."
+msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria os direitos "
+"de propriedade intelectual."
+
+#: udata/core/access_type/constants.py:106
+msgid "Personal data confidentiality"
+msgstr "Confidencialidade de dados pessoais"
+
+#: udata/core/access_type/constants.py:112
 msgid ""
 "Public access to datasets and services would adversely affect the "
-"protection of the environment to which such information relates, such as "
-"the location of rare species."
+"confidentiality of personal data and/or files relating to a natural person "
+"where that person has not consented to the disclosure of the information to "
+"the public, where such confidentiality is provided for by national or "
+"Community law."
 msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria a "
+"confidencialidade dos dados pessoais e/ou ficheiros relativos a uma pessoa "
+"singular, sempre que essa pessoa não tenha consentido a divulgação pública "
+"da informação, e quando essa confidencialidade esteja prevista na legislação"
+" nacional ou comunitária."
+
+#: udata/core/access_type/constants.py:118
+msgid "Protection of voluntary information suppliers"
+msgstr "Proteção dos fornecedores voluntários de informação"
+
+#: udata/core/access_type/constants.py:124
+msgid ""
+"Public access to datasets and services would adversely affect the interests "
+"or protection of any person who supplied the information requested on a "
+"voluntary basis without being under, or capable of being put under, a legal "
+"obligation to do so, unless that person has consented to the release of the "
+"information concerned."
+msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria os "
+"interesses ou a proteção de qualquer pessoa que tenha fornecido a informação"
+" solicitada a título voluntário, sem estar nem poder ser sujeita a uma "
+"obrigação legal de o fazer, salvo se essa pessoa tiver consentido a "
+"divulgação da informação em causa."
+
+#: udata/core/access_type/constants.py:130
+msgid "Environmental protection"
+msgstr "Proteção ambiental"
+
+#: udata/core/access_type/constants.py:136
+msgid ""
+"Public access to datasets and services would adversely affect the protection"
+" of the environment to which such information relates, such as the location "
+"of rare species."
+msgstr ""
+"O acesso público aos conjuntos de dados e serviços prejudicaria a proteção "
+"do ambiente a que essa informação diz respeito, como, por exemplo, a "
+"localização de espécies raras."
 
 #: udata/core/access_type/models.py:28
 msgid "You can only set one condition for a given access audience role"
-msgstr ""
+msgstr "Só pode definir uma condição para um dado papel de público de acesso"
 
 #: udata/core/badges/forms.py:12
 msgid "Kind"
@@ -393,7 +423,7 @@ msgstr "Tipo de insígnia (certificada, etc)"
 
 #: udata/core/contact_point/api.py:62
 msgid "An existing contact point already exists with these informations."
-msgstr ""
+msgstr "Já existe um ponto de contacto com estas informações."
 
 #: udata/core/contact_point/forms.py:12 udata/core/jobs/forms.py:27
 #: udata/core/organization/forms.py:47 udata/core/topic/forms.py:37
@@ -408,11 +438,11 @@ msgstr "E-mail"
 
 #: udata/core/contact_point/forms.py:17
 msgid "Contact form"
-msgstr ""
+msgstr "Formulário de contacto"
 
 #: udata/core/contact_point/forms.py:17
 msgid "The organization web contact form"
-msgstr ""
+msgstr "Formulário web de contacto da organização"
 
 #: udata/core/contact_point/forms.py:20 udata/core/dataset/forms.py:122
 #: udata/core/dataset/forms.py:218 udata/core/discussions/forms.py:13
@@ -428,83 +458,86 @@ msgstr "Perfil"
 
 #: udata/core/contact_point/models.py:13
 msgid "Contact"
-msgstr ""
+msgstr "Contacto"
 
 #: udata/core/contact_point/models.py:14
 msgid "Creator"
-msgstr ""
+msgstr "Criador"
 
 #: udata/core/contact_point/models.py:15
 msgid "Publisher"
-msgstr ""
+msgstr "Editor"
 
 #: udata/core/contact_point/models.py:16
 msgid "Rights Holder"
-msgstr ""
+msgstr "Titular de direitos"
 
 #: udata/core/contact_point/models.py:17
 msgid "Custodian"
-msgstr ""
+msgstr "Curador"
 
 #: udata/core/contact_point/models.py:18
 msgid "Distributor"
-msgstr ""
+msgstr "Distribuidor"
 
 #: udata/core/contact_point/models.py:19
 msgid "Originator"
-msgstr ""
+msgstr "Originador"
 
 #: udata/core/contact_point/models.py:20
 msgid "Principal Investigator"
-msgstr ""
+msgstr "Investigador principal"
 
 #: udata/core/contact_point/models.py:21
 msgid "Processor"
-msgstr ""
+msgstr "Processador"
 
 #: udata/core/contact_point/models.py:22
 msgid "Resource Provider"
-msgstr ""
+msgstr "Fornecedor do recurso"
 
 #: udata/core/contact_point/models.py:23
 msgid "User"
-msgstr ""
+msgstr "Utilizador"
 
 #: udata/core/contact_point/models.py:38
 #: udata/tests/api/test_contact_points.py:136
 msgid "At least an email or a contact form is required for a contact point"
 msgstr ""
+"É necessário pelo menos um e-mail ou um formulário de contacto para um ponto"
+" de contacto"
 
 #: udata/core/dataservices/activities.py:24
 msgid "created a dataservice"
-msgstr ""
+msgstr "criou um serviço de dados"
 
 #: udata/core/dataservices/activities.py:30
 msgid "updated a dataservice"
-msgstr ""
+msgstr "atualizou um serviço de dados"
 
 #: udata/core/dataservices/activities.py:37
 msgid "deleted a dataservice"
-msgstr ""
+msgstr "eliminou um serviço de dados"
 
 #: udata/core/dataservices/api.py:63
 msgid "Latest APIs"
-msgstr ""
+msgstr "APIs mais recentes"
 
-#: udata/core/dataservices/models.py:43
+#: udata/core/dataservices/models.py:45
 msgid "Dataservice serving high value datasets"
 msgstr ""
+"Serviço de dados que disponibiliza conjuntos de dados de elevado valor"
 
-#: udata/core/dataservices/models.py:211
+#: udata/core/dataservices/models.py:213
 msgid "dataservice"
-msgstr ""
+msgstr "serviço de dados"
 
-#: udata/core/dataservices/models.py:294 udata/core/dataset/models.py:622
+#: udata/core/dataservices/models.py:296 udata/core/dataset/models.py:622
 #: udata/mongo/datetime_fields.py:61
 msgid "Creation date"
 msgstr "Data de criação"
 
-#: udata/core/dataservices/models.py:301 udata/core/dataset/models.py:628
+#: udata/core/dataservices/models.py:303 udata/core/dataset/models.py:628
 #: udata/mongo/datetime_fields.py:68
 msgid "Last modification date"
 msgstr "Data da última modificação"
@@ -515,7 +548,7 @@ msgstr "criou um dataset"
 
 #: udata/core/dataset/activities.py:31
 msgid "updated a dataset"
-msgstr "atualizou um conjunto de dados"
+msgstr "atualizou um dataset"
 
 #: udata/core/dataset/activities.py:38
 msgid "deleted a dataset"
@@ -523,28 +556,28 @@ msgstr "apagou um dataset"
 
 #: udata/core/dataset/activities.py:44
 msgid "added a resource to a dataset"
-msgstr ""
+msgstr "adicionou um recurso a um conjunto de dados"
 
 #: udata/core/dataset/activities.py:50
 msgid "updated a resource"
-msgstr ""
+msgstr "atualizou um recurso"
 
 #: udata/core/dataset/activities.py:56
 msgid "removed a resource from a dataset"
-msgstr ""
+msgstr "removeu um recurso de um conjunto de dados"
 
-#: udata/core/dataset/api.py:346
+#: udata/core/dataset/api.py:352
 #, python-brace-format
 msgid "Datasets search: {q}"
-msgstr ""
+msgstr "Pesquisa de conjuntos de dados: {q}"
 
-#: udata/core/dataset/api.py:348
+#: udata/core/dataset/api.py:354
 msgid "Filtered datasets"
-msgstr ""
+msgstr "Conjuntos de dados filtrados"
 
-#: udata/core/dataset/api.py:350
+#: udata/core/dataset/api.py:356
 msgid "Latest datasets"
-msgstr ""
+msgstr "Conjuntos de dados mais recentes"
 
 #: udata/core/dataset/constants.py:19
 msgid "Real time"
@@ -552,43 +585,43 @@ msgstr "Tempo real"
 
 #: udata/core/dataset/constants.py:20
 msgid "Every minute"
-msgstr ""
+msgstr "Ao minuto"
 
 #: udata/core/dataset/constants.py:21
 msgid "Every five minutes"
-msgstr ""
+msgstr "A cada cinco minutos"
 
 #: udata/core/dataset/constants.py:22
 msgid "Every ten minutes"
-msgstr ""
+msgstr "A cada dez minutos"
 
 #: udata/core/dataset/constants.py:25
 msgid "Every fifteen minutes"
-msgstr ""
+msgstr "A cada quinze minutos"
 
 #: udata/core/dataset/constants.py:28
 msgid "Every thirty minute"
-msgstr ""
+msgstr "A cada trinta minutos"
 
 #: udata/core/dataset/constants.py:29
 msgid "Every hour"
-msgstr ""
+msgstr "À hora"
 
 #: udata/core/dataset/constants.py:30
 msgid "Every two hours"
-msgstr ""
+msgstr "A cada duas horas"
 
 #: udata/core/dataset/constants.py:31
 msgid "Every three hours"
-msgstr ""
+msgstr "A cada três horas"
 
 #: udata/core/dataset/constants.py:32
 msgid "Every twelve hours"
-msgstr ""
+msgstr "A cada doze horas"
 
 #: udata/core/dataset/constants.py:33
 msgid "Several times a day"
-msgstr ""
+msgstr "Várias vezes por dia"
 
 #: udata/core/dataset/constants.py:34
 msgid "Three times a day"
@@ -596,7 +629,7 @@ msgstr "Três vezes por dia"
 
 #: udata/core/dataset/constants.py:35
 msgid "Twice a day"
-msgstr ""
+msgstr "Duas vezes por dia"
 
 #: udata/core/dataset/constants.py:36 udata/harvest/models.py:34
 msgid "Daily"
@@ -604,7 +637,7 @@ msgstr "Diário"
 
 #: udata/core/dataset/constants.py:37
 msgid "Five times a week"
-msgstr ""
+msgstr "Cinco vezes por semana"
 
 #: udata/core/dataset/constants.py:40
 msgid "Three times a week"
@@ -612,7 +645,7 @@ msgstr "Três vezes por semana"
 
 #: udata/core/dataset/constants.py:43
 msgid "Twice a week"
-msgstr ""
+msgstr "Duas vezes por semana"
 
 #: udata/core/dataset/constants.py:44 udata/harvest/models.py:33
 msgid "Weekly"
@@ -620,7 +653,7 @@ msgstr "Semanal"
 
 #: udata/core/dataset/constants.py:45
 msgid "Every two weeks"
-msgstr ""
+msgstr "A cada duas semanas"
 
 #: udata/core/dataset/constants.py:48
 msgid "Three times a month"
@@ -628,7 +661,7 @@ msgstr "Três vezes por mês"
 
 #: udata/core/dataset/constants.py:51
 msgid "Twice a month"
-msgstr ""
+msgstr "Duas vezes por mês"
 
 #: udata/core/dataset/constants.py:52 udata/harvest/models.py:32
 msgid "Monthly"
@@ -636,7 +669,7 @@ msgstr "Mensal"
 
 #: udata/core/dataset/constants.py:53
 msgid "Every two months"
-msgstr ""
+msgstr "A cada dois meses"
 
 #: udata/core/dataset/constants.py:54
 msgid "Quarterly"
@@ -648,39 +681,39 @@ msgstr "Três vezes por ano"
 
 #: udata/core/dataset/constants.py:60
 msgid "Twice a year"
-msgstr ""
+msgstr "Duas vezes por ano"
 
 #: udata/core/dataset/constants.py:61
 msgid "Annually"
-msgstr ""
+msgstr "Anualmente"
 
 #: udata/core/dataset/constants.py:62
 msgid "Every two years"
-msgstr ""
+msgstr "A cada dois anos"
 
 #: udata/core/dataset/constants.py:63
 msgid "Every three years"
-msgstr ""
+msgstr "A cada três anos"
 
 #: udata/core/dataset/constants.py:64
 msgid "Every four years"
-msgstr ""
+msgstr "A cada quatro anos"
 
 #: udata/core/dataset/constants.py:65
 msgid "Every five years"
-msgstr ""
+msgstr "A cada cinco anos"
 
 #: udata/core/dataset/constants.py:66
 msgid "Every ten years"
-msgstr ""
+msgstr "A cada dez anos"
 
 #: udata/core/dataset/constants.py:67
 msgid "Every twenty years"
-msgstr ""
+msgstr "A cada vinte anos"
 
 #: udata/core/dataset/constants.py:68
 msgid "Every thirty years"
-msgstr ""
+msgstr "A cada trinta anos"
 
 #: udata/core/dataset/constants.py:69
 msgid "Punctual"
@@ -692,11 +725,11 @@ msgstr "Irregular"
 
 #: udata/core/dataset/constants.py:71
 msgid "Never"
-msgstr ""
+msgstr "Nunca"
 
 #: udata/core/dataset/constants.py:72
 msgid "Not planned"
-msgstr ""
+msgstr "Não planeada"
 
 #: udata/core/dataset/constants.py:73 udata/core/dataset/constants.py:149
 #: udata/core/spatial/constants.py:5
@@ -741,19 +774,19 @@ msgstr "Ficheiro remoto"
 
 #: udata/core/dataset/forms.py:39
 msgid "Checksum value"
-msgstr ""
+msgstr "Valor do checksum"
 
 #: udata/core/dataset/forms.py:50
 msgid "URL of the schema"
-msgstr ""
+msgstr "URL do esquema"
 
 #: udata/core/dataset/forms.py:51
 msgid "Name of the schema"
-msgstr ""
+msgstr "Nome do esquema"
 
 #: udata/core/dataset/forms.py:52
 msgid "Version of the schema"
-msgstr ""
+msgstr "Versão do esquema"
 
 #: udata/core/dataset/forms.py:71 udata/core/dataset/forms.py:162
 #: udata/core/discussions/forms.py:14 udata/core/discussions/forms.py:25
@@ -812,9 +845,11 @@ msgstr "Tamanho do ficheiro em bytes"
 msgid "Related dataset"
 msgstr "Dataset relacionado"
 
-#: udata/core/dataset/forms.py:147 udata/tests/api/test_datasets_api.py:1100
+#: udata/core/dataset/forms.py:147 udata/tests/api/test_datasets_api.py:1113
 msgid "Wrong contact point id or contact point ownership mismatch"
 msgstr ""
+"ID de ponto de contacto inválido ou propriedade do ponto de contacto não "
+"coincide"
 
 #: udata/core/dataset/forms.py:164 udata/core/organization/forms.py:49
 msgid "Acronym"
@@ -830,11 +865,11 @@ msgstr "Os detalhes do dataset (processo de coleta, especificidades...)."
 
 #: udata/core/dataset/forms.py:171
 msgid "Short description"
-msgstr ""
+msgstr "Descrição breve"
 
 #: udata/core/dataset/forms.py:173
 msgid "A short description of the dataset."
-msgstr ""
+msgstr "Uma descrição breve do conjunto de dados."
 
 #: udata/core/dataset/forms.py:175
 msgid "License"
@@ -842,15 +877,15 @@ msgstr "Licença"
 
 #: udata/core/dataset/forms.py:182
 msgid "Authorization request URL"
-msgstr ""
+msgstr "URL do pedido de autorização"
 
 #: udata/core/dataset/forms.py:184
 msgid "Access type reason category"
-msgstr ""
+msgstr "Categoria do motivo do tipo de acesso"
 
 #: udata/core/dataset/forms.py:188
 msgid "Access type reason"
-msgstr ""
+msgstr "Motivo do tipo de acesso"
 
 #: udata/core/dataset/forms.py:190
 msgid "Update frequency"
@@ -906,44 +941,49 @@ msgstr "Dados centrais"
 
 #: udata/core/dataset/models.py:97
 msgid "Reference data public service"
-msgstr ""
+msgstr "Serviço público de dados de referência"
 
 #: udata/core/dataset/models.py:98
 msgid "Inspire"
-msgstr ""
+msgstr "INSPIRE"
 
 #: udata/core/dataset/models.py:99
 msgid "High value datasets"
-msgstr ""
+msgstr "Conjuntos de dados de elevado valor"
 
 #: udata/core/dataset/models.py:100
 msgid "Certified statistic series"
-msgstr ""
+msgstr "Séries estatísticas certificadas"
 
 #: udata/core/dataset/models.py:101
 msgid "Statistical series of general interest"
-msgstr ""
+msgstr "Séries estatísticas de interesse geral"
 
 #: udata/core/dataset/models.py:183
 msgid "A schema must contains a name or an URL when a version is provided."
 msgstr ""
+"Um esquema tem de conter um nome ou um URL quando é indicada uma versão."
 
-#: udata/core/dataset/models.py:215 udata/tests/api/test_datasets_api.py:1196
-#: udata/tests/api/test_datasets_api.py:1207
+#: udata/core/dataset/models.py:215 udata/tests/api/test_datasets_api.py:1209
+#: udata/tests/api/test_datasets_api.py:1220
 #, python-brace-format
 msgid "Schema name \"{schema}\" is not an allowed value. Allowed values: {values}"
 msgstr ""
+"O nome de esquema \"{schema}\" não é um valor permitido. Valores permitidos:"
+" {values}"
 
-#: udata/core/dataset/models.py:234 udata/tests/api/test_datasets_api.py:1219
+#: udata/core/dataset/models.py:234 udata/tests/api/test_datasets_api.py:1232
 #, python-brace-format
 msgid ""
 "Version \"{version}\" is not an allowed value for the schema \"{name}\". "
 "Allowed versions: {values}"
 msgstr ""
+"A versão \"{version}\" não é um valor permitido para o esquema \"{name}\". "
+"Versões permitidas: {values}"
 
-#: udata/core/dataset/models.py:478 udata/core/dataset/rdf.py:596
-#: udata/tests/dataset/test_dataset_rdf.py:1007
-#: udata/tests/dataset/test_dataset_rdf.py:1020
+#: udata/core/dataset/models.py:478 udata/core/dataset/rdf.py:646
+#: udata/tests/dataset/test_dataset_rdf.py:1012
+#: udata/tests/dataset/test_dataset_rdf.py:1025
 msgid "Nameless resource"
 msgstr "Recurso sem nome"
 
@@ -953,14 +993,14 @@ msgstr "Data futura de atualização"
 
 #: udata/core/dataset/models.py:636
 msgid "Last update of the dataset resources"
-msgstr ""
+msgstr "Última atualização dos recursos do conjunto de dados"
 
 #: udata/core/dataset/models.py:691
 msgid "dataset"
 msgstr "conjunto de dados"
 
-#: udata/core/dataset/rdf.py:594 udata/tests/dataset/test_dataset_rdf.py:977
-#: udata/tests/dataset/test_dataset_rdf.py:994
+#: udata/core/dataset/rdf.py:644 udata/tests/dataset/test_dataset_rdf.py:982
+#: udata/tests/dataset/test_dataset_rdf.py:999
 #, python-brace-format
 msgid "{format} resource"
 msgstr "{format} recurso"
@@ -979,35 +1019,38 @@ msgstr "Assunto"
 #: udata/core/discussions/mails.py:9
 #, python-format
 msgid "A new discussion has been opened on your %(type)s"
-msgstr ""
+msgstr "Foi aberta uma nova discussão no seu %(type)s"
 
 #: udata/core/discussions/mails.py:15
 #, python-format
-msgid "You have a new discussion from %(user_or_org)s on your %(type)s %(object)s"
-msgstr ""
+msgid ""
+"You have a new discussion from %(user_or_org)s on your %(type)s %(object)s"
+msgstr "Tem uma nova discussão de %(user_or_org)s no seu %(type)s %(object)s"
 
 #: udata/core/discussions/mails.py:21 udata/core/discussions/mails.py:40
 #: udata/core/discussions/mails.py:59
 msgid "Discussion title:"
-msgstr ""
+msgstr "Título da discussão:"
 
 #: udata/core/discussions/mails.py:22 udata/core/discussions/mails.py:41
 #: udata/core/discussions/mails.py:60
 msgid "Comment:"
-msgstr ""
+msgstr "Comentário:"
 
 #: udata/core/discussions/mails.py:23 udata/core/discussions/mails.py:42
 msgid "Reply"
-msgstr ""
+msgstr "Responder"
 
 #: udata/core/discussions/mails.py:30
+#, python-format
 msgid "A new comment has been added to a discussion"
-msgstr ""
+msgstr "Foi adicionado um novo comentário a uma discussão"
 
 #: udata/core/discussions/mails.py:34
 #, python-format
-msgid "You have a new comment from %(user_or_org)s on your %(type)s %(object)s"
-msgstr ""
+msgid ""
+"You have a new comment from %(user_or_org)s on your %(type)s %(object)s"
+msgstr "Tem um novo comentário de %(user_or_org)s no seu %(type)s %(object)s"
 
 #: udata/core/discussions/mails.py:49
 msgid "A discussion has been closed"
@@ -1019,18 +1062,20 @@ msgid ""
 "The discussion you participated in on the %(type)s %(object)s has been "
 "closed by %(user_or_org)s."
 msgstr ""
+"A discussão em que participou no %(type)s %(object)s foi fechada por "
+"%(user_or_org)s."
 
 #: udata/core/discussions/mails.py:61
 msgid "View the discussion"
-msgstr ""
+msgstr "Ver a discussão"
 
-#: udata/core/discussions/models.py:35
+#: udata/core/discussions/models.py:36
 msgid "message"
-msgstr ""
+msgstr "mensagem"
 
-#: udata/core/discussions/models.py:93
+#: udata/core/discussions/models.py:94
 msgid "discussion"
-msgstr ""
+msgstr "discussão"
 
 #: udata/core/jobs/forms.py:29
 msgid "Tasks"
@@ -1055,59 +1100,81 @@ msgstr "cada {0.period} {0.every}"
 msgid ""
 "Our %(terms_link)s specify in point %(article)s that the platform is not "
 "\"intended to disseminate advertising content, promotions of private "
-"interests, content contrary to public order, illegal content, spam and "
-"any contribution violating the applicable legal framework. The Editor "
-"reserves the right, without prior notice, to remove or make inaccessible "
-"content published on the Platform that has no connection with its "
-"Purpose. The Editor does not carry out \"a priori\" control over "
-"publications. As soon as the Editor becomes aware of content contrary to "
-"these terms of use, it acts quickly to remove or make it inaccessible\"."
+"interests, content contrary to public order, illegal content, spam and any "
+"contribution violating the applicable legal framework. The Editor reserves "
+"the right, without prior notice, to remove or make inaccessible content "
+"published on the Platform that has no connection with its Purpose. The "
+"Editor does not carry out \"a priori\" control over publications. As soon as"
+" the Editor becomes aware of content contrary to these terms of use, it acts"
+" quickly to remove or make it inaccessible\"."
 msgstr ""
+"Os nossos %(terms_link)s especificam, no ponto %(article)s, que a plataforma"
+" não se destina à divulgação de conteúdos publicitários, promoções de "
+"interesses privados, conteúdos contrários à ordem pública, conteúdos "
+"ilegais, spam e qualquer contribuição que viole o enquadramento legal "
+"aplicável. O Editor reserva-se o direito de, sem aviso prévio, remover ou "
+"tornar inacessíveis conteúdos publicados na Plataforma que não estejam "
+"relacionados com a sua finalidade. O Editor não exerce um controlo prévio "
+"sobre as publicações. Logo que o Editor tome conhecimento de conteúdos "
+"contrários a estes Termos de Utilização, atua rapidamente para os remover ou"
+" tornar inacessíveis."
 
 #: udata/core/legal/mails.py:95
 msgid ""
 "The platform is not \"intended to disseminate advertising content, "
-"promotions of private interests, content contrary to public order, "
-"illegal content, spam and any contribution violating the applicable legal"
-" framework. The Editor reserves the right, without prior notice, to "
-"remove or make inaccessible content published on the Platform that has no"
-" connection with its Purpose. The Editor does not carry out \"a priori\" "
-"control over publications. As soon as the Editor becomes aware of content"
-" contrary to these terms of use, it acts quickly to remove or make it "
-"inaccessible\"."
+"promotions of private interests, content contrary to public order, illegal "
+"content, spam and any contribution violating the applicable legal framework."
+" The Editor reserves the right, without prior notice, to remove or make "
+"inaccessible content published on the Platform that has no connection with "
+"its Purpose. The Editor does not carry out \"a priori\" control over "
+"publications. As soon as the Editor becomes aware of content contrary to "
+"these terms of use, it acts quickly to remove or make it inaccessible\"."
 msgstr ""
+"A plataforma não se destina à divulgação de conteúdos publicitários, "
+"promoções de interesses privados, conteúdos contrários à ordem pública, "
+"conteúdos ilegais, spam e qualquer contribuição que viole o enquadramento "
+"legal aplicável. O Editor reserva-se o direito de, sem aviso prévio, remover"
+" ou tornar inacessíveis conteúdos publicados na Plataforma que não estejam "
+"relacionados com a sua finalidade. O Editor não exerce um controlo prévio "
+"sobre as publicações. Logo que o Editor tome conhecimento de conteúdos "
+"contrários a estes Termos de Utilização, atua rapidamente para os remover ou"
+" tornar inacessíveis."
 
 #: udata/core/legal/mails.py:107
 #, python-format
 msgid ""
 "You may contest this decision within two months of its notification by "
-"filing an administrative appeal (recours gracieux ou hiérarchique). You "
-"may also bring the matter before the administrative court via the "
+"filing an administrative appeal (recours gracieux ou hiérarchique). You may "
+"also bring the matter before the administrative court via the "
 "\"%(telerecours_link)s\" application."
 msgstr ""
+"Pode contestar esta decisão no prazo de dois meses a contar da sua "
+"notificação, apresentando uma reclamação administrativa (graciosa ou "
+"hierárquica). Pode também submeter a questão ao tribunal administrativo, "
+"através da aplicação \"%(telerecours_link)s\"."
 
 #: udata/core/legal/mails.py:114
 msgid "You may contest this decision by contacting us."
-msgstr ""
+msgstr "Pode contestar esta decisão contactando-nos."
 
 #: udata/core/legal/mails.py:117
 #, python-format
 msgid "Your %(content_type)s has been deleted."
-msgstr ""
+msgstr "O seu %(content_type)s foi eliminado."
 
 #: udata/core/legal/mails.py:120
 msgid "Best regards,"
-msgstr ""
+msgstr "Com os melhores cumprimentos,"
 
 #: udata/core/legal/mails.py:122
 #, python-format
 msgid "%(site)s team member"
-msgstr ""
+msgstr "Membro da equipa de %(site)s"
 
 #: udata/core/legal/mails.py:126
 #, python-format
 msgid "Deletion of your %(content_type)s"
-msgstr ""
+msgstr "Eliminação do seu %(content_type)s"
 
 #: udata/core/organization/activities.py:19
 msgid "created an organization"
@@ -1127,50 +1194,50 @@ msgstr "Editor"
 
 #: udata/core/organization/constants.py:6
 msgid "Partial editor"
-msgstr ""
+msgstr "Editor parcial"
 
-#: udata/core/organization/constants.py:12 udata/features/transfer/models.py:17
-#: udata/harvest/models.py:40 udata/harvest/models.py:52
-#: udata/harvest/models.py:101
+#: udata/core/organization/constants.py:12
+#: udata/features/transfer/models.py:17 udata/harvest/models.py:40
+#: udata/harvest/models.py:52 udata/harvest/models.py:101
 msgid "Pending"
 msgstr "Pendente"
 
-#: udata/core/organization/constants.py:13 udata/features/transfer/models.py:18
-#: udata/harvest/models.py:102
+#: udata/core/organization/constants.py:13
+#: udata/features/transfer/models.py:18 udata/harvest/models.py:102
 msgid "Accepted"
 msgstr "Aceite"
 
-#: udata/core/organization/constants.py:14 udata/features/transfer/models.py:19
-#: udata/harvest/models.py:103
+#: udata/core/organization/constants.py:14
+#: udata/features/transfer/models.py:19 udata/harvest/models.py:103
 msgid "Refused"
 msgstr "Recusado"
 
 #: udata/core/organization/constants.py:15
 msgid "Canceled"
-msgstr ""
+msgstr "Cancelado"
 
 #: udata/core/organization/constants.py:19
 msgid "Request"
-msgstr ""
+msgstr "Pedido"
 
 #: udata/core/organization/constants.py:20
 msgid "Invitation"
-msgstr ""
+msgstr "Convite"
 
 #: udata/core/organization/forms.py:26
 #: udata/tests/api/test_organizations_api.py:160
 msgid "A siret number is made of 14 digits"
-msgstr ""
+msgstr "Um número SIRET é composto por 14 dígitos"
 
 #: udata/core/organization/forms.py:37
 #: udata/tests/api/test_organizations_api.py:172
 msgid "A siret number is only made of digits"
-msgstr ""
+msgstr "Um número SIRET é composto apenas por dígitos"
 
 #: udata/core/organization/forms.py:40
 #: udata/tests/api/test_organizations_api.py:166
 msgid "Invalid Siret number"
-msgstr ""
+msgstr "Número SIRET inválido"
 
 #: udata/core/organization/forms.py:49
 msgid "Shorter organization name"
@@ -1194,15 +1261,15 @@ msgstr "Logótipo"
 
 #: udata/core/organization/forms.py:58
 msgid "Business id"
-msgstr ""
+msgstr "Identificador da entidade"
 
 #: udata/core/organization/forms.py:58
 msgid "Business identification number"
-msgstr ""
+msgstr "Número de identificação da entidade"
 
 #: udata/core/organization/forms.py:103
 msgid "User ID"
-msgstr ""
+msgstr "ID do utilizador"
 
 #: udata/core/organization/mails.py:9
 msgid "New membership request"
@@ -1214,10 +1281,11 @@ msgid ""
 "You received a membership request from %(user)s for your organization "
 "%(org)s"
 msgstr ""
+"Recebeu um pedido de adesão de %(user)s para a sua organização %(org)s"
 
 #: udata/core/organization/mails.py:18
 msgid "Reason for the request:"
-msgstr ""
+msgstr "Motivo do pedido:"
 
 #: udata/core/organization/mails.py:19
 msgid "See the request"
@@ -1230,124 +1298,146 @@ msgstr "Pedido de adesão recusado"
 #: udata/core/organization/mails.py:30
 #, python-format
 msgid "Your membership for the organization %(org)s has been refused"
-msgstr ""
+msgstr "A sua adesão à organização %(org)s foi recusada"
 
 #: udata/core/organization/mails.py:40
+#, python-format
 msgid "Your invitation to join an organization has been accepted"
-msgstr ""
+msgstr "O seu convite para se juntar a uma organização foi aceite"
 
 #: udata/core/organization/mails.py:44
 #, python-format
 msgid ""
-"Good news! Your request to join the organization %(org)s has been "
-"approved."
+"Good news! Your request to join the organization %(org)s has been approved."
 msgstr ""
+"Boas notícias! O seu pedido para se juntar à organização %(org)s foi "
+"aprovado."
 
 #: udata/core/organization/mails.py:49 udata/core/organization/mails.py:65
 #: udata/core/organization/mails.py:80 udata/core/organization/mails.py:95
 #: udata/core/organization/mails.py:110 udata/core/organization/mails.py:125
 #: udata/core/organization/mails.py:156
 msgid "View the organization"
-msgstr ""
+msgstr "Ver a organização"
 
 #: udata/core/organization/mails.py:57
+#, python-format
 msgid "Your organization has been certified"
-msgstr ""
+msgstr "A sua organização foi certificada"
 
 #: udata/core/organization/mails.py:61
 #, python-format
 msgid ""
-"Good news! Your organization %(org)s has been certified by our team. A "
-"badge is now associated with your organization."
+"Good news! Your organization %(org)s has been certified by our team. A badge"
+" is now associated with your organization."
 msgstr ""
+"Boas notícias! A sua organização %(org)s foi certificada pela nossa equipa. "
+"Foi agora associado um distintivo à sua organização."
 
 #: udata/core/organization/mails.py:72
+#, python-format
 msgid "Your organization has been identified as a public service"
-msgstr ""
+msgstr "A sua organização foi identificada como um serviço público"
 
 #: udata/core/organization/mails.py:76
 #, python-format
 msgid ""
-"Good news! Your organization %(org)s has been identified by our team as a"
-" public service. A badge is now associated with your organization."
+"Good news! Your organization %(org)s has been identified by our team as a "
+"public service. A badge is now associated with your organization."
 msgstr ""
+"Boas notícias! A sua organização %(org)s foi identificada pela nossa equipa "
+"como um serviço público. Foi agora associado um distintivo à sua "
+"organização."
 
 #: udata/core/organization/mails.py:87
+#, python-format
 msgid "Your organization has been identified as a local authority"
-msgstr ""
+msgstr "A sua organização foi identificada como uma autoridade local"
 
 #: udata/core/organization/mails.py:91
 #, python-format
 msgid ""
-"Good news! Your organization %(org)s has been identified by our team as a"
-" local authority. A badge is now associated with your organization."
+"Good news! Your organization %(org)s has been identified by our team as a "
+"local authority. A badge is now associated with your organization."
 msgstr ""
+"Boas notícias! A sua organização %(org)s foi identificada pela nossa equipa "
+"como uma autoridade local. Foi agora associado um distintivo à sua "
+"organização."
 
 #: udata/core/organization/mails.py:102
+#, python-format
 msgid "Your organization has been identified as a company"
-msgstr ""
+msgstr "A sua organização foi identificada como uma empresa"
 
 #: udata/core/organization/mails.py:106
 #, python-format
 msgid ""
-"Your organization %(org)s has been identified by our team as a company. A"
-" badge is now associated with your organization."
+"Your organization %(org)s has been identified by our team as a company. A "
+"badge is now associated with your organization."
 msgstr ""
+"A sua organização %(org)s foi identificada pela nossa equipa como uma "
+"empresa. Foi agora associado um distintivo à sua organização."
 
 #: udata/core/organization/mails.py:117
+#, python-format
 msgid "Your organization has been identified as an association"
-msgstr ""
+msgstr "A sua organização foi identificada como uma associação"
 
 #: udata/core/organization/mails.py:121
 #, python-format
 msgid ""
-"Your organization %(org)s has been identified by our team as an "
-"association. A badge is now associated with your organization."
+"Your organization %(org)s has been identified by our team as an association."
+" A badge is now associated with your organization."
 msgstr ""
+"A sua organização %(org)s foi identificada pela nossa equipa como uma "
+"associação. Foi agora associado um distintivo à sua organização."
 
 #: udata/core/organization/mails.py:132
+#, python-format
 msgid "An organization invitation has been canceled"
-msgstr ""
+msgstr "Um convite de organização foi cancelado"
 
 #: udata/core/organization/mails.py:136
 #, python-format
 msgid "The invitation to join the organization %(org)s has been canceled."
-msgstr ""
+msgstr "O convite para se juntar à organização %(org)s foi cancelado."
 
 #: udata/core/organization/mails.py:146
+#, python-format
 msgid "An invitation to join your organization has been accepted"
-msgstr ""
+msgstr "Um convite para se juntar à sua organização foi aceite"
 
 #: udata/core/organization/mails.py:150
 #, python-format
 msgid "%(user)s has accepted the invitation to join the organization %(org)s."
-msgstr ""
+msgstr "%(user)s aceitou o convite para se juntar à organização %(org)s."
 
 #: udata/core/organization/mails.py:164
+#, python-format
 msgid "An invitation to join your organization has been refused"
-msgstr ""
+msgstr "Um convite para se juntar à sua organização foi recusado"
 
 #: udata/core/organization/mails.py:168
 #, python-format
 msgid "%(user)s has refused the invitation to join the organization %(org)s."
-msgstr ""
+msgstr "%(user)s recusou o convite para se juntar à organização %(org)s."
 
 #: udata/core/organization/mails.py:183
 #, python-format
 msgid "You have been invited to join the organization %(org)s."
-msgstr ""
+msgstr "Foi convidado(a) a juntar-se à organização %(org)s."
 
 #: udata/core/organization/mails.py:189
 msgid "Message:"
-msgstr ""
+msgstr "Mensagem:"
 
 #: udata/core/organization/mails.py:196
 msgid "View and respond to invitation"
-msgstr ""
+msgstr "Ver e responder ao convite"
 
 #: udata/core/organization/mails.py:198
 msgid "You have been invited to join an organization"
-msgstr ""
+msgstr "Foi convidado(a) a juntar-se a uma organização"
 
 #: udata/core/organization/models.py:61
 msgid "Public Service"
@@ -1359,27 +1449,27 @@ msgstr "Certificado"
 
 #: udata/core/organization/models.py:63
 msgid "Association"
-msgstr ""
+msgstr "Associação"
 
 #: udata/core/organization/models.py:64
 msgid "Company"
-msgstr ""
+msgstr "Empresa"
 
 #: udata/core/organization/models.py:65
 msgid "Local authority"
-msgstr ""
+msgstr "Autoridade local"
 
 #: udata/core/organization/models.py:229
 msgid "organization"
-msgstr ""
+msgstr "organização"
 
 #: udata/core/post/api.py:73
 msgid "Latests posts"
-msgstr ""
+msgstr "Publicações mais recentes"
 
 #: udata/core/post/constants.py:9
 msgid "Markdown"
-msgstr ""
+msgstr "Markdown"
 
 #: udata/core/post/constants.py:10
 msgid "HTML"
@@ -1387,43 +1477,47 @@ msgstr "HTML"
 
 #: udata/core/post/constants.py:11
 msgid "Blocs"
-msgstr ""
+msgstr "Blocos"
 
 #: udata/core/post/constants.py:17
 msgid "News"
-msgstr ""
+msgstr "Notícias"
 
 #: udata/core/post/constants.py:18
 msgid "Page"
-msgstr ""
+msgstr "Página"
 
 #: udata/core/post/models.py:137
 msgid "post"
 msgstr "artigo"
 
-#: udata/core/reports/constants.py:22
-msgid "Explicit content"
-msgstr ""
-
 #: udata/core/reports/constants.py:23
-msgid "Illegal content"
-msgstr ""
+msgid "Auto-detected spam"
+msgstr "Spam detetado automaticamente"
 
-#: udata/core/reports/constants.py:24 udata/core/reuse/constants.py:29
+#: udata/core/reports/constants.py:24
+msgid "Explicit content"
+msgstr "Conteúdo explícito"
+
+#: udata/core/reports/constants.py:25
+msgid "Illegal content"
+msgstr "Conteúdo ilegal"
+
+#: udata/core/reports/constants.py:26 udata/core/reuse/constants.py:29
 msgid "Others"
 msgstr "Outros"
 
-#: udata/core/reports/constants.py:25
-msgid "Personal data"
-msgstr ""
-
-#: udata/core/reports/constants.py:26
-msgid "Security"
-msgstr ""
-
 #: udata/core/reports/constants.py:27
+msgid "Personal data"
+msgstr "Dados pessoais"
+
+#: udata/core/reports/constants.py:28
+msgid "Security"
+msgstr "Segurança"
+
+#: udata/core/reports/constants.py:29
 msgid "Spam"
-msgstr ""
+msgstr "Spam"
 
 #: udata/core/reuse/activities.py:19
 msgid "created a reuse"
@@ -1439,7 +1533,7 @@ msgstr "apagou uma reutilização"
 
 #: udata/core/reuse/api.py:144
 msgid "Latests reuses"
-msgstr ""
+msgstr "Reutilizações mais recentes"
 
 #: udata/core/reuse/constants.py:5
 msgid "Application"
@@ -1499,7 +1593,7 @@ msgstr "Ambiente e energia"
 
 #: udata/core/reuse/constants.py:22
 msgid "Work and training"
-msgstr ""
+msgstr "Trabalho e formação"
 
 #: udata/core/reuse/constants.py:23
 msgid "Politics and public life"
@@ -1511,7 +1605,7 @@ msgstr "Proteção e Segurança"
 
 #: udata/core/reuse/constants.py:25
 msgid "Education and research"
-msgstr ""
+msgstr "Educação e investigação"
 
 #: udata/core/reuse/constants.py:26
 msgid "Society and demography"
@@ -1527,7 +1621,7 @@ msgstr "Abrir ferramentas de dados"
 
 #: udata/core/reuse/mails.py:9
 msgid "New reuse on your dataset"
-msgstr ""
+msgstr "Nova reutilização no seu conjunto de dados"
 
 #: udata/core/reuse/mails.py:13
 #, python-format
@@ -1535,20 +1629,22 @@ msgid ""
 "A new reuse has been published by %(user_or_org)s on your dataset "
 "%(dataset)s"
 msgstr ""
+"Foi publicada uma nova reutilização por %(user_or_org)s no seu conjunto de "
+"dados %(dataset)s"
 
 #: udata/core/reuse/mails.py:18
 msgid "Reuse title:"
-msgstr ""
+msgstr "Título da reutilização:"
 
 #: udata/core/reuse/mails.py:19
 msgid "View the reuse"
-msgstr ""
+msgstr "Ver a reutilização"
 
-#: udata/core/reuse/models.py:58
+#: udata/core/reuse/models.py:59
 msgid "This URL is already registered"
 msgstr "Este URL já está registado"
 
-#: udata/core/reuse/models.py:215
+#: udata/core/reuse/models.py:216
 msgid "reuse"
 msgstr "reutilização"
 
@@ -1643,31 +1739,31 @@ msgstr "Quarteirão francês"
 
 #: udata/core/topic/activities.py:27
 msgid "created a topic"
-msgstr ""
+msgstr "criou um tema"
 
 #: udata/core/topic/activities.py:33
 msgid "updated a topic"
-msgstr ""
+msgstr "atualizou um tema"
 
 #: udata/core/topic/activities.py:40
 msgid "added an element to a topic"
-msgstr ""
+msgstr "adicionou um elemento a um tema"
 
 #: udata/core/topic/activities.py:46
 msgid "updated an element in a topic"
-msgstr ""
+msgstr "atualizou um elemento de um tema"
 
 #: udata/core/topic/activities.py:53
 msgid "removed an element from a topic"
-msgstr ""
+msgstr "removeu um elemento de um tema"
 
 #: udata/core/topic/forms.py:17
 msgid "Element"
-msgstr ""
+msgstr "Elemento"
 
 #: udata/core/topic/forms.py:26 udata/tests/apiv2/test_topics.py:720
 msgid "A topic element must have a title or an element."
-msgstr ""
+msgstr "Um elemento de tema deve ter um título ou um elemento."
 
 #: udata/core/topic/forms.py:91
 msgid "Featured"
@@ -1679,7 +1775,7 @@ msgstr "seguiu um utilizador"
 
 #: udata/core/user/activities.py:43
 msgid "discussed a dataservice"
-msgstr ""
+msgstr "comentou um serviço de dados"
 
 #: udata/core/user/activities.py:48
 msgid "discussed a dataset"
@@ -1691,7 +1787,7 @@ msgstr "discutiu uma reutilização"
 
 #: udata/core/user/activities.py:58
 msgid "followed a dataservice"
-msgstr ""
+msgstr "seguiu um serviço de dados"
 
 #: udata/core/user/activities.py:63
 msgid "followed a dataset"
@@ -1717,7 +1813,7 @@ msgstr "Sobre"
 msgid "Roles"
 msgstr "Perfis"
 
-#: udata/core/user/mails.py:10 udata/tests/api/test_me_api.py:295
+#: udata/core/user/mails.py:10 udata/tests/api/test_me_api.py:372
 msgid "Account deletion"
 msgstr "Conta eliminada"
 
@@ -1728,29 +1824,32 @@ msgstr "A sua conta foi eliminada"
 #: udata/core/user/mails.py:18
 #, python-format
 msgid "Deletion of your inactive %(site)s account"
-msgstr ""
+msgstr "Eliminação da sua conta inativa em %(site)s"
 
 #: udata/core/user/mails.py:22
 #, python-format
 msgid "Your account on %(site)s has been deleted due to inactivity"
-msgstr ""
+msgstr "A sua conta em %(site)s foi eliminada por inatividade"
 
 #: udata/core/user/mails.py:33 udata/tests/user/test_user_tasks.py:36
 #, python-brace-format
 msgid "Inactivity of your {site} account"
-msgstr ""
+msgstr "Inatividade da sua conta em {site}"
 
 #: udata/core/user/mails.py:36
 #, python-format
 msgid ""
-"We have noticed that your account associated to (%(user_email)s) has been"
-" inactive for %(inactivity_years)d years or more on %(site)s, the open "
+"We have noticed that your account associated to (%(user_email)s) has been "
+"inactive for %(inactivity_years)d years or more on %(site)s, the open "
 "platform for public data."
 msgstr ""
+"Verificámos que a sua conta associada a (%(user_email)s) está inativa há "
+"%(inactivity_years)d anos ou mais em %(site)s, a plataforma aberta de dados "
+"públicos."
 
 #: udata/core/user/mails.py:42
 msgid "If you want to keep your account, please log in with your account."
-msgstr ""
+msgstr "Se quiser manter a sua conta, por favor inicie sessão."
 
 #: udata/core/user/mails.py:46
 #, python-format
@@ -1758,17 +1857,22 @@ msgid ""
 "Without logging in, your account will be deleted within %(notify_delay)d "
 "days."
 msgstr ""
+"Se não iniciar sessão, a sua conta será eliminada dentro de %(notify_delay)d"
+" dias."
 
 #: udata/core/user/mails.py:50
 #, python-format
 msgid ""
-"This account is not tied to your other administration accounts and you "
-"can always re-create an account on the %(site)s platform if necessary."
+"This account is not tied to your other administration accounts and you can "
+"always re-create an account on the %(site)s platform if necessary."
 msgstr ""
+"Esta conta não está associada às suas outras contas da Administração Pública"
+" e pode sempre criar uma nova conta na plataforma %(site)s, caso seja "
+"necessário."
 
-#: udata/core/user/models.py:154
+#: udata/core/user/models.py:148
 msgid "account"
-msgstr ""
+msgstr "conta"
 
 #: udata/core/user/permissions.py:5
 msgid "System administrator"
@@ -1784,15 +1888,15 @@ msgstr "Moderador do site"
 
 #: udata/flask_mongoengine/fields.py:85
 msgid "Not a valid choice"
-msgstr ""
+msgstr "Escolha inválida"
 
 #: udata/forms/fields.py:139
 msgid "Please input a date/time value"
-msgstr ""
+msgstr "Por favor, indique um valor de data/hora"
 
 #: udata/forms/fields.py:151
 msgid "Invalid date/time input"
-msgstr ""
+msgstr "Valor de data/hora inválido"
 
 #: udata/forms/fields.py:181
 #, python-brace-format
@@ -1816,12 +1920,12 @@ msgstr "{0} não existe"
 #: udata/forms/fields.py:506 udata/tests/forms/test_model_field.py:332
 #: udata/tests/forms/test_model_field.py:348
 msgid "Missing \"id\" field"
-msgstr ""
+msgstr "Falta o campo \"id\""
 
 #: udata/forms/fields.py:513
 #, python-brace-format
 msgid "Expect a \"{0}\" class but \"{1}\" was found"
-msgstr ""
+msgstr "Esperava-se uma classe \"{0}\", mas foi encontrada \"{1}\""
 
 #: udata/forms/fields.py:519 udata/tests/forms/test_model_field.py:40
 #: udata/tests/forms/test_model_field.py:55
@@ -1838,16 +1942,22 @@ msgstr "Modelo para {0} não foi encontrado"
 msgid "Unknown identifiers: {identifiers}"
 msgstr "Identificadores desconhecidos: {identifiers}"
 
-#: udata/forms/fields.py:732
+#: udata/forms/fields.py:724 udata/forms/fields.py:727
+msgid "Date must be a string"
+msgstr "A data tem de ser uma cadeia de caracteres"
+
+#: udata/forms/fields.py:736
 msgid "Unable to parse date range"
 msgstr "Não é possível analisar o intervalo de datas"
 
-#: udata/forms/fields.py:764 udata/forms/fields.py:796
+#: udata/forms/fields.py:768 udata/forms/fields.py:800
 #: udata/tests/forms/test_publish_as_field.py:214
 msgid "Cannot change owner after creation. Please use transfer feature."
 msgstr ""
+"Não é possível alterar o proprietário após a criação. Por favor, utilize a "
+"funcionalidade de transferência."
 
-#: udata/forms/fields.py:769 udata/forms/fields.py:801
+#: udata/forms/fields.py:773 udata/forms/fields.py:805
 msgid "You must be authenticated"
 msgstr "Você deve estar autenticado"
 
@@ -1910,61 +2020,68 @@ msgstr "Arquivado"
 
 #: udata/harvest/backends/dcat.py:268
 msgid "Remote URL prefix"
-msgstr ""
+msgstr "Prefixo de URL remoto"
 
 #: udata/harvest/backends/dcat.py:271
 msgid "A prefix used to build the remote URL of the harvested items."
 msgstr ""
+"Um prefixo utilizado para construir o URL remoto dos itens recolhidos."
 
 #: udata/harvest/backends/dcat.py:458
 msgid "GeoDCAT-AP"
-msgstr ""
+msgstr "GeoDCAT-AP"
 
 #: udata/harvest/backends/dcat.py:459
-msgid "Request GeoDCAT-AP to the CSW server (must be supported by the server)."
+msgid ""
+"Request GeoDCAT-AP to the CSW server (must be supported by the server)."
 msgstr ""
+"Solicitar GeoDCAT-AP ao servidor CSW (tem de ser suportado pelo servidor)."
 
 #: udata/harvest/backends/ckan/harvesters.py:35
 msgid "Organization"
-msgstr ""
+msgstr "Organização"
 
 #: udata/harvest/backends/ckan/harvesters.py:35
 msgid "A CKAN Organization name"
-msgstr ""
+msgstr "Nome de uma organização CKAN"
 
 #: udata/harvest/backends/ckan/harvesters.py:36
 msgid "Tag"
-msgstr ""
+msgstr "Etiqueta"
 
 #: udata/harvest/backends/ckan/harvesters.py:36
 msgid "A CKAN tag name"
-msgstr ""
+msgstr "Nome de uma etiqueta CKAN"
 
 #: udata/templates/404.html:6 udata/tests/frontend/test_error_handlers.py:22
 #: udata/tests/frontend/test_error_handlers.py:48
 msgid "Page not found"
-msgstr ""
+msgstr "Página não encontrada"
 
 #: udata/templates/404.html:39 udata/tests/frontend/test_error_handlers.py:22
 #: udata/tests/frontend/test_error_handlers.py:48
 msgid "The page you are looking for does not exist."
-msgstr ""
+msgstr "A página que procura não existe."
 
 #: udata/templates/404.html:40 udata/tests/frontend/test_error_handlers.py:26
 msgid "Back to home"
-msgstr ""
+msgstr "Voltar à página inicial"
 
 #: udata/templates/comments/dataset_archived.txt:1
 msgid ""
 "This dataset has been archived by our administration team.\n"
 "\n"
-"An archived dataset is considered out of date by a combination of "
-"factors.\n"
-"It does not appear in the search results and has a special layout warning"
-" the site's users.\n"
+"An archived dataset is considered out of date by a combination of factors.\n"
+"It does not appear in the search results and has a special layout warning the site's users.\n"
 "\n"
 "If you think this is a mistake, you can contact the site administrator."
 msgstr ""
+"Este conjunto de dados foi arquivado pela nossa equipa de administração.\n"
+"\n"
+"Um conjunto de dados arquivado é considerado desatualizado em virtude de uma combinação de fatores.\n"
+"Não aparece nos resultados de pesquisa e apresenta uma disposição especial que alerta os utilizadores do site.\n"
+"\n"
+"Se considerar que se trata de um engano, pode contactar o administrador do site."
 
 #: udata/templates/mail/message.html:15
 #, python-format
@@ -1973,7 +2090,7 @@ msgstr "Olá %(user)s,"
 
 #: udata/templates/mail/message.html:36
 msgid "Have a great day"
-msgstr ""
+msgstr "Tenha um excelente dia"
 
 #: udata/templates/mail/message.html:37
 #, python-format
@@ -2050,88 +2167,98 @@ msgid "Submit"
 msgstr "Submeter"
 
 #: udata/templates/security/two_factor_setup.html:4
-msgid "Two-factor authentication adds an extra layer of security to your account"
+msgid ""
+"Two-factor authentication adds an extra layer of security to your account"
 msgstr ""
+"A autenticação de dois fatores adiciona uma camada extra de segurança à sua "
+"conta"
 
 #: udata/templates/security/two_factor_setup.html:5
 msgid "In addition to your username and password, you'll need to use a code."
 msgstr ""
+"Além do nome de utilizador e da palavra-passe, terá de utilizar um código."
 
 #: udata/templates/security/two_factor_setup.html:8
 #, python-format
 msgid "Currently setup two-factor method: %(method)s"
-msgstr ""
+msgstr "Método de dois fatores atualmente configurado: %(method)s"
 
 #: udata/templates/security/two_factor_setup.html:17
 msgid "To complete logging in, please enter the code sent to your mail"
 msgstr ""
+"Para concluir o início de sessão, introduza o código enviado para o seu "
+"e-mail"
 
 #: udata/templates/security/two_factor_setup.html:23
 msgid ""
-"Open an authenticator app on your device and scan the following QRcode "
-"(or enter the code below manually) to start receiving codes:"
+"Open an authenticator app on your device and scan the following QRcode (or "
+"enter the code below manually) to start receiving codes:"
 msgstr ""
+"Abra uma aplicação de autenticação no seu dispositivo e leia o QR Code "
+"seguinte (ou introduza manualmente o código abaixo) para começar a receber "
+"códigos:"
 
 #: udata/templates/security/two_factor_setup.html:26
 msgid "Two factor authentication code"
-msgstr ""
+msgstr "Código de autenticação de dois fatores"
 
 #: udata/templates/security/two_factor_setup.html:32
 msgid "To Which Phone Number Should We Send Code To?"
-msgstr ""
+msgstr "Para que número de telemóvel devemos enviar o código?"
 
 #: udata/templates/security/two_factor_setup.html:48
 msgid "Recovery Codes"
-msgstr ""
+msgstr "Códigos de recuperação"
 
 #: udata/templates/security/two_factor_setup.html:50
 msgid "This application supports setting up recovery codes."
-msgstr ""
+msgstr "Esta aplicação suporta a configuração de códigos de recuperação."
 
 #: udata/templates/security/two_factor_setup.html:51
 msgid "You can set them up here."
-msgstr ""
+msgstr "Pode configurá-los aqui."
 
 #: udata/templates/security/two_factor_verify_code.html:1
 #: udata/templates/security/two_factor_verify_code.html:6
 msgid "Two-Factor Authentication"
-msgstr ""
+msgstr "Autenticação de dois fatores"
 
 #: udata/templates/security/two_factor_verify_code.html:7
 #, python-format
 msgid "Please enter your authentication code generated via: %(method)s"
 msgstr ""
+"Por favor, introduza o código de autenticação gerado através de: %(method)s"
 
 #: udata/templates/security/two_factor_verify_code.html:20
 msgid "The code for authentication was sent to your email address"
-msgstr ""
+msgstr "O código de autenticação foi enviado para o seu endereço de e-mail"
 
 #: udata/templates/security/two_factor_verify_code.html:23
 msgid "An email was sent to us in order to reset your application account"
-msgstr ""
+msgstr "Foi-nos enviado um e-mail para reiniciar a sua conta na aplicação"
 
 #: udata/templates/security/verify.html:1
 msgid "Reauthenticate"
-msgstr ""
+msgstr "Reautenticar"
 
 #: udata/tests/test_mail.py:17 udata/tests/test_mail.py:32
 #: udata/tests/test_mail.py:45 udata/tests/test_mail.py:61
 msgid "Some text"
-msgstr ""
+msgstr "Algum texto"
 
 #: udata/tests/test_mail.py:76 udata/tests/test_mail.py:151
 #, python-format
 msgid "Some text %(org)s"
-msgstr ""
+msgstr "Algum texto %(org)s"
 
 #: udata/tests/test_mail.py:94 udata/tests/test_mail.py:111
 #: udata/tests/test_mail.py:133
 msgid "Some text:"
-msgstr ""
+msgstr "Algum texto:"
 
 #: udata/tests/forms/test_model_field.py:164
 msgid "Expect a \"Target\" class but \"Wrong\" was found"
-msgstr ""
+msgstr "Esperava-se uma classe \"Target\", mas foi encontrada \"Wrong\""
 
 #: udata/tests/frontend/test_error_handlers.py:26
 msgid "Home"
@@ -2156,9 +2283,27 @@ msgstr "Muito reutilizado"
 #: udata/tests/user/test_user_tasks.py:108
 #, python-brace-format
 msgid "Deletion of your inactive {site} account"
-msgstr ""
+msgstr "Eliminação da sua conta inativa em {site}"
 
 #~ msgid "Vous devez accepter les CGU pour continuer."
+#~ msgstr ""
+
+#~ msgid "Confirm change of email instructions"
+#~ msgstr ""
+
+#~ msgid "You need to update some frequency-based datasets"
+#~ msgstr "É necessário atualizar alguns datasets baseados em frequência"
+
+#~ msgid "Your %(type)s have a new discussion"
+#~ msgstr "O seu %(type)s tem uma nova discussão"
+
+#~ msgid "Your organization \"%(name)s\" has been identified as a company"
+#~ msgstr ""
+
+#~ msgid "Your organization \"%(name)s\" has been identified as an association"
+#~ msgstr ""
+
+#~ msgid "Your organization \"%(name)s\" has been identified as a local authority"
 #~ msgstr ""
 
 #~ msgid "Headline"
@@ -2166,9 +2311,6 @@ msgstr ""
 
 #~ msgid "Content"
 #~ msgstr "Conteúdo"
-
-#~ msgid "Associated datasets"
-#~ msgstr "Conjuntos de dados associados"
 
 #~ msgid "Associated reuses"
 #~ msgstr "Reutilizações associadas"
@@ -2188,21 +2330,6 @@ msgstr ""
 #~ msgid "Specify your body type (HTML or markdown)"
 #~ msgstr ""
 
-#~ msgid "on your browser."
-#~ msgstr "no seu navegador."
-
-#~ msgid "View this email %(link)s"
-#~ msgstr ""
-
-#~ msgid "See you soon on the platform"
-#~ msgstr "Até breve na plataforma"
-
-#~ msgid "You have been added as a member of an organization"
-#~ msgstr ""
-
-#~ msgid "Good news! You are now a member of %(org)s."
-#~ msgstr ""
-
 #~ msgid "Some SEO keywords"
 #~ msgstr "Algumas palavras-chave (SEO)"
 
@@ -2212,3 +2339,206 @@ msgstr ""
 #~ msgid "Number of elements in feeds"
 #~ msgstr "Número de elementos nos fluxos"
 
+#~ msgid "Test mail"
+#~ msgstr "E-mail de teste"
+
+#~ msgid "Admin"
+#~ msgstr "Admin"
+
+#~ msgid "You must be connected to do this action."
+#~ msgstr "Deverá estar conectado à internet."
+
+#~ msgid "Maintainer"
+#~ msgstr "Mantido por"
+
+#~ msgid "Edit"
+#~ msgstr "Editar"
+
+#~ msgid "Delete"
+#~ msgstr "Eliminar"
+
+#~ msgid "No OAuth clients"
+#~ msgstr "Nenhum cliente OAuth"
+
+#~ msgid "Add a client"
+#~ msgstr "Adicionar um cliente"
+
+#~ msgid "Details"
+#~ msgstr "Detalhes"
+
+#~ msgid "Read your profile, the orgnization you belong to, your publications"
+#~ msgstr ""
+#~ "Ler o seu perfil, a organização a que você pertence, as suas publicações"
+
+#~ msgid "Publish data"
+#~ msgstr "Publicar dados"
+
+#~ msgid "Publish datasets, reuses, follow or unfollow"
+#~ msgstr ""
+#~ "Publicar conjuntos de dados, reutilizações, seguir ou deixar de seguir"
+
+#~ msgid "Accept"
+#~ msgstr "Aceitar"
+
+#~ msgid "Refuse"
+#~ msgstr "Recusar"
+
+#~ msgid "Share, improve and reuse public data"
+#~ msgstr "Partilhar, melhorar e reutilizar dados públicos"
+
+#~ msgid ""
+#~ "If you want to keep your account, please log in with your account on "
+#~ "%(home)s."
+#~ msgstr ""
+
+#~ msgid "%(user)s has identified your organization \"%(name)s\" as an association"
+#~ msgstr ""
+
+#~ msgid "See the badge"
+#~ msgstr "Ver o emblema"
+
+#~ msgid "%(user)s has identified your organization \"%(name)s\" as a company"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "%(user)s has identified your organization \"%(name)s\" as a local authority"
+#~ msgstr ""
+
+#~ msgid "%(user)s has identified your organization \"%(name)s\" as public service"
+#~ msgstr "%(user)s identificou sua organização \"%(name)s\" como serviço público"
+
+#~ msgid "on your browser."
+#~ msgstr "no seu navegador."
+
+#~ msgid "View this email %(link)s"
+#~ msgstr ""
+
+#~ msgid "See you soon on the platform"
+#~ msgstr "Até breve na plataforma"
+
+#~ msgid "%(user)s closed an discussion on your %(type)s %(subject)s"
+#~ msgstr "%(user)s encerrou uma discussão sobre %(type)s %(subject)s"
+
+#~ msgid ""
+#~ "Some of your datasets need to be updated according to the frequency you set:"
+#~ msgstr ""
+#~ "Alguns dos seus conjuntos de dados precisam de ser atualizadas de acordo com"
+#~ " a frequência que definiu:"
+
+#~ msgid "Dataset \"%(dataset_title)s\" last update is on %(published_date)s."
+#~ msgstr ""
+#~ "A última atualização do conjunto de dados \"%(dataset_title)s\" foi em "
+#~ "%(published_date)s."
+
+#~ msgid ""
+#~ "Given the set frequency (%(dataset_frequency)s) update was due "
+#~ "%(due_update_days)s days ago."
+#~ msgstr ""
+#~ "Dada a frequência definida (%(dataset_frequency)s), os dados deveriam ter "
+#~ "sido atualizados %(due_update_days)s dias atrás."
+
+#~ msgid "Update the dataset and associated resources"
+#~ msgstr "Atualizar o dataset e recursos associados"
+
+#~ msgid "Refusal reason"
+#~ msgstr "Motivo da recusa"
+
+#~ msgid ""
+#~ "As an administrator of \"%(org)s\" you are being informed than a new "
+#~ "membership request from %(user)s is pending for validation"
+#~ msgstr ""
+#~ "Como administrador da organização \"%(org)s\" está a ser notificado que um "
+#~ "pedido de adesão do utilizador %(user)s está pendente de validação"
+
+#~ msgid "Congratulations, you are now a member of the organization \"%(org)s\""
+#~ msgstr "Parabéns, foi adicionado como membro da organização \"%(org)s\""
+
+#~ msgid "A new reuse of your dataset %(dataset)s has been published"
+#~ msgstr ""
+#~ "Foi publicada uma nova reutilização do seu conjunto de dados %(dataset)s"
+
+#~ msgid "This is a test mail"
+#~ msgstr "Este é um e-mail de teste"
+
+#~ msgid "If you read this, your mail configuration is working"
+#~ msgstr "Se estiver a ler isto a sua configuração de correio está operacional"
+
+#~ msgid "Reset password"
+#~ msgstr "Redefinir palavra-passe"
+
+#~ msgid "Please confirm your email through the link below:"
+#~ msgstr "Por favor, confirme o seu e-mail através do link abaixo:"
+
+#~ msgid "Confirm my account"
+#~ msgstr "Confirmar a minha conta"
+
+#~ msgid "You can log into your account through the link below:"
+#~ msgstr "Pode entrar na sua conta através do link abaixo:"
+
+#~ msgid "Login now"
+#~ msgstr "Iniciar sessão agora"
+
+#~ msgid ""
+#~ "To reset your password, please confirm your request through the link below:"
+#~ msgstr ""
+#~ "Para redefinir a sua palavra-passe, por favor confirme o seu pedido através "
+#~ "do link abaixo:"
+
+#~ msgid "Your password for %(site)s has been reset."
+#~ msgstr "A sua palavra-passe para o %(site)s foi redefinida."
+
+#~ msgid ""
+#~ "To activate your account, please confirm your email address through the link"
+#~ " below:"
+#~ msgstr ""
+#~ "Para ativar a sua conta, por favor confirme o seu endereço de e-mail através"
+#~ " do seguinte link:"
+
+#~ msgid "Confirm now"
+#~ msgstr "Confirmar agora"
+
+#~ msgid "Hello %(email)s!"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "Someone (you?) tried to register this email - which is already in our "
+#~ "system."
+#~ msgstr ""
+
+#~ msgid ""
+#~ "This account also has the following username associated with it: "
+#~ "%(username)s."
+#~ msgstr ""
+
+#~ msgid "If you forgot your password you can reset it"
+#~ msgstr ""
+
+#~ msgid "Here"
+#~ msgstr ""
+
+#~ msgid "Opened with an account"
+#~ msgstr "Aberto com uma conta"
+
+#~ msgid "Dear %(user)"
+#~ msgstr "Caro/a %(user)"
+
+#~ msgid "Your user account has been removed from the Dados.gov portal."
+#~ msgstr "A sua conta de utilizador foi removida no portal Dados.gov."
+
+#~ msgid "If you wish to regain access, you must create a new account."
+#~ msgstr "Se pretender retomar o acesso, deverá criar uma nova conta."
+
+#~ msgid "Thank you."
+#~ msgstr "Obrigado."
+
+#~ msgid "The Dados.gov Team"
+#~ msgstr "A equipa Dados.gov"
+
+#~ msgid "Attributions"
+#~ msgstr "Contato"
+
+#~ msgid "Latest update"
+#~ msgstr "Última atualização"
+
+#~ msgid "Metadata quality:"
+#~ msgstr "Qualidade dos metadados:"

@@ -3,7 +3,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version:  udata\n"
 "Report-Msgid-Bugs-To: i18n@opendata.team\n"
-"POT-Creation-Date: 2026-03-17 17:29+0100\n"
+"POT-Creation-Date: 2026-03-24 11:44+0100\n"
 "PO-Revision-Date: 2025-11-19 13:03+0000\n"
 "Last-Translator: Open Data Team <i18n@opendata.team>\n"
 "Language: fr\n"
@@ -12,33 +12,33 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.18.0\n"
+"Generated-By: Babel 2.17.0\n"
 
-#: udata/settings.py:130
+#: udata/settings.py:131
 msgid "Welcome"
 msgstr "Bienvenue"
 
-#: udata/settings.py:131
+#: udata/settings.py:132
 msgid "Please confirm your email"
 msgstr "Veuillez confirmer votre adresse e-mail"
 
-#: udata/settings.py:132
+#: udata/settings.py:133
 msgid "Login instructions"
 msgstr "Instructions de connexion"
 
-#: udata/auth/mails.py:127 udata/settings.py:133
+#: udata/auth/mails.py:127 udata/settings.py:134
 msgid "Your password has been reset"
 msgstr "Votre mot de passe a été réinitialisé"
 
-#: udata/auth/mails.py:139 udata/settings.py:134
+#: udata/auth/mails.py:139 udata/settings.py:135
 msgid "Your password has been changed"
 msgstr "Votre mot de passe a été modifié"
 
-#: udata/settings.py:135
+#: udata/settings.py:136
 msgid "Password reset instructions"
 msgstr "Instructions de réinitialisation du mot de passe"
 
-#: udata/settings.py:569
+#: udata/settings.py:574
 msgid "This dataset has been archived"
 msgstr "Ce jeu de données a été archivé"
 
@@ -47,7 +47,7 @@ msgstr "Ce jeu de données a été archivé"
 msgid "Invalid URL \"{url}\": {reason}"
 msgstr "URL invalide \"{url}\" : {reason}"
 
-#: udata/tests/api/test_datasets_api.py:1188 udata/tests/test_model.py:417
+#: udata/tests/api/test_datasets_api.py:1201 udata/tests/test_model.py:417
 #: udata/uris.py:62
 #, python-brace-format
 msgid "Invalid URL \"{url}\""
@@ -279,7 +279,7 @@ msgstr "Souhaitez-vous générer des données d'exemple ?"
 msgid "Your udata instance is ready!"
 msgstr "Votre instance udata est prête !"
 
-#: udata/core/owned.py:63 udata/forms/fields.py:771
+#: udata/core/owned.py:63 udata/forms/fields.py:775
 #: udata/tests/api/test_dataservices_api.py:569
 msgid "You can only set yourself as owner"
 msgstr "Vous ne pouvez définir que vous-même en tant que propriétaire"
@@ -288,44 +288,16 @@ msgstr "Vous ne pouvez définir que vous-même en tant que propriétaire"
 msgid "Unknown organization"
 msgstr "Organisation inconnue"
 
-#: udata/core/owned.py:76 udata/forms/fields.py:803
+#: udata/core/owned.py:76 udata/forms/fields.py:807
 #: udata/tests/api/test_dataservices_api.py:582
 msgid "Permission denied for this organization"
 msgstr "Permission refusée pour cette organisation"
 
-#: udata/core/access_type/constants.py:42
+#: udata/core/access_type/constants.py:46
 msgid "Confidentiality of public authorities proceedings"
 msgstr "Confidentialité des procédures des autorités publiques"
 
-#: udata/core/access_type/constants.py:44
-msgid "International relations, public security or national defence"
-msgstr "Relations internationales, sécurité publique ou défense nationale."
-
-#: udata/core/access_type/constants.py:46
-msgid "Course of justice"
-msgstr "Cours de la justice"
-
-#: udata/core/access_type/constants.py:48
-msgid "Commercial or industrial confidentiality"
-msgstr "Confidentialité commerciale ou industrielle"
-
-#: udata/core/access_type/constants.py:50
-msgid "Intellectual property rights"
-msgstr "Droits de propriété intellectuelle"
-
 #: udata/core/access_type/constants.py:52
-msgid "Personal data confidentiality"
-msgstr "Confidentialité des données personnelles"
-
-#: udata/core/access_type/constants.py:54
-msgid "Protection of voluntary information suppliers"
-msgstr "Protection des fournisseurs d'informations volontaires"
-
-#: udata/core/access_type/constants.py:56
-msgid "Environmental protection"
-msgstr "Protection de l'environnement"
-
-#: udata/core/access_type/constants.py:66
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of the proceedings of public authorities, where such "
@@ -335,7 +307,11 @@ msgstr ""
 "confidentialité des procédures des autorités publiques, lorsque cette "
 "confidentialité est prévue par la loi."
 
-#: udata/core/access_type/constants.py:70
+#: udata/core/access_type/constants.py:58
+msgid "International relations, public security or national defence"
+msgstr "Relations internationales, sécurité publique ou défense nationale."
+
+#: udata/core/access_type/constants.py:64
 msgid ""
 "Public access to datasets and services would adversely affect "
 "international relations, public security or national defence."
@@ -344,7 +320,11 @@ msgstr ""
 "répercussions négatives sur les relations internationales, la sécurité "
 "publique ou la défense nationale."
 
-#: udata/core/access_type/constants.py:74
+#: udata/core/access_type/constants.py:70
+msgid "Course of justice"
+msgstr "Cours de la justice"
+
+#: udata/core/access_type/constants.py:76
 msgid ""
 "Public access to datasets and services would adversely affect the course "
 "of justice, the ability of any person to receive a fair trial or the "
@@ -356,7 +336,11 @@ msgstr ""
 "recevoir un procès équitable ou la capacité d'une autorité publique à "
 "mener une enquête à caractère criminel ou disciplinaire."
 
-#: udata/core/access_type/constants.py:78
+#: udata/core/access_type/constants.py:82
+msgid "Commercial or industrial confidentiality"
+msgstr "Confidentialité commerciale ou industrielle"
+
+#: udata/core/access_type/constants.py:88
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of commercial or industrial information, where such "
@@ -371,7 +355,11 @@ msgstr ""
 "public pour le maintien de la confidentialité statistique et du secret "
 "fiscal."
 
-#: udata/core/access_type/constants.py:82
+#: udata/core/access_type/constants.py:94
+msgid "Intellectual property rights"
+msgstr "Droits de propriété intellectuelle"
+
+#: udata/core/access_type/constants.py:100
 msgid ""
 "Public access to datasets and services would adversely affect "
 "intellectual property rights."
@@ -379,7 +367,11 @@ msgstr ""
 "L'accès du public aux jeux de données et aux services aurait des "
 "répercussions négatives sur les droits de propriété intellectuelle."
 
-#: udata/core/access_type/constants.py:86
+#: udata/core/access_type/constants.py:106
+msgid "Personal data confidentiality"
+msgstr "Confidentialité des données personnelles"
+
+#: udata/core/access_type/constants.py:112
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "confidentiality of personal data and/or files relating to a natural "
@@ -393,7 +385,11 @@ msgstr ""
 "divulgation de l'information au public, lorsque cette confidentialité est"
 " prévue par le droit national ou communautaire."
 
-#: udata/core/access_type/constants.py:90
+#: udata/core/access_type/constants.py:118
+msgid "Protection of voluntary information suppliers"
+msgstr "Protection des fournisseurs d'informations volontaires"
+
+#: udata/core/access_type/constants.py:124
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "interests or protection of any person who supplied the information "
@@ -407,7 +403,11 @@ msgstr ""
 "pouvant être soumis, une obligation légale de le faire, à moins que cette"
 " personne ait consenti à la divulgation des renseignements concernés."
 
-#: udata/core/access_type/constants.py:94
+#: udata/core/access_type/constants.py:130
+msgid "Environmental protection"
+msgstr "Protection de l'environnement"
+
+#: udata/core/access_type/constants.py:136
 msgid ""
 "Public access to datasets and services would adversely affect the "
 "protection of the environment to which such information relates, such as "
@@ -531,20 +531,20 @@ msgstr "a supprimé une API"
 msgid "Latest APIs"
 msgstr "Dernières APIs"
 
-#: udata/core/dataservices/models.py:43
+#: udata/core/dataservices/models.py:45
 msgid "Dataservice serving high value datasets"
 msgstr "API servant des jeux de données de haute valeur"
 
-#: udata/core/dataservices/models.py:211
+#: udata/core/dataservices/models.py:213
 msgid "dataservice"
 msgstr "API"
 
-#: udata/core/dataservices/models.py:294 udata/core/dataset/models.py:622
+#: udata/core/dataservices/models.py:296 udata/core/dataset/models.py:622
 #: udata/mongo/datetime_fields.py:61
 msgid "Creation date"
 msgstr "Date de création"
 
-#: udata/core/dataservices/models.py:301 udata/core/dataset/models.py:628
+#: udata/core/dataservices/models.py:303 udata/core/dataset/models.py:628
 #: udata/mongo/datetime_fields.py:68
 msgid "Last modification date"
 msgstr "Date de dernière modification"
@@ -573,16 +573,16 @@ msgstr "a mis à jour une ressource"
 msgid "removed a resource from a dataset"
 msgstr "a supprimé une ressource d'un jeu de données"
 
-#: udata/core/dataset/api.py:346
+#: udata/core/dataset/api.py:352
 #, python-brace-format
 msgid "Datasets search: {q}"
 msgstr "Recherche de jeux de données : {q}"
 
-#: udata/core/dataset/api.py:348
+#: udata/core/dataset/api.py:354
 msgid "Filtered datasets"
 msgstr "Jeux de données filtrés"
 
-#: udata/core/dataset/api.py:350
+#: udata/core/dataset/api.py:356
 msgid "Latest datasets"
 msgstr "Derniers jeux de données"
 
@@ -854,7 +854,7 @@ msgstr "La taille du fichier en octets"
 msgid "Related dataset"
 msgstr "Jeu de données concerné"
 
-#: udata/core/dataset/forms.py:147 udata/tests/api/test_datasets_api.py:1100
+#: udata/core/dataset/forms.py:147 udata/tests/api/test_datasets_api.py:1113
 msgid "Wrong contact point id or contact point ownership mismatch"
 msgstr ""
 "Mauvais ID de point de contact ou incompatibilité de possession du point "
@@ -974,15 +974,15 @@ msgstr "Séries statistiques reconnues d’intérêt général"
 msgid "A schema must contains a name or an URL when a version is provided."
 msgstr "Un schéma doit contenir un nom ou une URL lorsqu'une version est fournie."
 
-#: udata/core/dataset/models.py:215 udata/tests/api/test_datasets_api.py:1196
-#: udata/tests/api/test_datasets_api.py:1207
+#: udata/core/dataset/models.py:215 udata/tests/api/test_datasets_api.py:1209
+#: udata/tests/api/test_datasets_api.py:1220
 #, python-brace-format
 msgid "Schema name \"{schema}\" is not an allowed value. Allowed values: {values}"
 msgstr ""
 "Le nom du schéma \"{schema}\" n'est pas une valeur autorisée. Valeurs "
 "autorisées : {values}"
 
-#: udata/core/dataset/models.py:234 udata/tests/api/test_datasets_api.py:1219
+#: udata/core/dataset/models.py:234 udata/tests/api/test_datasets_api.py:1232
 #, python-brace-format
 msgid ""
 "Version \"{version}\" is not an allowed value for the schema \"{name}\". "
@@ -991,9 +991,9 @@ msgstr ""
 "La version \"{version}\" n'est pas une valeur autorisée pour le schéma "
 "\"{name}\". Versions autorisées : {values}"
 
-#: udata/core/dataset/models.py:478 udata/core/dataset/rdf.py:596
-#: udata/tests/dataset/test_dataset_rdf.py:1007
-#: udata/tests/dataset/test_dataset_rdf.py:1020
+#: udata/core/dataset/models.py:478 udata/core/dataset/rdf.py:646
+#: udata/tests/dataset/test_dataset_rdf.py:1012
+#: udata/tests/dataset/test_dataset_rdf.py:1025
 msgid "Nameless resource"
 msgstr "Ressource sans nom"
 
@@ -1009,8 +1009,8 @@ msgstr "Dernière mise à jour des ressources de ce jeu de données"
 msgid "dataset"
 msgstr "jeu de données"
 
-#: udata/core/dataset/rdf.py:594 udata/tests/dataset/test_dataset_rdf.py:977
-#: udata/tests/dataset/test_dataset_rdf.py:994
+#: udata/core/dataset/rdf.py:644 udata/tests/dataset/test_dataset_rdf.py:982
+#: udata/tests/dataset/test_dataset_rdf.py:999
 #, python-brace-format
 msgid "{format} resource"
 msgstr "Ressource {format}"
@@ -1080,11 +1080,11 @@ msgstr ""
 msgid "View the discussion"
 msgstr "Voir la discussion"
 
-#: udata/core/discussions/models.py:35
+#: udata/core/discussions/models.py:36
 msgid "message"
 msgstr "message"
 
-#: udata/core/discussions/models.py:93
+#: udata/core/discussions/models.py:94
 msgid "discussion"
 msgstr "discussion"
 
@@ -1499,27 +1499,31 @@ msgstr "Page"
 msgid "post"
 msgstr "article"
 
-#: udata/core/reports/constants.py:22
+#: udata/core/reports/constants.py:23
+msgid "Auto-detected spam"
+msgstr ""
+
+#: udata/core/reports/constants.py:24
 msgid "Explicit content"
 msgstr "Contenu inapproprié"
 
-#: udata/core/reports/constants.py:23
+#: udata/core/reports/constants.py:25
 msgid "Illegal content"
 msgstr "Contenu illégal"
 
-#: udata/core/reports/constants.py:24 udata/core/reuse/constants.py:29
+#: udata/core/reports/constants.py:26 udata/core/reuse/constants.py:29
 msgid "Others"
 msgstr "Autres"
 
-#: udata/core/reports/constants.py:25
+#: udata/core/reports/constants.py:27
 msgid "Personal data"
 msgstr "Données personnelles"
 
-#: udata/core/reports/constants.py:26
+#: udata/core/reports/constants.py:28
 msgid "Security"
 msgstr "Sécurité"
 
-#: udata/core/reports/constants.py:27
+#: udata/core/reports/constants.py:29
 msgid "Spam"
 msgstr "Spam"
 
@@ -1644,11 +1648,11 @@ msgstr "Titre de la réutilisation :"
 msgid "View the reuse"
 msgstr "Voir la réutilisation"
 
-#: udata/core/reuse/models.py:58
+#: udata/core/reuse/models.py:59
 msgid "This URL is already registered"
 msgstr "Cette URL est déjà enregistrée"
 
-#: udata/core/reuse/models.py:215
+#: udata/core/reuse/models.py:216
 msgid "reuse"
 msgstr "réutilisation"
 
@@ -1817,7 +1821,7 @@ msgstr "À propos"
 msgid "Roles"
 msgstr "Rôles"
 
-#: udata/core/user/mails.py:10 udata/tests/api/test_me_api.py:295
+#: udata/core/user/mails.py:10 udata/tests/api/test_me_api.py:372
 msgid "Account deletion"
 msgstr "Suppression de compte"
 
@@ -1876,7 +1880,7 @@ msgstr ""
 "vous aurez toujours la possibilité de recréer un compte sur la plateforme"
 " %(site)s."
 
-#: udata/core/user/models.py:154
+#: udata/core/user/models.py:148
 msgid "account"
 msgstr "compte"
 
@@ -1948,18 +1952,22 @@ msgstr "Modèle pour {0} non trouvé"
 msgid "Unknown identifiers: {identifiers}"
 msgstr "Identifiants inconnus : {identifiers}"
 
-#: udata/forms/fields.py:732
+#: udata/forms/fields.py:724 udata/forms/fields.py:727
+msgid "Date must be a string"
+msgstr ""
+
+#: udata/forms/fields.py:736
 msgid "Unable to parse date range"
 msgstr "Incapable de comprendre la date"
 
-#: udata/forms/fields.py:764 udata/forms/fields.py:796
+#: udata/forms/fields.py:768 udata/forms/fields.py:800
 #: udata/tests/forms/test_publish_as_field.py:214
 msgid "Cannot change owner after creation. Please use transfer feature."
 msgstr ""
 "Impossible de modifier le propriétaire après la création. Veuillez "
 "utiliser la fonctionnalité de transfert."
 
-#: udata/forms/fields.py:769 udata/forms/fields.py:801
+#: udata/forms/fields.py:773 udata/forms/fields.py:805
 msgid "You must be authenticated"
 msgstr "Vous devez être authentifié"
 
