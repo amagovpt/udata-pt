@@ -184,7 +184,7 @@ msgstr "Por favor, confirme o seu endereço de e-mail."
 
 #: udata/auth/mails.py:82
 msgid "Account information"
-msgstr ""
+msgstr "Informações da conta"
 
 #: udata/auth/mails.py:85
 #, python-format
@@ -192,6 +192,8 @@ msgid ""
 "You received this email because a registration was attempted on %(site)s "
 "with your email address."
 msgstr ""
+"Recebeu este e-mail porque foi tentado um registo em %(site)s com o seu "
+"endereço de e-mail."
 
 #: udata/auth/mails.py:88
 msgid "If you forgot your password, you can reset it."
