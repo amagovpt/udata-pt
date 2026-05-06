@@ -42,7 +42,9 @@ from saml2.sigver import SignatureError
 # autenticacao.gov uses C14N 1.0 (http://www.w3.org/TR/2001/REC-xml-c14n-20010315)
 # but pysaml2 only allows Exclusive C14N by default. Add C14N 1.0 to allowed sets.
 _C14N_INCLUSIVE = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
-_C14N_INCLUSIVE_WITH_COMMENTS = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+_C14N_INCLUSIVE_WITH_COMMENTS = (
+    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+)
 ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
@@ -131,7 +133,9 @@ def _hash_nic(nic):
 def _is_nic_hashed(nic_value):
     """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
     return bool(
-        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
+        nic_value
+        and len(nic_value) == 64
+        and all(c in "0123456789abcdef" for c in nic_value)
     )
 
 
@@ -143,7 +147,9 @@ def _merge_nic_into_user(user, user_nic):
         user.extras = {}
     user.extras["auth_nic"] = _hash_nic(user_nic)
     user.save()
-    current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
+    current_app.logger.info(
+        f"SAML: NIC merged into existing account {user.email} (id={user.id})"
+    )
 
 
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
@@ -229,6 +235,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
 def _handle_saml_user_login(user):
     """Handle login/redirect after SAML authentication."""
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    next_path = session.pop("saml_next_url", "")
 
     if user is None:
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
@@ -245,7 +252,8 @@ def _handle_saml_user_login(user):
 
     login_user(user)
     session["saml_login"] = True
-    return redirect(frontend_url or "/")
+    destination = f"{frontend_url}{next_path}" if next_path else (frontend_url or "/")
+    return redirect(destination)
 
 
 def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name):
@@ -395,6 +403,10 @@ def saml_client_for(metadata_file):
 @autenticacao_gov.route("/saml/login")
 @anonymous_user_required
 def sp_initiated():
+    next_url = request.args.get("next", "")
+    if next_url.startswith("/") and not next_url.startswith("//"):
+        session["saml_next_url"] = next_url
+
     saml_client = saml_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
     )
@@ -490,8 +502,12 @@ def idp_initiated():
                     msg_text = status_msg.text if status_msg is not None else None
                     # Also check for a nested sub-status code (e.g. RequestDenied)
                     sub_code = status_code.find("samlp:StatusCode", ns)
-                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
-                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
+                    sub_value = (
+                        sub_code.attrib.get("Value", "") if sub_code is not None else ""
+                    )
+                    display_msg = (
+                        msg_text or sub_value.rsplit(":", 1)[-1] or status_value
+                    )
                     current_app.logger.error(
                         f"SAML: IdP rejeitou o pedido: "
                         f"status={status_value}, sub={sub_value}, msg={msg_text}"
@@ -546,9 +562,15 @@ def idp_initiated():
                 user_email = _first_value(
                     identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
                 )
-                user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-                first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-                last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+                user_nic = _first_value(
+                    identity, "http://interop.gov.pt/MDC/Cidadao/NIC"
+                )
+                first_name = _first_value(
+                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
+                )
+                last_name = _first_value(
+                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+                )
                 current_app.logger.info(
                     f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
                     f"nome={first_name} {last_name}"
@@ -571,7 +593,9 @@ def idp_initiated():
 
     # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
     if not user_email and not user_nic:
-        current_app.logger.info("pysaml2 não extraiu atributos, a tentar parsing manual do XML")
+        current_app.logger.info(
+            "pysaml2 não extraiu atributos, a tentar parsing manual do XML"
+        )
         try:
             decoded_response = base64.b64decode(raw_saml_response)
             root = None
@@ -596,13 +620,22 @@ def idp_initiated():
                             value = child.find(".//assertion:AttributeValue", ns)
                             if value is None or value.text is None:
                                 continue
-                            if attr_name == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico":
+                            if (
+                                attr_name
+                                == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+                            ):
                                 user_email = value.text
                             elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NIC":
                                 user_nic = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NomeProprio":
+                            elif (
+                                attr_name
+                                == "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
+                            ):
                                 first_name = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NomeApelido":
+                            elif (
+                                attr_name
+                                == "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+                            ):
                                 last_name = value.text
                         except (AttributeError, KeyError):
                             pass
@@ -625,10 +658,16 @@ def idp_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    user, status = _find_or_create_saml_user(
+        user_email, user_nic, first_name, last_name
+    )
 
-    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
-        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+    if status == "migration_candidate" and current_app.config.get(
+        "MIGRATION_MODE_ENABLED", False
+    ):
+        return _handle_migration_redirect(
+            user, user_email, user_nic, first_name, last_name
+        )
 
     return _handle_saml_user_login(user)
 
@@ -644,7 +683,11 @@ def saml_logout_postback():
 
     if saml_response:
         auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
-        binding = entity.BINDING_HTTP_POST if request.method == "POST" else BINDING_HTTP_REDIRECT
+        binding = (
+            entity.BINDING_HTTP_POST
+            if request.method == "POST"
+            else BINDING_HTTP_REDIRECT
+        )
 
         for server in auth_servers:
             saml_client = saml_client_for(server)
@@ -676,7 +719,9 @@ def saml_logout():
         text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
     )
 
-    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.saml_logout_postback", _external=True)))
+    logout_url = LogoutUrl(
+        text=_force_scheme(url_for("saml.saml_logout_postback", _external=True))
+    )
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
     extensions = Extensions(extension_elements=[logout_url])
@@ -718,6 +763,10 @@ def eidas_client_for(metadata_file):
 @autenticacao_gov.route("/saml/eidas/login")
 @anonymous_user_required
 def sp_eidas_initiated():
+    next_url = request.args.get("next", "")
+    if next_url.startswith("/") and not next_url.startswith("//"):
+        session["saml_next_url"] = next_url
+
     saml_client = eidas_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
     )
@@ -819,7 +868,9 @@ def idp_eidas_initiated():
             current_app.logger.error(f"eIDAS SignatureError para {server}: {se}")
             continue
         except Exception as e:
-            current_app.logger.error(f"Erro ao processar resposta eIDAS com {server}: {e}")
+            current_app.logger.error(
+                f"Erro ao processar resposta eIDAS com {server}: {e}"
+            )
             continue
         else:
             break
@@ -832,19 +883,29 @@ def idp_eidas_initiated():
                 user_email = _first_value(
                     identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
                 )
-                user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-                first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-                last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+                user_nic = _first_value(
+                    identity, "http://interop.gov.pt/MDC/Cidadao/NIC"
+                )
+                first_name = _first_value(
+                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
+                )
+                last_name = _first_value(
+                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+                )
                 current_app.logger.info(
                     f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
                     f"nome={first_name} {last_name}"
                 )
         except Exception as e:
-            current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
+            current_app.logger.warning(
+                f"Falha ao extrair identity do pysaml2 (eIDAS): {e}"
+            )
 
     # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
     if not user_email and not user_nic:
-        current_app.logger.info("eIDAS: pysaml2 não extraiu atributos, a tentar parsing manual")
+        current_app.logger.info(
+            "eIDAS: pysaml2 não extraiu atributos, a tentar parsing manual"
+        )
         try:
             decoded_response = base64.b64decode(raw_saml_response)
             root = None
@@ -869,13 +930,22 @@ def idp_eidas_initiated():
                             value = child.find(".//assertion:AttributeValue", ns)
                             if value is None or value.text is None:
                                 continue
-                            if attr_name == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico":
+                            if (
+                                attr_name
+                                == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+                            ):
                                 user_email = value.text
                             elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NIC":
                                 user_nic = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NomeProprio":
+                            elif (
+                                attr_name
+                                == "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
+                            ):
                                 first_name = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NomeApelido":
+                            elif (
+                                attr_name
+                                == "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+                            ):
                                 last_name = value.text
                         except (AttributeError, KeyError):
                             pass
@@ -898,10 +968,16 @@ def idp_eidas_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    user, status = _find_or_create_saml_user(
+        user_email, user_nic, first_name, last_name
+    )
 
-    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
-        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+    if status == "migration_candidate" and current_app.config.get(
+        "MIGRATION_MODE_ENABLED", False
+    ):
+        return _handle_migration_redirect(
+            user, user_email, user_nic, first_name, last_name
+        )
 
     return _handle_saml_user_login(user)
 
@@ -916,7 +992,11 @@ def eidas_logout_postback():
 
     if saml_response:
         auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
-        binding = entity.BINDING_HTTP_POST if request.method == "POST" else BINDING_HTTP_REDIRECT
+        binding = (
+            entity.BINDING_HTTP_POST
+            if request.method == "POST"
+            else BINDING_HTTP_REDIRECT
+        )
 
         for server in auth_servers:
             saml_client = eidas_client_for(server)
