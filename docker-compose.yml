@@ -1,7 +1,11 @@
 services:
   app:
     container_name: udata-backend-app
-    build: .
+    build:
+      context: .
+      args:
+        UDATA_UID: ${UDATA_UID:-10001}
+        UDATA_GID: ${UDATA_GID:-10001}
     command: uv run uwsgi --ini uwsgi/front.ini
     ports:
       - '7000:7000'
@@ -19,7 +23,11 @@ services:
 
   worker:
     container_name: udata-backend-worker
-    build: .
+    build:
+      context: .
+      args:
+        UDATA_UID: ${UDATA_UID:-10001}
+        UDATA_GID: ${UDATA_GID:-10001}
     command: uv run celery -A udata.worker worker --events --concurrency=4 -l info
     volumes:
       - ./udata.cfg:/app/udata.cfg:ro
@@ -35,7 +43,11 @@ services:
 
   beat:
     container_name: udata-backend-beat
-    build: .
+    build:
+      context: .
+      args:
+        UDATA_UID: ${UDATA_UID:-10001}
+        UDATA_GID: ${UDATA_GID:-10001}
     command: uv run celery -A udata.worker beat -l info
     volumes:
       - ./udata.cfg:/app/udata.cfg:ro

@@ -23,16 +23,17 @@ RUN curl -LsSf https://astral.sh/uv/install.sh \
 
 # Non-root runtime user. Fixed UID/GID so bind-mounted volumes
 # (FS_ROOT, logs, SAML credentials) can be chown'ed predictably on the host.
+# Host must have a matching `dadosgov` user with UID/GID 10001.
 ARG UDATA_UID=10001
 ARG UDATA_GID=10001
-RUN groupadd --system --gid ${UDATA_GID} udata \
+RUN groupadd --system --gid ${UDATA_GID} dadosgov \
     && useradd --system --uid ${UDATA_UID} --gid ${UDATA_GID} \
-       --home-dir /app --shell /sbin/nologin udata
+       --home-dir /app --shell /sbin/nologin dadosgov
 
 WORKDIR /app
 
 # Trust the /app directory for git (setuptools-scm needs it for versioning).
-# --system makes it visible to both root (at build time) and udata (at runtime).
+# --system makes it visible to both root (at build time) and dadosgov (at runtime).
 RUN git config --system --add safe.directory /app
 
 # Copy dependency files first for better layer caching
@@ -57,7 +58,7 @@ RUN chmod +x /docker-entrypoint.sh
 # Hand ownership of every path the runtime needs to read/write to the
 # non-root user (application code + generated .venv, logs, FS_ROOT mount
 # point and uwsgi runtime dir).
-RUN chown -R udata:udata /app /logs /dadosgov /var/run/uwsgi
+RUN chown -R dadosgov:dadosgov /app /logs /dadosgov /var/run/uwsgi
 
 # Default environment
 ENV UDATA_SETTINGS=/app/udata.cfg
@@ -65,7 +66,7 @@ ENV PYTHONPATH=/app
 
 EXPOSE 7000
 
-USER udata
+USER dadosgov
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # Default command: run the web server via uWSGI
