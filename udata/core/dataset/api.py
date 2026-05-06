@@ -19,7 +19,7 @@ These changes might lead to backward compatibility breakage meaning:
 
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import mongoengine
 from bson.objectid import ObjectId
@@ -30,7 +30,9 @@ from flask_security import current_user
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
+from udata.api.limits import CONTENT_CREATE_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core import storages
 from udata.core.access_type.constants import AccessType
@@ -87,6 +89,10 @@ from .models import (
 from .rdf import dataset_to_rdf
 
 DEFAULT_SORTING = "-created_at_internal"
+# Deduplication window for community resource submissions: a user re-posting the
+# exact same URL to the same dataset within this window is rejected with 409.
+# Defense in depth on top of the rate-limit (TICKET-59 / VULN-2078).
+COMMUNITY_RESOURCE_DEDUPE_WINDOW = timedelta(minutes=5)
 SUGGEST_SORTING = "-metrics.followers"
 
 
@@ -323,6 +329,15 @@ catalog_parser.replace_argument(
 class DatasetListAPI(API):
     """Datasets collection endpoint"""
 
+    # Per-user rate-limit on POST to prevent mass-creation abuse (TICKET-59).
+    decorators = [
+        limiter.limit(
+            CONTENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc("list_datasets")
     @api.expect(dataset_parser.parser)
     @api.marshal_with(dataset_page_fields)
@@ -553,6 +568,16 @@ class ResourceRedirectAPI(API):
 
 @ns.route("/<dataset:dataset>/resources/", endpoint="resources")
 class ResourcesAPI(API):
+    # Per-user rate-limit on POST to prevent mass-creation abuse (TICKET-59).
+    # PUT (re-order) and DELETE remain unaffected — limit is method-scoped.
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("create_resource", **common_doc, responses={400: "Validation error"})
     @api.expect(resource_fields)
@@ -622,6 +647,15 @@ class UploadMixin(object):
 @ns.route("/<dataset:dataset>/upload/", endpoint="upload_new_dataset_resource")
 @api.doc(**common_doc)
 class UploadNewDatasetResource(UploadMixin, API):
+    # Per-user rate-limit on file upload to prevent abuse (TICKET-59).
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc(
         "upload_new_dataset_resource",
@@ -641,6 +675,17 @@ class UploadNewDatasetResource(UploadMixin, API):
 @ns.route("/<dataset:dataset>/upload/community/", endpoint="upload_new_community_resource")
 @api.doc(**common_doc)
 class UploadNewCommunityResources(UploadMixin, API):
+    # Per-user rate-limit on community resource upload (TICKET-59 / VULN-2078).
+    # Tighter than UPLOAD_LIMIT because community resources are publicly
+    # visible content, not just files attached to a dataset.
+    decorators = [
+        limiter.limit(
+            CONTENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc(
         "upload_new_community_resource",
@@ -780,6 +825,16 @@ class ResourceAPI(ResourceMixin, API):
 
 @ns.route("/community_resources/", endpoint="community_resources")
 class CommunityResourcesAPI(API):
+    # Per-user rate-limit on POST to prevent mass-submission abuse (VULN-2078).
+    # GET (listing) is unaffected because the limit is method-scoped.
+    decorators = [
+        limiter.limit(
+            CONTENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc("list_community_resources")
     @api.expect(community_parser)
     @api.marshal_with(community_resource_page_fields)
@@ -796,7 +851,14 @@ class CommunityResourcesAPI(API):
         return community_resources.order_by(args["sort"]).paginate(args["page"], args["page_size"])
 
     @api.secure
-    @api.doc("create_community_resource", responses={400: "Validation error"})
+    @api.doc(
+        "create_community_resource",
+        responses={
+            400: "Validation error",
+            409: "Duplicate community resource recently submitted",
+            429: "Rate limit exceeded",
+        },
+    )
     @api.expect(community_resource_fields)
     @api.marshal_with(community_resource_fields, code=201)
     def post(self):
@@ -810,6 +872,22 @@ class CommunityResourcesAPI(API):
             api.abort(400, errors={"dataset": "A dataset identifier is required"})
         if not resource.organization:
             resource.owner = current_user._get_current_object()
+
+        # Reject duplicate submissions of the same URL on the same dataset by
+        # the same actor inside the dedupe window — see VULN-2078 PoC where
+        # 100+ identical entries flooded a dataset.
+        window_start = datetime.now(UTC) - COMMUNITY_RESOURCE_DEDUPE_WINDOW
+        if (
+            CommunityResource.objects(
+                dataset=resource.dataset,
+                url=resource.url,
+                owner=current_user._get_current_object(),
+                created_at_internal__gte=window_start,
+            ).first()
+            is not None
+        ):
+            api.abort(409, "Duplicate community resource recently submitted")
+
         resource.last_modified_internal = datetime.now(UTC)
         resource.save()
         return resource, 201

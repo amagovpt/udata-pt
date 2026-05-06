@@ -7,8 +7,10 @@ from flask import make_response, request
 from flask_login import current_user
 
 from udata.api import API, api, errors
+from udata.api.limits import CONTENT_CREATE_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
 from udata.api_fields import patch, patch_and_save
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.badges import api as badges_api
 from udata.core.badges.models import Badge
@@ -124,6 +126,15 @@ reuse_parser = ReuseApiParser()
 
 @ns.route("/", endpoint="reuses")
 class ReuseListAPI(API):
+    # Per-user rate-limit on POST to prevent mass-creation abuse (TICKET-59).
+    decorators = [
+        limiter.limit(
+            CONTENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc("list_reuses")
     @api.expect(Reuse.__index_parser__)
     @api.marshal_with(Reuse.__page_fields__)

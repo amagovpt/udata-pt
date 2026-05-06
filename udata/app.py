@@ -37,9 +37,17 @@ log = logging.getLogger(__name__)
 
 cache = Cache()
 csrf = CSRFProtect()
+# Rate limiter — IP-keyed global ceiling to protect against a single source
+# overwhelming the API. Per-endpoint, per-user limits are applied through the
+# `decorators` attribute on individual API resources, using the `user_or_ip`
+# key from `udata.api.limits` (TICKET-59).
+#
+# Production deploys MUST set RATELIMIT_STORAGE_URI to a Redis URL; otherwise
+# the in-memory backend does not share state across gunicorn workers and the
+# effective limits become per-worker.
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=["10000 per day", "5000 per hour"],
+    default_limits=["1000 per day", "200 per hour"],
     storage_uri="memory://",
 )
 

@@ -2645,6 +2645,66 @@ class CommunityResourceAPITest(APITestCase):
         self.assertEqual(CommunityResource.objects.count(), 0)
         self.assertEqual(list(storages.resources.list_files()), [])
 
+    def test_community_resource_api_create_remote_dedupes_recent_duplicates(self):
+        """Re-posting the same URL on the same dataset within the dedupe window
+        returns 409, defending against duplicate-submission abuse on top of
+        the rate-limit (TICKET-59 / VULN-2078).
+        """
+        from udata.app import limiter
+
+        limiter.reset()
+        self.login()
+        dataset = DatasetFactory()
+
+        attrs = CommunityResourceFactory.as_dict()
+        attrs["filetype"] = "remote"
+        attrs["dataset"] = str(dataset.id)
+        attrs["url"] = "https://example.com/duplicate.csv"
+
+        # First submission succeeds.
+        response = self.post(url_for("api.community_resources"), attrs)
+        self.assert201(response)
+
+        # Second submission with the same URL on the same dataset is rejected.
+        response = self.post(url_for("api.community_resources"), attrs)
+        self.assertStatus(response, 409)
+
+        # Only the first resource was persisted.
+        self.assertEqual(CommunityResource.objects.count(), 1)
+
+    def test_community_resource_api_create_remote_rate_limited(self):
+        """Mass-submission of remote community resources is throttled per user.
+
+        Regression test for TICKET-59 / VULN-2078: previously the endpoint
+        had no per-endpoint rate-limit, allowing automated submission of
+        100+ resources in seconds.
+        """
+        from udata.app import limiter
+
+        limiter.reset()
+        self.login()
+        dataset = DatasetFactory()
+
+        # First 5 submissions in the same minute pass.
+        for i in range(5):
+            attrs = CommunityResourceFactory.as_dict()
+            attrs["filetype"] = "remote"
+            attrs["dataset"] = str(dataset.id)
+            attrs["url"] = f"https://example.com/file-{i}.csv"
+            response = self.post(url_for("api.community_resources"), attrs)
+            self.assert201(response)
+
+        # The 6th submission within the per-minute window is rejected.
+        attrs = CommunityResourceFactory.as_dict()
+        attrs["filetype"] = "remote"
+        attrs["dataset"] = str(dataset.id)
+        attrs["url"] = "https://example.com/file-overflow.csv"
+        response = self.post(url_for("api.community_resources"), attrs)
+        self.assertStatus(response, 429)
+
+        # No extra resource was persisted.
+        self.assertEqual(CommunityResource.objects.count(), 5)
+
 
 class ResourcesTypesAPITest(APITestCase):
     def test_resource_types_list(self):

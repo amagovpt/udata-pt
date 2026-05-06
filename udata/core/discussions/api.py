@@ -5,6 +5,8 @@ from flask_restx.inputs import boolean
 from flask_security import current_user
 
 from udata.api import API, api, fields
+from udata.api.limits import COMMENT_CREATE_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.models import Dataset
 from udata.core.legal.mails import add_send_legal_notice_argument, send_legal_notice_on_deletion
@@ -164,6 +166,15 @@ class DiscussionAPI(API):
     Base class for a discussion thread.
     """
 
+    # Per-user rate-limit on POST (comment) to prevent spam (TICKET-59).
+    decorators = [
+        limiter.limit(
+            COMMENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc("get_discussion")
     @api.marshal_with(discussion_fields)
     def get(self, id):
@@ -301,6 +312,15 @@ class DiscussionsAPI(API):
     """
     Base class for a list of discussions.
     """
+
+    # Per-user rate-limit on POST (start a new discussion) (TICKET-59).
+    decorators = [
+        limiter.limit(
+            COMMENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
 
     @api.doc("list_discussions")
     @api.expect(parser)
