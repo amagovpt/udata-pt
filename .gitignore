@@ -1,6 +1,9 @@
 *.py[cod]
 *~
 
+# Bind-mounted log directory (uwsgi writes /logs/app.logs here)
+/logs/
+
 # C extensions
 *.so
 
