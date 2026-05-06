@@ -1,3 +1,6 @@
+from datetime import datetime, timezone
+from pathlib import Path
+
 from flask import current_app, json, make_response, redirect, request, url_for
 
 from udata.api import API, api, fields
@@ -365,3 +368,96 @@ def get_export_url(model):
     if not resource:
         api.abort(404)
     return resource.url
+
+
+LOG_TAIL_MAX_BYTES = 1 * 1024 * 1024  # 1 MB returned at most
+
+
+def _resolve_log_dir() -> Path:
+    """Return the configured log directory, falling back to /logs then ./logs."""
+    configured = current_app.config.get("LOG_DIR")
+    if configured:
+        return Path(configured)
+    container_path = Path("/logs")
+    if container_path.is_dir():
+        return container_path
+    # Fallback for local dev: backend/logs (sibling of the udata package root)
+    return Path(current_app.root_path).parent / "logs"
+
+
+def _log_file_meta(path: Path) -> dict:
+    stat = path.stat()
+    return {
+        "name": path.name,
+        "size": stat.st_size,
+        "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
+@api.route("/site/logs/", endpoint="site_logs")
+class SiteLogsAPI(API):
+    @api.secure(admin_permission)
+    @api.doc(id="list_site_logs")
+    def get(self):
+        """List log files available on the host (admin only)."""
+        log_dir = _resolve_log_dir()
+        if not log_dir.is_dir():
+            return []
+        files = []
+        for entry in sorted(log_dir.iterdir(), key=lambda p: p.name):
+            if not entry.is_file():
+                continue
+            try:
+                files.append(_log_file_meta(entry))
+            except OSError:
+                continue
+        return files
+
+
+@api.route("/site/logs/<string:filename>/", endpoint="site_log_content")
+class SiteLogContentAPI(API):
+    @api.secure(admin_permission)
+    @api.doc(id="get_site_log_content")
+    def get(self, filename: str):
+        """Return the (tailed) content of a log file (admin only)."""
+        # Reject any path traversal attempt outright
+        if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+            api.abort(400, "Invalid log filename")
+
+        log_dir = _resolve_log_dir()
+        if not log_dir.is_dir():
+            api.abort(404, "Log directory not available")
+
+        target = log_dir / filename
+        try:
+            resolved = target.resolve(strict=True)
+            log_dir_resolved = log_dir.resolve()
+            resolved.relative_to(log_dir_resolved)
+        except (FileNotFoundError, ValueError, OSError):
+            api.abort(404, "Log file not found")
+
+        if not resolved.is_file():
+            api.abort(404, "Log file not found")
+
+        stat = resolved.stat()
+        size = stat.st_size
+        truncated = False
+        try:
+            with open(resolved, "rb") as f:
+                if size > LOG_TAIL_MAX_BYTES:
+                    f.seek(size - LOG_TAIL_MAX_BYTES)
+                    f.readline()  # discard partial first line
+                    raw = f.read()
+                    truncated = True
+                else:
+                    raw = f.read()
+        except OSError:
+            api.abort(500, "Could not read log file")
+
+        return {
+            "name": resolved.name,
+            "size": size,
+            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            "truncated": truncated,
+            "content": raw.decode("utf-8", errors="replace"),
+        }
