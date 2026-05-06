@@ -1,7 +1,7 @@
 import os
 from datetime import UTC, datetime
 
-from flask import json
+from flask import current_app, json
 from werkzeug.datastructures import FileStorage
 
 from udata.api import api, fields
@@ -18,13 +18,17 @@ uploaded_image_fields = api.model(
     "UploadedImage",
     {
         "success": fields.Boolean(
-            description="Whether the upload succeeded or not.", readonly=True, default=True
+            description="Whether the upload succeeded or not.",
+            readonly=True,
+            default=True,
         ),
         "image": fields.ImageField(),
     },
 )
 
-chunk_status_fields = api.model("UploadStatus", {"success": fields.Boolean, "error": fields.String})
+chunk_status_fields = api.model(
+    "UploadStatus", {"success": fields.Boolean, "error": fields.String}
+)
 
 
 image_parser = api.parser()
@@ -148,7 +152,9 @@ def handle_upload(storage, prefix=None):
     else:
         # Normalize filename including extension
         filename = utils.normalize(uploaded_file.filename)
-        fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename, overwrite=True)
+        fs_filename = storage.save(
+            uploaded_file, prefix=prefix, filename=filename, overwrite=True
+        )
 
     metadata = storage.metadata(fs_filename)
     metadata["last_modified_internal"] = metadata.pop("modified")
@@ -158,9 +164,20 @@ def handle_upload(storage, prefix=None):
     metadata[algo] = checksum
     metadata["format"] = utils.extension(fs_filename)
 
+    # Validate extension against the allowed list
+    ext = metadata["format"].lower()
+    allowed = [
+        e.lower() for e in current_app.config.get("ALLOWED_RESOURCES_EXTENSIONS", [])
+    ]
+    if ext and ext not in allowed:
+        storage.delete(fs_filename)
+        api.abort(415, f"File extension '.{ext}' is not allowed.")
+
     # Validate file content against malicious payloads
     filepath = storage.path(fs_filename)
-    error = validate_upload(filepath, metadata.get("mime", ""), metadata.get("format", ""))
+    error = validate_upload(
+        filepath, metadata.get("mime", ""), metadata.get("format", "")
+    )
     if error:
         api.abort(415, error)
 
