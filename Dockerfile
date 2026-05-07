@@ -28,7 +28,7 @@ ARG UDATA_UID=10001
 ARG UDATA_GID=10001
 RUN groupadd --system --gid ${UDATA_GID} dadosgov \
     && useradd --system --uid ${UDATA_UID} --gid ${UDATA_GID} \
-       --home-dir /app --shell /sbin/nologin dadosgov
+       --no-create-home --home-dir /app --shell /sbin/nologin dadosgov
 
 WORKDIR /app
 
