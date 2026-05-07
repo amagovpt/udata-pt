@@ -6,7 +6,9 @@ from flask_restx import marshal
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
+from udata.api.limits import HEAVY_CREATE_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
+from udata.app import limiter
 from udata.auth import admin_permission, current_user
 from udata.core import csv
 from udata.core.badges import api as badges_api
@@ -139,6 +141,16 @@ common_doc = {"params": {"org": "The organization ID or slug"}}
 @ns.route("/", endpoint="organizations")
 class OrganizationListAPI(API):
     """Organizations collection endpoint"""
+
+    # Per-user rate-limit on POST: organization creation should be rare for
+    # legitimate users; HEAVY_CREATE_LIMIT (2/min, 5/h, 10/day) (TICKET-59).
+    decorators = [
+        limiter.limit(
+            HEAVY_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
 
     @api.doc("list_organizations")
     @api.expect(organization_parser.parser)
@@ -783,6 +795,15 @@ class OrganizationSuggestAPI(API):
 @ns.route("/<org:org>/logo/", endpoint="organization_logo")
 @api.doc(**common_doc)
 class AvatarAPI(API):
+    # Per-user rate-limit on POST/PUT (logo upload + resize) (TICKET-59).
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST", "PUT"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("organization_logo")
     @api.expect(image_parser)  # Swagger 2.0 does not support formData at path level

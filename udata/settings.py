@@ -128,8 +128,20 @@ class Defaults(object):
     # If empty, no origin is allowed (CORS with credentials is disabled).
     CORS_ALLOWED_ORIGINS = []
 
-    # Rate limiting storage URI ("memory://" for dev, "redis://..." for production)
+    # Rate limiting storage URI.
+    #
+    # PRODUCTION DEPLOYS MUST OVERRIDE THIS to a Redis URL (e.g.
+    # `redis://redis:6379/1`) — the in-memory backend does NOT share state
+    # across gunicorn workers or replicas, which means a multi-worker deploy
+    # effectively multiplies every limit by the worker count and renders
+    # per-endpoint throttling useless against an attacker who hits any
+    # available worker (TICKET-59 / VULN-2078).
     RATELIMIT_STORAGE_URI = "memory://"
+
+    # Default global rate-limit ceiling — IP-keyed.
+    # Per-endpoint, per-user limits override this for content-creation
+    # endpoints; see `udata/api/limits.py`.
+    RATELIMIT_DEFAULT = "1000 per day;200 per hour"
 
     SECURITY_PASSWORD_SALT = "Default uData secret password salt"
     SECURITY_CONFIRM_SALT = "Default uData secret confirm salt"

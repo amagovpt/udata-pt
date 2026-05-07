@@ -6,7 +6,9 @@ from mongoengine.queryset.visitor import Q
 from slugify import slugify
 
 from udata.api import API, api
+from udata.api.limits import UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.api_token.api import apitoken_created_fields
 from udata.core.api_token.models import ApiToken, parse_future_datetime
@@ -100,6 +102,15 @@ class MeAPI(API):
 
 @me.route("/avatar/", endpoint="my_avatar")
 class AvatarAPI(API):
+    # Per-user rate-limit on POST to prevent storage abuse (TICKET-59).
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("my_avatar")
     @api.expect(image_parser)
