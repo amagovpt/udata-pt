@@ -39,13 +39,13 @@ XML_EXTENSIONS = {"xml", "svg", "svgz", "xhtml", "rdf"}
 # restricted PLAIN_TEXT_DANGEROUS_PATTERNS to avoid false positives on
 # legitimate data (e.g. an "onclick" column value in a CSV).
 DANGEROUS_CONTENT_PATTERNS = {
-    r"<script": "embedded script tag (<script>)",
-    r"javascript:": "JavaScript URI (javascript:)",
-    r"on\w+\s*=": "inline event handler (e.g. onclick, onerror)",
-    r"<iframe": "embedded iframe tag (<iframe>)",
-    r"<object": "embedded object tag (<object>)",
-    r"<embed": "embedded embed tag (<embed>)",
-    r"<foreignobject": "SVG foreignObject element (<foreignObject>)",
+    r"<script": "tag de script embutida (<script>)",
+    r"javascript:": "URI JavaScript (javascript:)",
+    r"on\w+\s*=": "manipulador de eventos inline (ex.: onclick, onerror)",
+    r"<iframe": "tag iframe embutida (<iframe>)",
+    r"<object": "tag object embutida (<object>)",
+    r"<embed": "tag embed embutida (<embed>)",
+    r"<foreignobject": "elemento SVG foreignObject (<foreignObject>)",
 }
 
 # Patterns applied to arbitrary (non-image, non-XML) uploaded files. We only
@@ -53,18 +53,18 @@ DANGEROUS_CONTENT_PATTERNS = {
 # pattern is intentionally omitted because it matches too often on legitimate
 # text data (e.g. a CSV cell with the word "onclick=").
 PLAIN_TEXT_DANGEROUS_PATTERNS = {
-    r"<script": "embedded script tag (<script>)",
-    r"javascript:": "JavaScript URI (javascript:)",
-    r"<iframe": "embedded iframe tag (<iframe>)",
-    r"<object": "embedded object tag (<object>)",
-    r"<embed": "embedded embed tag (<embed>)",
+    r"<script": "tag de script embutida (<script>)",
+    r"javascript:": "URI JavaScript (javascript:)",
+    r"<iframe": "tag iframe embutida (<iframe>)",
+    r"<object": "tag object embutida (<object>)",
+    r"<embed": "tag embed embutida (<embed>)",
 }
 
 # Additional patterns specific to XML files (XXE)
 XXE_PATTERNS = {
-    r"<!entity\s": "XML entity declaration (<!ENTITY>)",
-    r"<!doctype\s[^>]*\[": "DOCTYPE with internal subset (potential XXE)",
-    r"system\s+[\"']": "external entity reference (SYSTEM)",
+    r"<!entity\s": "declaração de entidade XML (<!ENTITY>)",
+    r"<!doctype\s[^>]*\[": "DOCTYPE com subconjunto interno (potencial XXE)",
+    r"system\s+[\"']": "referência a entidade externa (SYSTEM)",
 }
 
 XML_DANGEROUS_PATTERNS = {**DANGEROUS_CONTENT_PATTERNS, **XXE_PATTERNS}
@@ -152,8 +152,9 @@ def validate_upload(filepath, mime, extension):
     if "html" in mime:
         _remove_file(filepath)
         return (
-            f"Upload rejected: '{filename}' has content type '{mime}' which is not allowed. "
-            "HTML files cannot be uploaded as they may contain executable code."
+            f"Carregamento rejeitado: '{filename}' tem o tipo de conteúdo '{mime}' "
+            "que não é permitido. Não é possível carregar ficheiros HTML porque podem "
+            "conter código executável."
         )
 
     # 2. For image files: verify magic bytes match claimed type
@@ -161,17 +162,18 @@ def validate_upload(filepath, mime, extension):
         if not _check_magic_bytes(filepath, mime):
             _remove_file(filepath)
             return (
-                f"Upload rejected: '{filename}' claims to be a '{mime}' image but its "
-                "binary content does not match that format. The file may be corrupted "
-                "or disguised as an image."
+                f"Carregamento rejeitado: '{filename}' indica ser uma imagem '{mime}', "
+                "mas o conteúdo binário não corresponde a esse formato. O ficheiro pode "
+                "estar corrompido ou disfarçado de imagem."
             )
 
         # Verify Pillow can parse it (catches polyglot files)
         if not _validate_image_is_parseable(filepath, mime):
             _remove_file(filepath)
             return (
-                f"Upload rejected: '{filename}' could not be parsed as a valid image. "
-                "The file may be corrupted or contain non-image data."
+                f"Carregamento rejeitado: '{filename}' não pôde ser interpretado como "
+                "uma imagem válida. O ficheiro pode estar corrompido ou conter dados "
+                "que não são de imagem."
             )
 
         # Even for valid images, scan for embedded script content
@@ -181,9 +183,9 @@ def validate_upload(filepath, mime, extension):
             _, description = match
             _remove_file(filepath)
             return (
-                f"Upload rejected: '{filename}' is an image file but contains "
-                f"dangerous embedded content: {description}. "
-                "Files with active content hidden inside images are not allowed."
+                f"Carregamento rejeitado: '{filename}' é um ficheiro de imagem mas "
+                f"contém conteúdo perigoso embutido: {description}. Não são permitidos "
+                "ficheiros com conteúdo ativo escondido dentro de imagens."
             )
 
     # 3. For XML-based files: scan for XSS + XXE patterns
@@ -193,10 +195,10 @@ def validate_upload(filepath, mime, extension):
             _, description = match
             _remove_file(filepath)
             return (
-                f"Upload rejected: '{filename}' (type: {mime or extension}) contains "
-                f"dangerous content: {description}. "
-                "XML-based files with scripts, event handlers, or external entity "
-                "declarations are not allowed."
+                f"Carregamento rejeitado: '{filename}' (tipo: {mime or extension}) "
+                f"contém conteúdo perigoso: {description}. Não são permitidos ficheiros "
+                "XML com scripts, manipuladores de eventos ou declarações de entidades "
+                "externas."
             )
 
     # 4. For all other files: scan for HTML/script injection only (no event
@@ -207,9 +209,9 @@ def validate_upload(filepath, mime, extension):
             _, description = match
             _remove_file(filepath)
             return (
-                f"Upload rejected: '{filename}' (type: {mime or extension}) contains "
-                f"dangerous embedded content: {description}. "
-                "Files with executable code or script injection are not allowed."
+                f"Carregamento rejeitado: '{filename}' (tipo: {mime or extension}) "
+                f"contém conteúdo perigoso embutido: {description}. Não são permitidos "
+                "ficheiros com código executável ou injeção de scripts."
             )
 
     return None
@@ -231,7 +233,10 @@ def validate_image_stream(file_storage):
     file_storage.stream.seek(0)
 
     if not header:
-        return f"Upload rejected: '{filename}' is empty. Please select a valid image file."
+        return (
+            f"Carregamento rejeitado: '{filename}' está vazio. Selecione um ficheiro "
+            "de imagem válido."
+        )
 
     magic = IMAGE_MAGIC.get(mime)
     if magic is not None:
@@ -245,9 +250,9 @@ def validate_image_stream(file_storage):
 
         if mismatch:
             return (
-                f"Upload rejected: '{filename}' claims to be a '{mime}' image but its "
-                "binary content does not match that format. The file may be corrupted "
-                "or disguised as an image."
+                f"Carregamento rejeitado: '{filename}' indica ser uma imagem '{mime}', "
+                "mas o conteúdo binário não corresponde a esse formato. O ficheiro pode "
+                "estar corrompido ou disfarçado de imagem."
             )
 
     # 2. Verify Pillow can parse it
@@ -260,8 +265,9 @@ def validate_image_stream(file_storage):
     except Exception:
         file_storage.stream.seek(0)
         return (
-            f"Upload rejected: '{filename}' could not be parsed as a valid image. "
-            "The file may be corrupted or contain non-image data."
+            f"Carregamento rejeitado: '{filename}' não pôde ser interpretado como uma "
+            "imagem válida. O ficheiro pode estar corrompido ou conter dados que não "
+            "são de imagem."
         )
 
     # 3. Scan raw bytes for embedded script content
@@ -278,9 +284,9 @@ def validate_image_stream(file_storage):
     for pattern, description in DANGEROUS_CONTENT_PATTERNS.items():
         if re.search(pattern, text):
             return (
-                f"Upload rejected: '{filename}' is an image file but contains "
-                f"dangerous embedded content: {description}. "
-                "Files with active content hidden inside images are not allowed."
+                f"Carregamento rejeitado: '{filename}' é um ficheiro de imagem mas "
+                f"contém conteúdo perigoso embutido: {description}. Não são permitidos "
+                "ficheiros com conteúdo ativo escondido dentro de imagens."
             )
 
     return None
