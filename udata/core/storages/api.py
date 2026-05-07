@@ -26,9 +26,7 @@ uploaded_image_fields = api.model(
     },
 )
 
-chunk_status_fields = api.model(
-    "UploadStatus", {"success": fields.Boolean, "error": fields.String}
-)
+chunk_status_fields = api.model("UploadStatus", {"success": fields.Boolean, "error": fields.String})
 
 
 image_parser = api.parser()
@@ -152,9 +150,7 @@ def handle_upload(storage, prefix=None):
     else:
         # Normalize filename including extension
         filename = utils.normalize(uploaded_file.filename)
-        fs_filename = storage.save(
-            uploaded_file, prefix=prefix, filename=filename, overwrite=True
-        )
+        fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename, overwrite=True)
 
     metadata = storage.metadata(fs_filename)
     metadata["last_modified_internal"] = metadata.pop("modified")
@@ -166,18 +162,14 @@ def handle_upload(storage, prefix=None):
 
     # Validate extension against the allowed list
     ext = metadata["format"].lower()
-    allowed = [
-        e.lower() for e in current_app.config.get("ALLOWED_RESOURCES_EXTENSIONS", [])
-    ]
+    allowed = [e.lower() for e in current_app.config.get("ALLOWED_RESOURCES_EXTENSIONS", [])]
     if ext and ext not in allowed:
         storage.delete(fs_filename)
-        api.abort(415, f"File extension '.{ext}' is not allowed.")
+        api.abort(415, f"A extensão de ficheiro '.{ext}' não é permitida.")
 
     # Validate file content against malicious payloads
     filepath = storage.path(fs_filename)
-    error = validate_upload(
-        filepath, metadata.get("mime", ""), metadata.get("format", "")
-    )
+    error = validate_upload(filepath, metadata.get("mime", ""), metadata.get("format", ""))
     if error:
         api.abort(415, error)
 
@@ -190,7 +182,7 @@ def parse_uploaded_image(field):
 
     image = args["file"]
     if image.mimetype not in IMAGES_MIMETYPES:
-        api.abort(400, "Unsupported image format")
+        api.abort(400, "Formato de imagem não suportado")
 
     # Validate file content: magic bytes, Pillow parsing, script scanning
     error = validate_image_stream(image)
