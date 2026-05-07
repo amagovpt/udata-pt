@@ -282,3 +282,47 @@ class VULN2078AuditSimulationTest(APITestCase):
         # All 50 should be 200; if any are 429 the per-endpoint decorator is
         # leaking onto GET, which would be a regression.
         self.assertEqual(dist.get(200, 0), 50, f"GET listing was throttled: {dist}")
+
+    # ------------------------------------------------------------------
+    # Vector 5 — production wiring: RATELIMIT_STORAGE_URI must be honored
+    # ------------------------------------------------------------------
+
+    def test_vector_5_storage_uri_from_config_is_honored(self):
+        """Regression test: the Limiter() must read its storage backend from
+        `RATELIMIT_STORAGE_URI` in app config, not from a hardcoded value in
+        the constructor.
+
+        Pre-fix the Limiter was instantiated with `storage_uri="memory://"`,
+        which silently overrides the config. Production deploys configured
+        Redis but were actually running on per-process memory storage,
+        rendering the rate-limit useless across multiple gunicorn workers.
+
+        We swap the config to a Redis URI and verify the limiter actually
+        switches storage class. If the constructor fallback regresses, the
+        storage will stay `MemoryStorage` regardless of config.
+        """
+        from udata.app import limiter
+
+        # The local docker-compose stack always has Redis available on 6379;
+        # if it isn't, this test is a no-op (skipped) rather than a false fail.
+        try:
+            import redis
+
+            redis.Redis(host="localhost", port=6379).ping()
+        except Exception:
+            self.skipTest("local Redis not reachable on localhost:6379")
+
+        original_uri = self.app.config.get("RATELIMIT_STORAGE_URI")
+        try:
+            self.app.config["RATELIMIT_STORAGE_URI"] = "redis://localhost:6379/3"
+            limiter.init_app(self.app)
+            storage_class = type(limiter.storage).__name__
+            self.assertEqual(
+                storage_class,
+                "RedisStorage",
+                f"limiter is using {storage_class} despite Redis config — "
+                "the constructor likely shadows RATELIMIT_STORAGE_URI again",
+            )
+        finally:
+            self.app.config["RATELIMIT_STORAGE_URI"] = original_uri or "memory://"
+            limiter.init_app(self.app)

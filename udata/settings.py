@@ -138,6 +138,11 @@ class Defaults(object):
     # available worker (TICKET-59 / VULN-2078).
     RATELIMIT_STORAGE_URI = "memory://"
 
+    # Default global rate-limit ceiling — IP-keyed.
+    # Per-endpoint, per-user limits override this for content-creation
+    # endpoints; see `udata/api/limits.py`.
+    RATELIMIT_DEFAULT = "1000 per day;200 per hour"
+
     SECURITY_PASSWORD_SALT = "Default uData secret password salt"
     SECURITY_CONFIRM_SALT = "Default uData secret confirm salt"
     SECURITY_RESET_SALT = "Default uData secret reset salt"

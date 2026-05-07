@@ -42,14 +42,16 @@ csrf = CSRFProtect()
 # `decorators` attribute on individual API resources, using the `user_or_ip`
 # key from `udata.api.limits` (TICKET-59).
 #
+# `default_limits` and `storage_uri` are intentionally NOT passed to the
+# constructor so that flask-limiter reads them from app config at
+# `init_app(app)` time (`RATELIMIT_DEFAULT`, `RATELIMIT_STORAGE_URI`).
+# Passing them here would override the config and silently force memory://
+# in production even when udata.cfg points at Redis.
+#
 # Production deploys MUST set RATELIMIT_STORAGE_URI to a Redis URL; otherwise
 # the in-memory backend does not share state across gunicorn workers and the
 # effective limits become per-worker.
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=["1000 per day", "200 per hour"],
-    storage_uri="memory://",
-)
+limiter = Limiter(key_func=get_remote_address)
 
 
 def send_static(directory, filename, cache_timeout):
