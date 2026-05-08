@@ -508,74 +508,77 @@ def idp_initiated():
     except Exception as e:
         current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
 
-    # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta)
+    # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta).
+    # Política fail-closed (VULN-2077 / TICKET-58):
+    # - MissingKey ou SignatureError em um IdP só é tolerado se ainda houver
+    #   outro IdP por tentar; após esgotados, o pedido é rejeitado.
+    # - Outras excepções propagam (500) — pedidos malformados não devem
+    #   contornar a validação.
+    last_validation_error = None
     for server in auth_servers:
+        saml_client = saml_client_for(server)
         try:
-            saml_client = saml_client_for(server)
             authn_response = saml_client.parse_authn_request_response(
                 raw_saml_response, entity.BINDING_HTTP_POST
             )
-            current_app.logger.info(f"SAML: pysaml2 processou com sucesso via {server}")
-        except sigver.MissingKey as e:
-            current_app.logger.warning(f"SAML MissingKey para {server}: {e}")
+        except (sigver.MissingKey, SignatureError) as exc:
+            last_validation_error = exc
+            current_app.logger.warning(f"SAML rejeitado por {server}: {type(exc).__name__}: {exc}")
             continue
-        except SignatureError as se:
-            current_app.logger.error(f"SAML SignatureError para {server}: {se}")
-            continue
-        except Exception as e:
-            current_app.logger.error(
-                f"SAML Erro ao processar resposta com {server}: {type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            continue
-        else:
-            break
+        current_app.logger.info(f"SAML: pysaml2 processou com sucesso via {server}")
+        break
+
+    if authn_response is None:
+        current_app.logger.error(
+            "SAML SSO rejeitado: nenhum IdP validou a resposta assinada "
+            f"(último erro: {last_validation_error})"
+        )
+        do_flash(
+            _("Autenticação rejeitada: assinatura SAML inválida."),
+            "error",
+        )
+        frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+        return redirect(f"{frontend_url}/pages/login")
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
     # Não existe fallback: atributos só são lidos depois da assinatura
     # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
-    if authn_response is not None:
-        # pysaml2 desencriptou e validou — extrair atributos do objeto
-        try:
-            identity = authn_response.get_identity()
-            current_app.logger.info(f"SAML pysaml2 identity: {identity}")
+    try:
+        identity = authn_response.get_identity()
+        current_app.logger.info(f"SAML pysaml2 identity: {identity}")
 
-            # Também tentar ava (attribute value assertions) como alternativa
-            if not identity:
-                try:
-                    ava = authn_response.ava
-                    current_app.logger.info(f"SAML pysaml2 ava: {ava}")
-                    if ava:
-                        identity = ava
-                except AttributeError:
-                    pass
+        # Também tentar ava (attribute value assertions) como alternativa
+        if not identity:
+            try:
+                ava = authn_response.ava
+                current_app.logger.info(f"SAML pysaml2 ava: {ava}")
+                if ava:
+                    identity = ava
+            except AttributeError:
+                pass
 
-            if identity:
-                user_email = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                )
-                user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-                first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-                last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
-                current_app.logger.info(
-                    f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
-                    f"nome={first_name} {last_name}"
-                )
-            else:
-                # Log debug info para diagnosticar
-                current_app.logger.warning(
-                    f"SAML pysaml2: identity vazio. "
-                    f"response type={type(authn_response).__name__}, "
-                    f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
-                    f"encrypted_assertions="
-                    f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
-                )
-        except Exception as e:
-            current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
-    else:
-        current_app.logger.error(
-            "SAML: pysaml2 não conseguiu processar a resposta de nenhum servidor"
-        )
+        if identity:
+            user_email = _first_value(
+                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+            )
+            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
+            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
+            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            current_app.logger.info(
+                f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
+                f"nome={first_name} {last_name}"
+            )
+        else:
+            # Log debug info para diagnosticar
+            current_app.logger.warning(
+                f"SAML pysaml2: identity vazio. "
+                f"response type={type(authn_response).__name__}, "
+                f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
+                f"encrypted_assertions="
+                f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
+            )
+    except Exception as e:
+        current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
 
     if not user_email and not user_nic:
         current_app.logger.error(
@@ -769,43 +772,53 @@ def idp_eidas_initiated():
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
 
-    # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta)
+    # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta).
+    # Política fail-closed (VULN-2077 / TICKET-58): MissingKey/SignatureError
+    # de um IdP só é tolerado enquanto restarem outros IdPs por tentar; após
+    # esgotados, o pedido é rejeitado. Outras excepções propagam (500).
+    last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
         try:
             authn_response = saml_client.parse_authn_request_response(
                 raw_saml_response, entity.BINDING_HTTP_POST
             )
-        except sigver.MissingKey:
+        except (sigver.MissingKey, SignatureError) as exc:
+            last_validation_error = exc
+            current_app.logger.warning(f"eIDAS rejeitado por {server}: {type(exc).__name__}: {exc}")
             continue
-        except SignatureError as se:
-            current_app.logger.error(f"eIDAS SignatureError para {server}: {se}")
-            continue
-        except Exception as e:
-            current_app.logger.error(f"Erro ao processar resposta eIDAS com {server}: {e}")
-            continue
-        else:
-            break
+        break
+
+    if authn_response is None:
+        current_app.logger.error(
+            "eIDAS SSO rejeitado: nenhum IdP validou a resposta assinada "
+            f"(último erro: {last_validation_error})"
+        )
+        do_flash(
+            _("Autenticação rejeitada: assinatura SAML inválida."),
+            "error",
+        )
+        frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+        return redirect(f"{frontend_url}/pages/login")
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
     # Não existe fallback: atributos só são lidos depois da assinatura
     # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
-    if authn_response is not None:
-        try:
-            identity = authn_response.get_identity()
-            if identity:
-                user_email = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                )
-                user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-                first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-                last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
-                current_app.logger.info(
-                    f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
-                    f"nome={first_name} {last_name}"
-                )
-        except Exception as e:
-            current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
+    try:
+        identity = authn_response.get_identity()
+        if identity:
+            user_email = _first_value(
+                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+            )
+            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
+            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
+            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            current_app.logger.info(
+                f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
+                f"nome={first_name} {last_name}"
+            )
+    except Exception as e:
+        current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
 
     if not user_email and not user_nic:
         current_app.logger.error(
