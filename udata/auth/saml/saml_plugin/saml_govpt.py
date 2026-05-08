@@ -171,6 +171,68 @@ def _name_id_binds_nic(name_id, nic):
     return False
 
 
+_OUTSTANDING_SESSION_KEY = "saml_outstanding"
+_OUTSTANDING_LIMIT = 8
+_REPLAY_CACHE_KEY = "saml_consumed:{kind}:{response_id}"
+
+
+def _remember_outstanding(reqid, kind):
+    """Record an AuthnRequest id in the user's session.
+
+    Used by sp_initiated/eidas_sp_initiated so that the SSO callback can
+    accept the response only if its ``InResponseTo`` matches a request
+    issued by the same browser session (defence in depth on top of
+    pysaml2's ``allow_unsolicited=False`` flag).
+    """
+    if not reqid:
+        return
+    bucket = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    bucket[reqid] = kind
+    # Cap the bucket to avoid unbounded session-cookie growth when a user
+    # opens many login tabs without completing them.
+    while len(bucket) > _OUTSTANDING_LIMIT:
+        bucket.pop(next(iter(bucket)))
+    session[_OUTSTANDING_SESSION_KEY] = bucket
+
+
+def _consume_outstanding(in_response_to, kind):
+    """Validate and remove an entry from the outstanding-requests bucket.
+
+    Returns True if ``in_response_to`` matches a tracked request of the
+    expected ``kind`` (cmd / eidas) and removes it (one-time use).
+    Returns False otherwise.
+    """
+    if not isinstance(in_response_to, str) or not in_response_to:
+        return False
+    bucket = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    if bucket.pop(in_response_to, None) != kind:
+        return False
+    session[_OUTSTANDING_SESSION_KEY] = bucket
+    return True
+
+
+def _check_and_record_replay(response_id, kind, ttl=None):
+    """Reject SAML responses that have already been consumed.
+
+    Uses Flask-Caching as a shared (Redis-backed in production) replay
+    cache keyed on ``Response@ID``. ``ttl`` defaults to 120 seconds —
+    well above the 60-second ``accepted_time_diff`` we tolerate, which
+    is the window in which a captured signed response could otherwise
+    be replayed.
+    """
+    from udata.app import cache
+
+    if not isinstance(response_id, str) or not response_id:
+        # Without a trustworthy ID we cannot deduplicate; pysaml2's
+        # NotOnOrAfter check is the remaining defence.
+        return True
+    cache_key = _REPLAY_CACHE_KEY.format(kind=kind, response_id=response_id)
+    if cache.get(cache_key):
+        return False
+    cache.set(cache_key, True, timeout=ttl if ttl is not None else 120)
+    return True
+
+
 def _reject_saml_login(log_message, flash_message, log_level="error"):
     """Reject a SAML SSO request: log + flash + redirect to /pages/login.
 
@@ -424,9 +486,11 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
                         (out_url, BINDING_HTTP_POST),
                     ],
                 },
-                # Don't verify that the incoming requests originate from us via
-                # the built-in cache for authn request ids in pysaml2
-                "allow_unsolicited": True,
+                # Refuse responses that are not tied to an AuthnRequest we
+                # issued. The req_id is stored in the user's Flask session
+                # by sp_initiated() and passed to parse_authn_request_response
+                # via the ``outstanding`` argument (VULN-2077 / TICKET-58).
+                "allow_unsolicited": False,
                 # Sign authn requests
                 "authn_requests_signed": True,
                 "logout_requests_signed": True,
@@ -520,6 +584,11 @@ def sp_initiated():
     }
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
+    # Track the AuthnRequest id so idp_initiated() can reject responses
+    # that are not ``InResponseTo`` a request we issued
+    # (VULN-2077 / TICKET-58 — defence-in-depth on top of pysaml2's
+    # ``allow_unsolicited=False`` flag).
+    _remember_outstanding(reqid, kind="cmd")
     return _extract_saml_form_data(info["data"])
 
 
@@ -584,12 +653,18 @@ def idp_initiated():
     #   outro IdP por tentar; após esgotados, o pedido é rejeitado.
     # - Outras excepções propagam (500) — pedidos malformados não devem
     #   contornar a validação.
+    # - ``outstanding`` liga o ``InResponseTo`` à sessão do utilizador; com
+    #   ``allow_unsolicited=False``, pysaml2 rejeita respostas sem um
+    #   AuthnRequest correspondente (defesa contra replay/IdP-initiated).
+    outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     last_validation_error = None
     for server in auth_servers:
         saml_client = saml_client_for(server)
         try:
             authn_response = saml_client.parse_authn_request_response(
-                raw_saml_response, entity.BINDING_HTTP_POST
+                raw_saml_response,
+                entity.BINDING_HTTP_POST,
+                outstanding=outstanding,
             )
         except (sigver.MissingKey, SignatureError) as exc:
             last_validation_error = exc
@@ -604,6 +679,21 @@ def idp_initiated():
             f"(último erro: {last_validation_error})",
             _("Autenticação rejeitada: assinatura SAML inválida."),
         )
+
+    # 1a. Replay cache: refuse a Response@ID we have already consumed
+    # (VULN-2077 / TICKET-58). Skipped for non-string IDs (test mocks).
+    response_id = getattr(getattr(authn_response, "response", None), "id", None)
+    if not _check_and_record_replay(response_id, kind="cmd"):
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: replay de Response@ID={response_id!r}",
+            _("Autenticação rejeitada: resposta já utilizada."),
+        )
+
+    # 1aa. One-time use of the matched AuthnRequest id (defence in depth
+    # on top of pysaml2's outstanding-queries check).
+    in_response_to = getattr(authn_response, "in_response_to", None)
+    if isinstance(in_response_to, str) and in_response_to:
+        _consume_outstanding(in_response_to, kind="cmd")
 
     # 1b. Validar Issuer e Subject/NameID (VULN-2077 / TICKET-58).
     # pysaml2 já confirmou a assinatura; defesa-em-profundidade contra XSW
@@ -857,6 +947,7 @@ def sp_eidas_initiated():
     }
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
+    _remember_outstanding(reqid, kind="eidas")
     return _extract_saml_form_data(info["data"])
 
 
@@ -885,12 +976,16 @@ def idp_eidas_initiated():
     # Política fail-closed (VULN-2077 / TICKET-58): MissingKey/SignatureError
     # de um IdP só é tolerado enquanto restarem outros IdPs por tentar; após
     # esgotados, o pedido é rejeitado. Outras excepções propagam (500).
+    # ``outstanding`` liga o ``InResponseTo`` à sessão (allow_unsolicited=False).
+    outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
         try:
             authn_response = saml_client.parse_authn_request_response(
-                raw_saml_response, entity.BINDING_HTTP_POST
+                raw_saml_response,
+                entity.BINDING_HTTP_POST,
+                outstanding=outstanding,
             )
         except (sigver.MissingKey, SignatureError) as exc:
             last_validation_error = exc
@@ -904,6 +999,19 @@ def idp_eidas_initiated():
             f"(último erro: {last_validation_error})",
             _("Autenticação rejeitada: assinatura SAML inválida."),
         )
+
+    # 1a. Replay cache (VULN-2077 / TICKET-58).
+    response_id = getattr(getattr(authn_response, "response", None), "id", None)
+    if not _check_and_record_replay(response_id, kind="eidas"):
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: replay de Response@ID={response_id!r}",
+            _("Autenticação rejeitada: resposta já utilizada."),
+        )
+
+    # 1aa. One-time use of the matched AuthnRequest id.
+    in_response_to = getattr(authn_response, "in_response_to", None)
+    if isinstance(in_response_to, str) and in_response_to:
+        _consume_outstanding(in_response_to, kind="eidas")
 
     # 1b. Validar Issuer e Subject/NameID (VULN-2077 / TICKET-58).
     try:
