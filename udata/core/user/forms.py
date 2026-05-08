@@ -1,3 +1,4 @@
+from udata.core.utils.sanitization import sanitize_markdown_html
 from udata.forms import ModelForm, fields, validators
 from udata.i18n import lazy_gettext as _
 from udata.models import User
@@ -22,6 +23,11 @@ class UserProfileForm(ModelForm):
     avatar = fields.ImageField(_("Avatar"), sizes=AVATAR_SIZES)
     website = fields.URLField(_("Website"))
     about = fields.MarkdownField(_("About"))
+
+    def validate(self, **kwargs):
+        # VULN-2075/2076: strip dangerous HTML from the user "about" field.
+        self.about.data = sanitize_markdown_html(self.about.data)
+        return super().validate(**kwargs)
 
 
 class UserProfileAdminForm(UserProfileForm):

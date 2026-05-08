@@ -27,6 +27,7 @@ from udata.core.linkable import Linkable
 from udata.core.metrics.helpers import get_stock_metrics
 from udata.core.metrics.models import WithMetrics
 from udata.core.storages import avatars, default_image_basename
+from udata.core.utils.sanitization import sanitize_markdown_html
 from udata.frontend.markdown import mdstrip
 from udata.i18n import lazy_gettext as _
 from udata.mongo.datetime_fields import Datetimed
@@ -275,6 +276,10 @@ class Organization(
 
     @classmethod
     def pre_save(cls, sender, document, **kwargs):
+        # VULN-2075: defense-in-depth sanitization for any write path
+        # (forms, api_fields.patch, direct ORM writes, harvesters).
+        if document.description:
+            document.description = sanitize_markdown_html(document.description)
         cls.before_save.send(document)
 
     def self_web_url(self, **kwargs):

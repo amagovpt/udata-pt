@@ -47,6 +47,7 @@ from udata.core.metrics.models import WithMetrics
 from udata.core.owned import Owned, OwnedQuerySet
 from udata.core.spatial.api_fields import spatial_coverage_fields
 from udata.core.spatial.models import SpatialCoverage
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.frontend.markdown import mdstrip
 from udata.i18n import lazy_gettext as _
 from udata.mongo.datetime_fields import DateRange
@@ -719,6 +720,15 @@ class Dataset(
 
     @classmethod
     def pre_save(cls, sender, document, **kwargs):
+        # VULN-2075/2076: defense-in-depth sanitization for any write path
+        # (forms, api_fields.patch, harvesters, direct ORM writes).
+        if document.title:
+            document.title = sanitize_strict(document.title)
+        if document.description:
+            document.description = sanitize_markdown_html(document.description)
+        for resource in document.resources or []:
+            if resource.description:
+                resource.description = sanitize_markdown_html(resource.description)
         cls.before_save.send(document)
 
     def clean(self):

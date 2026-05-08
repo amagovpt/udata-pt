@@ -28,6 +28,7 @@ from udata.core.followers.models import Follow
 from udata.core.linkable import Linkable
 from udata.core.metrics.models import WithMetrics
 from udata.core.storages import avatars, default_image_basename
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.frontend.markdown import mdstrip
 from udata.i18n import lazy_gettext as _
 from udata.mongo import db
@@ -239,6 +240,13 @@ class User(WithMetrics, UserMixin, Linkable, Document):
 
     @classmethod
     def pre_save(cls, sender, document, **kwargs):
+        # VULN-2075/2076: defense-in-depth sanitization for any write path.
+        if document.about:
+            document.about = sanitize_markdown_html(document.about)
+        if document.first_name:
+            document.first_name = sanitize_strict(document.first_name)
+        if document.last_name:
+            document.last_name = sanitize_strict(document.last_name)
         cls.before_save.send(document)
 
     @classmethod
