@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import random
 import re
@@ -233,15 +234,66 @@ def _check_and_record_replay(response_id, kind, ttl=None):
     return True
 
 
-def _reject_saml_login(log_message, flash_message, log_level="error"):
-    """Reject a SAML SSO request: log + flash + redirect to /pages/login.
+audit_logger = logging.getLogger("saml.audit")
+
+
+def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
+    """Emit a structured SAML SSO audit log line.
+
+    One line per terminal decision (success/reject/error) so the SAML
+    authentication funnel can be traced post-hoc without correlating
+    multiple debug logs. ``name_id`` is hashed (HMAC-SHA256) so the raw
+    Subject identifier is never written to disk; this matches how it is
+    stored in ``user.extras.auth_nic``.
+    """
+    name_id_hash = "-"
+    if name_id:
+        try:
+            name_id_hash = _hash_nic(name_id)
+        except Exception:  # noqa: BLE001
+            # Hashing requires SECRET_KEY; if missing, swallow rather
+            # than turn an audit emission into a 500.
+            name_id_hash = "?"
+    try:
+        ip = request.remote_addr or "-"
+        ua = request.user_agent.string if request.user_agent else "-"
+    except RuntimeError:
+        # Outside of a request context (e.g. unit tests calling helpers
+        # directly) audit fields fall back to placeholders.
+        ip = "-"
+        ua = "-"
+    audit_logger.info(
+        "saml_sso outcome=%s kind=%s issuer=%s name_id_hash=%s ip=%s ua=%r reason=%s",
+        outcome,
+        kind,
+        issuer or "-",
+        name_id_hash,
+        ip,
+        ua,
+        reason or "-",
+    )
+
+
+def _reject_saml_login(
+    log_message,
+    flash_message,
+    log_level="error",
+    *,
+    kind="cmd",
+    issuer=None,
+    name_id=None,
+    reason=None,
+):
+    """Reject a SAML SSO request: log + audit + flash + redirect.
 
     Used for every fail-closed exit in the SSO callback so the failure
     surface is uniform: no session cookie issued, generic flash for the
-    user, structured log for the auditor.
+    user, structured log for the operator and a dedicated audit entry
+    so security can replay rejections without grepping debug logs.
     """
     log = current_app.logger
     getattr(log, log_level)(log_message)
+    _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason=reason or log_message)
     do_flash(flash_message, "error")
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     return redirect(f"{frontend_url}/pages/login")
@@ -678,6 +730,8 @@ def idp_initiated():
             "SAML SSO rejeitado: nenhum IdP validou a resposta assinada "
             f"(último erro: {last_validation_error})",
             _("Autenticação rejeitada: assinatura SAML inválida."),
+            kind="cmd",
+            reason="signature_invalid",
         )
 
     # 1a. Replay cache: refuse a Response@ID we have already consumed
@@ -687,6 +741,8 @@ def idp_initiated():
         return _reject_saml_login(
             f"SAML SSO rejeitado: replay de Response@ID={response_id!r}",
             _("Autenticação rejeitada: resposta já utilizada."),
+            kind="cmd",
+            reason="replay",
         )
 
     # 1aa. One-time use of the matched AuthnRequest id (defence in depth
@@ -705,6 +761,8 @@ def idp_initiated():
         return _reject_saml_login(
             f"SAML SSO rejeitado: falha a obter Issuer ({exc})",
             _("Autenticação rejeitada: resposta SAML inválida."),
+            kind="cmd",
+            reason="issuer_unreadable",
         )
 
     trusted_issuers = _trusted_saml_issuers()
@@ -712,6 +770,9 @@ def idp_initiated():
         return _reject_saml_login(
             f"SAML SSO rejeitado: Issuer não confiado ({issuer!r})",
             _("Autenticação rejeitada: emissor SAML desconhecido."),
+            kind="cmd",
+            issuer=issuer,
+            reason="issuer_untrusted",
         )
 
     try:
@@ -720,12 +781,18 @@ def idp_initiated():
         return _reject_saml_login(
             f"SAML SSO rejeitado: falha a obter Subject ({exc})",
             _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="cmd",
+            issuer=issuer,
+            reason="subject_unreadable",
         )
     name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
     if not name_id_value:
         return _reject_saml_login(
             "SAML SSO rejeitado: Subject/NameID em falta",
             _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="cmd",
+            issuer=issuer,
+            reason="subject_missing",
         )
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
@@ -784,13 +851,31 @@ def idp_initiated():
         return _reject_saml_login(
             "SAML SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
             _("Autenticação rejeitada: identidade SAML inconsistente."),
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="subject_nic_mismatch",
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
     if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
+        _audit_saml(
+            "migration_pending",
+            "cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason=status,
+        )
         return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
+    _audit_saml(
+        "success" if user else "user_not_found",
+        "cmd",
+        issuer=issuer,
+        name_id=name_id_value,
+        reason=status,
+    )
     return _handle_saml_user_login(user)
 
 
@@ -998,6 +1083,8 @@ def idp_eidas_initiated():
             "eIDAS SSO rejeitado: nenhum IdP validou a resposta assinada "
             f"(último erro: {last_validation_error})",
             _("Autenticação rejeitada: assinatura SAML inválida."),
+            kind="eidas",
+            reason="signature_invalid",
         )
 
     # 1a. Replay cache (VULN-2077 / TICKET-58).
@@ -1006,6 +1093,8 @@ def idp_eidas_initiated():
         return _reject_saml_login(
             f"eIDAS SSO rejeitado: replay de Response@ID={response_id!r}",
             _("Autenticação rejeitada: resposta já utilizada."),
+            kind="eidas",
+            reason="replay",
         )
 
     # 1aa. One-time use of the matched AuthnRequest id.
@@ -1020,6 +1109,8 @@ def idp_eidas_initiated():
         return _reject_saml_login(
             f"eIDAS SSO rejeitado: falha a obter Issuer ({exc})",
             _("Autenticação rejeitada: resposta SAML inválida."),
+            kind="eidas",
+            reason="issuer_unreadable",
         )
 
     trusted_issuers = _trusted_saml_issuers()
@@ -1027,6 +1118,9 @@ def idp_eidas_initiated():
         return _reject_saml_login(
             f"eIDAS SSO rejeitado: Issuer não confiado ({issuer!r})",
             _("Autenticação rejeitada: emissor SAML desconhecido."),
+            kind="eidas",
+            issuer=issuer,
+            reason="issuer_untrusted",
         )
 
     try:
@@ -1035,12 +1129,18 @@ def idp_eidas_initiated():
         return _reject_saml_login(
             f"eIDAS SSO rejeitado: falha a obter Subject ({exc})",
             _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="eidas",
+            issuer=issuer,
+            reason="subject_unreadable",
         )
     name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
     if not name_id_value:
         return _reject_saml_login(
             "eIDAS SSO rejeitado: Subject/NameID em falta",
             _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="eidas",
+            issuer=issuer,
+            reason="subject_missing",
         )
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
@@ -1074,13 +1174,31 @@ def idp_eidas_initiated():
         return _reject_saml_login(
             "eIDAS SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
             _("Autenticação rejeitada: identidade SAML inconsistente."),
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="subject_nic_mismatch",
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
     if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
+        _audit_saml(
+            "migration_pending",
+            "eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason=status,
+        )
         return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
+    _audit_saml(
+        "success" if user else "user_not_found",
+        "eidas",
+        issuer=issuer,
+        name_id=name_id_value,
+        reason=status,
+    )
     return _handle_saml_user_login(user)
 
 
