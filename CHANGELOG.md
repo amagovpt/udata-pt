@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- **security: fix critical SAML account takeover (TICKET-58 / VULN-2077)**
+  - Drop the manual XML attribute fallback that read NIC/email/name from
+    `<AttributeStatement>` without re-checking the signature. Attributes
+    are now read only from a `pysaml2`-validated response.
+  - Fail-closed when no IdP can validate the signature: `MissingKey`
+    and `SignatureError` are tolerated only across the configured IdP
+    list; once exhausted, the request is logged, flashed and redirected
+    to `/pages/login` with no session cookie issued.
+  - Validate the `<Issuer>` against the entityID of every metadata file
+    in `SECURITY_SAML_IDP_METADATA` (extensible via the new optional
+    `TRUSTED_SAML_ISSUERS` config) and require a non-empty
+    `<Subject><NameID>` bound to the NIC attribute (defence against
+    XML Signature Wrapping).
+  - Flip `pysaml2` `allow_unsolicited` to `False` and track the
+    AuthnRequest id in the user's Flask session; add a Flask-Caching
+    backed replay cache keyed on `Response@ID` (TTL 120 s, namespaced
+    by CMD/eIDAS).
+  - Emit a structured `saml.audit` log line per terminal SSO decision
+    with `outcome`, `kind`, `issuer`, hashed `name_id`, `ip`, `ua` and
+    `reason` so security can replay rejections without grepping debug
+    logs.
+  - Add 12 regression tests (`SAMLVuln2077RegressionTest`, 6 CMD + 6
+    eIDAS) covering unsigned/unknown-key/XSW/replay/untrusted-issuer/
+    Subject-mismatch rejection paths. The previously self-documenting
+    `test_sso_callback_no_login_on_signature_error` is rewritten to
+    assert `mock_login.assert_not_called()`.
+
 ## 16.0.0 (2026-03-24)
 
 - **feat!: new api key system ([#3636](https://github.com/opendatateam/udata/pull/3636))**

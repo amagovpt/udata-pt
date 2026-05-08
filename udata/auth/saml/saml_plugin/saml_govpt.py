@@ -4,6 +4,7 @@ from __future__ import unicode_literals
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import random
 import re
@@ -42,9 +43,7 @@ from saml2.sigver import SignatureError
 # autenticacao.gov uses C14N 1.0 (http://www.w3.org/TR/2001/REC-xml-c14n-20010315)
 # but pysaml2 only allows Exclusive C14N by default. Add C14N 1.0 to allowed sets.
 _C14N_INCLUSIVE = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
-_C14N_INCLUSIVE_WITH_COMMENTS = (
-    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
-)
+_C14N_INCLUSIVE_WITH_COMMENTS = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
 ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
@@ -117,6 +116,189 @@ def _first_value(identity, key):
     return None
 
 
+def _trusted_saml_issuers():
+    """Return the set of SAML Issuer entityIDs we trust.
+
+    Derived from the entityID of every metadata file listed in
+    ``SECURITY_SAML_IDP_METADATA``, plus any entry in the optional
+    ``TRUSTED_SAML_ISSUERS`` config (string CSV or iterable). Used to
+    reject responses whose ``<Issuer>`` does not match a configured IdP
+    (defence in depth on top of pysaml2's signature check).
+    """
+    cfg = current_app.config
+    issuers = set()
+    metadata_paths = (cfg.get("SECURITY_SAML_IDP_METADATA") or "").split(",")
+    for path in metadata_paths:
+        path = path.strip()
+        if not path:
+            continue
+        try:
+            tree = ET.parse(_resolve_path(path))
+            entity_id = tree.getroot().attrib.get("entityID")
+            if entity_id:
+                issuers.add(entity_id)
+        except (ET.ParseError, OSError):
+            continue
+
+    extra = cfg.get("TRUSTED_SAML_ISSUERS")
+    if extra:
+        if isinstance(extra, str):
+            extra = [s.strip() for s in extra.split(",") if s.strip()]
+        issuers.update(extra)
+    return issuers
+
+
+def _name_id_binds_nic(name_id, nic):
+    """Check that the Subject NameID is bound to the NIC attribute.
+
+    Defence against XML Signature Wrapping (XSW): if a wrapper assertion
+    carries a forged ``<AttributeStatement>`` while the signed assertion
+    keeps a different ``<Subject>``, the two will not match and the
+    request must be rejected.
+
+    Accepts either the raw NIC or its HMAC-SHA256 form so future IdP
+    configuration changes (the IdP may emit either form as ``NameID``)
+    can be honoured without code changes.
+    """
+    if not name_id or not nic:
+        return False
+    name_id = name_id.strip()
+    if not name_id:
+        return False
+    if name_id == nic:
+        return True
+    if name_id == _hash_nic(nic):
+        return True
+    return False
+
+
+_OUTSTANDING_SESSION_KEY = "saml_outstanding"
+_OUTSTANDING_LIMIT = 8
+_REPLAY_CACHE_KEY = "saml_consumed:{kind}:{response_id}"
+
+
+def _remember_outstanding(reqid, kind):
+    """Record an AuthnRequest id in the user's session.
+
+    Used by sp_initiated/eidas_sp_initiated so that the SSO callback can
+    accept the response only if its ``InResponseTo`` matches a request
+    issued by the same browser session (defence in depth on top of
+    pysaml2's ``allow_unsolicited=False`` flag).
+    """
+    if not reqid:
+        return
+    bucket = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    bucket[reqid] = kind
+    # Cap the bucket to avoid unbounded session-cookie growth when a user
+    # opens many login tabs without completing them.
+    while len(bucket) > _OUTSTANDING_LIMIT:
+        bucket.pop(next(iter(bucket)))
+    session[_OUTSTANDING_SESSION_KEY] = bucket
+
+
+def _consume_outstanding(in_response_to, kind):
+    """Validate and remove an entry from the outstanding-requests bucket.
+
+    Returns True if ``in_response_to`` matches a tracked request of the
+    expected ``kind`` (cmd / eidas) and removes it (one-time use).
+    Returns False otherwise.
+    """
+    if not isinstance(in_response_to, str) or not in_response_to:
+        return False
+    bucket = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    if bucket.pop(in_response_to, None) != kind:
+        return False
+    session[_OUTSTANDING_SESSION_KEY] = bucket
+    return True
+
+
+def _check_and_record_replay(response_id, kind, ttl=None):
+    """Reject SAML responses that have already been consumed.
+
+    Uses Flask-Caching as a shared (Redis-backed in production) replay
+    cache keyed on ``Response@ID``. ``ttl`` defaults to 120 seconds —
+    well above the 60-second ``accepted_time_diff`` we tolerate, which
+    is the window in which a captured signed response could otherwise
+    be replayed.
+    """
+    from udata.app import cache
+
+    if not isinstance(response_id, str) or not response_id:
+        # Without a trustworthy ID we cannot deduplicate; pysaml2's
+        # NotOnOrAfter check is the remaining defence.
+        return True
+    cache_key = _REPLAY_CACHE_KEY.format(kind=kind, response_id=response_id)
+    if cache.get(cache_key):
+        return False
+    cache.set(cache_key, True, timeout=ttl if ttl is not None else 120)
+    return True
+
+
+audit_logger = logging.getLogger("saml.audit")
+
+
+def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
+    """Emit a structured SAML SSO audit log line.
+
+    One line per terminal decision (success/reject/error) so the SAML
+    authentication funnel can be traced post-hoc without correlating
+    multiple debug logs. ``name_id`` is hashed (HMAC-SHA256) so the raw
+    Subject identifier is never written to disk; this matches how it is
+    stored in ``user.extras.auth_nic``.
+    """
+    name_id_hash = "-"
+    if name_id:
+        try:
+            name_id_hash = _hash_nic(name_id)
+        except Exception:  # noqa: BLE001
+            # Hashing requires SECRET_KEY; if missing, swallow rather
+            # than turn an audit emission into a 500.
+            name_id_hash = "?"
+    try:
+        ip = request.remote_addr or "-"
+        ua = request.user_agent.string if request.user_agent else "-"
+    except RuntimeError:
+        # Outside of a request context (e.g. unit tests calling helpers
+        # directly) audit fields fall back to placeholders.
+        ip = "-"
+        ua = "-"
+    audit_logger.info(
+        "saml_sso outcome=%s kind=%s issuer=%s name_id_hash=%s ip=%s ua=%r reason=%s",
+        outcome,
+        kind,
+        issuer or "-",
+        name_id_hash,
+        ip,
+        ua,
+        reason or "-",
+    )
+
+
+def _reject_saml_login(
+    log_message,
+    flash_message,
+    log_level="error",
+    *,
+    kind="cmd",
+    issuer=None,
+    name_id=None,
+    reason=None,
+):
+    """Reject a SAML SSO request: log + audit + flash + redirect.
+
+    Used for every fail-closed exit in the SSO callback so the failure
+    surface is uniform: no session cookie issued, generic flash for the
+    user, structured log for the operator and a dedicated audit entry
+    so security can replay rejections without grepping debug logs.
+    """
+    log = current_app.logger
+    getattr(log, log_level)(log_message)
+    _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason=reason or log_message)
+    do_flash(flash_message, "error")
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    return redirect(f"{frontend_url}/pages/login")
+
+
 def _hash_nic(nic):
     """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY.
 
@@ -133,9 +315,7 @@ def _hash_nic(nic):
 def _is_nic_hashed(nic_value):
     """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
     return bool(
-        nic_value
-        and len(nic_value) == 64
-        and all(c in "0123456789abcdef" for c in nic_value)
+        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
     )
 
 
@@ -147,9 +327,7 @@ def _merge_nic_into_user(user, user_nic):
         user.extras = {}
     user.extras["auth_nic"] = _hash_nic(user_nic)
     user.save()
-    current_app.logger.info(
-        f"SAML: NIC merged into existing account {user.email} (id={user.id})"
-    )
+    current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
 
 
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
@@ -360,9 +538,11 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
                         (out_url, BINDING_HTTP_POST),
                     ],
                 },
-                # Don't verify that the incoming requests originate from us via
-                # the built-in cache for authn request ids in pysaml2
-                "allow_unsolicited": True,
+                # Refuse responses that are not tied to an AuthnRequest we
+                # issued. The req_id is stored in the user's Flask session
+                # by sp_initiated() and passed to parse_authn_request_response
+                # via the ``outstanding`` argument (VULN-2077 / TICKET-58).
+                "allow_unsolicited": False,
                 # Sign authn requests
                 "authn_requests_signed": True,
                 "logout_requests_signed": True,
@@ -456,6 +636,11 @@ def sp_initiated():
     }
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
+    # Track the AuthnRequest id so idp_initiated() can reject responses
+    # that are not ``InResponseTo`` a request we issued
+    # (VULN-2077 / TICKET-58 — defence-in-depth on top of pysaml2's
+    # ``allow_unsolicited=False`` flag).
+    _remember_outstanding(reqid, kind="cmd")
     return _extract_saml_form_data(info["data"])
 
 
@@ -502,12 +687,8 @@ def idp_initiated():
                     msg_text = status_msg.text if status_msg is not None else None
                     # Also check for a nested sub-status code (e.g. RequestDenied)
                     sub_code = status_code.find("samlp:StatusCode", ns)
-                    sub_value = (
-                        sub_code.attrib.get("Value", "") if sub_code is not None else ""
-                    )
-                    display_msg = (
-                        msg_text or sub_value.rsplit(":", 1)[-1] or status_value
-                    )
+                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
+                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
                     current_app.logger.error(
                         f"SAML: IdP rejeitou o pedido: "
                         f"status={status_value}, sub={sub_value}, msg={msg_text}"
@@ -518,138 +699,141 @@ def idp_initiated():
     except Exception as e:
         current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
 
-    # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta)
+    # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta).
+    # Política fail-closed (VULN-2077 / TICKET-58):
+    # - MissingKey ou SignatureError em um IdP só é tolerado se ainda houver
+    #   outro IdP por tentar; após esgotados, o pedido é rejeitado.
+    # - Outras excepções propagam (500) — pedidos malformados não devem
+    #   contornar a validação.
+    # - ``outstanding`` liga o ``InResponseTo`` à sessão do utilizador; com
+    #   ``allow_unsolicited=False``, pysaml2 rejeita respostas sem um
+    #   AuthnRequest correspondente (defesa contra replay/IdP-initiated).
+    outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    last_validation_error = None
     for server in auth_servers:
+        saml_client = saml_client_for(server)
         try:
-            saml_client = saml_client_for(server)
             authn_response = saml_client.parse_authn_request_response(
-                raw_saml_response, entity.BINDING_HTTP_POST
+                raw_saml_response,
+                entity.BINDING_HTTP_POST,
+                outstanding=outstanding,
             )
-            current_app.logger.info(f"SAML: pysaml2 processou com sucesso via {server}")
-        except sigver.MissingKey as e:
-            current_app.logger.warning(f"SAML MissingKey para {server}: {e}")
+        except (sigver.MissingKey, SignatureError) as exc:
+            last_validation_error = exc
+            current_app.logger.warning(f"SAML rejeitado por {server}: {type(exc).__name__}: {exc}")
             continue
-        except SignatureError as se:
-            current_app.logger.error(f"SAML SignatureError para {server}: {se}")
-            continue
-        except Exception as e:
-            current_app.logger.error(
-                f"SAML Erro ao processar resposta com {server}: {type(e).__name__}: {e}",
-                exc_info=True,
+        current_app.logger.info(f"SAML: pysaml2 processou com sucesso via {server}")
+        break
+
+    if authn_response is None:
+        return _reject_saml_login(
+            "SAML SSO rejeitado: nenhum IdP validou a resposta assinada "
+            f"(último erro: {last_validation_error})",
+            _("Autenticação rejeitada: assinatura SAML inválida."),
+            kind="cmd",
+            reason="signature_invalid",
+        )
+
+    # 1a. Replay cache: refuse a Response@ID we have already consumed
+    # (VULN-2077 / TICKET-58). Skipped for non-string IDs (test mocks).
+    response_id = getattr(getattr(authn_response, "response", None), "id", None)
+    if not _check_and_record_replay(response_id, kind="cmd"):
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: replay de Response@ID={response_id!r}",
+            _("Autenticação rejeitada: resposta já utilizada."),
+            kind="cmd",
+            reason="replay",
+        )
+
+    # 1aa. One-time use of the matched AuthnRequest id (defence in depth
+    # on top of pysaml2's outstanding-queries check).
+    in_response_to = getattr(authn_response, "in_response_to", None)
+    if isinstance(in_response_to, str) and in_response_to:
+        _consume_outstanding(in_response_to, kind="cmd")
+
+    # 1b. Validar Issuer e Subject/NameID (VULN-2077 / TICKET-58).
+    # pysaml2 já confirmou a assinatura; defesa-em-profundidade contra XSW
+    # exige que o Issuer venha da nossa whitelist e que o Subject NameID
+    # exista para mais tarde ser confrontado com o atributo NIC.
+    try:
+        issuer = authn_response.issuer()
+    except Exception as exc:  # noqa: BLE001 — pysaml2 attribute access surfaces
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: falha a obter Issuer ({exc})",
+            _("Autenticação rejeitada: resposta SAML inválida."),
+            kind="cmd",
+            reason="issuer_unreadable",
+        )
+
+    trusted_issuers = _trusted_saml_issuers()
+    if issuer not in trusted_issuers:
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: Issuer não confiado ({issuer!r})",
+            _("Autenticação rejeitada: emissor SAML desconhecido."),
+            kind="cmd",
+            issuer=issuer,
+            reason="issuer_untrusted",
+        )
+
+    try:
+        subject = authn_response.get_subject()
+    except Exception as exc:  # noqa: BLE001
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: falha a obter Subject ({exc})",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="cmd",
+            issuer=issuer,
+            reason="subject_unreadable",
+        )
+    name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    if not name_id_value:
+        return _reject_saml_login(
+            "SAML SSO rejeitado: Subject/NameID em falta",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="cmd",
+            issuer=issuer,
+            reason="subject_missing",
+        )
+
+    # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
+    # Não existe fallback: atributos só são lidos depois da assinatura
+    # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
+    try:
+        identity = authn_response.get_identity()
+        current_app.logger.info(f"SAML pysaml2 identity: {identity}")
+
+        # Também tentar ava (attribute value assertions) como alternativa
+        if not identity:
+            try:
+                ava = authn_response.ava
+                current_app.logger.info(f"SAML pysaml2 ava: {ava}")
+                if ava:
+                    identity = ava
+            except AttributeError:
+                pass
+
+        if identity:
+            user_email = _first_value(
+                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
             )
-            continue
+            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
+            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
+            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            current_app.logger.info(
+                f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
+                f"nome={first_name} {last_name}"
+            )
         else:
-            break
-
-    # 2. Extrair atributos — primeiro do pysaml2, depois fallback para XML manual
-    if authn_response is not None:
-        # pysaml2 desencriptou e validou — extrair atributos do objeto
-        try:
-            identity = authn_response.get_identity()
-            current_app.logger.info(f"SAML pysaml2 identity: {identity}")
-
-            # Também tentar ava (attribute value assertions) como alternativa
-            if not identity:
-                try:
-                    ava = authn_response.ava
-                    current_app.logger.info(f"SAML pysaml2 ava: {ava}")
-                    if ava:
-                        identity = ava
-                except AttributeError:
-                    pass
-
-            if identity:
-                user_email = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                )
-                user_nic = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NIC"
-                )
-                first_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                )
-                last_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                )
-                current_app.logger.info(
-                    f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
-                    f"nome={first_name} {last_name}"
-                )
-            else:
-                # Log debug info para diagnosticar
-                current_app.logger.warning(
-                    f"SAML pysaml2: identity vazio. "
-                    f"response type={type(authn_response).__name__}, "
-                    f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
-                    f"encrypted_assertions="
-                    f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
-                )
-        except Exception as e:
-            current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
-    else:
-        current_app.logger.error(
-            "SAML: pysaml2 não conseguiu processar a resposta de nenhum servidor"
-        )
-
-    # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
-    if not user_email and not user_nic:
-        current_app.logger.info(
-            "pysaml2 não extraiu atributos, a tentar parsing manual do XML"
-        )
-        try:
-            decoded_response = base64.b64decode(raw_saml_response)
-            root = None
-            for codec in ["utf-8", "ISO-8859-1"]:
-                try:
-                    decoded_str = decoded_response.decode(codec)
-                    root = ET.fromstring(decoded_str)
-                    break
-                except (UnicodeDecodeError, ET.ParseError):
-                    continue
-
-            if root is not None:
-                ns = {
-                    "assertion": "urn:oasis:names:tc:SAML:2.0:assertion",
-                    "atributos": "http://autenticacao.cartaodecidadao.pt/atributos",
-                }
-                attribute_statement = root.find(".//assertion:AttributeStatement", ns)
-                if attribute_statement is not None:
-                    for child in attribute_statement:
-                        try:
-                            attr_name = child.attrib.get("Name", "")
-                            value = child.find(".//assertion:AttributeValue", ns)
-                            if value is None or value.text is None:
-                                continue
-                            if (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                            ):
-                                user_email = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NIC":
-                                user_nic = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                            ):
-                                first_name = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                            ):
-                                last_name = value.text
-                        except (AttributeError, KeyError):
-                            pass
-                    current_app.logger.info(
-                        f"SAML atributos via XML manual: email={user_email}, nic={'***' if user_nic else None}, "
-                        f"nome={first_name} {last_name}"
-                    )
-                else:
-                    current_app.logger.warning(
-                        "AttributeStatement não encontrado no XML — "
-                        "as assertions podem estar encriptadas"
-                    )
-        except Exception as e:
-            current_app.logger.error(f"Erro no parsing manual do XML: {e}")
+            # Log debug info para diagnosticar
+            current_app.logger.warning(
+                f"SAML pysaml2: identity vazio. "
+                f"response type={type(authn_response).__name__}, "
+                f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
+                f"encrypted_assertions="
+                f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
+            )
+    except Exception as e:
+        current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
 
     if not user_email and not user_nic:
         current_app.logger.error(
@@ -658,17 +842,40 @@ def idp_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    user, status = _find_or_create_saml_user(
-        user_email, user_nic, first_name, last_name
-    )
-
-    if status == "migration_candidate" and current_app.config.get(
-        "MIGRATION_MODE_ENABLED", False
-    ):
-        return _handle_migration_redirect(
-            user, user_email, user_nic, first_name, last_name
+    # 2b. NameID ↔ NIC binding (VULN-2077 / TICKET-58).
+    # If the IdP shipped a NIC, it must match the authenticated Subject.
+    # Mismatch indicates either a misconfigured IdP or an XSW-style attack
+    # where a wrapper assertion is feeding a forged NIC alongside a valid
+    # signed assertion with a different Subject.
+    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+        return _reject_saml_login(
+            "SAML SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
+            _("Autenticação rejeitada: identidade SAML inconsistente."),
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="subject_nic_mismatch",
         )
 
+    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+
+    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
+        _audit_saml(
+            "migration_pending",
+            "cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason=status,
+        )
+        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+
+    _audit_saml(
+        "success" if user else "user_not_found",
+        "cmd",
+        issuer=issuer,
+        name_id=name_id_value,
+        reason=status,
+    )
     return _handle_saml_user_login(user)
 
 
@@ -683,11 +890,7 @@ def saml_logout_postback():
 
     if saml_response:
         auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
-        binding = (
-            entity.BINDING_HTTP_POST
-            if request.method == "POST"
-            else BINDING_HTTP_REDIRECT
-        )
+        binding = entity.BINDING_HTTP_POST if request.method == "POST" else BINDING_HTTP_REDIRECT
 
         for server in auth_servers:
             saml_client = saml_client_for(server)
@@ -719,9 +922,7 @@ def saml_logout():
         text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
     )
 
-    logout_url = LogoutUrl(
-        text=_force_scheme(url_for("saml.saml_logout_postback", _external=True))
-    )
+    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.saml_logout_postback", _external=True)))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
     extensions = Extensions(extension_elements=[logout_url])
@@ -831,6 +1032,7 @@ def sp_eidas_initiated():
     }
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
+    _remember_outstanding(reqid, kind="eidas")
     return _extract_saml_form_data(info["data"])
 
 
@@ -855,111 +1057,110 @@ def idp_eidas_initiated():
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
 
-    # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta)
+    # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta).
+    # Política fail-closed (VULN-2077 / TICKET-58): MissingKey/SignatureError
+    # de um IdP só é tolerado enquanto restarem outros IdPs por tentar; após
+    # esgotados, o pedido é rejeitado. Outras excepções propagam (500).
+    # ``outstanding`` liga o ``InResponseTo`` à sessão (allow_unsolicited=False).
+    outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
         try:
             authn_response = saml_client.parse_authn_request_response(
-                raw_saml_response, entity.BINDING_HTTP_POST
+                raw_saml_response,
+                entity.BINDING_HTTP_POST,
+                outstanding=outstanding,
             )
-        except sigver.MissingKey:
+        except (sigver.MissingKey, SignatureError) as exc:
+            last_validation_error = exc
+            current_app.logger.warning(f"eIDAS rejeitado por {server}: {type(exc).__name__}: {exc}")
             continue
-        except SignatureError as se:
-            current_app.logger.error(f"eIDAS SignatureError para {server}: {se}")
-            continue
-        except Exception as e:
-            current_app.logger.error(
-                f"Erro ao processar resposta eIDAS com {server}: {e}"
-            )
-            continue
-        else:
-            break
+        break
 
-    # 2. Extrair atributos — primeiro do pysaml2, depois fallback para XML manual
-    if authn_response is not None:
-        try:
-            identity = authn_response.get_identity()
-            if identity:
-                user_email = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                )
-                user_nic = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NIC"
-                )
-                first_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                )
-                last_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                )
-                current_app.logger.info(
-                    f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
-                    f"nome={first_name} {last_name}"
-                )
-        except Exception as e:
-            current_app.logger.warning(
-                f"Falha ao extrair identity do pysaml2 (eIDAS): {e}"
-            )
-
-    # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
-    if not user_email and not user_nic:
-        current_app.logger.info(
-            "eIDAS: pysaml2 não extraiu atributos, a tentar parsing manual"
+    if authn_response is None:
+        return _reject_saml_login(
+            "eIDAS SSO rejeitado: nenhum IdP validou a resposta assinada "
+            f"(último erro: {last_validation_error})",
+            _("Autenticação rejeitada: assinatura SAML inválida."),
+            kind="eidas",
+            reason="signature_invalid",
         )
-        try:
-            decoded_response = base64.b64decode(raw_saml_response)
-            root = None
-            for codec in ["utf-8", "ISO-8859-1"]:
-                try:
-                    decoded_str = decoded_response.decode(codec)
-                    root = ET.fromstring(decoded_str)
-                    break
-                except (UnicodeDecodeError, ET.ParseError):
-                    continue
 
-            if root is not None:
-                ns = {
-                    "assertion": "urn:oasis:names:tc:SAML:2.0:assertion",
-                    "atributos": "http://autenticacao.cartaodecidadao.pt/atributos",
-                }
-                attribute_statement = root.find(".//assertion:AttributeStatement", ns)
-                if attribute_statement is not None:
-                    for child in attribute_statement:
-                        try:
-                            attr_name = child.attrib.get("Name", "")
-                            value = child.find(".//assertion:AttributeValue", ns)
-                            if value is None or value.text is None:
-                                continue
-                            if (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                            ):
-                                user_email = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NIC":
-                                user_nic = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                            ):
-                                first_name = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                            ):
-                                last_name = value.text
-                        except (AttributeError, KeyError):
-                            pass
-                    current_app.logger.info(
-                        f"eIDAS atributos via XML manual: email={user_email}, nic={'***' if user_nic else None}, "
-                        f"nome={first_name} {last_name}"
-                    )
-                else:
-                    current_app.logger.warning(
-                        "eIDAS: AttributeStatement não encontrado no XML — "
-                        "as assertions podem estar encriptadas"
-                    )
-        except Exception as e:
-            current_app.logger.error(f"eIDAS: Erro no parsing manual do XML: {e}")
+    # 1a. Replay cache (VULN-2077 / TICKET-58).
+    response_id = getattr(getattr(authn_response, "response", None), "id", None)
+    if not _check_and_record_replay(response_id, kind="eidas"):
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: replay de Response@ID={response_id!r}",
+            _("Autenticação rejeitada: resposta já utilizada."),
+            kind="eidas",
+            reason="replay",
+        )
+
+    # 1aa. One-time use of the matched AuthnRequest id.
+    in_response_to = getattr(authn_response, "in_response_to", None)
+    if isinstance(in_response_to, str) and in_response_to:
+        _consume_outstanding(in_response_to, kind="eidas")
+
+    # 1b. Validar Issuer e Subject/NameID (VULN-2077 / TICKET-58).
+    try:
+        issuer = authn_response.issuer()
+    except Exception as exc:  # noqa: BLE001
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: falha a obter Issuer ({exc})",
+            _("Autenticação rejeitada: resposta SAML inválida."),
+            kind="eidas",
+            reason="issuer_unreadable",
+        )
+
+    trusted_issuers = _trusted_saml_issuers()
+    if issuer not in trusted_issuers:
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: Issuer não confiado ({issuer!r})",
+            _("Autenticação rejeitada: emissor SAML desconhecido."),
+            kind="eidas",
+            issuer=issuer,
+            reason="issuer_untrusted",
+        )
+
+    try:
+        subject = authn_response.get_subject()
+    except Exception as exc:  # noqa: BLE001
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: falha a obter Subject ({exc})",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="eidas",
+            issuer=issuer,
+            reason="subject_unreadable",
+        )
+    name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    if not name_id_value:
+        return _reject_saml_login(
+            "eIDAS SSO rejeitado: Subject/NameID em falta",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+            kind="eidas",
+            issuer=issuer,
+            reason="subject_missing",
+        )
+
+    # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
+    # Não existe fallback: atributos só são lidos depois da assinatura
+    # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
+    try:
+        identity = authn_response.get_identity()
+        if identity:
+            user_email = _first_value(
+                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+            )
+            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
+            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
+            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            current_app.logger.info(
+                f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
+                f"nome={first_name} {last_name}"
+            )
+    except Exception as e:
+        current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
 
     if not user_email and not user_nic:
         current_app.logger.error(
@@ -968,17 +1169,36 @@ def idp_eidas_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    user, status = _find_or_create_saml_user(
-        user_email, user_nic, first_name, last_name
-    )
-
-    if status == "migration_candidate" and current_app.config.get(
-        "MIGRATION_MODE_ENABLED", False
-    ):
-        return _handle_migration_redirect(
-            user, user_email, user_nic, first_name, last_name
+    # 2b. NameID ↔ NIC binding (VULN-2077 / TICKET-58).
+    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+        return _reject_saml_login(
+            "eIDAS SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
+            _("Autenticação rejeitada: identidade SAML inconsistente."),
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="subject_nic_mismatch",
         )
 
+    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+
+    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
+        _audit_saml(
+            "migration_pending",
+            "eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason=status,
+        )
+        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+
+    _audit_saml(
+        "success" if user else "user_not_found",
+        "eidas",
+        issuer=issuer,
+        name_id=name_id_value,
+        reason=status,
+    )
     return _handle_saml_user_login(user)
 
 
@@ -992,11 +1212,7 @@ def eidas_logout_postback():
 
     if saml_response:
         auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
-        binding = (
-            entity.BINDING_HTTP_POST
-            if request.method == "POST"
-            else BINDING_HTTP_REDIRECT
-        )
+        binding = entity.BINDING_HTTP_POST if request.method == "POST" else BINDING_HTTP_REDIRECT
 
         for server in auth_servers:
             saml_client = eidas_client_for(server)
