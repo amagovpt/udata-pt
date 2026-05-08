@@ -13,11 +13,10 @@ import inspect
 from unittest.mock import MagicMock, patch
 
 import pytest
-from flask import session, url_for
+from flask import session
 
 from udata.auth.saml.saml_plugin.saml_govpt import _hash_nic
 from udata.core.user.factories import UserFactory
-from udata.models import datastore
 from udata.tests.api import APITestCase
 
 
@@ -64,6 +63,31 @@ def _build_saml_response_xml(email=None, nic=None, first_name=None, last_name=No
         </saml:AttributeStatement>
     </saml:Assertion>
 </samlp:Response>"""
+
+
+def _make_authn_response_mock(email=None, nic=None, first_name=None, last_name=None):
+    """Build a MagicMock that mimics a validated pysaml2 AuthnResponse.
+
+    Returns an object that exposes the SAML attributes via ``get_identity()``
+    just like ``saml2.response.AuthnResponse`` would after a successful
+    signature + envelope check. Tests must use this helper instead of a
+    bare ``MagicMock()`` because, post-VULN-2077, attributes are only read
+    from the validated pysaml2 object — there is no XML fallback parser.
+    """
+    identity = {}
+    if email:
+        identity["http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"] = [email]
+    if nic:
+        identity["http://interop.gov.pt/MDC/Cidadao/NIC"] = [nic]
+    if first_name:
+        identity["http://interop.gov.pt/MDC/Cidadao/NomeProprio"] = [first_name]
+    if last_name:
+        identity["http://interop.gov.pt/MDC/Cidadao/NomeApelido"] = [last_name]
+
+    response = MagicMock()
+    response.get_identity.return_value = identity
+    response.ava = identity
+    return response
 
 
 class SAMLCodeIntegrityTest(APITestCase):
@@ -263,9 +287,7 @@ class SAMLLoginFlowTest(APITestCase):
             self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
             user = UserFactory(confirmed_at="2024-01-01")
 
-            with patch(
-                "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-            ) as mock_login:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
                 response = _handle_saml_user_login(user)
 
                 mock_login.assert_called_once_with(user)
@@ -297,12 +319,15 @@ class SAMLSSOCallbackTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_sso_callback_creates_user_and_logs_in(
-        self, mock_client_for, mock_requires_conf
-    ):
+    def test_sso_callback_creates_user_and_logs_in(self, mock_client_for, mock_requires_conf):
         """After autenticacao.gov success, udata must create user and login."""
         mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="cidadao@example.pt",
+            nic="12345678",
+            first_name="João",
+            last_name="Silva",
+        )
         mock_client_for.return_value = mock_saml_client
 
         xml = _build_saml_response_xml(
@@ -312,9 +337,7 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="Silva",
         )
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
             # login_user must have been called exactly once
@@ -331,12 +354,15 @@ class SAMLSSOCallbackTest(APITestCase):
     def test_sso_callback_finds_existing_user_by_email(self, mock_client_for):
         """If user already exists with that email, login existing user."""
         mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="existing@example.pt",
+            nic="99999999",
+            first_name="Test",
+            last_name="User",
+        )
         mock_client_for.return_value = mock_saml_client
 
-        existing = UserFactory(
-            email="existing@example.pt", confirmed_at="2024-01-01"
-        )
+        existing = UserFactory(email="existing@example.pt", confirmed_at="2024-01-01")
 
         xml = _build_saml_response_xml(
             email="existing@example.pt",
@@ -345,9 +371,7 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="User",
         )
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
             assert mock_login.call_count == 1
@@ -358,7 +382,9 @@ class SAMLSSOCallbackTest(APITestCase):
     def test_sso_callback_finds_existing_user_by_nic(self, mock_client_for):
         """If user exists with that NIC, login existing user even without email."""
         mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            nic="55555555", first_name="Test", last_name="User"
+        )
         mock_client_for.return_value = mock_saml_client
 
         existing = UserFactory(
@@ -371,9 +397,7 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="User",
         )
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
             assert mock_login.call_count == 1
@@ -390,9 +414,7 @@ class SAMLSSOCallbackTest(APITestCase):
         # Empty attributes — no email, no NIC
         xml = _build_saml_response_xml()
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
             # login_user must NOT be called when no user can be found/created
@@ -418,7 +440,12 @@ class SAMLSSOCallbackTest(APITestCase):
 
         def track_parse(*args, **kwargs):
             call_order.append("saml_parse")
-            return MagicMock()
+            return _make_authn_response_mock(
+                email="order_test@example.pt",
+                nic="33333333",
+                first_name="Ana",
+                last_name="Costa",
+            )
 
         mock_saml_client.parse_authn_request_response.side_effect = track_parse
         mock_client_for.return_value = mock_saml_client
@@ -430,9 +457,7 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="Costa",
         )
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
 
             def track_login(user):
                 call_order.append("login_user")
@@ -451,7 +476,14 @@ class SAMLSSOCallbackTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_no_login_on_signature_error(self, mock_client_for):
-        """If SAML signature validation fails, login_user must NOT be called."""
+        """SignatureError must abort the SSO and never call login_user.
+
+        Regression test for VULN-2077 / TICKET-58: previously, a manual
+        XML fallback would extract attributes from an unverified response
+        and grant a session, allowing account takeover. After the fix, no
+        attributes are read from a response whose signature pysaml2 could
+        not validate.
+        """
         from saml2.sigver import SignatureError
 
         mock_saml_client = MagicMock()
@@ -460,6 +492,9 @@ class SAMLSSOCallbackTest(APITestCase):
         )
         mock_client_for.return_value = mock_saml_client
 
+        # XML carries attributes that, before the fix, the fallback parser
+        # would have used to log in as the victim. After the fix these
+        # attributes are ignored because the signature check failed.
         xml = _build_saml_response_xml(
             email="hacker@evil.com",
             nic="00000000",
@@ -467,24 +502,25 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="Actor",
         )
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
-            # On signature error the code still parses XML and tries to login
-            # because the except SignatureError block just logs and continues.
-            # This is the current behavior — the XML is parsed independently
-            # of the pysaml2 signature check.
+            # login_user MUST NOT be called when signature validation fails.
+            mock_login.assert_not_called()
 
-        # Response should still work (attributes parsed from XML directly)
-        assert response.status_code in (302, 400)
+        # Must redirect (no session cookie set, no user logged in).
+        assert response.status_code == 302
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_sets_session_saml_login(self, mock_client_for):
         """After successful SAML login, session['saml_login'] must be True."""
         mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="session_test@example.pt",
+            nic="44444444",
+            first_name="Rui",
+            last_name="Mendes",
+        )
         mock_client_for.return_value = mock_saml_client
 
         UserFactory(email="session_test@example.pt", confirmed_at="2024-01-01")
@@ -499,9 +535,7 @@ class SAMLSSOCallbackTest(APITestCase):
         with self.client.session_transaction() as sess:
             assert sess.get("saml_login") is None
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             mock_login.return_value = True
             self._post_saml_response(xml)
 
@@ -513,14 +547,14 @@ class SAMLSSOCallbackTest(APITestCase):
     def test_sso_callback_with_only_email(self, mock_client_for, mock_requires_conf):
         """autenticacao.gov may return only email (NIC is optional)."""
         mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="email_only@example.pt"
+        )
         mock_client_for.return_value = mock_saml_client
 
         xml = _build_saml_response_xml(email="email_only@example.pt")
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
             assert mock_login.call_count == 1
@@ -534,16 +568,14 @@ class SAMLSSOCallbackTest(APITestCase):
     ):
         """autenticacao.gov may return NIC but no email; placeholder generated."""
         mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = MagicMock()
-        mock_client_for.return_value = mock_saml_client
-
-        xml = _build_saml_response_xml(
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
             nic="88888888", first_name="Pedro", last_name="Nunes"
         )
+        mock_client_for.return_value = mock_saml_client
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        xml = _build_saml_response_xml(nic="88888888", first_name="Pedro", last_name="Nunes")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
 
             assert mock_login.call_count == 1
@@ -561,9 +593,7 @@ class SAMLSSOCallbackTest(APITestCase):
         """POST with invalid base64 must not login any user."""
         mock_client_for.return_value = MagicMock()
 
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt.login_user"
-        ) as mock_login:
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self.client.post(
                 "/saml/sso",
                 data={"SAMLResponse": "not-valid-base64!!!"},

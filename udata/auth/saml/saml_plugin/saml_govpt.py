@@ -42,9 +42,7 @@ from saml2.sigver import SignatureError
 # autenticacao.gov uses C14N 1.0 (http://www.w3.org/TR/2001/REC-xml-c14n-20010315)
 # but pysaml2 only allows Exclusive C14N by default. Add C14N 1.0 to allowed sets.
 _C14N_INCLUSIVE = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
-_C14N_INCLUSIVE_WITH_COMMENTS = (
-    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
-)
+_C14N_INCLUSIVE_WITH_COMMENTS = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
 ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
@@ -133,9 +131,7 @@ def _hash_nic(nic):
 def _is_nic_hashed(nic_value):
     """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
     return bool(
-        nic_value
-        and len(nic_value) == 64
-        and all(c in "0123456789abcdef" for c in nic_value)
+        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
     )
 
 
@@ -147,9 +143,7 @@ def _merge_nic_into_user(user, user_nic):
         user.extras = {}
     user.extras["auth_nic"] = _hash_nic(user_nic)
     user.save()
-    current_app.logger.info(
-        f"SAML: NIC merged into existing account {user.email} (id={user.id})"
-    )
+    current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
 
 
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
@@ -502,12 +496,8 @@ def idp_initiated():
                     msg_text = status_msg.text if status_msg is not None else None
                     # Also check for a nested sub-status code (e.g. RequestDenied)
                     sub_code = status_code.find("samlp:StatusCode", ns)
-                    sub_value = (
-                        sub_code.attrib.get("Value", "") if sub_code is not None else ""
-                    )
-                    display_msg = (
-                        msg_text or sub_value.rsplit(":", 1)[-1] or status_value
-                    )
+                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
+                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
                     current_app.logger.error(
                         f"SAML: IdP rejeitou o pedido: "
                         f"status={status_value}, sub={sub_value}, msg={msg_text}"
@@ -541,7 +531,9 @@ def idp_initiated():
         else:
             break
 
-    # 2. Extrair atributos — primeiro do pysaml2, depois fallback para XML manual
+    # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
+    # Não existe fallback: atributos só são lidos depois da assinatura
+    # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
     if authn_response is not None:
         # pysaml2 desencriptou e validou — extrair atributos do objeto
         try:
@@ -562,15 +554,9 @@ def idp_initiated():
                 user_email = _first_value(
                     identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
                 )
-                user_nic = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NIC"
-                )
-                first_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                )
-                last_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                )
+                user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
+                first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
+                last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
                 current_app.logger.info(
                     f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
                     f"nome={first_name} {last_name}"
@@ -591,66 +577,6 @@ def idp_initiated():
             "SAML: pysaml2 não conseguiu processar a resposta de nenhum servidor"
         )
 
-    # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
-    if not user_email and not user_nic:
-        current_app.logger.info(
-            "pysaml2 não extraiu atributos, a tentar parsing manual do XML"
-        )
-        try:
-            decoded_response = base64.b64decode(raw_saml_response)
-            root = None
-            for codec in ["utf-8", "ISO-8859-1"]:
-                try:
-                    decoded_str = decoded_response.decode(codec)
-                    root = ET.fromstring(decoded_str)
-                    break
-                except (UnicodeDecodeError, ET.ParseError):
-                    continue
-
-            if root is not None:
-                ns = {
-                    "assertion": "urn:oasis:names:tc:SAML:2.0:assertion",
-                    "atributos": "http://autenticacao.cartaodecidadao.pt/atributos",
-                }
-                attribute_statement = root.find(".//assertion:AttributeStatement", ns)
-                if attribute_statement is not None:
-                    for child in attribute_statement:
-                        try:
-                            attr_name = child.attrib.get("Name", "")
-                            value = child.find(".//assertion:AttributeValue", ns)
-                            if value is None or value.text is None:
-                                continue
-                            if (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                            ):
-                                user_email = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NIC":
-                                user_nic = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                            ):
-                                first_name = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                            ):
-                                last_name = value.text
-                        except (AttributeError, KeyError):
-                            pass
-                    current_app.logger.info(
-                        f"SAML atributos via XML manual: email={user_email}, nic={'***' if user_nic else None}, "
-                        f"nome={first_name} {last_name}"
-                    )
-                else:
-                    current_app.logger.warning(
-                        "AttributeStatement não encontrado no XML — "
-                        "as assertions podem estar encriptadas"
-                    )
-        except Exception as e:
-            current_app.logger.error(f"Erro no parsing manual do XML: {e}")
-
     if not user_email and not user_nic:
         current_app.logger.error(
             "SAML SSO: nenhum atributo extraído (email/NIC). "
@@ -658,16 +584,10 @@ def idp_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    user, status = _find_or_create_saml_user(
-        user_email, user_nic, first_name, last_name
-    )
+    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate" and current_app.config.get(
-        "MIGRATION_MODE_ENABLED", False
-    ):
-        return _handle_migration_redirect(
-            user, user_email, user_nic, first_name, last_name
-        )
+    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
+        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
     return _handle_saml_user_login(user)
 
@@ -683,11 +603,7 @@ def saml_logout_postback():
 
     if saml_response:
         auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
-        binding = (
-            entity.BINDING_HTTP_POST
-            if request.method == "POST"
-            else BINDING_HTTP_REDIRECT
-        )
+        binding = entity.BINDING_HTTP_POST if request.method == "POST" else BINDING_HTTP_REDIRECT
 
         for server in auth_servers:
             saml_client = saml_client_for(server)
@@ -719,9 +635,7 @@ def saml_logout():
         text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
     )
 
-    logout_url = LogoutUrl(
-        text=_force_scheme(url_for("saml.saml_logout_postback", _external=True))
-    )
+    logout_url = LogoutUrl(text=_force_scheme(url_for("saml.saml_logout_postback", _external=True)))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
 
     extensions = Extensions(extension_elements=[logout_url])
@@ -868,14 +782,14 @@ def idp_eidas_initiated():
             current_app.logger.error(f"eIDAS SignatureError para {server}: {se}")
             continue
         except Exception as e:
-            current_app.logger.error(
-                f"Erro ao processar resposta eIDAS com {server}: {e}"
-            )
+            current_app.logger.error(f"Erro ao processar resposta eIDAS com {server}: {e}")
             continue
         else:
             break
 
-    # 2. Extrair atributos — primeiro do pysaml2, depois fallback para XML manual
+    # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
+    # Não existe fallback: atributos só são lidos depois da assinatura
+    # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
     if authn_response is not None:
         try:
             identity = authn_response.get_identity()
@@ -883,83 +797,15 @@ def idp_eidas_initiated():
                 user_email = _first_value(
                     identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
                 )
-                user_nic = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NIC"
-                )
-                first_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                )
-                last_name = _first_value(
-                    identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                )
+                user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
+                first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
+                last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
                 current_app.logger.info(
                     f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
                     f"nome={first_name} {last_name}"
                 )
         except Exception as e:
-            current_app.logger.warning(
-                f"Falha ao extrair identity do pysaml2 (eIDAS): {e}"
-            )
-
-    # 3. Fallback: parsing manual do XML (para respostas não encriptadas)
-    if not user_email and not user_nic:
-        current_app.logger.info(
-            "eIDAS: pysaml2 não extraiu atributos, a tentar parsing manual"
-        )
-        try:
-            decoded_response = base64.b64decode(raw_saml_response)
-            root = None
-            for codec in ["utf-8", "ISO-8859-1"]:
-                try:
-                    decoded_str = decoded_response.decode(codec)
-                    root = ET.fromstring(decoded_str)
-                    break
-                except (UnicodeDecodeError, ET.ParseError):
-                    continue
-
-            if root is not None:
-                ns = {
-                    "assertion": "urn:oasis:names:tc:SAML:2.0:assertion",
-                    "atributos": "http://autenticacao.cartaodecidadao.pt/atributos",
-                }
-                attribute_statement = root.find(".//assertion:AttributeStatement", ns)
-                if attribute_statement is not None:
-                    for child in attribute_statement:
-                        try:
-                            attr_name = child.attrib.get("Name", "")
-                            value = child.find(".//assertion:AttributeValue", ns)
-                            if value is None or value.text is None:
-                                continue
-                            if (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-                            ):
-                                user_email = value.text
-                            elif attr_name == "http://interop.gov.pt/MDC/Cidadao/NIC":
-                                user_nic = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
-                            ):
-                                first_name = value.text
-                            elif (
-                                attr_name
-                                == "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
-                            ):
-                                last_name = value.text
-                        except (AttributeError, KeyError):
-                            pass
-                    current_app.logger.info(
-                        f"eIDAS atributos via XML manual: email={user_email}, nic={'***' if user_nic else None}, "
-                        f"nome={first_name} {last_name}"
-                    )
-                else:
-                    current_app.logger.warning(
-                        "eIDAS: AttributeStatement não encontrado no XML — "
-                        "as assertions podem estar encriptadas"
-                    )
-        except Exception as e:
-            current_app.logger.error(f"eIDAS: Erro no parsing manual do XML: {e}")
+            current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
 
     if not user_email and not user_nic:
         current_app.logger.error(
@@ -968,16 +814,10 @@ def idp_eidas_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    user, status = _find_or_create_saml_user(
-        user_email, user_nic, first_name, last_name
-    )
+    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate" and current_app.config.get(
-        "MIGRATION_MODE_ENABLED", False
-    ):
-        return _handle_migration_redirect(
-            user, user_email, user_nic, first_name, last_name
-        )
+    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
+        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
     return _handle_saml_user_login(user)
 
@@ -992,11 +832,7 @@ def eidas_logout_postback():
 
     if saml_response:
         auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
-        binding = (
-            entity.BINDING_HTTP_POST
-            if request.method == "POST"
-            else BINDING_HTTP_REDIRECT
-        )
+        binding = entity.BINDING_HTTP_POST if request.method == "POST" else BINDING_HTTP_REDIRECT
 
         for server in auth_servers:
             saml_client = eidas_client_for(server)
