@@ -200,6 +200,35 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
         assert source.validation.by is None
         assert source.validation.comment == "comment"
 
+    @patch("udata.harvest.actions.launch")
+    @patch("udata.harvest.actions.current_user", None)
+    def test_validate_source_without_request_context(self, mock):
+        # Refs: LEDG-1719 — CLI path resolves current_user to None instead of
+        # AnonymousUserMixin; validate_source must not raise AttributeError.
+        source = HarvestSourceFactory()
+
+        actions.validate_source(source)
+
+        source.reload()
+        assert source.validation.state == VALIDATION_ACCEPTED
+        assert source.validation.on is not None
+        assert source.validation.by is None
+        assert source.validation.comment is None
+        mock.assert_called_once_with(source)
+
+    @patch("udata.harvest.actions.current_user", None)
+    def test_reject_source_without_request_context(self):
+        # Refs: LEDG-1719 — same defensive contract as validate_source.
+        source = HarvestSourceFactory()
+
+        actions.reject_source(source, "comment")
+
+        source.reload()
+        assert source.validation.state == VALIDATION_REFUSED
+        assert source.validation.on is not None
+        assert source.validation.by is None
+        assert source.validation.comment == "comment"
+
     def test_get_source_by_slug(self):
         source = HarvestSourceFactory()
         assert HarvestSource.get(source.slug) == source
