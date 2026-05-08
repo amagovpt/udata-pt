@@ -65,14 +65,30 @@ def _build_saml_response_xml(email=None, nic=None, first_name=None, last_name=No
 </samlp:Response>"""
 
 
-def _make_authn_response_mock(email=None, nic=None, first_name=None, last_name=None):
+TEST_SAML_ISSUER = "https://autenticacao.cartaodecidadao.pt"
+
+
+def _make_authn_response_mock(
+    email=None,
+    nic=None,
+    first_name=None,
+    last_name=None,
+    issuer=TEST_SAML_ISSUER,
+    name_id=None,
+):
     """Build a MagicMock that mimics a validated pysaml2 AuthnResponse.
 
     Returns an object that exposes the SAML attributes via ``get_identity()``
     just like ``saml2.response.AuthnResponse`` would after a successful
     signature + envelope check. Tests must use this helper instead of a
     bare ``MagicMock()`` because, post-VULN-2077, attributes are only read
-    from the validated pysaml2 object — there is no XML fallback parser.
+    from the validated pysaml2 object — there is no XML fallback parser,
+    and the SSO callback now also checks ``issuer()`` against a whitelist
+    and binds the ``Subject/NameID`` to the NIC attribute.
+
+    ``name_id`` defaults to ``nic`` so the binding check passes for the
+    common case; pass an explicit value (e.g. ``""``) to simulate a
+    Subject mismatch in dedicated tests.
     """
     identity = {}
     if email:
@@ -87,6 +103,17 @@ def _make_authn_response_mock(email=None, nic=None, first_name=None, last_name=N
     response = MagicMock()
     response.get_identity.return_value = identity
     response.ava = identity
+    response.issuer.return_value = issuer
+
+    subject_mock = MagicMock()
+    if name_id is not None:
+        subject_mock.text = name_id
+    else:
+        # Default to the NIC so the Subject↔NIC binding check passes when a
+        # NIC is present; fall back to a stable placeholder for tests that
+        # do not exercise NIC at all (e.g. email-only logins).
+        subject_mock.text = nic or "test-name-id"
+    response.get_subject.return_value = subject_mock
     return response
 
 

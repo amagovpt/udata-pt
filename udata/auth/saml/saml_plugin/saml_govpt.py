@@ -115,6 +115,76 @@ def _first_value(identity, key):
     return None
 
 
+def _trusted_saml_issuers():
+    """Return the set of SAML Issuer entityIDs we trust.
+
+    Derived from the entityID of every metadata file listed in
+    ``SECURITY_SAML_IDP_METADATA``, plus any entry in the optional
+    ``TRUSTED_SAML_ISSUERS`` config (string CSV or iterable). Used to
+    reject responses whose ``<Issuer>`` does not match a configured IdP
+    (defence in depth on top of pysaml2's signature check).
+    """
+    cfg = current_app.config
+    issuers = set()
+    metadata_paths = (cfg.get("SECURITY_SAML_IDP_METADATA") or "").split(",")
+    for path in metadata_paths:
+        path = path.strip()
+        if not path:
+            continue
+        try:
+            tree = ET.parse(_resolve_path(path))
+            entity_id = tree.getroot().attrib.get("entityID")
+            if entity_id:
+                issuers.add(entity_id)
+        except (ET.ParseError, OSError):
+            continue
+
+    extra = cfg.get("TRUSTED_SAML_ISSUERS")
+    if extra:
+        if isinstance(extra, str):
+            extra = [s.strip() for s in extra.split(",") if s.strip()]
+        issuers.update(extra)
+    return issuers
+
+
+def _name_id_binds_nic(name_id, nic):
+    """Check that the Subject NameID is bound to the NIC attribute.
+
+    Defence against XML Signature Wrapping (XSW): if a wrapper assertion
+    carries a forged ``<AttributeStatement>`` while the signed assertion
+    keeps a different ``<Subject>``, the two will not match and the
+    request must be rejected.
+
+    Accepts either the raw NIC or its HMAC-SHA256 form so future IdP
+    configuration changes (the IdP may emit either form as ``NameID``)
+    can be honoured without code changes.
+    """
+    if not name_id or not nic:
+        return False
+    name_id = name_id.strip()
+    if not name_id:
+        return False
+    if name_id == nic:
+        return True
+    if name_id == _hash_nic(nic):
+        return True
+    return False
+
+
+def _reject_saml_login(log_message, flash_message, log_level="error"):
+    """Reject a SAML SSO request: log + flash + redirect to /pages/login.
+
+    Used for every fail-closed exit in the SSO callback so the failure
+    surface is uniform: no session cookie issued, generic flash for the
+    user, structured log for the auditor.
+    """
+    log = current_app.logger
+    getattr(log, log_level)(log_message)
+    do_flash(flash_message, "error")
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    return redirect(f"{frontend_url}/pages/login")
+
+
 def _hash_nic(nic):
     """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY.
 
@@ -529,16 +599,44 @@ def idp_initiated():
         break
 
     if authn_response is None:
-        current_app.logger.error(
+        return _reject_saml_login(
             "SAML SSO rejeitado: nenhum IdP validou a resposta assinada "
-            f"(último erro: {last_validation_error})"
-        )
-        do_flash(
+            f"(último erro: {last_validation_error})",
             _("Autenticação rejeitada: assinatura SAML inválida."),
-            "error",
         )
-        frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-        return redirect(f"{frontend_url}/pages/login")
+
+    # 1b. Validar Issuer e Subject/NameID (VULN-2077 / TICKET-58).
+    # pysaml2 já confirmou a assinatura; defesa-em-profundidade contra XSW
+    # exige que o Issuer venha da nossa whitelist e que o Subject NameID
+    # exista para mais tarde ser confrontado com o atributo NIC.
+    try:
+        issuer = authn_response.issuer()
+    except Exception as exc:  # noqa: BLE001 — pysaml2 attribute access surfaces
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: falha a obter Issuer ({exc})",
+            _("Autenticação rejeitada: resposta SAML inválida."),
+        )
+
+    trusted_issuers = _trusted_saml_issuers()
+    if issuer not in trusted_issuers:
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: Issuer não confiado ({issuer!r})",
+            _("Autenticação rejeitada: emissor SAML desconhecido."),
+        )
+
+    try:
+        subject = authn_response.get_subject()
+    except Exception as exc:  # noqa: BLE001
+        return _reject_saml_login(
+            f"SAML SSO rejeitado: falha a obter Subject ({exc})",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+        )
+    name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    if not name_id_value:
+        return _reject_saml_login(
+            "SAML SSO rejeitado: Subject/NameID em falta",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+        )
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
     # Não existe fallback: atributos só são lidos depois da assinatura
@@ -585,6 +683,17 @@ def idp_initiated():
             "SAML SSO: nenhum atributo extraído (email/NIC). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
             "tem acesso à chave privada para desencriptar."
+        )
+
+    # 2b. NameID ↔ NIC binding (VULN-2077 / TICKET-58).
+    # If the IdP shipped a NIC, it must match the authenticated Subject.
+    # Mismatch indicates either a misconfigured IdP or an XSW-style attack
+    # where a wrapper assertion is feeding a forged NIC alongside a valid
+    # signed assertion with a different Subject.
+    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+        return _reject_saml_login(
+            "SAML SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
+            _("Autenticação rejeitada: identidade SAML inconsistente."),
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
@@ -790,16 +899,41 @@ def idp_eidas_initiated():
         break
 
     if authn_response is None:
-        current_app.logger.error(
+        return _reject_saml_login(
             "eIDAS SSO rejeitado: nenhum IdP validou a resposta assinada "
-            f"(último erro: {last_validation_error})"
-        )
-        do_flash(
+            f"(último erro: {last_validation_error})",
             _("Autenticação rejeitada: assinatura SAML inválida."),
-            "error",
         )
-        frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-        return redirect(f"{frontend_url}/pages/login")
+
+    # 1b. Validar Issuer e Subject/NameID (VULN-2077 / TICKET-58).
+    try:
+        issuer = authn_response.issuer()
+    except Exception as exc:  # noqa: BLE001
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: falha a obter Issuer ({exc})",
+            _("Autenticação rejeitada: resposta SAML inválida."),
+        )
+
+    trusted_issuers = _trusted_saml_issuers()
+    if issuer not in trusted_issuers:
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: Issuer não confiado ({issuer!r})",
+            _("Autenticação rejeitada: emissor SAML desconhecido."),
+        )
+
+    try:
+        subject = authn_response.get_subject()
+    except Exception as exc:  # noqa: BLE001
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: falha a obter Subject ({exc})",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+        )
+    name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    if not name_id_value:
+        return _reject_saml_login(
+            "eIDAS SSO rejeitado: Subject/NameID em falta",
+            _("Autenticação rejeitada: identidade SAML em falta."),
+        )
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
     # Não existe fallback: atributos só são lidos depois da assinatura
@@ -825,6 +959,13 @@ def idp_eidas_initiated():
             "eIDAS SSO: nenhum atributo extraído (email/NIC). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
             "tem acesso à chave privada para desencriptar."
+        )
+
+    # 2b. NameID ↔ NIC binding (VULN-2077 / TICKET-58).
+    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+        return _reject_saml_login(
+            "eIDAS SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
+            _("Autenticação rejeitada: identidade SAML inconsistente."),
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
