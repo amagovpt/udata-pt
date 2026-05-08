@@ -26,6 +26,7 @@ from udata.core.metrics.models import WithMetrics
 from udata.core.owned import Owned, OwnedQuerySet
 from udata.core.reuse.api_fields import BIGGEST_IMAGE_SIZE, reuse_permissions_fields
 from udata.core.storages import default_image_basename, images
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.frontend.markdown import mdstrip
 from udata.i18n import lazy_gettext as _
 from udata.mongo.datetime_fields import Datetimed
@@ -218,6 +219,12 @@ class Reuse(
 
     @classmethod
     def pre_save(cls, sender, document, **kwargs):
+        # VULN-2076: defense-in-depth sanitization for any write path
+        # (Reuse has no WTForm; api_fields.patch and harvesters all land here).
+        if document.title:
+            document.title = sanitize_strict(document.title)
+        if document.description:
+            document.description = sanitize_markdown_html(document.description)
         # Emit before_save
         cls.before_save.send(document)
 

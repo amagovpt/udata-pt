@@ -1,4 +1,5 @@
 from udata.core.spatial.forms import SpatialCoverageField
+from udata.core.utils.sanitization import sanitize_markdown_html
 from udata.forms import ModelForm, fields, validators
 from udata.i18n import lazy_gettext as _
 
@@ -38,6 +39,11 @@ class TopicForm(ModelForm):
     description = fields.MarkdownField(_("Description"), [validators.DataRequired()])
 
     elements = fields.NestedModelList(TopicElementForm)
+
+    def validate(self, **kwargs):
+        # VULN-2075/2076: strip dangerous HTML from the topic description.
+        self.description.data = sanitize_markdown_html(self.description.data)
+        return super().validate(**kwargs)
 
     @property
     def data(self):

@@ -7,6 +7,7 @@ from udata.core.access_type.constants import (
 from udata.core.access_type.models import AccessAudience
 from udata.core.spatial.forms import SpatialCoverageField
 from udata.core.storages import resources
+from udata.core.utils.sanitization import sanitize_markdown_html
 from udata.forms import ModelForm, fields, validators
 from udata.i18n import lazy_gettext as _
 from udata.mongo.errors import FieldValidationError
@@ -102,6 +103,11 @@ class BaseResourceForm(ModelForm):
     )
     extras = fields.ExtrasField()
     schema = fields.FormField(SchemaForm)
+
+    def validate(self, **kwargs):
+        # VULN-2075/2076: strip dangerous HTML from the resource description.
+        self.description.data = sanitize_markdown_html(self.description.data)
+        return super().validate(**kwargs)
 
 
 class ResourceForm(BaseResourceForm):
@@ -219,6 +225,11 @@ class DatasetForm(ModelForm):
     extras = fields.ExtrasField()
     resources = fields.NestedModelList(ResourceForm)
     contact_points = fields.ContactPointListField(validators=[validate_contact_point])
+
+    def validate(self, **kwargs):
+        # VULN-2075/2076: strip dangerous HTML from the dataset description.
+        self.description.data = sanitize_markdown_html(self.description.data)
+        return super().validate(**kwargs)
 
 
 class ResourcesListForm(ModelForm):

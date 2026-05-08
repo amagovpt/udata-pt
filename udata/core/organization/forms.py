@@ -1,6 +1,7 @@
 from flask import current_app
 
 from udata.auth import current_user
+from udata.core.utils.sanitization import sanitize_markdown_html
 from udata.forms import Form, ModelForm, fields, validators
 from udata.i18n import lazy_gettext as _
 
@@ -60,6 +61,11 @@ class OrganizationForm(ModelForm):
 
     deleted = fields.DateTimeField()
     extras = fields.ExtrasField()
+
+    def validate(self, **kwargs):
+        # VULN-2075: strip dangerous HTML before further validation runs.
+        self.description.data = sanitize_markdown_html(self.description.data)
+        return super().validate(**kwargs)
 
     def save(self, commit=True, **kwargs):
         """Register the current user as admin on creation"""

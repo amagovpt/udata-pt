@@ -10,13 +10,14 @@ from mongoengine.fields import (
     ReferenceField,
     StringField,
 )
-from mongoengine.signals import post_delete, post_save
+from mongoengine.signals import post_delete, post_save, pre_save
 
 from udata.api_fields import field
 from udata.core.activity.models import Auditable
 from udata.core.linkable import Linkable
 from udata.core.owned import Owned, OwnedQuerySet
 from udata.core.spatial.models import SpatialCoverage
+from udata.core.utils.sanitization import sanitize_markdown_html
 from udata.mongo.datetime_fields import Datetimed
 from udata.mongo.document import UDataDocument as Document
 from udata.mongo.extras_fields import ExtrasField
@@ -153,6 +154,20 @@ class Topic(Datetimed, Auditable, Linkable, Document[OwnedQuerySet], Owned):
         )
 
 
+def _sanitize_topic(sender, document, **kwargs):
+    # VULN-2075/2076: defense-in-depth sanitization for any write path.
+    if document.description:
+        document.description = sanitize_markdown_html(document.description)
+
+
+def _sanitize_topic_element(sender, document, **kwargs):
+    # VULN-2075/2076: defense-in-depth sanitization for any write path.
+    if document.description:
+        document.description = sanitize_markdown_html(document.description)
+
+
+pre_save.connect(_sanitize_topic, sender=Topic)
+pre_save.connect(_sanitize_topic_element, sender=TopicElement)
 post_save.connect(Topic.post_save, sender=Topic)
 post_save.connect(TopicElement.post_save, sender=TopicElement)
 post_delete.connect(Topic.post_delete, sender=Topic)
