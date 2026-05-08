@@ -631,6 +631,263 @@ class SAMLSSOCallbackTest(APITestCase):
         assert response.status_code == 302
 
 
+class SAMLVuln2077RegressionTest(APITestCase):
+    """Regression suite for VULN-2077 / TICKET-58 (Account Takeover via SAML).
+
+    Each test exercises one fail-closed exit added to ``idp_initiated`` so
+    a future regression that re-introduces the manual XML fallback, the
+    permissive ``except`` clauses or relaxes the Issuer / Subject /
+    replay checks will be caught here.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _post_saml_response(self, saml_xml):
+        encoded = base64.b64encode(saml_xml.encode("utf-8")).decode("utf-8")
+        return self.client.post(
+            "/saml/sso",
+            data={"SAMLResponse": encoded},
+            follow_redirects=False,
+        )
+
+    def _post_eidas_response(self, saml_xml):
+        encoded = base64.b64encode(saml_xml.encode("utf-8")).decode("utf-8")
+        return self.client.post(
+            "/saml/eidas/sso",
+            data={"SAMLResponse": encoded},
+            follow_redirects=False,
+        )
+
+    # ----- CMD path ----------------------------------------------------
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_rejects_unsigned_response(self, mock_client_for):
+        """A SAML Response with no <Signature> raises SignatureError → reject."""
+        from saml2.sigver import SignatureError
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.side_effect = SignatureError(
+            "Response is not signed"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="12345678")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_saml_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+        assert "/pages/login" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_rejects_response_signed_by_unknown_key(self, mock_client_for):
+        """SignatureError from a key not present in the IdP metadata → reject."""
+        from saml2.sigver import SignatureError
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.side_effect = SignatureError(
+            "Signature key not in trust store"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="12345678")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_saml_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_rejects_xsw_attack(self, mock_client_for):
+        """Subject NameID does not match the NIC carried by AttributeStatement.
+
+        Simulates an XML Signature Wrapping (XSW) attack: pysaml2 validated
+        a signed assertion whose Subject points at one user, while a
+        wrapper assertion smuggled an AttributeStatement with a NIC for a
+        different user. The binding check must catch the mismatch.
+        """
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="victim@example.pt",
+            nic="11111111",  # forged NIC in attribute statement
+            name_id="22222222",  # legitimate Subject
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="victim@example.pt", nic="11111111")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_saml_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_rejects_replay(self, mock_client_for):
+        """A second consumption of the same Response@ID is refused."""
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="replay@example.pt", nic="33333333"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="replay@example.pt", nic="33333333")
+
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._check_and_record_replay",
+            return_value=False,  # simulate "already consumed"
+        ):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = self._post_saml_response(xml)
+                mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_rejects_untrusted_issuer(self, mock_client_for):
+        """An <Issuer> outside the configured metadata is rejected."""
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="a@b.pt",
+            nic="44444444",
+            issuer="https://evil-idp.example.com",
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="44444444")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_saml_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_rejects_subject_attribute_mismatch(self, mock_client_for):
+        """Subject NameID present but pointing at a different user than NIC."""
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="a@b.pt",
+            nic="55555555",
+            name_id="not-the-same-id",
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="55555555")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_saml_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    # ----- eIDAS path --------------------------------------------------
+    # The eIDAS handler mirrors idp_initiated; the same six rejections
+    # must hold there too.
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_unsigned_response(self, mock_client_for):
+        from saml2.sigver import SignatureError
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.side_effect = SignatureError(
+            "Response is not signed"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="12345678")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_response_signed_by_unknown_key(self, mock_client_for):
+        from saml2.sigver import SignatureError
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.side_effect = SignatureError(
+            "Signature key not in trust store"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="12345678")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_xsw_attack(self, mock_client_for):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="victim@example.pt",
+            nic="11111111",
+            name_id="22222222",
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="victim@example.pt", nic="11111111")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_replay(self, mock_client_for):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="replay@example.pt", nic="33333333"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="replay@example.pt", nic="33333333")
+
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._check_and_record_replay",
+            return_value=False,
+        ):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = self._post_eidas_response(xml)
+                mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_untrusted_issuer(self, mock_client_for):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="a@b.pt",
+            nic="44444444",
+            issuer="https://evil-idp.example.com",
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="44444444")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_subject_attribute_mismatch(self, mock_client_for):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            email="a@b.pt",
+            nic="55555555",
+            name_id="not-the-same-id",
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(email="a@b.pt", nic="55555555")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(xml)
+            mock_login.assert_not_called()
+        assert response.status_code == 302
+
+
 class SAMLLogoutFlowTest(APITestCase):
     """Test the SAML logout callback clears the session."""
 
