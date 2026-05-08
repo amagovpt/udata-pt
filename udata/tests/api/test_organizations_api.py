@@ -544,8 +544,8 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         organization.reload()
         assert organization.requests[0].status == "pending"
 
-    def test_invite_member_by_user_id(self):
-        """Test inviting a user by their user ID creates an invitation."""
+    def test_add_member_by_user_id_directly(self):
+        """Posting a known user_id adds them as a member directly (no invitation)."""
         user = self.login()
         invited_user = UserFactory()
         organization = OrganizationFactory(
@@ -559,18 +559,18 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
         assert201(response)
 
-        assert response.json["kind"] == "invitation"
+        # Response is a Member (no `kind`, has `user`/`role`/`since`).
+        assert "kind" not in response.json
         assert response.json["role"] == "admin"
-        assert response.json["status"] == "pending"
+        assert response.json["user"]["id"] == str(invited_user.id)
+        assert response.json["since"]
 
         organization.reload()
-        assert not organization.is_member(invited_user)
-        assert len(organization.requests) == 1
-        assert organization.requests[0].kind == "invitation"
-        assert organization.requests[0].user == invited_user
+        assert organization.is_member(invited_user)
+        assert len(organization.requests) == 0
 
-    def test_invite_member_creates_notification_for_invited_user(self):
-        """Test that inviting a user creates a notification for the invited user, not the admins."""
+    def test_add_member_by_user_id_does_not_create_invitation_notification(self):
+        """Direct add does not create a pending-invitation notification."""
         user = self.login()
         invited_user = UserFactory()
         organization = OrganizationFactory(
@@ -580,10 +580,10 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         api_url = url_for("api.invite_member", org=organization)
         self.post(api_url, {"user": str(invited_user.id), "role": "editor"})
 
-        notifications = Notification.objects(user=invited_user)
-        assert notifications.count() == 1
-        assert notifications.first().details.request_organization == organization
-        assert notifications.first().details.kind == "invitation"
+        invitation_notifications = Notification.objects(
+            user=invited_user, details__kind="invitation"
+        )
+        assert invitation_notifications.count() == 0
 
         admin_notifications = Notification.objects(user=user)
         assert admin_notifications.count() == 0
@@ -611,8 +611,8 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert organization.requests[0].email == "newuser@example.com"
         assert organization.requests[0].user is None
 
-    def test_invite_member_by_email_existing_user(self):
-        """Test inviting by email when user already exists links to the user."""
+    def test_add_member_by_email_resolves_to_existing_user(self):
+        """Posting an email matching an existing user adds them directly (no invitation)."""
         user = self.login()
         existing_user = UserFactory(email="existing@example.com")
         organization = OrganizationFactory(
@@ -626,13 +626,14 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
         assert201(response)
 
+        # Resolves to the existing user and adds them as a Member (no `kind`).
+        assert "kind" not in response.json
         assert response.json["user"]["id"] == str(existing_user.id)
-        assert response.json["email"] is None
+        assert response.json["role"] == "editor"
 
         organization.reload()
-        assert len(organization.requests) == 1
-        assert organization.requests[0].user == existing_user
-        assert organization.requests[0].email is None
+        assert organization.is_member(existing_user)
+        assert len(organization.requests) == 0
 
     def test_only_admin_can_invite_member(self):
         user = self.login()
