@@ -1,6 +1,10 @@
+import ipaddress
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
+import requests as http_requests
 from flask import current_app, json, make_response, redirect, request, url_for
 
 from udata.api import API, api, fields
@@ -56,7 +60,9 @@ def _serialize_dataset(dataset):
         "title": dataset.title,
         "slug": dataset.slug,
         "description": dataset.description,
-        "last_modified": dataset.last_modified.isoformat() if dataset.last_modified else None,
+        "last_modified": (
+            dataset.last_modified.isoformat() if dataset.last_modified else None
+        ),
         "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
         "organization": {"name": org.name} if org else None,
         "metrics": dataset.metrics or {},
@@ -117,7 +123,9 @@ support_contact_fields = api.model(
         ),
         "email": fields.String(description="Sender email address", required=True),
         "subject": fields.String(description="Subject line", required=True),
-        "message": fields.String(description="Body of the support request", required=True),
+        "message": fields.String(
+            description="Body of the support request", required=True
+        ),
     },
 )
 
@@ -133,9 +141,9 @@ class SiteContactAPI(API):
         """Send a support email composed from the public support form."""
         form = api.validate(SupportContactForm)
 
-        recipient = current_app.config.get("MAIL_DEFAULT_RECEIVER") or current_app.config.get(
-            "CONTACT_EMAIL"
-        )
+        recipient = current_app.config.get(
+            "MAIL_DEFAULT_RECEIVER"
+        ) or current_app.config.get("CONTACT_EMAIL")
         if not recipient:
             api.abort(503, "Support recipient is not configured")
 
@@ -301,7 +309,9 @@ class SiteOrganizationsCsv(API):
         if not params and "organization" in exported_models:
             return redirect(get_export_url("organization"))
         params["facets"] = False
-        organizations = OrgApiParser.parse_filters(get_csv_queryset(Organization), params)
+        organizations = OrgApiParser.parse_filters(
+            get_csv_queryset(Organization), params
+        )
         return csv.stream(OrganizationCsvAdapter(organizations), "organizations")
 
 
@@ -338,7 +348,9 @@ class SiteHarvestsCsv(API):
         exported_models = current_app.config.get("EXPORT_CSV_MODELS", [])
         if "harvest" in exported_models:
             return redirect(get_export_url("harvest"))
-        adapter = HarvestSourceCsvAdapter(get_csv_queryset(HarvestSource).order_by("created_at"))
+        adapter = HarvestSourceCsvAdapter(
+            get_csv_queryset(HarvestSource).order_by("created_at")
+        )
         return csv.stream(adapter, "harvest")
 
 
@@ -457,7 +469,67 @@ class SiteLogContentAPI(API):
         return {
             "name": resolved.name,
             "size": size,
-            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            "modified": datetime.fromtimestamp(
+                stat.st_mtime, tz=timezone.utc
+            ).isoformat(),
             "truncated": truncated,
             "content": raw.decode("utf-8", errors="replace"),
         }
+
+
+_PRIVATE_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def _is_safe_host(hostname: str) -> bool:
+    try:
+        ip_str = socket.gethostbyname(hostname)
+        addr = ipaddress.ip_address(ip_str)
+        return not any(addr in net for net in _PRIVATE_NETS)
+    except (socket.gaierror, ValueError):
+        return False
+
+
+@api.route("/site/check_url/", endpoint="site_check_url")
+class SiteCheckUrlAPI(API):
+    @api.doc("site_check_url")
+    @api.secure
+    def get(self):
+        """Check if a URL is publicly reachable (HEAD request, 5 s timeout)."""
+        url = request.args.get("url", "").strip()
+        if not url:
+            return {"reachable": False, "reason": "no_url"}
+
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return {"reachable": False, "reason": "invalid_url"}
+
+        if parsed.scheme not in ("http", "https"):
+            return {"reachable": False, "reason": "invalid_scheme"}
+
+        hostname = parsed.hostname
+        if not hostname:
+            return {"reachable": False, "reason": "no_hostname"}
+
+        if not _is_safe_host(hostname):
+            return {"reachable": False, "reason": "dns_failed"}
+
+        try:
+            resp = http_requests.head(
+                url,
+                timeout=5,
+                allow_redirects=True,
+                headers={"User-Agent": "dados.gov.pt/1.0 URL-Validator"},
+            )
+            return {"reachable": resp.status_code < 500}
+        except http_requests.exceptions.RequestException:
+            return {"reachable": False, "reason": "connection_failed"}
