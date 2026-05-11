@@ -206,7 +206,7 @@ def create_security_blueprint(app, state, import_name):
             app.config["SECURITY_CONFIRM_URL"],
             methods=["GET", "POST"],
             endpoint="send_confirmation",
-        )(send_confirmation)
+        )(auth_rate_limit(send_confirmation))
         bp.route(
             app.config["SECURITY_CONFIRM_URL"]
             + slash_url_suffix(app.config["SECURITY_CONFIRM_URL"], "<token>"),

@@ -246,30 +246,12 @@ class SendConfirmationRateLimitRegressionTest(PytestOnlyAPITestCase):
     rapid submissions, enabling email-flood / phishing-list validation
     abuse.
 
-    ``udata.auth.views`` wraps ``login``, ``register``, ``forgot_password``
-    and ``reset_password`` in ``auth_rate_limit`` (5 requests/minute) but
-    leaves ``send_confirmation`` (lines 205-209) wired bare. This test is
-    intentionally **fail-by-design** until the wrapper is applied — the
-    failure is the diagnostic signal to apply the matching fix:
-
-        bp.route(app.config["SECURITY_CONFIRM_URL"], methods=[...],
-                 endpoint="send_confirmation")(
-            auth_rate_limit(send_confirmation)
-        )
-
-    Once the fix lands, this assertion flips to passing and the same test
-    file documents the regression boundary going forward.
+    ``udata.auth.views`` wraps every auth view in ``auth_rate_limit``
+    (5 requests/minute) — including ``send_confirmation`` (lines 205-209)
+    since the VULN-1498 fix. This test pins that contract: ten rapid
+    POSTs to ``/confirm/`` must include at least one 429 response.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "VULN-1498 fix pending — send_confirmation (udata/auth/views.py:"
-            "205-209) is not wrapped in auth_rate_limit. When the wrapper "
-            "is added, this test starts passing and strict=True flips the "
-            "result to red, forcing removal of the xfail marker."
-        ),
-    )
     @pytest.mark.options(
         CAPTCHETAT_BASE_URL=None,
         SECURITY_RETURN_GENERIC_RESPONSES=True,
