@@ -15,7 +15,7 @@ from mongoengine.fields import (
     ReferenceField,
     StringField,
 )
-from mongoengine.signals import post_save
+from mongoengine.signals import post_save, pre_save
 
 from udata.api import api, fields
 from udata.api_fields import field, generate_fields
@@ -33,6 +33,7 @@ from udata.core.linkable import Linkable
 from udata.core.metrics.helpers import get_stock_metrics
 from udata.core.metrics.models import WithMetrics
 from udata.core.owned import Owned, OwnedQuerySet
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.i18n import lazy_gettext as _
 from udata.mongo.document import UDataDocument as Document
 from udata.mongo.extras_fields import ExtrasField
@@ -212,6 +213,17 @@ class Dataservice(
 
     verbose_name = _("dataservice")
 
+    @classmethod
+    def pre_save(cls, sender, document, **kwargs):
+        # LEDG-1715 / VULN-2075: defense-in-depth sanitization for any write path
+        # (Dataservice uses field()/api_fields.patch and harvesters all land here).
+        if document.title:
+            document.title = sanitize_strict(document.title)
+        if document.acronym:
+            document.acronym = sanitize_strict(document.acronym)
+        if document.description:
+            document.description = sanitize_markdown_html(document.description)
+
     def __str__(self):
         return self.title or ""
 
@@ -389,3 +401,4 @@ class Dataservice(
 
 
 post_save.connect(Dataservice.post_save, sender=Dataservice)
+pre_save.connect(Dataservice.pre_save, sender=Dataservice)
