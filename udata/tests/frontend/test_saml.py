@@ -10,6 +10,7 @@ then perform the udata login (login_user + session['saml_login']).
 
 import base64
 import inspect
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +19,13 @@ from flask import session
 from udata.auth.saml.saml_plugin.saml_govpt import _hash_nic
 from udata.core.user.factories import UserFactory
 from udata.tests.api import APITestCase
+
+# Placeholder email shape generated when the IdP does not return an email:
+# saml-<uuid4().hex[:8]>@autenticacao.gov.pt — 8 lowercase hex characters.
+# We assert the structure, not the literal value, because the NIC must NOT
+# leak into the email address (privacy fix; see
+# saml_govpt._find_or_create_saml_user).
+_SAML_PLACEHOLDER_EMAIL_RE = re.compile(r"^saml-[a-f0-9]{8}@autenticacao\.gov\.pt$")
 
 
 def _build_saml_response_xml(email=None, nic=None, first_name=None, last_name=None):
@@ -236,7 +244,9 @@ class SAMLAutoRegistrationTest(APITestCase):
 
             assert status == "new"
             assert user is not None
-            assert user.email == "saml-77777777@autenticacao.gov.pt"
+            # Email must be the random-uuid placeholder, NOT a NIC-derived value.
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
+            assert "77777777" not in user.email  # NIC must not leak
             assert user.extras.get("auth_nic") == _hash_nic("77777777")
 
     def test_returns_none_when_no_email_and_no_nic(self):
@@ -371,7 +381,8 @@ class SAMLSSOCallbackTest(APITestCase):
             assert mock_login.call_count == 1
             logged_in_user = mock_login.call_args[0][0]
             assert logged_in_user.email == "cidadao@example.pt"
-            assert logged_in_user.extras.get("auth_nic") == "12345678"
+            # auth_nic is stored as HMAC-SHA256 hex, never the raw NIC.
+            assert logged_in_user.extras.get("auth_nic") == _hash_nic("12345678")
             assert logged_in_user.first_name == "João"
             assert logged_in_user.last_name == "Silva"
 
@@ -607,7 +618,9 @@ class SAMLSSOCallbackTest(APITestCase):
 
             assert mock_login.call_count == 1
             logged_in_user = mock_login.call_args[0][0]
-            assert logged_in_user.email == "saml-88888888@autenticacao.gov.pt"
+            # Placeholder email must be a random uuid hex, NOT NIC-derived.
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(logged_in_user.email), logged_in_user.email
+            assert "88888888" not in logged_in_user.email  # NIC must not leak
             assert logged_in_user.extras.get("auth_nic") == _hash_nic("88888888")
 
     def test_sso_rejects_missing_saml_response(self):
