@@ -3,8 +3,8 @@ Sanitize stored HTML in user-authored fields (VULN-2075, VULN-2076).
 
 Strips dangerous HTML (``<script>``, event handlers, ``javascript:`` URIs,
 unsupported tags) from existing documents in the ``organization``, ``reuse``,
-``dataset``, ``topic``, ``topic_element``, ``user`` and ``dataservice``
-collections.
+``dataset``, ``topic``, ``topic_element``, ``user``, ``dataservice`` and
+``community_resource`` collections.
 
 Markdown fields (``description``, ``about``) keep the application's
 ``MD_ALLOWED_TAGS`` allow-list. Plain-string fields (``title``, ``acronym``,
@@ -47,6 +47,7 @@ TARGETS = [
     ("topic_element", [("description", "md")]),
     ("user", [("about", "md"), ("first_name", "strict"), ("last_name", "strict")]),
     ("dataservice", [("title", "strict"), ("acronym", "strict"), ("description", "md")]),
+    ("community_resource", [("title", "strict"), ("description", "md")]),
 ]
 
 
