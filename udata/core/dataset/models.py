@@ -1171,6 +1171,17 @@ class CommunityResource(ResourceMixin, WithMetrics, Owned, Document[OwnedQuerySe
         "queryset_class": OwnedQuerySet,
     }
 
+    @classmethod
+    def pre_save(cls, sender, document, **kwargs):
+        # LEDG-1716 / VULN-2075: defense-in-depth sanitization for any write
+        # path that bypasses CommunityResourceForm (mass imports, harvesters,
+        # direct ORM writes, future GraphQL/CLI). The form layer also strips
+        # description, but does not touch title — covered here.
+        if document.title:
+            document.title = sanitize_strict(document.title)
+        if document.description:
+            document.description = sanitize_markdown_html(document.description)
+
     @property
     def from_community(self):
         return True
@@ -1183,6 +1194,9 @@ class CommunityResource(ResourceMixin, WithMetrics, Owned, Document[OwnedQuerySe
             "delete": ResourceEditPermission(self),
             "edit": ResourceEditPermission(self),
         }
+
+
+pre_save.connect(CommunityResource.pre_save, sender=CommunityResource)
 
 
 class ResourceSchema(object):
