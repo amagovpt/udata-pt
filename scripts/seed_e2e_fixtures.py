@@ -41,6 +41,47 @@ REUSE_TITLE = "E2E Test Reuse"
 REUSE_SLUG = "e2e-test-reuse"
 RESOURCE_TITLE = "E2E Test Resource"
 
+# XSS regression fixtures (consumed by tests/e2e/frontend-vulnerabilities/).
+# Slugs are stable so the Playwright suite can navigate by URL. The payloads
+# below are written to the DB via `update_one(set__description=...)`, which
+# bypasses Reuse/Organization/Dataset.pre_save sanitization — that is the
+# point: we want to test the FRONTEND rendering layer in the worst case where
+# a malicious record has somehow landed in MongoDB despite the backend's
+# defense-in-depth. If frontend regresses (e.g. someone reintroduces
+# dangerouslySetInnerHTML on `description`), one of the XSS flags below will
+# fire when Playwright visits the page.
+XSS_ORG_SLUG = "e2e-xss-test-organization"
+XSS_ORG_NAME = "E2E XSS Test Organization"
+XSS_DATASET_SLUG = "e2e-xss-test-dataset"
+XSS_DATASET_TITLE_SAFE = "E2E XSS Test Dataset"
+XSS_REUSE_SLUG = "e2e-xss-test-reuse"
+XSS_REUSE_TITLE_SAFE = "E2E XSS Test Reuse"
+
+# Each payload sets a unique flag on `window.__xssFlags`. The frontend spec
+# reads the object back via `page.evaluate` and asserts every flag is
+# undefined. The keys here MUST stay in sync with
+# `frontend/tests/e2e/frontend-vulnerabilities/_payloads.ts`.
+_XSS_VECTORS = [
+    '<img src=x onerror="window.__xssFlags = (window.__xssFlags || {}); '
+    'window.__xssFlags.imgOnError = 1">',
+    "<script>window.__xssFlags = (window.__xssFlags || {}); "
+    "window.__xssFlags.scriptTag = 1;</script>",
+    '<svg onload="window.__xssFlags = (window.__xssFlags || {}); '
+    'window.__xssFlags.svgOnLoad = 1"></svg>',
+    "[click-here](javascript:window.__xssFlags = (window.__xssFlags || {}); "
+    "window.__xssFlags.javascriptLink = 1)",
+    '<iframe srcdoc="<script>parent.__xssFlags = (parent.__xssFlags || {}); '
+    'parent.__xssFlags.iframeSrcDoc = 1;</script>"></iframe>',
+]
+XSS_DESCRIPTION_PAYLOAD = "\n\n".join(_XSS_VECTORS)
+# Title is plain text in the frontend (never markdown), so a single inline
+# vector is enough to detect regressions like a raw {title} interpolation
+# inside dangerouslySetInnerHTML.
+XSS_TITLE_PAYLOAD = (
+    '<img src=x onerror="window.__xssFlags = (window.__xssFlags || {}); '
+    'window.__xssFlags.titleImgOnError = 1">'
+)
+
 
 def get_or_create_org(admin: User, editor: User) -> Organization:
     org = Organization.objects(slug=ORG_SLUG).first()
@@ -118,6 +159,75 @@ def get_or_create_reuse(org: Organization, dataset: Dataset) -> Reuse:
     return reuse
 
 
+def get_or_create_xss_org(admin: User, editor: User) -> Organization:
+    org = Organization.objects(slug=XSS_ORG_SLUG).first()
+    if org is None:
+        org = Organization(
+            name=XSS_ORG_NAME,
+            slug=XSS_ORG_SLUG,
+            description="placeholder — overwritten by update_one() below",
+            members=[
+                Member(user=admin, role="admin"),
+                Member(user=editor, role="editor"),
+            ],
+        )
+        org.save()
+    # Bypass pre_save by issuing a raw $set. We want the malicious payload to
+    # land in the DB untouched so the rendering pipeline is what actually
+    # gets exercised.
+    Organization.objects(id=org.id).update_one(set__description=XSS_DESCRIPTION_PAYLOAD)
+    org.reload()
+    return org
+
+
+def get_or_create_xss_dataset(org: Organization) -> Dataset:
+    dataset = Dataset.objects(slug=XSS_DATASET_SLUG).first()
+    if dataset is None:
+        licence = License.objects.first()
+        dataset = Dataset(
+            title=XSS_DATASET_TITLE_SAFE,
+            slug=XSS_DATASET_SLUG,
+            description="placeholder — overwritten by update_one() below",
+            organization=org,
+            license=licence,
+            tags=["e2e", "xss-fixture"],
+        )
+        dataset.resources.append(
+            Resource(
+                title="E2E XSS Test Resource",
+                description="placeholder",
+                url="https://example.com/e2e-xss-resource.csv",
+                format="csv",
+            )
+        )
+        dataset.save()
+    Dataset.objects(id=dataset.id).update_one(set__description=XSS_DESCRIPTION_PAYLOAD)
+    dataset.reload()
+    return dataset
+
+
+def get_or_create_xss_reuse(org: Organization, dataset: Dataset) -> Reuse:
+    reuse = Reuse.objects(slug=XSS_REUSE_SLUG).first()
+    if reuse is None:
+        reuse = Reuse(
+            title=XSS_REUSE_TITLE_SAFE,
+            slug=XSS_REUSE_SLUG,
+            description="placeholder — overwritten by update_one() below",
+            url="https://example.com/e2e-xss-reuse",
+            type="api",
+            topic="open_data_tools",
+            organization=org,
+            datasets=[dataset],
+        )
+        reuse.save()
+    Reuse.objects(id=reuse.id).update_one(
+        set__description=XSS_DESCRIPTION_PAYLOAD,
+        set__title=XSS_TITLE_PAYLOAD,
+    )
+    reuse.reload()
+    return reuse
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -155,6 +265,9 @@ def main() -> int:
         org = get_or_create_org(admin, editor)
         dataset = get_or_create_dataset(org)
         reuse = get_or_create_reuse(org, dataset)
+        xss_org = get_or_create_xss_org(admin, editor)
+        xss_dataset = get_or_create_xss_dataset(xss_org)
+        xss_reuse = get_or_create_xss_reuse(xss_org, xss_dataset)
 
         fixtures = {
             "admin": {"id": str(admin.id), "email": admin.email, "slug": admin.slug},
@@ -174,6 +287,18 @@ def main() -> int:
                 "id": str(reuse.id),
                 "slug": reuse.slug,
                 "title": reuse.title,
+            },
+            "xss_organization": {
+                "id": str(xss_org.id),
+                "slug": xss_org.slug,
+            },
+            "xss_dataset": {
+                "id": str(xss_dataset.id),
+                "slug": xss_dataset.slug,
+            },
+            "xss_reuse": {
+                "id": str(xss_reuse.id),
+                "slug": xss_reuse.slug,
             },
         }
 
