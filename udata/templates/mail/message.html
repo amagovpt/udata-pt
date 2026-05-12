@@ -12,7 +12,7 @@
     </div>
     {% endif %}
 
-    <p style="margin-bottom: 20px;">{{ _('Hi %(user)s', user=recipient.first_name) }},</p>
+    <p style="margin-bottom: 20px;">{% if recipient.first_name %}{{ _('Hi %(user)s', user=recipient.first_name) }}{% elif config.MAIL_DEFAULT_RECEIVER_NAME %}{{ _('Hi %(user)s', user=config.MAIL_DEFAULT_RECEIVER_NAME) }}{% else %}{{ _('Hello') }}{% endif %},</p>
 
     {% for item in message.paragraphs %}
         {% if item.__class__.__name__ == 'MailCTA' %}

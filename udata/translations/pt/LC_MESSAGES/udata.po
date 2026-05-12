@@ -2121,7 +2121,11 @@ msgstr ""
 #: udata/templates/mail/message.html:15
 #, python-format
 msgid "Hi %(user)s"
-msgstr "Olá %(user)s,"
+msgstr "Olá %(user)s"
+
+#: udata/templates/mail/message.html:14
+msgid "Hello"
+msgstr "Olá"
 
 #: udata/templates/mail/message.html:36
 msgid "Have a great day"
@@ -2131,6 +2135,38 @@ msgstr "Tenha um excelente dia"
 #, python-format
 msgid "The %(site)s team"
 msgstr "A equipa do %(site)s"
+
+#: udata/core/site/mails.py:7
+msgid "Question"
+msgstr "Pergunta"
+
+#: udata/core/site/mails.py:8
+msgid "Problem"
+msgstr "Problema"
+
+#: udata/core/site/mails.py:9
+msgid "Feedback"
+msgstr "Sugestão"
+
+#: udata/core/site/mails.py:20
+msgid "Support"
+msgstr "Suporte"
+
+#: udata/core/site/mails.py:24
+msgid "A portal visitor submitted the support form."
+msgstr "Um visitante do portal submeteu o formulário de suporte."
+
+#: udata/core/site/mails.py:25
+msgid "Topic:"
+msgstr "Tópico:"
+
+#: udata/core/site/mails.py:26
+msgid "From:"
+msgstr "De:"
+
+#: udata/core/site/mails.py:27
+msgid "Subject:"
+msgstr "Assunto:"
 
 #: udata/templates/security/change_password.html:9
 #: udata/templates/security/change_password.html:16
