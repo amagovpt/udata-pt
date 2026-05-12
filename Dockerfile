@@ -48,6 +48,10 @@ COPY . .
 # Install the project itself
 RUN uv sync --no-dev
 
+# Compile gettext .mo catalogs from the .po sources so Flask-Babel
+# can resolve translations at runtime (emails, UI strings).
+RUN uv run pybabel compile -D udata -d udata/translations
+
 # Create directories for logs, uploads, and uwsgi socket
 RUN mkdir -p /logs /dadosgov/fs /var/run/uwsgi
 
