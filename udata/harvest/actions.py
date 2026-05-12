@@ -121,6 +121,12 @@ def delete_source(source: HarvestSource):
     """Delete an harvest source"""
     source.deleted = datetime.now(UTC)
     source.save()
+    # LEDG-1727: also disable the linked PeriodicTask so the beat scheduler
+    # stops dispatching no-op tasks between delete and the next purge_sources
+    # run. The PeriodicTask document is preserved for audit; purge_sources
+    # removes it permanently.
+    if source.periodic_task and source.periodic_task.enabled:
+        source.periodic_task.modify(enabled=False)
     signals.harvest_source_deleted.send(source)
     return source
 

@@ -267,6 +267,29 @@ class HarvestActionsTest(MockBackendsMixin, PytestOnlyDBTestCase):
         deleted_sources = HarvestSource.objects(deleted__exists=True)
         assert len(deleted_sources) == 1
 
+    def test_delete_source_disables_periodic_task(self):
+        """LEDG-1727: deleting a scheduled source must disable its PeriodicTask
+        so the beat scheduler stops firing no-op dispatches before purge runs."""
+        source = HarvestSourceFactory()
+        actions.schedule(source, hour=0)
+        source.reload()
+        assert source.periodic_task.enabled is True
+
+        actions.delete_source(source)
+        source.reload()
+        # PeriodicTask document still exists (preserved until purge), but is disabled.
+        assert source.periodic_task is not None
+        source.periodic_task.reload()
+        assert source.periodic_task.enabled is False
+
+    def test_delete_source_without_periodic_task_is_safe(self):
+        """LEDG-1727: delete must remain a no-op on schedule when none exists."""
+        source = HarvestSourceFactory()
+        assert source.periodic_task is None
+        actions.delete_source(source)  # must not raise
+        source.reload()
+        assert source.deleted is not None
+
     def test_clean_source(self):
         source = HarvestSourceFactory()
         for _ in range(5):

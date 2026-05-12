@@ -6,13 +6,45 @@ from .models import HarvestJob, HarvestSource
 log = get_logger(__name__)
 
 
+def _report_orphan_dispatch(source):
+    """Notify ops that beat fired a task for an unusable source (LEDG-1727).
+
+    Surfaces a class of wasted beat slots that used to be silent: PeriodicTask
+    documents pointing at a deleted/inactive HarvestSource. The fix in
+    `delete_source()` disables future dispatches, but old data may already be
+    in flight. Sentry capture is best-effort and never blocks the worker.
+    """
+    state = "deleted" if source.deleted else "inactive"
+    log.warning(
+        'Periodic harvest task fired for %s source "%s" (slug=%s); '
+        "the linked PeriodicTask should be disabled. "
+        "Run `udata harvest orphans` to list affected schedules.",
+        state,
+        source.id,
+        source.slug,
+    )
+    try:
+        import sentry_sdk
+
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("harvest.source_id", str(source.id))
+            scope.set_tag("harvest.source_state", state)
+            scope.set_extra("source_slug", source.slug)
+            sentry_sdk.capture_message(
+                f"Harvest periodic task fired for {state} source",
+                level="warning",
+            )
+    except ImportError:
+        pass
+
+
 @job("harvest", route="low.harvest")
 def harvest(self, ident):
     log.info('Launching harvest job for source "%s"', ident)
 
     source = HarvestSource.get(ident)
     if source.deleted or not source.active:
-        log.info('Ignoring inactive or deleted source "%s"', source.id)
+        _report_orphan_dispatch(source)
         return  # Ignore deleted and inactive sources
     Backend = backends.get_backend(source.backend)
     backend = Backend(source)

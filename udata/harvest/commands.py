@@ -1,12 +1,15 @@
+import json
 import logging
+from datetime import UTC, datetime
 
 import click
 
 from udata.commands import KO, OK, cli, green, red
 from udata.harvest.backends import get_all_backends, is_backend_enabled
-from udata.models import Dataset
+from udata.models import Dataset, PeriodicTask
 
 from . import actions
+from .models import HarvestSource
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +174,204 @@ def detach(dataset_id):
     dataset = Dataset.get(dataset_id)
     actions.detach(dataset)
     log.info("Done")
+
+
+def _humanize_age(dt):
+    """Return a short human-readable age (e.g. '9h12m', '3d', '148d')."""
+    if not dt:
+        return "-"
+    # Normalize to UTC-aware for arithmetic.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - dt
+    days = delta.days
+    if days >= 1:
+        return f"{days}d"
+    hours, remainder = divmod(delta.seconds, 3600)
+    minutes = remainder // 60
+    if hours >= 1:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _format_dt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "(never)"
+
+
+def _build_diagnose_row(source):
+    """Collect diagnostic data for a single HarvestSource.
+
+    Tolerant: missing periodic_task / no jobs / dereference failures all
+    produce sentinel values rather than raising, so this command remains
+    safe to run on a messy production database.
+    """
+    pt = source.periodic_task
+    pt_enabled = pt.enabled if pt else None
+    crontab_str = pt.schedule_display if pt else "(unscheduled)"
+    last_run_at = pt.last_run_at if pt else None
+    run_count = pt.total_run_count if pt else 0
+
+    try:
+        last_job = source.get_last_job(reduced=True)
+    except Exception:
+        last_job = None
+    last_job_created = last_job.created if last_job else None
+    last_job_status = last_job.status if last_job else "-"
+
+    return {
+        "slug": source.slug,
+        "id": str(source.id),
+        "backend": source.backend,
+        "active": bool(source.active),
+        "deleted": source.deleted is not None,
+        "frequency": source.frequency,
+        "periodic_task_enabled": pt_enabled,
+        "crontab": crontab_str,
+        "last_run_at": last_run_at.isoformat() if last_run_at else None,
+        "total_run_count": run_count,
+        "last_job_at": last_job_created.isoformat() if last_job_created else None,
+        "last_job_status": last_job_status,
+        "last_run_age": _humanize_age(last_run_at),
+        "last_job_age": _humanize_age(last_job_created),
+    }
+
+
+@grp.command()
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit machine-readable JSON instead of the tabular default",
+)
+@click.option(
+    "--include-deleted",
+    is_flag=True,
+    help="Include sources flagged as deleted (default: skip)",
+)
+def diagnose(as_json, include_deleted):
+    """Print a snapshot of every HarvestSource for scheduling triage.
+
+    Read-only. Surfaces: active flag, periodic_task.enabled, crontab,
+    last_run_at + age, total_run_count, last HarvestJob + age. Use to
+    quickly spot sources whose schedule has drifted or that are firing
+    but not producing jobs.
+    """
+    sources = list(HarvestSource.objects)
+    if not include_deleted:
+        sources = [s for s in sources if s.deleted is None]
+
+    rows = [_build_diagnose_row(s) for s in sources]
+
+    if as_json:
+        click.echo(json.dumps(rows, indent=2, default=str))
+        return
+
+    if not rows:
+        click.echo("No harvest sources found.")
+        return
+
+    cols = [
+        ("SLUG", "slug", 28),
+        ("BACKEND", "backend", 10),
+        ("ACTIVE", "active", 6),
+        ("PT_ENABLED", "periodic_task_enabled", 10),
+        ("CRONTAB", "crontab", 18),
+        ("LAST_RUN_AT", "last_run_at", 25),
+        ("LAST_RUN_AGE", "last_run_age", 12),
+        ("RUNS", "total_run_count", 5),
+        ("LAST_JOB_AGE", "last_job_age", 12),
+        ("JOB_STATUS", "last_job_status", 12),
+    ]
+    header = "  ".join(label.ljust(width) for label, _, width in cols)
+    click.echo(header)
+    click.echo("-" * len(header))
+    for row in rows:
+        line = "  ".join(
+            str(row.get(key, "") if row.get(key) is not None else "-").ljust(width)
+            for _, key, width in cols
+        )
+        click.echo(line)
+
+    # Summary.
+    scheduled = [r for r in rows if r["periodic_task_enabled"]]
+    active_scheduled = [r for r in scheduled if r["active"]]
+    never_ran = [r for r in active_scheduled if r["last_run_at"] is None]
+    click.echo("")
+    click.echo(
+        f"Total: {len(rows)} source(s) "
+        f"({len(scheduled)} scheduled, {len(active_scheduled)} active+scheduled, "
+        f"{len(never_ran)} never executed)"
+    )
+
+
+@grp.command()
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit machine-readable JSON instead of the tabular default",
+)
+def orphans(as_json):
+    """List PeriodicTask documents whose harvest source is missing/deleted/inactive.
+
+    Read-only. Surfaces beat-slot waste: PeriodicTask docs whose ``args[0]``
+    does not resolve to a live HarvestSource. The beat scheduler still
+    dispatches these, the worker enters the early-return in
+    ``harvest()``, and nothing observable happens until you run this.
+    """
+    tasks = PeriodicTask.objects(task="harvest")
+    orphan_rows = []
+    for pt in tasks:
+        ident = pt.args[0] if pt.args else None
+        try:
+            source = HarvestSource.objects(pk=ident).first() if ident else None
+        except Exception:
+            source = None
+
+        if source is None:
+            reason = "source not found"
+        elif source.deleted is not None:
+            reason = "source deleted"
+        elif not source.active:
+            reason = "source inactive"
+        else:
+            continue
+
+        orphan_rows.append(
+            {
+                "periodic_task_id": str(pt.id),
+                "name": pt.name,
+                "source_id": ident,
+                "enabled": pt.enabled,
+                "last_run_at": pt.last_run_at.isoformat() if pt.last_run_at else None,
+                "total_run_count": pt.total_run_count,
+                "reason": reason,
+            }
+        )
+
+    if as_json:
+        click.echo(json.dumps(orphan_rows, indent=2, default=str))
+        return
+
+    if not orphan_rows:
+        click.echo("No orphan harvest PeriodicTask documents found.")
+        return
+
+    cols = [
+        ("PT_ID", "periodic_task_id", 26),
+        ("NAME", "name", 50),
+        ("ENABLED", "enabled", 8),
+        ("RUNS", "total_run_count", 5),
+        ("REASON", "reason", 20),
+    ]
+    header = "  ".join(label.ljust(width) for label, _, width in cols)
+    click.echo(header)
+    click.echo("-" * len(header))
+    for row in orphan_rows:
+        line = "  ".join(str(row.get(key, "-") or "-").ljust(width) for _, key, width in cols)
+        click.echo(line)
+    click.echo("")
+    click.echo(f"{len(orphan_rows)} orphan PeriodicTask document(s) wasting beat slots.")
 
 
 @grp.command()
