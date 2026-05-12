@@ -55,9 +55,6 @@ coverage.xml
 /coverage/
 /reports/
 
-# Translations
-*.mo
-
 # Mr Developer
 .mr.developer.cfg
 .project
