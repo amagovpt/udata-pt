@@ -368,7 +368,12 @@ def orphans(as_json):
     click.echo(header)
     click.echo("-" * len(header))
     for row in orphan_rows:
-        line = "  ".join(str(row.get(key, "-") or "-").ljust(width) for _, key, width in cols)
+        # Use `is None` check so that falsy values (False, 0) render literally
+        # rather than collapsing to "-" via the `or` short-circuit.
+        line = "  ".join(
+            ("-" if row.get(key) is None else str(row.get(key))).ljust(width)
+            for _, key, width in cols
+        )
         click.echo(line)
     click.echo("")
     click.echo(f"{len(orphan_rows)} orphan PeriodicTask document(s) wasting beat slots.")
