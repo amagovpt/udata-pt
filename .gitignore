@@ -1,8 +1,11 @@
 *.py[cod]
 *~
 
-# Bind-mounted log directory (uwsgi writes /logs/app.logs here)
-/logs/
+# Bind-mounted log directory (uwsgi writes /logs/app.logs here):
+# keep the folder in the repo so it is created with the dadosgov owner
+# on clone, but ignore its contents.
+/logs/*
+!/logs/.gitkeep
 
 # C extensions
 *.so
