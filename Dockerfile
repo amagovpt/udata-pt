@@ -52,17 +52,21 @@ RUN uv sync --no-dev
 # can resolve translations at runtime (emails, UI strings).
 RUN uv run pybabel compile -D udata -d udata/translations
 
-# Create directories for logs, uploads, and uwsgi socket
-RUN mkdir -p /logs /dadosgov/fs /var/run/uwsgi
+# Create directories for uploads and uwsgi socket.
+# /logs is provided by a bind mount from the host (see docker-compose.yml);
+# the host directory is tracked in the repo so it already has the correct
+# owner (dadosgov, UID/GID 10001) on clone.
+RUN mkdir -p /dadosgov/fs /var/run/uwsgi
 
 # Entrypoint: generates self-signed SAML credentials if not mounted
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 # Hand ownership of every path the runtime needs to read/write to the
-# non-root user (application code + generated .venv, logs, FS_ROOT mount
-# point and uwsgi runtime dir).
-RUN chown -R dadosgov:dadosgov /app /logs /dadosgov /var/run/uwsgi
+# non-root user (application code + generated .venv, FS_ROOT mount point
+# and uwsgi runtime dir). /logs is bind-mounted from the host with the
+# correct owner already.
+RUN chown -R dadosgov:dadosgov /app /dadosgov /var/run/uwsgi
 
 # Default environment
 ENV UDATA_SETTINGS=/app/udata.cfg
