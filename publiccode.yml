@@ -1,26 +1,48 @@
-publiccodeYmlVersion: "0.2"
+publiccodeYmlVersion: '0'
 name: udata
-url: https://github.com/opendatateam/udata
-landingURL: http://udata.readthedocs.org
-creationDate: 2014-04-25
-latestRelease:
-  date: ""
-  version: ""
-logo: https://github.com/opendatateam.png
-usedBy: []
-fundedBy:
-  - name: Direction interministérielle du numérique
-    url: https://lannuaire.service-public.fr/gouvernement/d1a97841-b4bf-46df-a089-1003e4e266b4
-softwareType: ""
+url: 'https://github.com/amagovpt/udata-pt'
+landingURL: 'https://dados.gov.pt'
+softwareVersion: '15.1.0'
+releaseDate: '2026-05-06'
+logo: 'https://github.com/opendatateam.png'
+platforms:
+  - web
+developmentStatus: stable
+softwareType: standalone/web
+categories:
+  - data-collection
+  - data-analytics
 description:
   en:
+    localisedName: dados.gov.pt
     shortDescription: Customizable and skinnable social platform dedicated to open data.
-    documentation: ""
+    longDescription: >
+      Portuguese government fork of udata, the open data portal platform.
+      It powers dados.gov.pt, the Portuguese national open data portal,
+      managed by AMA (Agência para a Modernização Administrativa). It
+      provides dataset cataloging, harvesting from remote sources, user
+      contributions, spatial and temporal indexing, and a plugin
+      architecture for customization.
+    features:
+      - Dataset cataloging and publishing
+      - Harvesting from remote sources
+      - Community contributions
+      - Spatial and temporal search
+      - Plugin and theme architecture
+      - Full REST API
 legal:
-  license: agpl-3.0
-  authorsFile: ""
+  license: AGPL-3.0-only
 maintenance:
-  type: community
+  type: internal
   contacts:
-    - name: ""
-      email: ""
+    - name: AMA
+      email: ama@ama.pt
+      affiliation: Agência para a Modernização Administrativa
+localisation:
+  localisationReady: true
+  availableLanguages:
+    - pt
+    - en
+intendedAudience:
+  countries:
+    - PT
