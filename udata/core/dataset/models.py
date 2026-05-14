@@ -790,7 +790,7 @@ class Dataset(
         }
 
     def self_web_url(self, **kwargs):
-        return cdata_url(f"/datasets/{self._link_id(**kwargs)}", **kwargs)
+        return cdata_url(f"/pages/datasets/{self._link_id(**kwargs)}", **kwargs)
 
     def self_api_url(self, **kwargs):
         return url_for(
