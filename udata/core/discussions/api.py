@@ -6,6 +6,7 @@ from flask_security import current_user
 
 from udata.api import API, api, fields
 from udata.api.limits import COMMENT_CREATE_LIMIT, user_or_ip
+from udata.api.parsers import normalize_search_query
 from udata.app import limiter
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.models import Dataset
@@ -348,7 +349,7 @@ class DiscussionsAPI(API):
             discussions = discussions(closed__ne=None)
 
         if args["q"]:
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
             discussions = discussions.search_text(phrase_query).order_by("$text_score")
 
         discussions = discussions.order_by(args["sort"])

@@ -31,7 +31,7 @@ from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
 from udata.api.limits import CONTENT_CREATE_LIMIT, UPLOAD_LIMIT, user_or_ip
-from udata.api.parsers import ModelApiParser
+from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core import storages
@@ -184,7 +184,7 @@ class DatasetApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
             datasets = datasets.search_text(phrase_query)
         if args.get("tag"):
             datasets = datasets.filter(tags__all=args["tag"])

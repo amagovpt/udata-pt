@@ -5,7 +5,7 @@ from bson.objectid import ObjectId
 from flask_restx.inputs import boolean
 
 from udata.api import api
-from udata.api.parsers import ModelApiParser
+from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.core.access_type.constants import AccessType
 from udata.core.organization.constants import PRODUCER_TYPES
 from udata.core.organization.helpers import get_producer_type
@@ -50,7 +50,7 @@ class DataserviceApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
             dataservices = dataservices.search_text(phrase_query)
         if args.get("tag"):
             dataservices = dataservices.filter(tags=args["tag"])

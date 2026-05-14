@@ -7,7 +7,7 @@ from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
 from udata.api.limits import HEAVY_CREATE_LIMIT, UPLOAD_LIMIT, user_or_ip
-from udata.api.parsers import ModelApiParser
+from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.app import limiter
 from udata.auth import admin_permission, current_user
 from udata.core import csv
@@ -115,7 +115,7 @@ class OrgApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
             organizations = organizations.search_text(phrase_query)
         if args.get("badge"):
             organizations = organizations.filter(badges__kind__in=args["badge"])

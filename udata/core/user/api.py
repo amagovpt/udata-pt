@@ -121,6 +121,25 @@ class AvatarAPI(API):
         current_user.save()
         return {"image": current_user.avatar}
 
+    @api.secure
+    @api.doc("delete_my_avatar")
+    def delete(self):
+        """Delete the current user's avatar"""
+        from udata.core.storages import avatars as avatar_storage
+
+        if current_user.avatar.filename is not None:
+            try:
+                avatar_storage.delete(current_user.avatar.filename)
+                avatar_storage.delete(current_user.avatar.original)
+                for value in current_user.avatar.thumbnails.values():
+                    avatar_storage.delete(value)
+            except FileNotFoundError:
+                pass
+        current_user.avatar = None
+        current_user.avatar_url = None
+        current_user.save()
+        return "", 204
+
 
 @me.route("/reuses/", endpoint="my_reuses")
 class MyReusesAPI(API):

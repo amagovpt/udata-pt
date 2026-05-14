@@ -8,7 +8,7 @@ from flask_login import current_user
 
 from udata.api import API, api, errors
 from udata.api.limits import CONTENT_CREATE_LIMIT, user_or_ip
-from udata.api.parsers import ModelApiParser
+from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.api_fields import patch, patch_and_save
 from udata.app import limiter
 from udata.auth import admin_permission
@@ -83,7 +83,7 @@ class ReuseApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
             reuses = reuses.search_text(phrase_query)
         if args.get("dataset"):
             if not ObjectId.is_valid(args["dataset"]):

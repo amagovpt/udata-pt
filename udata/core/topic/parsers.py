@@ -5,7 +5,7 @@ from flask_security import current_user
 from mongoengine import Q
 
 from udata.api import api
-from udata.api.parsers import ModelApiParser
+from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.core.topic import DEFAULT_PAGE_SIZE
 from udata.core.topic.models import TopicElement
 
@@ -37,7 +37,7 @@ class TopicElementsParser(ModelApiParser):
     @staticmethod
     def parse_filters(elements, args):
         if args.get("q"):
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
             elements = elements.search_text(phrase_query)
         if args.get("tag"):
             elements = elements.filter(tags__all=args["tag"])
@@ -78,7 +78,7 @@ class TopicApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in args["q"].split(" ")])
+            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
 
             # Search topics by their own content
             topic_text_filter = Q(__raw__={"$text": {"$search": phrase_query}})

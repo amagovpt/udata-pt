@@ -1,4 +1,11 @@
+import unicodedata
+
 from udata.api import api
+
+
+def normalize_search_query(query: str) -> str:
+    """Strip diacritics so accent-less input (e.g. 'agencia') matches accented names."""
+    return unicodedata.normalize("NFD", query).encode("ascii", "ignore").decode("ascii")
 
 
 class ModelApiParser:
