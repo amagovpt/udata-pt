@@ -16,7 +16,7 @@ def new_membership_request(org: Organization, request: MembershipRequest) -> Mai
                 )
             ),
             LabelledContent(_("Reason for the request:"), request.comment),
-            MailCTA(_("See the request"), cdata_url(f"/admin/organizations/{org.id}/members")),
+            MailCTA(_("See the request"), cdata_url(f"/pages/admin/org/{org.id}/members")),
         ],
     )
 
@@ -45,9 +45,7 @@ def membership_accepted(org: Organization) -> MailMessage:
                     org=org,
                 )
             ),
-            MailCTA(
-                _("View the organization"), cdata_url(f"/admin/organizations/{org.id}/datasets")
-            ),
+            MailCTA(_("View the organization"), cdata_url(f"/pages/admin/org/{org.id}/datasets")),
         ],
     )
 
@@ -137,7 +135,7 @@ def welcome_new_member(org: Organization) -> MailMessage:
                     org=org,
                 )
             ),
-            MailCTA(_("View the organization"), org.self_web_url()),
+            MailCTA(_("View the organization"), cdata_url(f"/pages/admin/org/{org.id}/datasets")),
         ],
     )
 
@@ -167,9 +165,7 @@ def membership_invitation_accepted(org: Organization, invitation: MembershipRequ
                     org=org,
                 )
             ),
-            MailCTA(
-                _("View the organization"), cdata_url(f"/admin/organizations/{org.id}/members")
-            ),
+            MailCTA(_("View the organization"), cdata_url(f"/pages/admin/org/{org.id}/members")),
         ],
     )
 
@@ -204,9 +200,9 @@ def membership_invitation(
         paragraphs.append(LabelledContent(_("Message:"), invitation.comment))
 
     if user_exists:
-        url = cdata_url("/admin/me/profile")
+        url = cdata_url("/pages/admin/me/profile")
     else:
-        url = cdata_url("/register", next="/admin/me/profile", email=invitation.email)
+        url = cdata_url("/pages/register", next="/pages/admin/me/profile", email=invitation.email)
 
     paragraphs.append(MailCTA(_("View and respond to invitation"), url))
     return MailMessage(
