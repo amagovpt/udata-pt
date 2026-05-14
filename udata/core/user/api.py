@@ -497,7 +497,10 @@ class UserListAPI(API):
                     args["page"], args["page_size"]
                 )
         if args["sort"]:
-            return users.order_by(args["sort"]).paginate(args["page"], args["page_size"])
+          qs = users.order_by(args["sort"])
+            if args["sort"].lstrip("-") in ("last_name", "first_name"):
+                qs = qs.collation({"locale": "pt", "strength": 1})
+            return qs.paginate(args["page"], args["page_size"])   
         return users.order_by(DEFAULT_SORTING).paginate(args["page"], args["page_size"])
 
     @api.secure(admin_permission)
