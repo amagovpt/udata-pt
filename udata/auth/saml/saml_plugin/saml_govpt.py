@@ -32,7 +32,29 @@ from saml2 import (
     entity,
     sigver,
 )
+from saml2 import validate as _saml_validate
 from saml2 import xmldsig as ds
+
+# autenticacao.gov coloca um valor não-IP em <SubjectConfirmationData Address="…">
+# (e.g., hostname ou string não-RFC), o que faz pysaml2 rejeitar a resposta com
+# `NotValid("address")` em saml2/validate.py:valid_address. A integridade desse
+# atributo já é garantida pela assinatura da Response (xmlsec1 valida o digest),
+# pelo que tornamos a validação permissiva, registando o valor recebido para
+# rastreio. Não relaxa nenhuma das outras defesas anti-XSW/replay.
+_original_valid_address = _saml_validate.valid_address
+
+
+def _lenient_valid_address(address):
+    try:
+        return _original_valid_address(address)
+    except Exception:
+        logging.getLogger("udata.saml").warning(
+            "SAML: SubjectConfirmation Address ignored (non-IP format): %r", address
+        )
+        return True
+
+
+_saml_validate.valid_address = _lenient_valid_address
 from saml2.client import Saml2Client
 from saml2.config import Config as Saml2Config
 from saml2.pack import http_form_post_message
@@ -546,7 +568,12 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
                 # Sign authn requests
                 "authn_requests_signed": True,
                 "logout_requests_signed": True,
-                "want_assertions_signed": True,
+                # autenticacao.gov assina o <Response> mas não cada <Assertion>.
+                # Aceitamos só assinatura da Response — xmlsec1 verifica o digest
+                # sobre o XML canonical, garantindo integridade do conteúdo interno.
+                # Defesas anti-XSW continuam: Issuer whitelist, replay cache e
+                # binding Subject↔NIC (`_name_id_binds_nic`).
+                "want_assertions_signed": False,
                 "want_response_signed": True,
             },
         },
