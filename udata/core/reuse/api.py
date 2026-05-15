@@ -284,6 +284,23 @@ class ReuseDatasetsAPI(API):
         return reuse, 201
 
 
+@ns.route("/<reuse:reuse>/datasets/<dataset:dataset>/", endpoint="reuse_remove_dataset")
+class ReuseDatasetAPI(API):
+    @api.secure
+    @api.doc("reuse_remove_dataset", **common_doc)
+    @api.response(204, "Dataset removed")
+    @api.response(403, "Not allowed to modify this reuse")
+    @api.response(404, "Dataset not associated with this reuse")
+    def delete(self, reuse, dataset):
+        """Remove a dataset from a given reuse"""
+        reuse.permissions["edit"].test()
+        if dataset not in reuse.datasets:
+            api.abort(404, "Dataset not associated with this reuse")
+        reuse.datasets.remove(dataset)
+        reuse.save()
+        return "", 204
+
+
 @ns.route("/<reuse:reuse>/dataservices/", endpoint="reuse_add_dataservice")
 class ReuseDataservicesAPI(API):
     @api.secure
