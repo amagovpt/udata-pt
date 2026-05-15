@@ -763,3 +763,4 @@ class Debug(Defaults):
     )
     CACHE_TYPE = "flask_caching.backends.null"
     CACHE_NO_NULL_WARNING = True
+    RATELIMIT_ENABLED = False
