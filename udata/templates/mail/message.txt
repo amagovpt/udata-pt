@@ -1,4 +1,4 @@
-{% if recipient.first_name %}{{ _('Hi %(user)s', user=recipient.first_name) }}{% else %}{{ _('Hello') }}{% endif %},
+{% if recipient.first_name %}Bom dia, {{ recipient.first_name }}{% else %}Bom dia{% endif %},
 
 {% for item in message.paragraphs %}
 {% if item.__class__.__name__ == 'MailCTA' %}
@@ -12,5 +12,5 @@
 
 {% endfor %}
 
-{{ _('Have a great day') }},
-{{ _('The %(site)s team', site=config.SITE_TITLE) }}
+Obrigada,
+A equipa de dados.gov.pt

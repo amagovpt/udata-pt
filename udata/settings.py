@@ -177,6 +177,9 @@ class Defaults(object):
     DAYS_BEFORE_ACCOUNT_INACTIVITY_NOTIFY_DELAY = 30
     MAX_NUMBER_OF_USER_INACTIVITY_NOTIFICATIONS = 200
 
+    # Google reCAPTCHA v2 — set secret key to enable captcha on password reset
+    GOOGLE_RECAPTCHA_SECRET_KEY = None
+
     # You can activate CaptchEtat, a captcha.com integration by providing
     # CAPTCHETAT_BASE_URL, CAPTCHETAT_OAUTH_BASE_URL, CAPTCHETAT_CLIENT_ID and CAPTCHETAT_CLIENT_SECRET
     CAPTCHETAT_BASE_URL = None

@@ -12,7 +12,7 @@
     </div>
     {% endif %}
 
-    <p style="margin-bottom: 20px;">{% if recipient.first_name %}{{ _('Hi %(user)s', user=recipient.first_name) }}{% else %}{{ _('Hello') }}{% endif %},</p>
+    <p style="margin-bottom: 20px;">{% if recipient.first_name %}Bom dia, {{ recipient.first_name }}{% else %}Bom dia{% endif %},</p>
 
     {% for item in message.paragraphs %}
         {% if item.__class__.__name__ == 'MailCTA' %}
@@ -33,7 +33,7 @@
         {% endif %}
     {% endfor %}
 
-    <p style="margin-top: 30px; margin-bottom: 5px;">{{ _('Have a great day') }},</p>
-    <p style="margin: 0;">{{ _('The %(site)s team', site=config.SITE_TITLE) }}</p>
+    <p style="margin-top: 30px; margin-bottom: 5px;">Obrigada,</p>
+    <p style="margin: 0;">A equipa de dados.gov.pt</p>
 </body>
 </html>

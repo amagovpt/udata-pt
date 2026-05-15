@@ -31,6 +31,34 @@ class WithCaptcha:
         return False
 
 
+class WithGoogleReCaptcha:
+    recaptcha_token = fields.StringField(_("reCAPTCHA token"))
+
+    def validate_recaptcha(self):
+        secret = current_app.config.get("GOOGLE_RECAPTCHA_SECRET_KEY")
+        if not secret:
+            return True
+
+        token = self.recaptcha_token.data
+        if not token:
+            self.recaptcha_token.errors = [_("reCAPTCHA validation required")]
+            return False
+
+        try:
+            resp = requests.post(
+                "https://www.google.com/recaptcha/api/siteverify",
+                data={"secret": secret, "response": token},
+            )
+            if resp.json().get("success"):
+                return True
+        except requests.exceptions.RequestException as err:
+            log.error(f"Failed to validate reCAPTCHA: {err}")
+            return False
+
+        self.recaptcha_token.errors = [_("Invalid reCAPTCHA")]
+        return False
+
+
 class ExtendedRegisterForm(WithCaptcha, RegisterFormV2):
     first_name = fields.StringField(
         _("First name"),
@@ -91,9 +119,9 @@ class ExtendedResetPasswordForm(ResetPasswordForm):
         return True
 
 
-class ExtendedForgotPasswordForm(WithCaptcha, ForgotPasswordForm):
+class ExtendedForgotPasswordForm(WithGoogleReCaptcha, ForgotPasswordForm):
     def validate(self, **kwargs):
-        if not self.validate_captcha():
+        if not self.validate_recaptcha():
             return False
 
         if not super().validate(**kwargs):

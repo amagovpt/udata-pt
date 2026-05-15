@@ -104,29 +104,26 @@ def confirmation_instructions(confirmation_link: str, **kwargs) -> MailMessage:
 
 
 def reset_instructions(reset_token: str, **kwargs) -> MailMessage:
-    from udata.i18n import lazy_gettext as _
     from udata.uris import cdata_url
 
     return MailMessage(
-        subject=_("Reset your password"),
+        subject="Redefinição de palavra-passe — dados.gov.pt",
         paragraphs=[
-            _(
-                "Someone requested a password reset for your %(site)s account.",
-                site=current_app.config["SITE_TITLE"],
+            "Alguém pediu uma redefinição da palavra-passe da sua conta no dados.gov.pt.",
+            "Se isto não foi você, ignore este e-mail.",
+            MailCTA(
+                "Reinicializar a sua palavra-passe",
+                cdata_url(f"/pages/reset-password/{reset_token}"),
             ),
-            _("If this wasn't you, please ignore this email."),
-            MailCTA(_("Reset your password"), cdata_url(f"/reset/{reset_token}")),
         ],
     )
 
 
 def reset_notice(**kwargs) -> MailMessage:
-    from udata.i18n import lazy_gettext as _
-
     return MailMessage(
-        subject=_("Your password has been reset"),
+        subject="A sua palavra-passe foi reinicializada — dados.gov.pt",
         paragraphs=[
-            _("Your data.gouv.fr password has been reset."),
+            "A sua palavra-passe dados.gov.pt foi reinicializada.",
         ],
     )
 
