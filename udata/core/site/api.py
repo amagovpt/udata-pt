@@ -65,6 +65,7 @@ def _serialize_dataset(dataset):
         ),
         "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
         "organization": {"name": org.name} if org else None,
+        "quality": dataset.quality,
         "metrics": dataset.metrics or {},
     }
 
