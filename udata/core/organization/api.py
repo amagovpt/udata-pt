@@ -31,6 +31,7 @@ from udata.core.storages.api import (
     parse_uploaded_image,
     uploaded_image_fields,
 )
+from udata.i18n import lazy_gettext as _
 from udata.mongo import db
 from udata.mongo.errors import FieldValidationError
 from udata.rdf import RDF_EXTENSIONS, graph_response, negociate_content
@@ -115,7 +116,9 @@ class OrgApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
+            phrase_query = " ".join(
+                [f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")]
+            )
             organizations = organizations.search_text(phrase_query)
         if args.get("badge"):
             organizations = organizations.filter(badges__kind__in=args["badge"])
@@ -403,7 +406,9 @@ class MembershipRequestAPI(API):
             ):
                 api.abort(
                     403,
-                    "You can only access your own membership requests or the one of your organizations.",
+                    _(
+                        "You can only access your own membership requests or the one of your organizations."
+                    ),
                 )
             if args["status"]:
                 return [
@@ -445,7 +450,7 @@ class MembershipAPI(API):
         for membership_request in org.requests:
             if membership_request.id == id:
                 return membership_request
-        api.abort(404, "Unknown membership request id")
+        api.abort(404, _("Unknown membership request id"))
 
 
 @ns.route("/<org:org>/membership/<uuid:id>/accept/", endpoint="accept_membership")
@@ -487,7 +492,7 @@ class MembershipRefuseAPI(MembershipAPI):
         membership_request = self.get_or_404(org, id)
 
         if membership_request.kind == "invitation":
-            api.abort(400, "Use the cancel endpoint for invitations")
+            api.abort(400, _("Use the cancel endpoint for invitations"))
 
         form = api.validate(MembershipRefuseForm)
         membership_request.status = "refused"
@@ -514,10 +519,10 @@ class MembershipCancelAPI(MembershipAPI):
         membership_request = self.get_or_404(org, id)
 
         if membership_request.kind != "invitation":
-            api.abort(400, "Only invitations can be canceled")
+            api.abort(400, _("Only invitations can be canceled"))
 
         if membership_request.status != "pending":
-            api.abort(400, "Only pending invitations can be canceled")
+            api.abort(400, _("Only pending invitations can be canceled"))
 
         membership_request.status = "canceled"
         membership_request.handled_by = current_user._get_current_object()
@@ -552,7 +557,9 @@ class MemberInviteAPI(API):
         comment = form.comment.data
 
         if user_id and email:
-            raise FieldValidationError(field="user", message="Cannot provide both user and email")
+            raise FieldValidationError(
+                field="user", message=_("Cannot provide both user and email")
+            )
 
         user = None
 
@@ -560,7 +567,10 @@ class MemberInviteAPI(API):
         if user_id:
             user = User.objects(id=user_id).first()
             if not user:
-                raise FieldValidationError(field="user", message=f"Unknown user '{user_id}'")
+                raise FieldValidationError(
+                    field="user",
+                    message=_("Unknown user '{user_id}'").format(user_id=user_id),
+                )
 
         # If email provided (and no user), check if it matches an existing user
         if email and not user:
@@ -570,24 +580,26 @@ class MemberInviteAPI(API):
 
         # Validate we have either user or email
         if not user and not email:
-            raise FieldValidationError(field="user", message="Either user or email is required")
+            raise FieldValidationError(field="user", message=_("Either user or email is required"))
 
         # Check if user is already a member or has a pending request/invitation
         email_lower = email.lower() if email else None
         for member in org.members:
             if user and member.user == user:
-                raise FieldValidationError(field="user", message="User is already a member")
+                raise FieldValidationError(field="user", message=_("User is already a member"))
 
         for req in org.requests:
             if req.status != "pending":
                 continue
             if user and req.user == user:
                 raise FieldValidationError(
-                    field="user", message="A request or invitation is already pending for this user"
+                    field="user",
+                    message=_("A request or invitation is already pending for this user"),
                 )
             if email_lower and req.email and req.email.lower() == email_lower:
                 raise FieldValidationError(
-                    field="email", message="An invitation is already pending for this email"
+                    field="email",
+                    message=_("An invitation is already pending for this email"),
                 )
 
         # Resolve assignments for partial_editor role
@@ -597,7 +609,7 @@ class MemberInviteAPI(API):
             if role != "partial_editor":
                 raise FieldValidationError(
                     field="assignments",
-                    message="Assignments can only be set for partial_editor role",
+                    message=_("Assignments can only be set for partial_editor role"),
                 )
             allowed_classes = ASSIGNABLE_OBJECT_TYPES
             for raw in raw_assignments:
@@ -606,19 +618,23 @@ class MemberInviteAPI(API):
                 if cls_name not in allowed_classes:
                     raise FieldValidationError(
                         field="assignments",
-                        message=f"Invalid object class '{cls_name}'",
+                        message=_("Invalid object class '{cls_name}'").format(cls_name=cls_name),
                     )
                 model_cls = db.resolve_model(cls_name)
                 obj = model_cls.objects(id=obj_id).first()
                 if not obj:
                     raise FieldValidationError(
                         field="assignments",
-                        message=f"{cls_name} '{obj_id}' not found",
+                        message=_("{cls_name} '{obj_id}' not found").format(
+                            cls_name=cls_name, obj_id=obj_id
+                        ),
                     )
                 if not hasattr(obj, "organization") or obj.organization != org:
                     raise FieldValidationError(
                         field="assignments",
-                        message=f"{cls_name} '{obj_id}' does not belong to this organization",
+                        message=_(
+                            "{cls_name} '{obj_id}' does not belong to this organization"
+                        ).format(cls_name=cls_name, obj_id=obj_id),
                     )
                 assignment_subjects.append(obj)
 
@@ -721,7 +737,7 @@ class MemberAssignmentsAPI(API):
 
         member = org.member(user)
         if not member or member.role != "partial_editor":
-            api.abort(400, "User must be a partial_editor member of this organization")
+            api.abort(400, _("User must be a partial_editor member of this organization"))
 
         raw_subjects = request.json or []
         allowed_classes = ASSIGNABLE_OBJECT_TYPES
@@ -731,13 +747,21 @@ class MemberAssignmentsAPI(API):
             cls_name = raw.get("class")
             obj_id = raw.get("id")
             if cls_name not in allowed_classes:
-                api.abort(400, f"Invalid object class '{cls_name}'")
+                api.abort(400, _("Invalid object class '{cls_name}'").format(cls_name=cls_name))
             model_cls = db.resolve_model(cls_name)
             obj = model_cls.objects(id=obj_id).first()
             if not obj:
-                api.abort(400, f"{cls_name} '{obj_id}' not found")
+                api.abort(
+                    400,
+                    _("{cls_name} '{obj_id}' not found").format(cls_name=cls_name, obj_id=obj_id),
+                )
             if not hasattr(obj, "organization") or obj.organization != org:
-                api.abort(400, f"{cls_name} '{obj_id}' does not belong to this organization")
+                api.abort(
+                    400,
+                    _("{cls_name} '{obj_id}' does not belong to this organization").format(
+                        cls_name=cls_name, obj_id=obj_id
+                    ),
+                )
             desired_subjects.append(obj)
 
         current = list(Assignment.objects(user=user, organization=org))
