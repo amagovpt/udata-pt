@@ -55,6 +55,12 @@ def _lenient_valid_address(address):
 
 
 _saml_validate.valid_address = _lenient_valid_address
+# saml2.response was loaded transitively by `from saml2 import entity` above and
+# captured `valid_address` via `from saml2.validate import valid_address` — a
+# local binding that the global patch alone does not reach. Rebind it.
+import saml2.response as _saml_response  # noqa: E402
+
+_saml_response.valid_address = _lenient_valid_address
 from saml2.client import Saml2Client
 from saml2.config import Config as Saml2Config
 from saml2.pack import http_form_post_message
@@ -438,6 +444,10 @@ def _handle_saml_user_login(user):
     next_path = session.pop("saml_next_url", "")
 
     if user is None:
+        current_app.logger.warning(
+            f"[DEBUG] _handle_saml_user_login: user is None -> redirect /pages/login "
+            f"(frontend_url={frontend_url!r})"
+        )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
         return redirect(f"{frontend_url}/pages/login")
 
@@ -447,12 +457,19 @@ def _handle_saml_user_login(user):
         datastore.commit()
 
     if user.deleted:
+        current_app.logger.warning(
+            f"[DEBUG] _handle_saml_user_login: user.deleted=True, email={user.email!r}"
+        )
         do_flash(*get_message("DISABLED_ACCOUNT"))
         return redirect(frontend_url or "/")
 
     login_user(user)
     session["saml_login"] = True
     destination = f"{frontend_url}{next_path}" if next_path else (frontend_url or "/")
+    current_app.logger.warning(
+        f"[DEBUG] _handle_saml_user_login: login_user OK, email={user.email!r}, "
+        f"redirect destination={destination!r}, next_path={next_path!r}"
+    )
     return redirect(destination)
 
 
@@ -548,6 +565,14 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
         ],
         "metadata": {"local": [_resolve_path(metadata_file)]},
         "accepted_time_diff": 60,
+        # autenticacao.gov ships attributes with URIs from the
+        # `http://interop.gov.pt/MDC/Cidadao/*` namespace, which is not part
+        # of pysaml2's default URI converters. With allow_unknown_attributes
+        # disabled the parser silently drops those attributes and get_identity()
+        # returns {}, yielding a `user_not_found` redirect to /pages/login
+        # without an error. Allow unknown attributes so they reach the
+        # extraction code in idp_initiated.
+        "allow_unknown_attributes": True,
         "service": {
             "sp": {
                 "endpoints": {
@@ -813,6 +838,7 @@ def idp_initiated():
             reason="subject_unreadable",
         )
     name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    name_id_format = (getattr(subject, "format", None) or "").strip() if subject else ""
     if not name_id_value:
         return _reject_saml_login(
             "SAML SSO rejeitado: Subject/NameID em falta",
@@ -846,9 +872,10 @@ def idp_initiated():
             user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
             first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
             last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
-            current_app.logger.info(
-                f"SAML atributos extraídos: email={user_email}, nic={'***' if user_nic else None}, "
-                f"nome={first_name} {last_name}"
+            current_app.logger.warning(
+                f"[DEBUG] SAML atributos extraídos: email={user_email!r}, "
+                f"nic_present={bool(user_nic)}, nome={first_name!r} {last_name!r}, "
+                f"identity_keys={list(identity.keys()) if identity else None}"
             )
         else:
             # Log debug info para diagnosticar
@@ -874,7 +901,18 @@ def idp_initiated():
     # Mismatch indicates either a misconfigured IdP or an XSW-style attack
     # where a wrapper assertion is feeding a forged NIC alongside a valid
     # signed assertion with a different Subject.
-    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+    # autenticacao.gov emits NameID as an opaque persistent pseudonym with
+    # Format=unspecified — it is unrelated to the NIC attribute, so the
+    # Subject↔NIC equality check would always fail. XSW protection here
+    # comes from Response signature (xmlsec1), Issuer whitelist, replay
+    # cache and allow_unsolicited=False; the NameID↔NIC binding only adds
+    # value for IdPs that actually emit the NIC as Subject. Skip it when
+    # the format is unspecified (or absent).
+    nameid_is_pseudonym = name_id_format in (
+        "",
+        "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+    )
+    if user_nic and not nameid_is_pseudonym and not _name_id_binds_nic(name_id_value, user_nic):
         return _reject_saml_login(
             "SAML SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
             _("Autenticação rejeitada: identidade SAML inconsistente."),
@@ -885,6 +923,11 @@ def idp_initiated():
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    current_app.logger.warning(
+        f"[DEBUG cmd] post _find_or_create_saml_user: user_id={getattr(user, 'id', None)}, "
+        f"user_email={getattr(user, 'email', None)!r}, status={status!r}, "
+        f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
+    )
 
     if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
         _audit_saml(
