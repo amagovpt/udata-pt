@@ -29,6 +29,7 @@ from werkzeug.exceptions import NotFound
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from udata import cors
+from udata.method_override import MethodOverrideMiddleware
 
 APP_NAME = __name__.split(".")[0]
 ROOT_DIR = abspath(join(dirname(__file__)))
@@ -193,7 +194,10 @@ def create_app(config="udata.settings.Defaults", override=None, init_logging=ini
     # trailing slashes. Without this, /api/1/me → 308 → /api/1/me/ → loop.
     app.url_map.strict_slashes = False
 
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+    # Order matters: ProxyFix runs first to normalize the environ from the
+    # upstream reverse proxy (X-Forwarded-* headers), then MethodOverrideMiddleware
+    # rewrites REQUEST_METHOD before Flask routing/CSRF/rate-limiter see it.
+    app.wsgi_app = MethodOverrideMiddleware(ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1))
 
     init_logging(app)
     register_extensions(app)
