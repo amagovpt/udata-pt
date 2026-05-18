@@ -222,6 +222,27 @@ def extract_name_from_path(path):
 
 @apiv1_blueprint.after_request
 @apiv2_blueprint.after_request
+def make_swagger_spec_host_relative(response):
+    # Strip the absolute `host` from /api/*/swagger.json so Swagger UI builds
+    # requests against the current page origin. Without this, accessing the
+    # doc through a reverse proxy (e.g. the Next.js frontend on a different
+    # port) makes Swagger call the backend host directly and fail with CORS.
+    if not request.path.endswith("/swagger.json"):
+        return response
+    if response.mimetype != "application/json":
+        return response
+    try:
+        spec = json.loads(response.get_data(as_text=True))
+    except (ValueError, UnicodeDecodeError):
+        return response
+    spec.pop("host", None)
+    spec["schemes"] = [request.scheme]
+    response.set_data(json.dumps(spec))
+    return response
+
+
+@apiv1_blueprint.after_request
+@apiv2_blueprint.after_request
 def collect_stats(response):
     action_name = extract_name_from_path(request.full_path)
     blacklist = current_app.config.get("TRACKING_BLACKLIST", [])
