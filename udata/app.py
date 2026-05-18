@@ -262,11 +262,21 @@ def add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: https:; font-src 'self'; frame-ancestors 'self'",
-    )
+    # Flask-RestX renders the Swagger UI doc page with inline <script> blocks,
+    # so its CSP needs 'unsafe-inline' for scripts. Keep the strict policy
+    # everywhere else.
+    if request.path.rstrip("/") in ("/api/1", "/api/2"):
+        csp = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; "
+            "font-src 'self'; frame-ancestors 'self'"
+        )
+    else:
+        csp = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; font-src 'self'; frame-ancestors 'self'"
+        )
+    response.headers.setdefault("Content-Security-Policy", csp)
     # Hide server version to prevent information leakage
     response.headers["Server"] = "dados.gov"
     return response
