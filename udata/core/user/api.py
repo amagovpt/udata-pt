@@ -8,6 +8,7 @@ from slugify import slugify
 from udata.api import API, api
 from udata.api.limits import UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
+from udata.utils import Paginable
 from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.api_token.api import apitoken_created_fields
@@ -464,6 +465,100 @@ class RefuseOrgInvitationAPI(API):
         api.abort(404, "Invitation not found")
 
 
+class AggregationPaginator(Paginable):
+    """Paginable wrapper for results from a MongoDB aggregation pipeline."""
+
+    def __init__(self, items, page, page_size, total):
+        self._items = items
+        self.page = page
+        self.page_size = page_size
+        self.total = total
+
+    @property
+    def objects(self):
+        return self._items
+
+
+def _paginate_name_sorted_users(users_qs, direction, page, page_size):
+    """Sort users by name following this priority order (A→Z); reversed for Z→A:
+      0 – Latin letters, with or without diacritics (A/Á/Ã, C/Ç, N/Ñ, O/Ø ...)
+      1 – Cyrillic (А, Б, В … Я)
+      2 – all other Unicode letters (Greek, Arabic, Chinese …)
+      3 – digits (0-9)
+      4 – symbols/punctuation (+, -, !, #, @, ...)
+    """
+    sort_dir = 1 if direction == "" else -1
+    collation_spec = {"locale": "pt", "strength": 1}
+    fn = {"$ifNull": ["$first_name", ""]}
+
+    name_priority = {
+        "$switch": {
+            "branches": [
+                # Latin (Basic + Extended-A/B + Extended Additional): first in A→Z
+                {
+                    "case": {
+                        "$regexMatch": {
+                            "input": fn,
+                            "regex": "^[a-zA-ZÀ-ɏḀ-ỿ]",
+                        }
+                    },
+                    "then": 0,
+                },
+                # Cyrillic block
+                {
+                    "case": {"$regexMatch": {"input": fn, "regex": "^[Ѐ-ӿ]"}},
+                    "then": 1,
+                },
+                # Any other Unicode letter (Greek, Arabic, CJK, …)
+                {
+                    "case": {"$regexMatch": {"input": fn, "regex": "^\\p{L}"}},
+                    "then": 2,
+                },
+                # digits: 0-9
+                {"case": {"$regexMatch": {"input": fn, "regex": "^[0-9]"}}, "then": 3},
+            ],
+            # default: symbols / punctuation — last in A→Z
+            "default": 4,
+        }
+    }
+
+    pipeline = [
+        {"$match": users_qs._query},
+        {"$addFields": {"_name_priority": name_priority}},
+        # _name_priority is always ascending so letters(0) come first and symbols(4) last,
+        # regardless of sort direction. Only the name fields change direction.
+        {"$sort": {"_name_priority": 1, "first_name": sort_dir, "last_name": sort_dir}},
+    ]
+
+    collection = User._get_collection()
+
+    count_result = list(
+        collection.aggregate(pipeline + [{"$count": "total"}], collation=collation_spec)
+    )
+    total = count_result[0]["total"] if count_result else 0
+
+    raw_ids = list(
+        collection.aggregate(
+            pipeline
+            + [
+                {"$skip": (page - 1) * page_size},
+                {"$limit": page_size},
+                {"$project": {"_id": 1}},
+            ],
+            collation=collation_spec,
+        )
+    )
+    sorted_ids = [r["_id"] for r in raw_ids]
+
+    if sorted_ids:
+        users_map = {u.id: u for u in User.objects(id__in=sorted_ids).select_related()}
+        items = [users_map[uid] for uid in sorted_ids if uid in users_map]
+    else:
+        items = []
+
+    return AggregationPaginator(items=items, page=page, page_size=page_size, total=total)
+
+
 @ns.route("/", endpoint="users")
 class UserListAPI(API):
     model = User
@@ -497,10 +592,11 @@ class UserListAPI(API):
                     args["page"], args["page_size"]
                 )
         if args["sort"]:
-            qs = users.order_by(args["sort"])
-            if args["sort"].lstrip("-") in ("last_name", "first_name"):
-                qs = qs.collation({"locale": "pt", "strength": 1})
-            return qs.paginate(args["page"], args["page_size"])
+            sort_field = args["sort"].lstrip("-")
+            direction = "-" if args["sort"].startswith("-") else ""
+            if sort_field in ("first_name", "last_name"):
+                return _paginate_name_sorted_users(users, direction, args["page"], args["page_size"])
+            return users.order_by(args["sort"]).paginate(args["page"], args["page_size"])
         return users.order_by(DEFAULT_SORTING).paginate(args["page"], args["page_size"])
 
     @api.secure(admin_permission)
