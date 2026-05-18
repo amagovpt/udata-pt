@@ -87,7 +87,7 @@ class MembershipRequestForm(ModelForm):
     model_class = MembershipRequest
 
     user = fields.CurrentUserField()
-    comment = fields.StringField(_("Comment"), [validators.DataRequired()])
+    comment = fields.StringField(_("Comment"), [validators.Optional()])
 
 
 class MembershipRefuseForm(Form):
