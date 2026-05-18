@@ -254,6 +254,17 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert request.handled_by is None
         assert request.refusal_comment is None
 
+    def test_request_membership_without_comment(self):
+        organization = OrganizationFactory()
+        self.login()
+
+        response = self.post(url_for("api.request_membership", org=organization), {})
+        assert201(response)
+
+        organization.reload()
+        assert len(organization.requests) == 1
+        assert organization.requests[0].comment in (None, "")
+
     def test_request_existing_pending_membership_do_not_duplicate_it(self):
         user = self.login()
         previous_request = MembershipRequest(user=user, comment="previous")
