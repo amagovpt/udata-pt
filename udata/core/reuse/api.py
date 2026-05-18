@@ -140,7 +140,7 @@ class ReuseListAPI(API):
     @api.marshal_with(Reuse.__page_fields__)
     def get(self):
         query = Reuse.objects.visible_by_user(
-            current_user, mongoengine.Q(private__ne=True, deleted=None)
+            current_user, mongoengine.Q(private__ne=True, archived=None, deleted=None)
         )
         query = Reuse.apply_sort_filters(query)
         modified_since = request.args.get("modified_since")
