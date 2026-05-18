@@ -1,11 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from bson import ObjectId
 from flask_restx.inputs import boolean
 from flask_security import current_user
 
 from udata.api import API, api, fields
-from udata.api.limits import COMMENT_CREATE_LIMIT, user_or_ip
+from udata.api.limits import COMMENT_CREATE_LIMIT, DISCUSSION_CREATE_LIMIT, user_or_ip
 from udata.api.parsers import normalize_search_query
 from udata.app import limiter
 from udata.core.dataservices.models import Dataservice
@@ -24,6 +24,12 @@ from .forms import (
     DiscussionEditForm,
 )
 from .models import Discussion, Message
+
+# Reject re-submissions of the same (subject, user, title) tuple inside this
+# window with 409. Defense in depth on top of the per-user rate-limit — see
+# TICKET-1728 / VULN-2083 audit replay where the Burp Intruder created 99
+# discussions on a single dataset by simply varying the payload number.
+DISCUSSION_DEDUPE_WINDOW = timedelta(minutes=1)
 
 ns = api.namespace("discussions", "Discussion related operations")
 
@@ -314,10 +320,13 @@ class DiscussionsAPI(API):
     Base class for a list of discussions.
     """
 
-    # Per-user rate-limit on POST (start a new discussion) (TICKET-59).
+    # Per-user rate-limit on POST (start a new discussion). The discussion-
+    # create profile is tighter than COMMENT_CREATE_LIMIT because opening a
+    # new thread is a much rarer human action than commenting on an existing
+    # one — see TICKET-1728 / VULN-2083 (Burp Intruder mass-creation).
     decorators = [
         limiter.limit(
-            COMMENT_CREATE_LIMIT,
+            DISCUSSION_CREATE_LIMIT,
             methods=["POST"],
             key_func=user_or_ip,
         ),
@@ -349,14 +358,23 @@ class DiscussionsAPI(API):
             discussions = discussions(closed__ne=None)
 
         if args["q"]:
-            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
+            phrase_query = " ".join(
+                [f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")]
+            )
             discussions = discussions.search_text(phrase_query).order_by("$text_score")
 
         discussions = discussions.order_by(args["sort"])
         return discussions.paginate(args["page"], args["page_size"])
 
     @api.secure
-    @api.doc("create_discussion")
+    @api.doc(
+        "create_discussion",
+        responses={
+            400: "Validation error",
+            409: "Duplicate discussion recently submitted",
+            429: "Rate limit exceeded",
+        },
+    )
     @api.expect(start_discussion_fields)
     @api.marshal_with(discussion_fields)
     def post(self):
@@ -370,6 +388,22 @@ class DiscussionsAPI(API):
         )
         discussion = Discussion(user=current_user.id, discussion=[message])
         form.populate_obj(discussion)
+
+        # Reject duplicate submissions of the same (subject, user, title)
+        # tuple inside the dedupe window — see TICKET-1728 / VULN-2083 PoC
+        # where 99 discussions flooded a single dataset.
+        window_start = datetime.now(UTC) - DISCUSSION_DEDUPE_WINDOW
+        if (
+            Discussion.objects(
+                subject=discussion.subject,
+                user=current_user.id,
+                title=discussion.title,
+                created__gte=window_start,
+            ).first()
+            is not None
+        ):
+            api.abort(409, "Duplicate discussion recently submitted")
+
         discussion.save()
 
         discussion.signal_new()
