@@ -24,6 +24,7 @@ from ..models import (
     archive_harvested_dataset,
 )
 from ..signals import after_harvest_job, before_harvest_job
+from ..url_filter import HarvestURLForbidden, check_harvest_url
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +120,21 @@ class BaseBackend(object):
     def config(self):
         return self.source.config
 
+    def _guard_url(self, url):
+        """Re-check the URL right before issuing the HTTP request.
+
+        Defense in depth against DNS rebinding and against backends that
+        bypassed `HarvestSourceForm` (e.g. tests, fixtures, sources created
+        programmatically). The form-level gate is still the first line.
+        See LEDG-1729 / VULN-2084.
+        """
+        try:
+            check_harvest_url(url)
+        except HarvestURLForbidden as e:
+            raise HarvestException(str(e))
+
     def head(self, url, headers={}, **kwargs):
+        self._guard_url(url)
         headers.update(self.get_headers())
         kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
         kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)
@@ -129,6 +144,7 @@ class BaseBackend(object):
         return response
 
     def get(self, url, headers={}, **kwargs):
+        self._guard_url(url)
         headers.update(self.get_headers())
         kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
         kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)
@@ -138,6 +154,7 @@ class BaseBackend(object):
         return response
 
     def post(self, url, data, headers={}, **kwargs):
+        self._guard_url(url)
         headers.update(self.get_headers())
         kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
         kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)

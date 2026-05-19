@@ -4,8 +4,26 @@ from udata.i18n import lazy_gettext as _
 from udata.utils import safe_unicode
 
 from .models import VALIDATION_REFUSED, VALIDATION_STATES
+from .url_filter import HarvestURLForbidden, check_harvest_url
 
 __all__ = "HarvestSourceForm", "HarvestSourceValidationForm"
+
+
+class HarvestURLField(fields.URLField):
+    """`URLField` that gates the hostname against the harvest deny/allow list
+    BEFORE the parent `pre_validate` triggers DNS resolution.
+
+    Prevents the out-of-band DNS leak from VULN-2084 — a denied hostname
+    never reaches `socket.getaddrinfo`.
+    """
+
+    def pre_validate(self, form):
+        if self.data:
+            try:
+                check_harvest_url(self.data)
+            except HarvestURLForbidden as e:
+                raise validators.ValidationError(str(e))
+        return super().pre_validate(form)
 
 
 class HarvestConfigField(fields.DictField):
@@ -81,7 +99,7 @@ class HarvestSourceForm(Form):
     description = fields.MarkdownField(
         _("Description"), description=_("Some optional details about this harvester")
     )
-    url = fields.URLField(_("URL"), [validators.DataRequired()])
+    url = HarvestURLField(_("URL"), [validators.DataRequired()])
     backend = fields.SelectField(
         _("Backend"),
         choices=lambda: [(b.name, b.display_name) for b in get_enabled_backends().values()],
