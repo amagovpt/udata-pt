@@ -427,6 +427,8 @@ class MembershipRequestAPI(API):
     @api.marshal_with(request_fields)
     def post(self, org):
         """Apply for membership to a given organization."""
+        if org.is_member(current_user._get_current_object()):
+            api.abort(409, "You are already a member of this organization.")
         membership_request = org.pending_request(current_user._get_current_object())
         code = 200 if membership_request else 201
 
@@ -463,12 +465,15 @@ class MembershipAcceptAPI(MembershipAPI):
         org.permissions["members"].test()
         membership_request = self.get_or_404(org, id)
 
-        if org.is_member(membership_request.user):
-            return org.member(membership_request.user), 409
-
         membership_request.status = "accepted"
         membership_request.handled_by = current_user._get_current_object()
         membership_request.handled_on = datetime.now(UTC)
+
+        if org.is_member(membership_request.user):
+            org.save()
+            MembershipRequest.after_handle.send(membership_request, org=org)
+            return org.member(membership_request.user)
+
         member = Member(user=membership_request.user, role=membership_request.role or "editor")
 
         org.members.append(member)
