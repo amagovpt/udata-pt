@@ -565,6 +565,53 @@ class Defaults(object):
     # List of allowed TLDs.
     URLS_ALLOWED_TLDS = tld_set
 
+    # Harvest URL SSRF guard — see TICKET-1729 / VULN-2084.
+    ###########################################################################
+    # Optional allowlist of glob patterns for harvest source hostnames.
+    # When `None` the allowlist is not enforced (only the denylist below and
+    # the private/local IP guard from `uris.validate` apply). When set to a
+    # tuple of patterns, only hostnames matching at least one pattern are
+    # accepted — useful for tightening preprod/prod to known catalog domains.
+    # Example: ("*.gov.pt", "ec.europa.eu", "data.europa.eu").
+    HARVEST_URL_HOST_ALLOWLIST = None
+    # Denylist of glob patterns for harvest source hostnames. These are
+    # public out-of-band interaction services routinely used by pentest
+    # frameworks (Burp Collaborator, Interactsh, oast.*) to detect SSRF.
+    # Matched BEFORE the DNS resolution in `uris.validate`, so a blocked
+    # host never reaches `socket.getaddrinfo`.
+    HARVEST_URL_HOST_DENYLIST = (
+        # Apex domains and subdomains for each canary service. fnmatch's `*`
+        # only matches the wildcard segment, so both forms are needed.
+        "interact.sh",
+        "*.interact.sh",
+        "oast.fun",
+        "*.oast.fun",
+        "oast.live",
+        "*.oast.live",
+        "oast.me",
+        "*.oast.me",
+        "oast.online",
+        "*.oast.online",
+        "oast.pro",
+        "*.oast.pro",
+        "oast.site",
+        "*.oast.site",
+        "s.inty.io",
+        "*.s.inty.io",
+        "burpcollaborator.net",
+        "*.burpcollaborator.net",
+        "webhook.site",
+        "*.webhook.site",
+        "requestbin.com",
+        "*.requestbin.com",
+        "requestcatcher.com",
+        "*.requestcatcher.com",
+        "pipedream.net",
+        "*.pipedream.net",
+        "beeceptor.com",
+        "*.beeceptor.com",
+    )
+
     # Flask-CDN options
     # See: https://github.com/libwilliam/flask-cdn#flask-cdn-options
     # If this value is defined, toggle static assets on external domain
