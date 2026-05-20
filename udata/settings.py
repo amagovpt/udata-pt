@@ -612,6 +612,22 @@ class Defaults(object):
         "*.beeceptor.com",
     )
 
+    # Resource download proxy — see LEDG-1214.
+    ###########################################################################
+    # The proxy fetches user-supplied external URLs server-side and streams the
+    # response back with `Content-Disposition: attachment`. It reuses the
+    # harvest SSRF guard (`check_harvest_url` + `uris.validate`) because the
+    # threat model is identical: server-side fetch of a URL controlled by the
+    # caller.
+    # Hard cap on the number of bytes streamed back per request. Prevents
+    # operators from being used as a free egress amplifier or hitting OOM on
+    # adversarially-large origins. Default: 500 MB.
+    DOWNLOAD_PROXY_MAX_BYTES = 500 * 1024 * 1024
+    # Connect timeout (seconds) for the outbound request to the origin.
+    DOWNLOAD_PROXY_CONNECT_TIMEOUT_S = 10
+    # Read timeout (seconds) between successive chunks from the origin.
+    DOWNLOAD_PROXY_READ_TIMEOUT_S = 300
+
     # Flask-CDN options
     # See: https://github.com/libwilliam/flask-cdn#flask-cdn-options
     # If this value is defined, toggle static assets on external domain
