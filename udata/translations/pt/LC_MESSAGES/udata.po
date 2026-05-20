@@ -244,19 +244,19 @@ msgstr "A palavra-passe tem de ter, no mínimo, {pass_length} caracteres"
 
 #: udata/auth/password_validation.py:33
 msgid "Password must contain lowercases"
-msgstr "A senha deve conter letras minúsculas"
+msgstr "A palavra-passe tem de conter letras minúsculas"
 
 #: udata/auth/password_validation.py:39
 msgid "Password must contain digits"
-msgstr "Password deve conter um ou mais dígitos"
+msgstr "A palavra-passe tem de conter dígitos"
 
 #: udata/auth/password_validation.py:45
 msgid "Password must contain uppercases"
-msgstr "A senha deve conter maiúsculas"
+msgstr "A palavra-passe tem de conter letras maiúsculas"
 
 #: udata/auth/password_validation.py:51
 msgid "Password must contain symbols"
-msgstr "A palavra-passe pode conter símbolos"
+msgstr "A palavra-passe tem de conter símbolos"
 
 #: udata/auth/saml/saml_plugin/saml_govpt.py:506
 msgid "Account migration verification code"

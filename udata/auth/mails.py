@@ -110,9 +110,9 @@ def reset_instructions(reset_token: str, **kwargs) -> MailMessage:
         subject="Redefinição de palavra-passe — dados.gov.pt",
         paragraphs=[
             "Alguém pediu uma redefinição da palavra-passe da sua conta no dados.gov.pt.",
-            "Se isto não foi você, ignore este e-mail.",
+            "Caso não tenha efetuado este pedido, ignore este e-mail.",
             MailCTA(
-                "Reinicializar a sua palavra-passe",
+                "Redefinir a sua palavra-passe",
                 cdata_url(f"/pages/reset-password/{reset_token}"),
             ),
         ],
@@ -120,10 +120,13 @@ def reset_instructions(reset_token: str, **kwargs) -> MailMessage:
 
 
 def reset_notice(**kwargs) -> MailMessage:
+    from udata.uris import cdata_url
+
     return MailMessage(
-        subject="A sua palavra-passe foi reinicializada — dados.gov.pt",
+        subject="A sua palavra-passe foi redefinida — dados.gov.pt",
         paragraphs=[
-            "A sua palavra-passe dados.gov.pt foi reinicializada.",
+            "A sua palavra-passe dados.gov.pt foi redefinida.",
+            MailCTA("Visitar dados.gov.pt", cdata_url("/")),
         ],
     )
 
