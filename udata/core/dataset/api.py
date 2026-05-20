@@ -22,9 +22,19 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import mongoengine
+import requests
 from bson.objectid import ObjectId
 from feedgenerator.django.utils.feedgenerator import Atom1Feed
-from flask import abort, current_app, make_response, redirect, request, url_for
+from flask import (
+    Response,
+    abort,
+    current_app,
+    make_response,
+    redirect,
+    request,
+    stream_with_context,
+    url_for,
+)
 from flask_restx.inputs import boolean
 from flask_security import current_user
 from mongoengine.queryset.visitor import Q
@@ -67,6 +77,13 @@ from .api_fields import (
     upload_fields,
 )
 from .constants import RESOURCE_TYPES, UpdateFrequency
+from .download_proxy import (
+    ProxyDownloadForbidden,
+    check_external_url,
+    derive_filename,
+    iter_capped,
+    open_upstream,
+)
 from .exceptions import (
     SchemasCacheUnavailableException,
     SchemasCatalogNotFoundException,
@@ -564,6 +581,72 @@ class ResourceRedirectAPI(API):
         """
         resource = get_resource(id)
         return redirect(resource.url.strip()) if resource else abort(404, "Resource not found")
+
+
+proxy_download_parser = api.parser()
+proxy_download_parser.add_argument(
+    "url",
+    type=str,
+    required=True,
+    location="args",
+    help="The external URL to fetch and stream back as an attachment.",
+)
+proxy_download_parser.add_argument(
+    "filename",
+    type=str,
+    required=False,
+    location="args",
+    help="Optional filename to suggest in Content-Disposition. "
+    "Falls back to the URL's last path segment.",
+)
+
+
+@ns.route("/proxy/download/", endpoint="proxy_download")
+class ResourceProxyDownloadAPI(API):
+    @api.doc(
+        "proxy_download_external_resource",
+        **common_doc,
+        responses={
+            400: "Missing or invalid 'url' query parameter",
+            403: "URL rejected by SSRF guard",
+            502: "Upstream fetch failed",
+        },
+    )
+    @api.expect(proxy_download_parser)
+    def get(self):
+        """Fetch an external resource server-side and stream it back with
+        Content-Disposition: attachment so the browser always downloads.
+
+        See LEDG-1214. Reuses the harvest SSRF guard, disables redirects on
+        the outbound request, and caps the streamed body at
+        DOWNLOAD_PROXY_MAX_BYTES.
+        """
+        args = proxy_download_parser.parse_args()
+        url = (args.get("url") or "").strip()
+        if not url:
+            api.abort(400, "Missing 'url' query parameter")
+        try:
+            check_external_url(url)
+        except ProxyDownloadForbidden as e:
+            api.abort(403, str(e))
+        try:
+            upstream = open_upstream(url)
+        except requests.RequestException as e:
+            api.abort(502, f"Upstream fetch failed: {e}")
+        filename = derive_filename(url, fallback=args.get("filename"))
+        content_type = upstream.headers.get("Content-Type") or "application/octet-stream"
+        # No Content-Length: `iter_capped` may truncate mid-stream and the
+        # advertised length would no longer match the body.
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache, no-store",
+        }
+        return Response(
+            stream_with_context(iter_capped(upstream)),
+            status=200,
+            content_type=content_type,
+            headers=headers,
+        )
 
 
 @ns.route("/<dataset:dataset>/resources/", endpoint="resources")
