@@ -26,13 +26,11 @@ import requests
 from bson.objectid import ObjectId
 from feedgenerator.django.utils.feedgenerator import Atom1Feed
 from flask import (
-    Response,
     abort,
     current_app,
     make_response,
     redirect,
     request,
-    stream_with_context,
     url_for,
 )
 from flask_restx.inputs import boolean
@@ -79,10 +77,7 @@ from .api_fields import (
 from .constants import RESOURCE_TYPES, UpdateFrequency
 from .download_proxy import (
     ProxyDownloadForbidden,
-    check_external_url,
-    derive_filename,
-    iter_capped,
-    open_upstream,
+    stream_as_attachment,
 )
 from .exceptions import (
     SchemasCacheUnavailableException,
@@ -626,27 +621,11 @@ class ResourceProxyDownloadAPI(API):
         if not url:
             api.abort(400, "Missing 'url' query parameter")
         try:
-            check_external_url(url)
+            return stream_as_attachment(url, filename_hint=args.get("filename"))
         except ProxyDownloadForbidden as e:
             api.abort(403, str(e))
-        try:
-            upstream = open_upstream(url)
         except requests.RequestException as e:
             api.abort(502, f"Upstream fetch failed: {e}")
-        filename = derive_filename(url, fallback=args.get("filename"))
-        content_type = upstream.headers.get("Content-Type") or "application/octet-stream"
-        # No Content-Length: `iter_capped` may truncate mid-stream and the
-        # advertised length would no longer match the body.
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control": "no-cache, no-store",
-        }
-        return Response(
-            stream_with_context(iter_capped(upstream)),
-            status=200,
-            content_type=content_type,
-            headers=headers,
-        )
 
 
 @ns.route("/<dataset:dataset>/resources/", endpoint="resources")

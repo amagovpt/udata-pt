@@ -19,7 +19,7 @@ import re
 from urllib.parse import unquote, urlparse
 
 import requests
-from flask import current_app
+from flask import Response, current_app, stream_with_context
 
 import udata.uris as uris
 from udata.harvest.url_filter import HarvestURLForbidden, check_harvest_url
@@ -115,3 +115,34 @@ def iter_capped(response: requests.Response):
             yield chunk
     finally:
         response.close()
+
+
+def stream_as_attachment(url: str, filename_hint: str | None = None) -> Response:
+    """End-to-end helper: validate, fetch, and stream `url` as an attachment.
+
+    Combines `check_external_url` + `open_upstream` + `iter_capped` and
+    builds a Flask `Response` with `Content-Disposition: attachment` and
+    the upstream `Content-Type` (or `application/octet-stream` when the
+    origin omits it). Reused by both the proxy endpoint and the
+    `/r/<id>/` resource redirect for `remote` resources.
+
+    Raises:
+        ProxyDownloadForbidden: when the URL is rejected by the SSRF guard.
+        requests.RequestException: when the upstream call fails.
+
+    Callers are expected to map those to their preferred HTTP status codes.
+    """
+    check_external_url(url)
+    upstream = open_upstream(url)
+    filename = derive_filename(url, fallback=filename_hint)
+    content_type = upstream.headers.get("Content-Type") or "application/octet-stream"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-cache, no-store",
+    }
+    return Response(
+        stream_with_context(iter_capped(upstream)),
+        status=200,
+        content_type=content_type,
+        headers=headers,
+    )
