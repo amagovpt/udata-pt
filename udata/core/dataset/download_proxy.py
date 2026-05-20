@@ -39,13 +39,19 @@ def check_external_url(url: str) -> None:
     Order matters: the pattern denylist runs first (no I/O), then DNS
     resolution with private-IP rejection. Out-of-band canaries are stopped
     before any hostname lookup.
+
+    `uris.validate` is called with explicit `local=False, private=False`
+    so the proxy never fetches loopback or private-network addresses, even
+    when the global `URLS_ALLOW_LOCAL` / `URLS_ALLOW_PRIVATE` config is
+    permissive (the test environment legitimately sets `URLS_ALLOW_LOCAL=
+    True` to talk to `local.test`, but the proxy must remain strict).
     """
     try:
         check_harvest_url(url)
     except HarvestURLForbidden as e:
         raise ProxyDownloadForbidden(str(e))
     try:
-        uris.validate(url)
+        uris.validate(url, local=False, private=False)
     except uris.ValidationError as e:
         raise ProxyDownloadForbidden(str(e))
 
