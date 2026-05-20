@@ -564,6 +564,16 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
             },
         ],
         "metadata": {"local": [_resolve_path(metadata_file)]},
+        # Trust anchor pinning: verify SAML Response signatures exclusively
+        # against the IdP cert loaded from metadata.xml, never against the
+        # cert that autenticacao.gov inlines in <ds:KeyInfo>/<X509Certificate>.
+        # AMA sometimes ships that inline element as a PKCS#7 SignedData
+        # bundle, which pysaml2 base64-wraps with PEM CERTIFICATE markers and
+        # hands to xmlsec1; OpenSSL's PEM_read_bio_X509_AUX then rejects it
+        # with "wrong tag" (it expects an X.509 SEQUENCE, not PKCS#7), and
+        # signature verification fails with no path to recover. Pinning to
+        # the offline-distributed metadata cert also hardens trust anchoring.
+        "only_use_keys_in_metadata": True,
         "accepted_time_diff": 60,
         # autenticacao.gov ships attributes with URIs from the
         # `http://interop.gov.pt/MDC/Cidadao/*` namespace, which is not part
