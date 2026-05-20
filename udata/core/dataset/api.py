@@ -31,6 +31,7 @@ from flask import (
     make_response,
     redirect,
     request,
+    send_file,
     url_for,
 )
 from flask_restx.inputs import boolean
@@ -571,11 +572,56 @@ class DatasetBadgeAPI(API):
 class ResourceRedirectAPI(API):
     @api.doc("redirect_resource", **common_doc)
     def get(self, id):
-        """
-        Redirect to the latest version of a resource given its identifier.
+        """Stream the latest version of a resource as a forced download.
+
+        See LEDG-1765. Replaces the previous 302 redirect, which let the
+        browser render the file inline (PDFs, images, HTML, etc.) and
+        ignored cross-origin `download` attributes. Both code paths emit
+        `Content-Disposition: attachment` so the browser always saves the
+        file to disk.
+
+        - Hosted resources (`fs_filename` set) are streamed from the
+          storage backend via `send_file(as_attachment=True)`.
+        - Remote resources are pulled through the SSRF-guarded download
+          proxy (LEDG-1214), reusing `stream_as_attachment`.
+
+        The endpoint URL is unchanged, so the permanent `latest` link of
+        a resource keeps working for harvesters and external integrations.
         """
         resource = get_resource(id)
-        return redirect(resource.url.strip()) if resource else abort(404, "Resource not found")
+        if not resource:
+            abort(404, "Resource not found")
+        if resource.fs_filename:
+            return _serve_hosted_resource(resource)
+        return _proxy_remote_resource(resource)
+
+
+def _serve_hosted_resource(resource):
+    """Stream a hosted resource (`fs_filename`) with attachment headers.
+
+    The storage handle is closed via `call_on_close` so it stays open for
+    the duration of the streamed response, on both local and S3 backends.
+    """
+    fp = storages.resources.open(resource.fs_filename, "rb")
+    download_name = resource.title or os.path.basename(resource.fs_filename)
+    response = send_file(
+        fp,
+        mimetype=resource.mime or "application/octet-stream",
+        as_attachment=True,
+        download_name=download_name,
+    )
+    response.call_on_close(fp.close)
+    return response
+
+
+def _proxy_remote_resource(resource):
+    """Pipe a remote-URL resource through the SSRF-guarded download proxy."""
+    try:
+        return stream_as_attachment(resource.url.strip(), filename_hint=resource.title)
+    except ProxyDownloadForbidden as e:
+        api.abort(403, str(e))
+    except requests.RequestException as e:
+        api.abort(502, f"Upstream fetch failed: {e}")
 
 
 proxy_download_parser = api.parser()
