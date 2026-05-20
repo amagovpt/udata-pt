@@ -2,14 +2,19 @@
 from __future__ import unicode_literals
 
 import base64
+import binascii
 import hashlib
 import hmac
 import logging
 import os
 import random
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import pkcs7
 
 from flask import (
     Blueprint,
@@ -129,6 +134,111 @@ def _resolve_path(path):
         return path
     backend_root = os.path.dirname(current_app.root_path)
     return os.path.join(backend_root, path)
+
+
+# DER bytes of OID 1.2.840.113549.1.7.2 (pkcs7-signedData). When the
+# IdP signing cert in metadata.xml is shipped as a PKCS#7 bundle, the
+# decoded `<X509Certificate>` payload starts with `30 82 LL LL` and then
+# this OID at offset 4 — pysaml2 hands the bundle as-is to xmlsec1 which
+# rejects it with `PEM_read_bio_X509_AUX:wrong tag` because it expects
+# a raw X.509 SEQUENCE.
+_PKCS7_SIGNED_DATA_OID = b"\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x02"
+
+
+def _normalize_idp_metadata_certs(metadata_path):
+    """Return a metadata file path with `<X509Certificate>` payloads guaranteed
+    to be raw X.509 certs.
+
+    autenticacao.gov has shipped the IdP signing cert wrapped in PKCS#7
+    SignedData (the same format as the `.p7b` bundle that AMA distributes
+    via doc-AUTENTICACAO). When that blob lands in a `<KeyDescriptor>` it
+    parses as XML fine, but pysaml2 forwards the decoded bytes to xmlsec1
+    via `--pubkey-cert-pem`, and OpenSSL's `PEM_read_bio_X509_AUX` rejects
+    PKCS#7 with `wrong tag` because it expects an X.509 SEQUENCE.
+
+    If any element is PKCS#7-wrapped, this helper extracts the leaf cert
+    (cryptography.pkcs7.load_der_pkcs7_certificates) and writes a cleaned
+    copy of the metadata XML to a content-addressed file under the system
+    tmpdir. The normalized file is reused across requests with the same
+    content. When nothing needs normalizing, the original path is returned
+    unchanged so we do not touch files that are already correct.
+    """
+    try:
+        with open(metadata_path, encoding="utf-8") as f:
+            xml = f.read()
+    except (OSError, UnicodeDecodeError):
+        return metadata_path
+
+    normalized_count = 0
+
+    def _maybe_unwrap(match):
+        nonlocal normalized_count
+        raw_b64 = re.sub(r"\s+", "", match.group(1))
+        if not raw_b64:
+            return match.group(0)
+        try:
+            der = base64.b64decode(raw_b64, validate=False)
+        except (binascii.Error, ValueError):
+            return match.group(0)
+        # PKCS#7 SignedData is SEQUENCE (0x30 0x82 LL LL) + OID at offset 4.
+        # A raw X.509 cert is SEQUENCE (0x30 0x82 LL LL) + SEQUENCE (0x30 0x82 ...)
+        # at offset 4, so the OID check uniquely identifies the wrapped case.
+        if len(der) < 14 or der[4 : 4 + len(_PKCS7_SIGNED_DATA_OID)] != _PKCS7_SIGNED_DATA_OID:
+            return match.group(0)
+        try:
+            certs = pkcs7.load_der_pkcs7_certificates(der)
+        except Exception:
+            return match.group(0)
+        if not certs:
+            return match.group(0)
+        leaf_b64 = base64.b64encode(certs[0].public_bytes(serialization.Encoding.DER)).decode(
+            "ascii"
+        )
+        normalized_count += 1
+        return match.group(0).split(">", 1)[0] + ">" + leaf_b64 + "</X509Certificate>"
+
+    cleaned = re.sub(
+        r"<(?:ds:)?X509Certificate>([^<]+)</(?:ds:)?X509Certificate>",
+        _maybe_unwrap,
+        xml,
+    )
+
+    if normalized_count == 0:
+        return metadata_path
+
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+    normalized_path = os.path.join(
+        tempfile.gettempdir(),
+        f"saml-idp-{digest}-{os.path.basename(metadata_path)}",
+    )
+    if not os.path.exists(normalized_path):
+        # Write atomically: write to a sibling temp file in the same dir,
+        # then rename, so concurrent workers never observe a half-written file.
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(normalized_path),
+            prefix=os.path.basename(normalized_path) + ".",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(cleaned)
+            os.replace(tmp, normalized_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            current_app.logger.info(
+                "SAML: unwrapped PKCS#7 IdP cert in %s (%d element(s)) -> %s",
+                metadata_path,
+                normalized_count,
+                normalized_path,
+            )
+        except RuntimeError:
+            # No active Flask app context (e.g., import-time tests) — ignore.
+            pass
+    return normalized_path
 
 
 autenticacao_gov = Blueprint("saml", __name__)
@@ -563,7 +673,7 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
                 "cert_file": cert_file,
             },
         ],
-        "metadata": {"local": [_resolve_path(metadata_file)]},
+        "metadata": {"local": [_normalize_idp_metadata_certs(_resolve_path(metadata_file))]},
         # Trust anchor pinning: verify SAML Response signatures exclusively
         # against the IdP cert loaded from metadata.xml, never against the
         # cert that autenticacao.gov inlines in <ds:KeyInfo>/<X509Certificate>.
