@@ -24,8 +24,11 @@ from cryptography.x509.oid import NameOID
 from flask import session
 
 from udata.auth.saml.saml_plugin.saml_govpt import (
+    _consume_outstanding_relay,
     _hash_nic,
+    _new_relay_state_token,
     _normalize_idp_metadata_certs,
+    _store_outstanding_relay,
 )
 from udata.core.user.factories import UserFactory
 from udata.tests.api import APITestCase
@@ -275,6 +278,109 @@ class SAMLIdpMetadataCertNormalizationTest:
         result = _normalize_idp_metadata_certs(path)
 
         assert result == path, "malformed b64 must not trigger a rewrite"
+
+
+class _InMemoryCache:
+    """Minimal Flask-Caching stand-in for unit tests.
+
+    The default test config uses `flask_caching.backends.null` (no-op),
+    which silently drops every `cache.set` and makes round-trip tests
+    impossible. Patch `udata.app.cache` with this to validate the
+    store/consume cycle of the RelayState-backed outstanding bucket.
+    """
+
+    def __init__(self):
+        self._store = {}
+
+    def set(self, key, value, timeout=None):
+        self._store[key] = value
+        return True
+
+    def get(self, key):
+        return self._store.get(key)
+
+    def delete(self, key):
+        return self._store.pop(key, None) is not None
+
+
+class SAMLOutstandingRelayTest(APITestCase):
+    """Redis-backed `outstanding` bucket via SAML RelayState.
+
+    Bypasses the session cookie on the SAML callback so deployments
+    behind middleware that mangles the `Set-Cookie` `SameSite` attribute
+    (e.g. F5 appending `SameSite=Lax` to cookies already marked
+    `SameSite=None`) can still match `InResponseTo` against the issued
+    AuthnRequest. RelayState is a regular SAML form field the IdP
+    echoes back, so it rides the cross-site POST end-to-end.
+    """
+
+    def test_token_is_random_and_url_safe(self):
+        a = _new_relay_state_token()
+        b = _new_relay_state_token()
+
+        assert a and b and a != b, "tokens must be unique per call"
+        assert re.fullmatch(r"[A-Za-z0-9_\-]+", a), (
+            "token must be URL-safe so it round-trips through HTTP-POST RelayState"
+        )
+
+    def test_store_then_consume_returns_bucket(self):
+        cache = _InMemoryCache()
+        with patch("udata.app.cache", cache):
+            token = _new_relay_state_token()
+            _store_outstanding_relay(token, "id-abc", kind="cmd")
+
+            assert _consume_outstanding_relay(token) == {"id-abc": "cmd"}
+
+    def test_consume_is_single_use(self):
+        cache = _InMemoryCache()
+        with patch("udata.app.cache", cache):
+            token = _new_relay_state_token()
+            _store_outstanding_relay(token, "id-abc", kind="cmd")
+
+            first = _consume_outstanding_relay(token)
+            second = _consume_outstanding_relay(token)
+
+            assert first == {"id-abc": "cmd"}
+            assert second == {}, (
+                "second consume must return empty so the response cannot be replayed"
+            )
+
+    def test_consume_unknown_token_returns_empty(self):
+        with patch("udata.app.cache", _InMemoryCache()):
+            assert _consume_outstanding_relay("unknown-token-xyz") == {}
+
+    def test_consume_empty_or_invalid_returns_empty(self):
+        with patch("udata.app.cache", _InMemoryCache()):
+            assert _consume_outstanding_relay("") == {}
+            assert _consume_outstanding_relay(None) == {}
+
+    def test_store_ignores_empty_inputs(self):
+        cache = _InMemoryCache()
+        with patch("udata.app.cache", cache):
+            # Both empty token and empty reqid are no-ops; nothing to consume.
+            _store_outstanding_relay("", "id-abc", kind="cmd")
+            _store_outstanding_relay("token-xyz", "", kind="cmd")
+
+            assert _consume_outstanding_relay("") == {}
+            assert _consume_outstanding_relay("token-xyz") == {}
+
+    def test_store_failure_does_not_raise(self):
+        """Cache outage must not break SP-initiated flow; fall back to cookie."""
+
+        class _BrokenCache:
+            def set(self, *a, **kw):
+                raise RuntimeError("Redis is down")
+
+            def get(self, *a, **kw):
+                raise RuntimeError("Redis is down")
+
+            def delete(self, *a, **kw):
+                raise RuntimeError("Redis is down")
+
+        with patch("udata.app.cache", _BrokenCache()):
+            # No exception escapes; both calls return safe empty defaults.
+            _store_outstanding_relay("token-xyz", "id-abc", kind="cmd")
+            assert _consume_outstanding_relay("token-xyz") == {}
 
 
 class SAMLAutoRegistrationTest(APITestCase):

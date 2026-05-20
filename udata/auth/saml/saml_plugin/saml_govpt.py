@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -313,6 +314,9 @@ def _name_id_binds_nic(name_id, nic):
 _OUTSTANDING_SESSION_KEY = "saml_outstanding"
 _OUTSTANDING_LIMIT = 8
 _REPLAY_CACHE_KEY = "saml_consumed:{kind}:{response_id}"
+_OUTSTANDING_RELAY_KEY = "saml_outstanding_relay:{token}"
+_OUTSTANDING_RELAY_TTL = 600  # 10 minutes — enough for the user to complete CMD
+_OUTSTANDING_RELAY_TOKEN_BYTES = 32
 
 
 def _remember_outstanding(reqid, kind):
@@ -348,6 +352,80 @@ def _consume_outstanding(in_response_to, kind):
         return False
     session[_OUTSTANDING_SESSION_KEY] = bucket
     return True
+
+
+def _new_relay_state_token():
+    """Return a fresh cryptographically random RelayState token.
+
+    URL-safe and short enough to round-trip through HTTP-POST binding
+    without bumping into IdP-side length limits. 32 random bytes → 43
+    base64url characters, indistinguishable from the static placeholder
+    we used to send so middleware shouldn't treat it any differently.
+    """
+    return secrets.token_urlsafe(_OUTSTANDING_RELAY_TOKEN_BYTES)
+
+
+def _store_outstanding_relay(relay_token, reqid, kind):
+    """Mirror ``_remember_outstanding`` into Redis keyed by ``RelayState``.
+
+    Some deployments sit behind middleware (F5/WAF) that mangles the
+    ``Set-Cookie`` ``SameSite`` attribute, breaking the cross-site SAML
+    POST and emptying the session bucket on the callback. RelayState is
+    a regular SAML form field the IdP echoes back, so the bucket can
+    follow the request end-to-end without depending on the cookie.
+
+    Stored as a 1-entry dict (``{reqid: kind}``) so ``idp_initiated``
+    can merge it into the same ``outstanding`` dict it already passes
+    to pysaml2. Single-use enforcement comes from
+    ``_consume_outstanding_relay`` which deletes the Redis entry.
+    """
+    if not relay_token or not reqid:
+        return
+    from udata.app import cache
+
+    try:
+        cache.set(
+            _OUTSTANDING_RELAY_KEY.format(token=relay_token),
+            {reqid: kind},
+            timeout=_OUTSTANDING_RELAY_TTL,
+        )
+    except Exception:
+        # Cache miss is non-fatal — the session bucket still works in
+        # environments where the cookie survives the cross-site POST.
+        current_app.logger.warning(
+            "SAML: failed to persist outstanding bucket to Redis; "
+            "falling back to session cookie only",
+            exc_info=True,
+        )
+
+
+def _consume_outstanding_relay(relay_token):
+    """Return and delete the outstanding bucket stored under ``relay_token``.
+
+    Returns ``{}`` when the token is empty, unknown, or the cache
+    backend is unavailable — callers must treat the dict as advisory
+    and fall back to the session-based bucket / pysaml2's own
+    ``allow_unsolicited=False`` rejection if both come back empty.
+    """
+    if not isinstance(relay_token, str) or not relay_token:
+        return {}
+    from udata.app import cache
+
+    key = _OUTSTANDING_RELAY_KEY.format(token=relay_token)
+    try:
+        bucket = cache.get(key) or {}
+    except Exception:
+        return {}
+    if bucket:
+        try:
+            cache.delete(key)
+        except Exception:
+            # If delete fails the TTL will reap it; we still treat the
+            # bucket as consumed for this request to keep replay defence.
+            pass
+    if not isinstance(bucket, dict):
+        return {}
+    return bucket
 
 
 def _check_and_record_replay(response_id, kind, ttl=None):
@@ -813,9 +891,10 @@ def sp_initiated():
         ]
     )
 
+    relay_token = _new_relay_state_token()
     args = {
         "binding": BINDING_HTTP_POST,
-        "relay_state": "dWRhdGEtZ291dnB0",
+        "relay_state": relay_token,
         "sign": True,
         "force_authn": "true",
         "is_passive": "false",
@@ -829,6 +908,12 @@ def sp_initiated():
     # (VULN-2077 / TICKET-58 — defence-in-depth on top of pysaml2's
     # ``allow_unsolicited=False`` flag).
     _remember_outstanding(reqid, kind="cmd")
+    # Mirror into Redis keyed by RelayState. Some deployments sit behind
+    # WAFs/load-balancers (F5) that mangle the SameSite attribute on
+    # `Set-Cookie`, dropping the session cookie on the cross-site SAML
+    # POST and emptying the bucket on the callback. RelayState rides
+    # the form payload end-to-end so the bucket survives that path too.
+    _store_outstanding_relay(relay_token, reqid, kind="cmd")
     return _extract_saml_form_data(info["data"])
 
 
@@ -893,10 +978,15 @@ def idp_initiated():
     #   outro IdP por tentar; após esgotados, o pedido é rejeitado.
     # - Outras excepções propagam (500) — pedidos malformados não devem
     #   contornar a validação.
-    # - ``outstanding`` liga o ``InResponseTo`` à sessão do utilizador; com
+    # - ``outstanding`` liga o ``InResponseTo`` ao pedido SP-initiated; com
     #   ``allow_unsolicited=False``, pysaml2 rejeita respostas sem um
     #   AuthnRequest correspondente (defesa contra replay/IdP-initiated).
+    #   O bucket vem (a) da sessão (cookie path) e (b) do Redis indexado
+    #   pelo RelayState ecoado pela AMA — assim sobrevivemos a middleware
+    #   que mangleia o atributo SameSite do cookie de sessão.
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    relay_token = request.form.get("RelayState", "")
+    outstanding.update(_consume_outstanding_relay(relay_token))
     last_validation_error = None
     for server in auth_servers:
         saml_client = saml_client_for(server)
@@ -1227,9 +1317,10 @@ def sp_eidas_initiated():
         ]
     )
 
+    relay_token = _new_relay_state_token()
     args = {
         "binding": BINDING_HTTP_POST,
-        "relay_state": "dWRhdGEtZ291dnB0",
+        "relay_state": relay_token,
         "sign": True,
         "force_authn": "true",
         "is_passive": "false",
@@ -1239,6 +1330,7 @@ def sp_eidas_initiated():
 
     reqid, info = saml_client.prepare_for_authenticate(**args)
     _remember_outstanding(reqid, kind="eidas")
+    _store_outstanding_relay(relay_token, reqid, kind="eidas")
     return _extract_saml_form_data(info["data"])
 
 
@@ -1267,8 +1359,13 @@ def idp_eidas_initiated():
     # Política fail-closed (VULN-2077 / TICKET-58): MissingKey/SignatureError
     # de um IdP só é tolerado enquanto restarem outros IdPs por tentar; após
     # esgotados, o pedido é rejeitado. Outras excepções propagam (500).
-    # ``outstanding`` liga o ``InResponseTo`` à sessão (allow_unsolicited=False).
+    # ``outstanding`` liga o ``InResponseTo`` ao pedido SP-initiated
+    # (allow_unsolicited=False) — bucket vem da sessão (cookie) e do Redis
+    # indexado pelo RelayState ecoado pela IdP (resiliente a middleware
+    # que mangleia o cookie SameSite).
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
+    relay_token = request.form.get("RelayState", "")
+    outstanding.update(_consume_outstanding_relay(relay_token))
     last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
