@@ -914,6 +914,22 @@ def sp_initiated():
     # POST and emptying the bucket on the callback. RelayState rides
     # the form payload end-to-end so the bucket survives that path too.
     _store_outstanding_relay(relay_token, reqid, kind="cmd")
+    # TEMP DIAG (remove after PPR is green): confirm bucket landed in Redis.
+    try:
+        from udata.app import cache as _diag_cache
+
+        _diag_stored = _diag_cache.get(_OUTSTANDING_RELAY_KEY.format(token=relay_token))
+    except Exception as _diag_exc:
+        _diag_stored = f"cache_err:{type(_diag_exc).__name__}"
+    current_app.logger.info(
+        "SAML diag sp_initiated kind=cmd reqid=%s relay_token=%s relay_token_len=%d "
+        "redis_readback=%r session_bucket_keys=%s",
+        reqid,
+        relay_token,
+        len(relay_token),
+        _diag_stored,
+        list(session.get(_OUTSTANDING_SESSION_KEY, {}).keys()),
+    )
     return _extract_saml_form_data(info["data"])
 
 
@@ -986,7 +1002,35 @@ def idp_initiated():
     #   que mangleia o atributo SameSite do cookie de sessão.
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
-    outstanding.update(_consume_outstanding_relay(relay_token))
+    _diag_redis_bucket = _consume_outstanding_relay(relay_token)
+    outstanding.update(_diag_redis_bucket)
+    # TEMP DIAG (remove after PPR is green): see what AMA actually echoed and
+    # whether we matched it in Redis. `in_response_to` is parsed from raw XML
+    # below by pysaml2; here we just confirm the inputs we received.
+    try:
+        _diag_form_keys = list(request.form.keys())
+    except Exception:
+        _diag_form_keys = []
+    _diag_inresponse_to = None
+    try:
+        _m = re.search(r'\bInResponseTo="([^"]+)"', decoded_xml.decode("utf-8", "replace"))
+        if _m:
+            _diag_inresponse_to = _m.group(1)
+    except Exception:
+        pass
+    current_app.logger.info(
+        "SAML diag idp_initiated kind=cmd form_keys=%s relay_state_recv=%r "
+        "relay_state_len=%d session_bucket_keys=%s redis_bucket=%s "
+        "merged_outstanding_keys=%s in_response_to=%r cookie_keys=%s",
+        _diag_form_keys,
+        relay_token,
+        len(relay_token or ""),
+        list(session.get(_OUTSTANDING_SESSION_KEY, {}).keys()),
+        _diag_redis_bucket,
+        list(outstanding.keys()),
+        _diag_inresponse_to,
+        list(request.cookies.keys()),
+    )
     last_validation_error = None
     for server in auth_servers:
         saml_client = saml_client_for(server)
