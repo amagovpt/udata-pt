@@ -10,13 +10,23 @@ then perform the udata login (login_user + session['saml_login']).
 
 import base64
 import inspect
+import os
 import re
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.x509.oid import NameOID
 from flask import session
 
-from udata.auth.saml.saml_plugin.saml_govpt import _hash_nic
+from udata.auth.saml.saml_plugin.saml_govpt import (
+    _hash_nic,
+    _normalize_idp_metadata_certs,
+)
 from udata.core.user.factories import UserFactory
 from udata.tests.api import APITestCase
 
@@ -160,6 +170,111 @@ class SAMLCodeIntegrityTest(APITestCase):
         assert 'url_for("saml.register")' not in source, (
             "saml_govpt.py still redirects to saml.register instead of auto-creating users"
         )
+
+
+def _make_test_cert_and_key():
+    """Return a freshly-minted self-signed X.509 cert + matching RSA key."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-idp.example")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    return cert, key
+
+
+def _make_pkcs7_signed_data_bundle(cert, key):
+    """Return DER bytes of a PKCS#7 SignedData bundle wrapping the given cert.
+
+    Mirrors the shape autenticacao.gov has shipped inside metadata
+    `<X509Certificate>` elements in some environments (OID
+    1.2.840.113549.1.7.2 — pkcs7-signedData), which xmlsec1 cannot parse
+    when handed to OpenSSL as a `--pubkey-cert-pem` argument.
+    """
+    return (
+        pkcs7.PKCS7SignatureBuilder()
+        .set_data(b"")
+        .add_signer(cert, key, hashes.SHA256())
+        .sign(serialization.Encoding.DER, [])
+    )
+
+
+def _write_metadata(tmp_path, x509_b64):
+    """Write a minimal IdP metadata file with a single signing cert."""
+    path = os.path.join(tmp_path, "metadata.xml")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            '<EntityDescriptor entityID="https://test-idp.example" '
+            'xmlns="urn:oasis:names:tc:SAML:2.0:metadata">'
+            "<IDPSSODescriptor protocolSupportEnumeration="
+            '"urn:oasis:names:tc:SAML:2.0:protocol">'
+            '<KeyDescriptor use="signing">'
+            '<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">'
+            f"<X509Data><X509Certificate>{x509_b64}</X509Certificate></X509Data>"
+            "</KeyInfo></KeyDescriptor></IDPSSODescriptor></EntityDescriptor>"
+        )
+    return path
+
+
+class SAMLIdpMetadataCertNormalizationTest:
+    """`_normalize_idp_metadata_certs` must unwrap PKCS#7-wrapped IdP certs in
+    `<X509Certificate>` so xmlsec1 can verify SAML Response signatures.
+
+    Triggered by autenticacao.gov shipping the IdP signing cert as PKCS#7
+    SignedData in some environments. Without this normalization, even with
+    `only_use_keys_in_metadata=True`, xmlsec1 fails with
+    `PEM_read_bio_X509_AUX:error=4:wrong tag` because OpenSSL expects an
+    X.509 SEQUENCE, not the PKCS#7 OID 1.2.840.113549.1.7.2.
+    """
+
+    def test_passthrough_when_cert_is_already_x509(self, tmp_path):
+        cert, _key = _make_test_cert_and_key()
+        x509_b64 = base64.b64encode(cert.public_bytes(serialization.Encoding.DER)).decode()
+        path = _write_metadata(str(tmp_path), x509_b64)
+
+        result = _normalize_idp_metadata_certs(path)
+
+        assert result == path, "clean metadata must not be rewritten"
+
+    def test_unwraps_pkcs7_signed_data(self, tmp_path):
+        cert, key = _make_test_cert_and_key()
+        pkcs7_der = _make_pkcs7_signed_data_bundle(cert, key)
+        path = _write_metadata(str(tmp_path), base64.b64encode(pkcs7_der).decode())
+
+        result = _normalize_idp_metadata_certs(path)
+
+        assert result != path, "PKCS#7-wrapped metadata must be rewritten"
+        with open(result, encoding="utf-8") as f:
+            cleaned = f.read()
+        match = re.search(r"<X509Certificate>([^<]+)</X509Certificate>", cleaned)
+        assert match, "normalized file must still contain <X509Certificate>"
+        cleaned_der = base64.b64decode(match.group(1))
+        # Round-trip parse must yield the same cert that was wrapped.
+        x509.load_der_x509_certificate(cleaned_der)
+        assert cleaned_der == cert.public_bytes(serialization.Encoding.DER)
+
+    def test_normalized_output_is_content_addressed(self, tmp_path):
+        cert, key = _make_test_cert_and_key()
+        pkcs7_der = _make_pkcs7_signed_data_bundle(cert, key)
+        path = _write_metadata(str(tmp_path), base64.b64encode(pkcs7_der).decode())
+
+        first = _normalize_idp_metadata_certs(path)
+        second = _normalize_idp_metadata_certs(path)
+
+        assert first == second, "repeated calls with the same source must reuse the same temp file"
+
+    def test_handles_invalid_base64_gracefully(self, tmp_path):
+        path = _write_metadata(str(tmp_path), "not-valid-base64-@@@")
+
+        result = _normalize_idp_metadata_certs(path)
+
+        assert result == path, "malformed b64 must not trigger a rewrite"
 
 
 class SAMLAutoRegistrationTest(APITestCase):
