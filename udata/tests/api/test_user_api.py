@@ -475,6 +475,49 @@ class UserAPITest(APITestCase):
         assert response.json["data"][0]["name"] == data["name"]
         assert response.json["data"][0]["email"] == data["email"]
 
+    def test_users_list_exposes_datasets_count_and_reuses_count_flat(self):
+        """LEDG-1763: admin user listing must expose `datasets_count` and
+        `reuses_count` as top-level fields, not only nested in `metrics`.
+
+        Reproduces the backoffice bug where the listing showed 0 even
+        though the user owned datasets — the frontend reads
+        `user.datasets_count` (flat) and the backend only exposed
+        `user.metrics.datasets` (nested).
+        """
+        self.login(AdminFactory())
+        target = UserFactory()
+        DatasetFactory(owner=target)
+        DatasetFactory(owner=target)
+        target.count_datasets()  # refresh user.metrics from the DB
+
+        response = self.get(url_for("api.users") + f"?q={target.first_name}")
+        self.assert200(response)
+        match = next(
+            (u for u in response.json["data"] if u["id"] == str(target.id)),
+            None,
+        )
+        assert match is not None, "target user missing from search results"
+
+        # The bug: these were undefined before LEDG-1763.
+        assert match["datasets_count"] == 2
+        assert match["reuses_count"] == 0
+        # Backward compat: `metrics` nested dict is still present and matches.
+        assert match["metrics"]["datasets"] == 2
+        assert match["metrics"]["reuses"] == 0
+
+    def test_user_detail_exposes_datasets_count_and_reuses_count_flat(self):
+        """Same contract on the single-user endpoint, since both share `user_fields`."""
+        target = UserFactory()
+        DatasetFactory(owner=target)
+        target.count_datasets()
+
+        response = self.get(url_for("api.user", user=target))
+        self.assert200(response)
+
+        assert response.json["datasets_count"] == 1
+        assert response.json["reuses_count"] == 0
+        assert response.json["metrics"]["datasets"] == 1
+
 
 class OrgInvitationsAPITest(APITestCase):
     def test_list_org_invitations(self):
