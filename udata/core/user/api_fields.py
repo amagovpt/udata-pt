@@ -91,6 +91,20 @@ user_fields = api.model(
         "metrics": fields.Raw(
             attribute=lambda o: o.get_metrics(), description="The user metrics", readonly=True
         ),
+        # Flat aliases of `metrics.datasets` and `metrics.reuses`, consumed by the
+        # admin user listing column renderers in the frontend (LEDG-1763). The
+        # nested `metrics` field above is kept for backward compatibility with
+        # any external consumer of the public `/api/1/users/` endpoint.
+        "datasets_count": fields.Integer(
+            attribute=lambda o: (o.get_metrics() or {}).get("datasets", 0),
+            description="Number of datasets owned by the user (alias of metrics.datasets).",
+            readonly=True,
+        ),
+        "reuses_count": fields.Integer(
+            attribute=lambda o: (o.get_metrics() or {}).get("reuses", 0),
+            description="Number of reuses owned by the user (alias of metrics.reuses).",
+            readonly=True,
+        ),
     },
 )
 
