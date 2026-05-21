@@ -26,13 +26,12 @@ import requests
 from bson.objectid import ObjectId
 from feedgenerator.django.utils.feedgenerator import Atom1Feed
 from flask import (
-    Response,
     abort,
     current_app,
     make_response,
     redirect,
     request,
-    stream_with_context,
+    send_file,
     url_for,
 )
 from flask_restx.inputs import boolean
@@ -79,10 +78,7 @@ from .api_fields import (
 from .constants import RESOURCE_TYPES, UpdateFrequency
 from .download_proxy import (
     ProxyDownloadForbidden,
-    check_external_url,
-    derive_filename,
-    iter_capped,
-    open_upstream,
+    stream_as_attachment,
 )
 from .exceptions import (
     SchemasCacheUnavailableException,
@@ -576,11 +572,56 @@ class DatasetBadgeAPI(API):
 class ResourceRedirectAPI(API):
     @api.doc("redirect_resource", **common_doc)
     def get(self, id):
-        """
-        Redirect to the latest version of a resource given its identifier.
+        """Stream the latest version of a resource as a forced download.
+
+        See LEDG-1765. Replaces the previous 302 redirect, which let the
+        browser render the file inline (PDFs, images, HTML, etc.) and
+        ignored cross-origin `download` attributes. Both code paths emit
+        `Content-Disposition: attachment` so the browser always saves the
+        file to disk.
+
+        - Hosted resources (`fs_filename` set) are streamed from the
+          storage backend via `send_file(as_attachment=True)`.
+        - Remote resources are pulled through the SSRF-guarded download
+          proxy (LEDG-1214), reusing `stream_as_attachment`.
+
+        The endpoint URL is unchanged, so the permanent `latest` link of
+        a resource keeps working for harvesters and external integrations.
         """
         resource = get_resource(id)
-        return redirect(resource.url.strip()) if resource else abort(404, "Resource not found")
+        if not resource:
+            abort(404, "Resource not found")
+        if resource.fs_filename:
+            return _serve_hosted_resource(resource)
+        return _proxy_remote_resource(resource)
+
+
+def _serve_hosted_resource(resource):
+    """Stream a hosted resource (`fs_filename`) with attachment headers.
+
+    The storage handle is closed via `call_on_close` so it stays open for
+    the duration of the streamed response, on both local and S3 backends.
+    """
+    fp = storages.resources.open(resource.fs_filename, "rb")
+    download_name = resource.title or os.path.basename(resource.fs_filename)
+    response = send_file(
+        fp,
+        mimetype=resource.mime or "application/octet-stream",
+        as_attachment=True,
+        download_name=download_name,
+    )
+    response.call_on_close(fp.close)
+    return response
+
+
+def _proxy_remote_resource(resource):
+    """Pipe a remote-URL resource through the SSRF-guarded download proxy."""
+    try:
+        return stream_as_attachment(resource.url.strip(), filename_hint=resource.title)
+    except ProxyDownloadForbidden as e:
+        api.abort(403, str(e))
+    except requests.RequestException as e:
+        api.abort(502, f"Upstream fetch failed: {e}")
 
 
 proxy_download_parser = api.parser()
@@ -626,27 +667,11 @@ class ResourceProxyDownloadAPI(API):
         if not url:
             api.abort(400, "Missing 'url' query parameter")
         try:
-            check_external_url(url)
+            return stream_as_attachment(url, filename_hint=args.get("filename"))
         except ProxyDownloadForbidden as e:
             api.abort(403, str(e))
-        try:
-            upstream = open_upstream(url)
         except requests.RequestException as e:
             api.abort(502, f"Upstream fetch failed: {e}")
-        filename = derive_filename(url, fallback=args.get("filename"))
-        content_type = upstream.headers.get("Content-Type") or "application/octet-stream"
-        # No Content-Length: `iter_capped` may truncate mid-stream and the
-        # advertised length would no longer match the body.
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control": "no-cache, no-store",
-        }
-        return Response(
-            stream_with_context(iter_capped(upstream)),
-            status=200,
-            content_type=content_type,
-            headers=headers,
-        )
 
 
 @ns.route("/<dataset:dataset>/resources/", endpoint="resources")
