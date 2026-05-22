@@ -19,9 +19,9 @@ import errno
 import json
 import traceback
 
-REPORT_FILE_PATH = '/home/dev/udata/report.csv'
+REPORT_FILE_PATH = '/opt/dadosgov/report.csv'
 DADOSGOVPATH = 'dadosGovFiles'
-DOWNLOADFILEPATH = '/home/dev/udata/fs/%s' % (DADOSGOVPATH)
+DOWNLOADFILEPATH = '/opt/dadosgov/fs/%s' % (DADOSGOVPATH)
 DADOSGOVURL = 'servico.dados.gov.pt'
 
 class DGBackend(DGBaseBackend):
