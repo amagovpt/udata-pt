@@ -39,11 +39,18 @@ from .models import Site, current_site
 from .rdf import build_catalog
 
 
-def _serialize_image(image_field, size):
-    """Safely extract image URL from a MongoEngine ImageField."""
+def _serialize_image(image_field, size=None):
+    """Safely extract image URL from a MongoEngine ImageField.
+
+    When ``size`` is ``None``, returns the URL of the original uploaded file
+    (matching how ``ImageField(original=True)`` serializes it on the regular
+    listing endpoints).
+    """
     if not image_field:
         return None
     try:
+        if size is None:
+            return image_field.fs.url(image_field.original, external=True)
         return image_field(size, external=True)
     except Exception:
         try:
@@ -64,7 +71,11 @@ def _serialize_dataset(dataset):
             dataset.last_modified.isoformat() if dataset.last_modified else None
         ),
         "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
-        "organization": {"name": org.name} if org else None,
+        "organization": (
+            {"name": org.name, "logo": _serialize_image(org.logo)}
+            if org
+            else None
+        ),
         "quality": dataset.quality,
         "metrics": dataset.metrics or {},
     }
