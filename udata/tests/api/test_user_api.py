@@ -5,6 +5,7 @@ from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.organization.notifications import MembershipRequestNotificationDetails
+from udata.core.reuse.factories import ReuseFactory, VisibleReuseFactory
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.features.notifications.models import Notification
 from udata.models import Discussion, Follow, Member, MembershipRequest
@@ -517,6 +518,36 @@ class UserAPITest(APITestCase):
         assert response.json["datasets_count"] == 1
         assert response.json["reuses_count"] == 0
         assert response.json["metrics"]["datasets"] == 1
+
+    def test_reuses_count_includes_reuses_without_datasets(self):
+        """LEDG-1763 follow-up (Camila Manique reteste 2026-05-25).
+
+        The admin user listing was still showing the wrong reuses number:
+        `Reuse.visible()` requires `datasets__0__exists=True`, so a reuse
+        owned by the user but not yet linked to any dataset was skipped by
+        `count_reuses()`. Admins viewing the user profile see those
+        orphan reuses (via `visible_by_user`), creating an observable gap
+        between the profile and the listing.
+
+        Sanity:
+        - 1 fully-visible reuse (with linked dataset)
+        - 1 orphan reuse (no datasets) — the one previously missed
+        - 1 private reuse (still excluded — only `datasets__0__exists` was
+          the bug; private/archived/deleted continue to be hidden)
+
+        Expected: `metrics.reuses == 2` and the flat alias matches.
+        """
+        self.login(AdminFactory())
+        target = UserFactory()
+        VisibleReuseFactory(owner=target)
+        ReuseFactory(owner=target)  # orphan — used to be uncounted
+        ReuseFactory(owner=target, private=True)  # excluded
+        target.count_reuses()
+
+        response = self.get(url_for("api.user", user=target))
+        self.assert200(response)
+        assert response.json["reuses_count"] == 2
+        assert response.json["metrics"]["reuses"] == 2
 
 
 class OrgInvitationsAPITest(APITestCase):
