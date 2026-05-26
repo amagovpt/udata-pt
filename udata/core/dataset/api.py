@@ -197,7 +197,9 @@ class DatasetApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
+            phrase_query = " ".join(
+                [f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")]
+            )
             datasets = datasets.search_text(phrase_query)
         if args.get("tag"):
             datasets = datasets.filter(tags__all=args["tag"])
@@ -596,6 +598,26 @@ class ResourceRedirectAPI(API):
         return _proxy_remote_resource(resource)
 
 
+def _ensure_extension(name: str, format_hint: str | None) -> str:
+    """Append `.{format_hint}` to `name` when the extension is missing.
+
+    Resources often have a human-readable `title` ("Lista de Apoios 2026")
+    that omits the extension while `format` carries the file kind ("csv").
+    Without this Windows shows the saved file as "Arquivo" and asks the
+    user which program should open it (reported on LEDG-1765).
+
+    The check is case-insensitive so an upstream `.CSV` is not duplicated.
+    A blank `format_hint` is a no-op — better to leave the name unchanged
+    than to invent a wrong extension.
+    """
+    ext = (format_hint or "").strip().lstrip(".").lower()
+    if not name or not ext:
+        return name
+    if name.lower().endswith("." + ext):
+        return name
+    return f"{name}.{ext}"
+
+
 def _serve_hosted_resource(resource):
     """Stream a hosted resource (`fs_filename`) with attachment headers.
 
@@ -603,7 +625,8 @@ def _serve_hosted_resource(resource):
     the duration of the streamed response, on both local and S3 backends.
     """
     fp = storages.resources.open(resource.fs_filename, "rb")
-    download_name = resource.title or os.path.basename(resource.fs_filename)
+    base_name = resource.title or os.path.basename(resource.fs_filename)
+    download_name = _ensure_extension(base_name, resource.format)
     response = send_file(
         fp,
         mimetype=resource.mime or "application/octet-stream",
@@ -616,8 +639,9 @@ def _serve_hosted_resource(resource):
 
 def _proxy_remote_resource(resource):
     """Pipe a remote-URL resource through the SSRF-guarded download proxy."""
+    filename_hint = _ensure_extension(resource.title, resource.format) if resource.title else None
     try:
-        return stream_as_attachment(resource.url.strip(), filename_hint=resource.title)
+        return stream_as_attachment(resource.url.strip(), filename_hint=filename_hint)
     except ProxyDownloadForbidden as e:
         api.abort(403, str(e))
     except requests.RequestException as e:
