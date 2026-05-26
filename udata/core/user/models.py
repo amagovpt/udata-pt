@@ -354,7 +354,16 @@ class User(WithMetrics, UserMixin, Linkable, Document):
     def count_reuses(self):
         from udata.models import Reuse
 
-        self.metrics["reuses"] = Reuse.objects(owner=self).visible().count()
+        # `Reuse.visible()` also requires `datasets__0__exists=True`, which
+        # was undercounting in the admin user listing (LEDG-1763 follow-up):
+        # a reuse owned by the user but with no datasets linked yet showed
+        # up on the user's profile (admins see everything via
+        # `visible_by_user`) but was missing from `metrics.reuses`. Mirror
+        # the public listing filter (`/api/1/reuses/`) instead so the
+        # admin column and the profile agree.
+        self.metrics["reuses"] = Reuse.objects(
+            owner=self, private__ne=True, archived=None, deleted=None
+        ).count()
         self.save(signal_kwargs={"ignores": ["post_save"]})
 
     def count_dataservices(self):
