@@ -11,6 +11,20 @@ def _get_saml_login():
     return session.get("saml_login", False)
 
 
+def _count_user_reuses(user) -> int:
+    """Live count of a user's non-private, non-archived, non-deleted reuses.
+
+    Computed directly from MongoDB on every request so that the admin user
+    listing is always accurate, regardless of whether the pre-computed
+    metrics dict has been refreshed by the signal pipeline.
+    """
+    from udata.models import Reuse  # avoid circular imports
+
+    return Reuse.objects(
+        owner=user, private__ne=True, archived=None, deleted=None
+    ).count()
+
+
 user_ref_fields = api.inherit(
     "UserReference",
     base_reference,
@@ -91,18 +105,18 @@ user_fields = api.model(
         "metrics": fields.Raw(
             attribute=lambda o: o.get_metrics(), description="The user metrics", readonly=True
         ),
-        # Flat aliases of `metrics.datasets` and `metrics.reuses`, consumed by the
-        # admin user listing column renderers in the frontend (LEDG-1763). The
-        # nested `metrics` field above is kept for backward compatibility with
-        # any external consumer of the public `/api/1/users/` endpoint.
+        # Flat counts consumed by the admin user listing column renderers in the
+        # frontend (LEDG-1763). Computed live from MongoDB so the values are
+        # always accurate regardless of whether the pre-computed metrics dict
+        # has been refreshed.
         "datasets_count": fields.Integer(
             attribute=lambda o: (o.get_metrics() or {}).get("datasets", 0),
             description="Number of datasets owned by the user (alias of metrics.datasets).",
             readonly=True,
         ),
         "reuses_count": fields.Integer(
-            attribute=lambda o: (o.get_metrics() or {}).get("reuses", 0),
-            description="Number of reuses owned by the user (alias of metrics.reuses).",
+            attribute=lambda o: _count_user_reuses(o),
+            description="Number of reuses owned by the user (live count).",
             readonly=True,
         ),
     },
