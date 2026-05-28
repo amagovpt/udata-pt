@@ -11,6 +11,17 @@ def _get_saml_login():
     return session.get("saml_login", False)
 
 
+def _count_user_datasets(user) -> int:
+    """Live count of all non-deleted, non-archived datasets owned by the user.
+
+    Includes drafts (private=True) so that admin users see the full count of
+    all active datasets regardless of publication state.
+    """
+    from udata.models import Dataset  # avoid circular imports
+
+    return Dataset.objects(owner=user, deleted=None, archived=None).count()
+
+
 def _count_user_reuses(user) -> int:
     """Live count of a user's non-private, non-archived, non-deleted reuses.
 
@@ -110,8 +121,8 @@ user_fields = api.model(
         # always accurate regardless of whether the pre-computed metrics dict
         # has been refreshed.
         "datasets_count": fields.Integer(
-            attribute=lambda o: (o.get_metrics() or {}).get("datasets", 0),
-            description="Number of datasets owned by the user (alias of metrics.datasets).",
+            attribute=lambda o: _count_user_datasets(o),
+            description="Number of visible datasets owned by the user (live count).",
             readonly=True,
         ),
         "reuses_count": fields.Integer(
