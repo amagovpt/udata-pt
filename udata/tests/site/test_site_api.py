@@ -1,6 +1,8 @@
 import pytest
 from flask import url_for
 
+from udata.core.dataset.factories import DatasetFactory, LicenseFactory
+from udata.core.organization.factories import OrganizationFactory
 from udata.core.pages.factories import PageFactory
 from udata.core.site.models import Site
 from udata.core.user.factories import AdminFactory
@@ -168,3 +170,69 @@ class SiteContactAPITest(APITestCase):
         self.assertStatus(response, 204)
         assert len(mails) == 1
         assert mails[0].recipients == ["fallback@example.org"]
+
+
+class SiteDatasetsListingAPITest(APITestCase):
+    """LEDG-1836: aggregated endpoint that replaces 14 parallel calls with 1."""
+
+    def test_get_returns_aggregated_payload(self):
+        org = OrganizationFactory()
+        license = LicenseFactory()
+        DatasetFactory.create_batch(3, organization=org, license=license)
+        DatasetFactory(tags=["hvd"], organization=org)
+
+        response = self.get(url_for("api.site_datasets_listing"))
+        self.assert200(response)
+
+        payload = response.json
+        assert set(payload.keys()) == {
+            "listing",
+            "filter_counts",
+            "organizations",
+            "licenses",
+            "frequencies",
+            "granularities",
+        }
+
+        listing = payload["listing"]
+        assert {"data", "page", "page_size", "total", "next_page", "previous_page"} <= set(
+            listing.keys()
+        )
+        assert listing["total"] >= 4
+
+        counts = payload["filter_counts"]
+        for key in (
+            "formato_all",
+            "formato_tabular",
+            "formato_structured",
+            "formato_geographic",
+            "formato_documents",
+            "atualizacao_all",
+            "atualizacao_30_days",
+            "atualizacao_12_months",
+            "atualizacao_3_years",
+            "rotulo_all",
+            "rotulo_high_value",
+        ):
+            assert key in counts, f"missing filter count: {key}"
+        assert counts["formato_all"] == counts["atualizacao_all"] == counts["rotulo_all"]
+        assert counts["rotulo_high_value"] >= 1
+        assert counts["atualizacao_all"] >= 4
+
+        assert any(o["id"] == str(org.id) for o in payload["organizations"])
+        assert any(l["id"] == license.id for l in payload["licenses"])
+        assert payload["frequencies"]
+        assert payload["granularities"]
+
+    def test_get_respects_query_filter(self):
+        org = OrganizationFactory()
+        DatasetFactory.create_batch(2, organization=org, title="alpha needle")
+        DatasetFactory(organization=org, title="beta haystack")
+
+        response = self.get(url_for("api.site_datasets_listing", q="needle"))
+        self.assert200(response)
+
+        listing = response.json["listing"]
+        assert listing["total"] == 2
+        for ds in listing["data"]:
+            assert "needle" in ds["title"]
