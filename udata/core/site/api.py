@@ -1,11 +1,13 @@
 import ipaddress
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+import mongoengine
 import requests as http_requests
 from flask import current_app, json, make_response, redirect, request, url_for
+from flask_login import current_user
 
 from udata.api import API, api, fields
 from udata.api_fields import patch
@@ -14,16 +16,20 @@ from udata.auth import admin_permission
 from udata.core import csv
 from udata.core.dataservices.csv import DataserviceCsvAdapter
 from udata.core.dataservices.models import Dataservice
-from udata.core.dataset.api import DatasetApiParser, catalog_parser
+from udata.core.dataset.api import DEFAULT_SORTING, DatasetApiParser, catalog_parser, dataset_parser
+from udata.core.dataset.api_fields import dataset_page_fields, license_fields
 from udata.core.dataset.csv import ResourcesCsvAdapter
+from udata.core.dataset.models import License, UpdateFrequency
 from udata.core.dataset.search import DatasetSearch
 from udata.core.dataset.tasks import get_queryset as get_csv_queryset
-from udata.core.organization.api import OrgApiParser
+from udata.core.organization.api import OrgApiParser, organization_parser
+from udata.core.organization.api_fields import org_fields, org_page_fields
 from udata.core.organization.csv import OrganizationCsvAdapter
 from udata.core.organization.models import Organization
 from udata.core.post.models import Post
 from udata.core.reuse.api import ReuseApiParser
 from udata.core.reuse.csv import ReuseCsvAdapter
+from udata.core.spatial.models import spatial_granularities
 from udata.core.tags.csv import TagCsvAdapter
 from udata.core.tags.models import Tag
 from udata.harvest.csv import HarvestSourceCsvAdapter
@@ -238,6 +244,183 @@ class SiteHomeReusesAPI(API):
         current_site.settings.home_reuses = reuses
         current_site.save()
         return [_serialize_reuse(r) for r in reuses]
+
+
+# Format groups for the /pages/datasets sidebar filters. Kept in sync with
+# FORMAT_GROUP_MAP in frontend/src/components/datasets/DatasetsFilters.tsx.
+_DATASET_FORMAT_GROUPS: dict[str, list[str]] = {
+    "tabular": ["csv", "xls", "xlsx", "ods", "parquet", "tsv"],
+    "structured": ["json", "rdf", "xml", "sql", "ndjson", "jsonl"],
+    "geographic": ["geojson", "shp", "kml", "kmz", "gpx", "wfs", "wms"],
+    "documents": ["pdf", "doc", "docx", "md", "txt", "odt", "rtf"],
+}
+
+
+def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
+    """Return the unfiltered global counts used by the dataset sidebar filters.
+
+    These counts do not vary with the user's current query: they reflect the
+    full visible dataset corpus and feed the "Todos / Tabular / Estruturado /
+    ..." labels in the sidebar.
+    """
+    now = datetime.now(timezone.utc)
+    d30 = now - timedelta(days=30)
+    d12m = now - timedelta(days=365)
+    d3y = now - timedelta(days=365 * 3)
+
+    total = base_qs.count()
+    counts: dict[str, int] = {
+        "formato_all": total,
+        "atualizacao_all": total,
+        "rotulo_all": total,
+        "atualizacao_30_days": base_qs.filter(last_modified_internal__gte=d30).count(),
+        "atualizacao_12_months": base_qs.filter(last_modified_internal__gte=d12m).count(),
+        "atualizacao_3_years": base_qs.filter(last_modified_internal__gte=d3y).count(),
+        "rotulo_high_value": base_qs.filter(tags="hvd").count(),
+    }
+    for group_id, formats in _DATASET_FORMAT_GROUPS.items():
+        counts[f"formato_{group_id}"] = base_qs.filter(resources__format__in=formats).count()
+    return counts
+
+
+@api.route("/site/datasets-listing/", endpoint="site_datasets_listing")
+class SiteDatasetsListingAPI(API):
+    """Aggregated data for the /pages/datasets listing (LEDG-1836).
+
+    Combines the paginated listing, sidebar filter counts and metadata
+    (organizations, licenses, frequencies, granularities) in one response.
+    Replaces 14 parallel calls with 1, removing the fan-out that triggered
+    ECONNRESET errors when the dev server / proxy could not keep up.
+    """
+
+    @api.doc(id="get_site_datasets_listing")
+    @api.expect(dataset_parser.parser)
+    @cache.cached(timeout=60, query_string=True)
+    def get(self):
+        """Aggregated payload for the datasets listing page."""
+        args = dataset_parser.parse()
+
+        base_qs = Dataset.objects.visible_by_user(
+            current_user,
+            mongoengine.Q(private__ne=True, archived=None, deleted=None),
+        )
+
+        listing_qs = dataset_parser.parse_filters(base_qs, args)
+        sort = args["sort"] or ("$text_score" if args["q"] else None) or DEFAULT_SORTING
+        listing_page = listing_qs.order_by(sort).paginate(args["page"], args["page_size"])
+
+        organizations = (
+            Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
+        )
+
+        return {
+            "listing": api.marshal(listing_page, dataset_page_fields),
+            "filter_counts": _compute_dataset_filter_counts(base_qs),
+            "organizations": api.marshal(list(organizations), org_fields),
+            "licenses": api.marshal(list(License.objects), license_fields),
+            "frequencies": [{"id": f.id, "label": f.label} for f in UpdateFrequency],
+            "granularities": [{"id": gid, "name": name} for gid, name in spatial_granularities],
+        }
+
+
+def _compute_reuse_filter_counts(base_qs) -> dict[str, int]:
+    """Return the global modification-date counts for the reuse sidebar.
+
+    Reuses don't have format/tag groups in the sidebar — only the
+    "Data da atualização" toggle, so we just count by `last_modified`.
+    """
+    now = datetime.now(timezone.utc)
+    d30 = now - timedelta(days=30)
+    d12m = now - timedelta(days=365)
+    d3y = now - timedelta(days=365 * 3)
+
+    total = base_qs.count()
+    return {
+        "atualizacao_all": total,
+        "atualizacao_30_days": base_qs.filter(last_modified__gte=d30).count(),
+        "atualizacao_12_months": base_qs.filter(last_modified__gte=d12m).count(),
+        "atualizacao_3_years": base_qs.filter(last_modified__gte=d3y).count(),
+    }
+
+
+@api.route("/site/reuses-listing/", endpoint="site_reuses_listing")
+class SiteReusesListingAPI(API):
+    """Aggregated data for the /pages/reuses listing (LEDG-1836).
+
+    Returns the paginated reuse listing, sidebar filter counts (modification
+    dates) and the top organizations in one response. Replaces 6 parallel
+    calls with 1.
+    """
+
+    @api.doc(id="get_site_reuses_listing")
+    @api.expect(Reuse.__index_parser__)
+    @cache.cached(timeout=60, query_string=True)
+    def get(self):
+        """Aggregated payload for the reuses listing page."""
+        base_qs = Reuse.objects.visible_by_user(
+            current_user,
+            mongoengine.Q(private__ne=True, archived=None, deleted=None),
+        )
+        listing_qs = Reuse.apply_sort_filters(base_qs)
+
+        modified_since = request.args.get("modified_since")
+        if modified_since:
+            try:
+                since = datetime.fromisoformat(modified_since).replace(tzinfo=timezone.utc)
+                listing_qs = listing_qs.filter(last_modified__gte=since)
+            except ValueError:
+                api.abort(400, "modified_since must be a valid ISO date (e.g. 2024-01-01)")
+
+        listing_page = Reuse.apply_pagination(listing_qs)
+
+        organizations = (
+            Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
+        )
+
+        return {
+            "listing": api.marshal(listing_page, Reuse.__page_fields__),
+            "filter_counts": _compute_reuse_filter_counts(base_qs),
+            "organizations": api.marshal(list(organizations), org_fields),
+        }
+
+
+_ORG_DEFAULT_SORTING = "-created_at"
+
+
+@api.route("/site/organizations-listing/", endpoint="site_organizations_listing")
+class SiteOrganizationsListingAPI(API):
+    """Aggregated data for the /pages/organizations listing (LEDG-1836).
+
+    Returns the paginated organization listing, the badge metadata, per-badge
+    counts and the top-organizations sidebar list in a single response.
+    Replaces ~3 + N (one per badge) parallel calls with 1.
+    """
+
+    @api.doc(id="get_site_organizations_listing")
+    @api.expect(organization_parser.parser)
+    @cache.cached(timeout=60, query_string=True)
+    def get(self):
+        """Aggregated payload for the organizations listing page."""
+        args = organization_parser.parse()
+
+        base_qs = Organization.objects(deleted=None)
+        listing_qs = organization_parser.parse_filters(base_qs, args)
+        sort = args["sort"] or ("$text_score" if args["q"] else None) or _ORG_DEFAULT_SORTING
+        listing_page = listing_qs.order_by(sort).paginate(args["page"], args["page_size"])
+
+        top_organizations = base_qs.order_by("-metrics.datasets").limit(100)
+
+        badges = Organization.available_badges()
+        badge_counts = {
+            kind: base_qs.filter(badges__kind=kind).count() for kind in Organization.__badges__
+        }
+
+        return {
+            "listing": api.marshal(listing_page, org_page_fields),
+            "badges": badges,
+            "badge_counts": badge_counts,
+            "organizations": api.marshal(list(top_organizations), org_fields),
+        }
 
 
 @api.route("/site/data.<_format>", endpoint="site_dataportal")
