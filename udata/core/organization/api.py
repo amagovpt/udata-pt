@@ -112,14 +112,10 @@ class OrgApiParser(ModelApiParser):
     @staticmethod
     def parse_filters(organizations, args):
         if args.get("q"):
-            # Following code splits the 'q' argument by spaces to surround
-            # every word in it with quotes before rebuild it.
-            # This allows the search_text method to tokenise with an AND
-            # between tokens whereas an OR is used without it.
-            phrase_query = " ".join(
-                [f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")]
+            query_str = normalize_search_query(args["q"])
+            organizations = organizations.filter(
+                Q(name__icontains=query_str) | Q(acronym__icontains=query_str)
             )
-            organizations = organizations.search_text(phrase_query)
         if args.get("badge"):
             organizations = organizations.filter(badges__kind__in=args["badge"])
         if args.get("name"):
@@ -164,7 +160,7 @@ class OrganizationListAPI(API):
         organizations = Organization.objects(deleted=None)
         organizations = organization_parser.parse_filters(organizations, args)
 
-        sort = args["sort"] or ("$text_score" if args["q"] else None) or DEFAULT_SORTING
+        sort = args["sort"] or DEFAULT_SORTING
         return organizations.order_by(sort).paginate(args["page"], args["page_size"])
 
     @api.secure

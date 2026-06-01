@@ -44,11 +44,7 @@ class OrganizationSearch(search.ModelSearchAdapter):
         orgs = Organization.objects.visible()
         orgs = OrgApiParser.parse_filters(orgs, args)
 
-        sort = (
-            cls.parse_sort(args["sort"])
-            or ("$text_score" if args["q"] else None)
-            or DEFAULT_SORTING
-        )
+        sort = cls.parse_sort(args["sort"]) or DEFAULT_SORTING
         return orgs.order_by(sort).paginate(args["page"], args["page_size"])
 
     @classmethod

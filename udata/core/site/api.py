@@ -405,7 +405,7 @@ class SiteOrganizationsListingAPI(API):
 
         base_qs = Organization.objects(deleted=None)
         listing_qs = organization_parser.parse_filters(base_qs, args)
-        sort = args["sort"] or ("$text_score" if args["q"] else None) or _ORG_DEFAULT_SORTING
+        sort = args["sort"] or _ORG_DEFAULT_SORTING
         listing_page = listing_qs.order_by(sort).paginate(args["page"], args["page_size"])
 
         top_organizations = base_qs.order_by("-metrics.datasets").limit(100)
