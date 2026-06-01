@@ -1,8 +1,10 @@
 import pytest
 from flask import url_for
 
+from udata.core.dataservices.factories import DataserviceFactory  # noqa: F401 - registers Dataservice model
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
+from udata.core.reuse.factories import ReuseFactory
 from udata.core.pages.factories import PageFactory
 from udata.core.site.models import Site
 from udata.core.user.factories import AdminFactory
@@ -236,3 +238,35 @@ class SiteDatasetsListingAPITest(APITestCase):
         assert listing["total"] == 2
         for ds in listing["data"]:
             assert "needle" in ds["title"]
+
+
+class SiteReusesListingAPITest(APITestCase):
+    """LEDG-1836: aggregated endpoint that replaces 6 parallel calls with 1."""
+
+    def test_get_returns_aggregated_payload(self):
+        org = OrganizationFactory()
+        ReuseFactory.create_batch(4, organization=org)
+
+        response = self.get(url_for("api.site_reuses_listing"))
+        self.assert200(response)
+
+        payload = response.json
+        assert set(payload.keys()) == {"listing", "filter_counts", "organizations"}
+
+        listing = payload["listing"]
+        assert {"data", "page", "page_size", "total", "next_page", "previous_page"} <= set(
+            listing.keys()
+        )
+        assert listing["total"] >= 4
+
+        counts = payload["filter_counts"]
+        for key in (
+            "atualizacao_all",
+            "atualizacao_30_days",
+            "atualizacao_12_months",
+            "atualizacao_3_years",
+        ):
+            assert key in counts, f"missing filter count: {key}"
+        assert counts["atualizacao_all"] >= 4
+
+        assert any(o["id"] == str(org.id) for o in payload["organizations"])

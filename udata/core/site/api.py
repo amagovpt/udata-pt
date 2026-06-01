@@ -323,6 +323,67 @@ class SiteDatasetsListingAPI(API):
         }
 
 
+def _compute_reuse_filter_counts(base_qs) -> dict[str, int]:
+    """Return the global modification-date counts for the reuse sidebar.
+
+    Reuses don't have format/tag groups in the sidebar — only the
+    "Data da atualização" toggle, so we just count by `last_modified`.
+    """
+    now = datetime.now(timezone.utc)
+    d30 = now - timedelta(days=30)
+    d12m = now - timedelta(days=365)
+    d3y = now - timedelta(days=365 * 3)
+
+    total = base_qs.count()
+    return {
+        "atualizacao_all": total,
+        "atualizacao_30_days": base_qs.filter(last_modified__gte=d30).count(),
+        "atualizacao_12_months": base_qs.filter(last_modified__gte=d12m).count(),
+        "atualizacao_3_years": base_qs.filter(last_modified__gte=d3y).count(),
+    }
+
+
+@api.route("/site/reuses-listing/", endpoint="site_reuses_listing")
+class SiteReusesListingAPI(API):
+    """Aggregated data for the /pages/reuses listing (LEDG-1836).
+
+    Returns the paginated reuse listing, sidebar filter counts (modification
+    dates) and the top organizations in one response. Replaces 6 parallel
+    calls with 1.
+    """
+
+    @api.doc(id="get_site_reuses_listing")
+    @api.expect(Reuse.__index_parser__)
+    @cache.cached(timeout=60, query_string=True)
+    def get(self):
+        """Aggregated payload for the reuses listing page."""
+        base_qs = Reuse.objects.visible_by_user(
+            current_user,
+            mongoengine.Q(private__ne=True, archived=None, deleted=None),
+        )
+        listing_qs = Reuse.apply_sort_filters(base_qs)
+
+        modified_since = request.args.get("modified_since")
+        if modified_since:
+            try:
+                since = datetime.fromisoformat(modified_since).replace(tzinfo=timezone.utc)
+                listing_qs = listing_qs.filter(last_modified__gte=since)
+            except ValueError:
+                api.abort(400, "modified_since must be a valid ISO date (e.g. 2024-01-01)")
+
+        listing_page = Reuse.apply_pagination(listing_qs)
+
+        organizations = (
+            Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
+        )
+
+        return {
+            "listing": api.marshal(listing_page, Reuse.__page_fields__),
+            "filter_counts": _compute_reuse_filter_counts(base_qs),
+            "organizations": api.marshal(list(organizations), org_fields),
+        }
+
+
 @api.route("/site/data.<_format>", endpoint="site_dataportal")
 class SiteDataPortal(API):
     def get(self, _format):
