@@ -1,11 +1,13 @@
 import pytest
 from flask import url_for
 
-from udata.core.dataservices.factories import DataserviceFactory  # noqa: F401 - registers Dataservice model
+from udata.core.dataservices.factories import (
+    DataserviceFactory,  # noqa: F401 - registers Dataservice model
+)
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
-from udata.core.reuse.factories import ReuseFactory
 from udata.core.pages.factories import PageFactory
+from udata.core.reuse.factories import ReuseFactory
 from udata.core.site.models import Site
 from udata.core.user.factories import AdminFactory
 from udata.tests.api import APITestCase
@@ -222,7 +224,7 @@ class SiteDatasetsListingAPITest(APITestCase):
         assert counts["atualizacao_all"] >= 4
 
         assert any(o["id"] == str(org.id) for o in payload["organizations"])
-        assert any(l["id"] == license.id for l in payload["licenses"])
+        assert any(lic["id"] == license.id for lic in payload["licenses"])
         assert payload["frequencies"]
         assert payload["granularities"]
 
@@ -270,3 +272,32 @@ class SiteReusesListingAPITest(APITestCase):
         assert counts["atualizacao_all"] >= 4
 
         assert any(o["id"] == str(org.id) for o in payload["organizations"])
+
+
+class SiteOrganizationsListingAPITest(APITestCase):
+    """LEDG-1836: aggregated endpoint that replaces 3+N parallel calls with 1."""
+
+    def test_get_returns_aggregated_payload(self):
+        OrganizationFactory.create_batch(3)
+        certified = OrganizationFactory()
+        certified.add_badge("certified")
+        public_service = OrganizationFactory()
+        public_service.add_badge("public-service")
+
+        response = self.get(url_for("api.site_organizations_listing"))
+        self.assert200(response)
+
+        payload = response.json
+        assert set(payload.keys()) == {"listing", "badges", "badge_counts", "organizations"}
+
+        listing = payload["listing"]
+        assert {"data", "page", "page_size", "total", "next_page", "previous_page"} <= set(
+            listing.keys()
+        )
+        assert listing["total"] >= 5
+
+        assert "certified" in payload["badges"]
+        assert "public-service" in payload["badges"]
+        assert payload["badge_counts"]["certified"] >= 1
+        assert payload["badge_counts"]["public-service"] >= 1
+        assert payload["organizations"]

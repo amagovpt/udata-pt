@@ -22,8 +22,8 @@ from udata.core.dataset.csv import ResourcesCsvAdapter
 from udata.core.dataset.models import License, UpdateFrequency
 from udata.core.dataset.search import DatasetSearch
 from udata.core.dataset.tasks import get_queryset as get_csv_queryset
-from udata.core.organization.api import OrgApiParser
-from udata.core.organization.api_fields import org_fields
+from udata.core.organization.api import OrgApiParser, organization_parser
+from udata.core.organization.api_fields import org_fields, org_page_fields
 from udata.core.organization.csv import OrganizationCsvAdapter
 from udata.core.organization.models import Organization
 from udata.core.post.models import Post
@@ -381,6 +381,45 @@ class SiteReusesListingAPI(API):
             "listing": api.marshal(listing_page, Reuse.__page_fields__),
             "filter_counts": _compute_reuse_filter_counts(base_qs),
             "organizations": api.marshal(list(organizations), org_fields),
+        }
+
+
+_ORG_DEFAULT_SORTING = "-created_at"
+
+
+@api.route("/site/organizations-listing/", endpoint="site_organizations_listing")
+class SiteOrganizationsListingAPI(API):
+    """Aggregated data for the /pages/organizations listing (LEDG-1836).
+
+    Returns the paginated organization listing, the badge metadata, per-badge
+    counts and the top-organizations sidebar list in a single response.
+    Replaces ~3 + N (one per badge) parallel calls with 1.
+    """
+
+    @api.doc(id="get_site_organizations_listing")
+    @api.expect(organization_parser.parser)
+    @cache.cached(timeout=60, query_string=True)
+    def get(self):
+        """Aggregated payload for the organizations listing page."""
+        args = organization_parser.parse()
+
+        base_qs = Organization.objects(deleted=None)
+        listing_qs = organization_parser.parse_filters(base_qs, args)
+        sort = args["sort"] or ("$text_score" if args["q"] else None) or _ORG_DEFAULT_SORTING
+        listing_page = listing_qs.order_by(sort).paginate(args["page"], args["page_size"])
+
+        top_organizations = base_qs.order_by("-metrics.datasets").limit(100)
+
+        badges = Organization.available_badges()
+        badge_counts = {
+            kind: base_qs.filter(badges__kind=kind).count() for kind in Organization.__badges__
+        }
+
+        return {
+            "listing": api.marshal(listing_page, org_page_fields),
+            "badges": badges,
+            "badge_counts": badge_counts,
+            "organizations": api.marshal(list(top_organizations), org_fields),
         }
 
 
