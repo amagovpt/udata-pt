@@ -162,6 +162,7 @@ class DatasetApiParser(ModelApiParser):
             "access_type", choices=[elem.value for elem in AccessType], location="args"
         )
         self.parser.add_argument("topic", type=str, location="args")
+        self.parser.add_argument("frequency", type=str, location="args", action="append")
         self.parser.add_argument("credit", type=str, location="args")
         self.parser.add_argument("dataservice", type=str, location="args")
         self.parser.add_argument("reuse", type=str, location="args")
@@ -246,6 +247,8 @@ class DatasetApiParser(ModelApiParser):
             datasets = datasets.filter(resources__schema__name=args["schema"])
         if args.get("schema_version"):
             datasets = datasets.filter(resources__schema__version=args["schema_version"])
+        if args.get("frequency"):
+            datasets = datasets.filter(frequency__in=args["frequency"])
         if args.get("access_type"):
             datasets = datasets.filter(access_type=args["access_type"])
         if args.get("topic"):

@@ -220,6 +220,7 @@ class DatasetAPITest(APITestCase):
         )
 
         restricted_dataset = DatasetFactory(access_type=AccessType.RESTRICTED)
+        frequency_dataset = DatasetFactory(frequency=UpdateFrequency.MONTHLY)
 
         total_datasets = Dataset.objects().count()
 
@@ -350,6 +351,24 @@ class DatasetAPITest(APITestCase):
         # filter on non id for topic
         response = self.get(url_for("api.datasets", topic="xxx"))
         self.assert400(response)
+
+        # filter on frequency
+        response = self.get(url_for("api.datasets", frequency=UpdateFrequency.MONTHLY))
+        self.assert200(response)
+        self.assertEqual(len(response.json["data"]), 1)
+        self.assertEqual(response.json["data"][0]["id"], str(frequency_dataset.id))
+
+        # filter on multiple frequencies
+        frequency_dataset_annual = DatasetFactory(frequency=UpdateFrequency.ANNUAL)
+        response = self.get(
+            url_for("api.datasets", frequency=[UpdateFrequency.MONTHLY, UpdateFrequency.ANNUAL])
+        )
+        self.assert200(response)
+        self.assertEqual(len(response.json["data"]), 2)
+        self.assertEqual(
+            {str(frequency_dataset.id), str(frequency_dataset_annual.id)},
+            {d["id"] for d in response.json["data"]},
+        )
 
     def test_dataset_api_list_with_restricted_filters(self):
         owner = UserFactory()
