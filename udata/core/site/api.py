@@ -183,12 +183,19 @@ class SiteHomeAPI(API):
         """Aggregated homepage data with lightweight serialization"""
         site = current_site
         metrics = site.metrics or {}
-        featured = [d for d in (site.settings.home_datasets or []) if d is not None]
-        if featured:
-            datasets = featured[:6]
+        featured_datasets = [d for d in (site.settings.home_datasets or []) if d is not None]
+        if featured_datasets:
+            datasets = featured_datasets[:6]
         else:
             datasets = Dataset.objects.visible().order_by("-created_at_internal")[:6]
-        reuses = Reuse.objects.visible().order_by("-created_at")[:3]
+        # Honour the editorially picked reuses when present, matching the
+        # featured-datasets behaviour above (LEDG-1860). Fall back to the
+        # most recent visible reuses otherwise.
+        featured_reuses = [r for r in (site.settings.home_reuses or []) if r is not None]
+        if featured_reuses:
+            reuses = featured_reuses[:3]
+        else:
+            reuses = Reuse.objects.visible().order_by("-created_at")[:3]
         posts = Post.objects.published()[:3]
         return {
             "site_metrics": {
@@ -243,6 +250,11 @@ class SiteHomeReusesAPI(API):
         reuses = [Reuse.objects.get_or_404(id=reuse_id) for reuse_id in ids]
         current_site.settings.home_reuses = reuses
         current_site.save()
+        # Invalidate the cached homepage payload so the change is visible
+        # on the next /site/home/ hit instead of waiting up to 5 min for
+        # the @cache.cached timeout to expire (LEDG-1860). Matches the
+        # equivalent call in SiteHomeDatasetsAPI.put() above.
+        cache.delete("site_home")
         return [_serialize_reuse(r) for r in reuses]
 
 
