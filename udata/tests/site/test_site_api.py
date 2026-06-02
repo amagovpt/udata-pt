@@ -301,3 +301,62 @@ class SiteOrganizationsListingAPITest(APITestCase):
         assert payload["badge_counts"]["certified"] >= 1
         assert payload["badge_counts"]["public-service"] >= 1
         assert payload["organizations"]
+
+
+class SiteHomeCacheInvalidationTest(APITestCase):
+    """LEDG-1860: setting featured datasets/reuses must invalidate /site/home/.
+
+    Each test follows the same pattern that proves cache invalidation:
+      1. set initial featured = [first]
+      2. GET /site/home/  -> warms the @cache.cached payload with "first"
+      3. PUT new featured = [second]  (must call cache.delete("site_home"))
+      4. GET /site/home/  -> must surface "second", not the cached "first"
+
+    Without the fix, step 4 would return the warm "first" payload because the
+    Flask-Caching key is unchanged.
+    """
+
+    def _set_featured(self, endpoint, ids):
+        return self.put(url_for(endpoint), ids)
+
+    def test_put_featured_datasets_invalidates_home_cache(self):
+        first = DatasetFactory(title="cached-first dataset")
+        second = DatasetFactory(title="post-update dataset")
+        self.login(AdminFactory())
+
+        # 1 + 2: prime the cache with `first` featured.
+        self.assert200(self._set_featured("api.site_home_datasets", [str(first.id)]))
+        warm = self.get(url_for("api.site_home"))
+        self.assert200(warm)
+        warm_titles = [d["title"] for d in warm.json["latest_datasets"]]
+        assert "cached-first dataset" in warm_titles
+        assert "post-update dataset" not in warm_titles
+
+        # 3: switch featured to `second`.
+        self.assert200(self._set_featured("api.site_home_datasets", [str(second.id)]))
+
+        # 4: the very next /site/home/ must reflect the change, not the warm payload.
+        fresh = self.get(url_for("api.site_home"))
+        self.assert200(fresh)
+        fresh_titles = [d["title"] for d in fresh.json["latest_datasets"]]
+        assert "post-update dataset" in fresh_titles
+        assert "cached-first dataset" not in fresh_titles
+
+    def test_put_featured_reuses_invalidates_home_cache(self):
+        org = OrganizationFactory()
+        first = ReuseFactory(organization=org, title="cached-first reuse")
+        second = ReuseFactory(organization=org, title="post-update reuse")
+        self.login(AdminFactory())
+
+        # 1 + 2: prime the cache with `first` featured.
+        self.assert200(self._set_featured("api.site_home_reuses", [str(first.id)]))
+        warm = self.get(url_for("api.site_home"))
+        self.assert200(warm)
+        # 3: switch featured to `second`.
+        self.assert200(self._set_featured("api.site_home_reuses", [str(second.id)]))
+        # 4: confirm /site/home/ payload re-runs and the change is visible.
+        fresh = self.get(url_for("api.site_home"))
+        self.assert200(fresh)
+        fresh_titles = [r["title"] for r in fresh.json["latest_reuses"]]
+        assert "post-update reuse" in fresh_titles
+        assert "cached-first reuse" not in fresh_titles
