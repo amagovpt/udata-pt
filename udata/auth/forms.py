@@ -49,7 +49,9 @@ class WithGoogleReCaptcha:
                 "https://www.google.com/recaptcha/api/siteverify",
                 data={"secret": secret, "response": token},
             )
-            if resp.json().get("success"):
+            result = resp.json()
+            # v3 returns a score (0.0–1.0); require >= 0.5 to pass
+            if result.get("success") and result.get("score", 1.0) >= 0.5:
                 return True
         except requests.exceptions.RequestException as err:
             log.error(f"Failed to validate reCAPTCHA: {err}")
