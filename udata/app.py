@@ -193,7 +193,12 @@ def create_app(config="udata.settings.Defaults", override=None, init_logging=ini
     # trailing slashes. Without this, /api/1/me → 308 → /api/1/me/ → loop.
     app.url_map.strict_slashes = False
 
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+    # Trust `PROXY_FIX_X_FOR` reverse-proxy hops so `get_remote_address()`
+    # recovers the real client IP from `X-Forwarded-For`. A too-low value
+    # collapses all users behind the proxy chain into one IP-keyed rate-limit
+    # bucket; see `PROXY_FIX_X_FOR` in `udata/settings.py`.
+    proxy_hops = app.config.get("PROXY_FIX_X_FOR", 1)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=proxy_hops, x_proto=proxy_hops, x_host=1)
 
     init_logging(app)
     register_extensions(app)
