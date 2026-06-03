@@ -65,6 +65,20 @@ def _serialize_image(image_field, size=None):
             return None
 
 
+def _serialize_user_ref(user):
+    """Serialize a User reference (lightweight, only the fields needed to render
+    an author chip + link to the public profile)."""
+    if user is None:
+        return None
+    return {
+        "id": str(user.id),
+        "slug": user.slug,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "avatar_thumbnail": _serialize_image(user.avatar, 100),
+    }
+
+
 def _serialize_dataset(dataset):
     """Serialize a Dataset to lightweight homepage dict."""
     org = dataset.organization
@@ -82,6 +96,10 @@ def _serialize_dataset(dataset):
             if org
             else None
         ),
+        # Owner is the fallback author when no organization is set (LEDG-1861).
+        # Including it on the lightweight payload lets the homepage card link
+        # to /pages/users/<slug> instead of falling back to "Sem Organização".
+        "owner": _serialize_user_ref(dataset.owner),
         "quality": dataset.quality,
         "metrics": dataset.metrics or {},
     }

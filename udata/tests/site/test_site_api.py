@@ -9,7 +9,7 @@ from udata.core.organization.factories import OrganizationFactory
 from udata.core.pages.factories import PageFactory
 from udata.core.reuse.factories import ReuseFactory
 from udata.core.site.models import Site
-from udata.core.user.factories import AdminFactory
+from udata.core.user.factories import AdminFactory, UserFactory
 from udata.tests.api import APITestCase
 from udata.tests.helpers import capture_mails
 
@@ -360,3 +360,55 @@ class SiteHomeCacheInvalidationTest(APITestCase):
         fresh_titles = [r["title"] for r in fresh.json["latest_reuses"]]
         assert "post-update reuse" in fresh_titles
         assert "cached-first reuse" not in fresh_titles
+
+
+class SiteHomeOwnerSerializationTest(APITestCase):
+    """LEDG-1861: /site/home/ must expose dataset.owner so user-authored
+    datasets can be attributed (and linked to /pages/users/<slug>) on the
+    homepage card instead of falling back to "Sem Organização"."""
+
+    def test_dataset_owner_present_when_no_organization(self):
+        author = UserFactory(first_name="Ana", last_name="Carvalho")
+        target = DatasetFactory(
+            title="user-authored dataset",
+            owner=author,
+            organization=None,
+        )
+        self.login(AdminFactory())
+        self.assert200(self.put(url_for("api.site_home_datasets"), [str(target.id)]))
+
+        response = self.get(url_for("api.site_home"))
+        self.assert200(response)
+
+        items = response.json["latest_datasets"]
+        match = next((d for d in items if d["title"] == "user-authored dataset"), None)
+        assert match is not None
+        assert match["organization"] is None
+        owner = match["owner"]
+        assert owner is not None
+        assert owner["slug"] == author.slug
+        assert owner["first_name"] == "Ana"
+        assert owner["last_name"] == "Carvalho"
+        assert "avatar_thumbnail" in owner
+
+    def test_dataset_owner_none_when_organization_present(self):
+        org = OrganizationFactory()
+        target = DatasetFactory(
+            title="org-authored dataset",
+            owner=UserFactory(),
+            organization=org,
+        )
+        self.login(AdminFactory())
+        self.assert200(self.put(url_for("api.site_home_datasets"), [str(target.id)]))
+
+        response = self.get(url_for("api.site_home"))
+        self.assert200(response)
+        match = next(
+            (d for d in response.json["latest_datasets"] if d["title"] == "org-authored dataset"),
+            None,
+        )
+        assert match is not None
+        # When an organization is set the card uses it, but `owner` is still
+        # serialised so consumers can choose attribution logic on the client.
+        assert match["organization"]["name"] == org.name
+        assert match["owner"] is not None
