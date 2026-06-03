@@ -59,26 +59,65 @@ $ udata purge
 -> Purging datasets
 -> Purging reuses
 -> Purging organizations
+-> Purging dataservices
 ```
 
 Sometimes you need to purge only a given type of data. You can use the appropriate flags to do so:
 
 ```shell
 # purge only datasets
-$ udata purge --datasets
+$ udata purge --datasets        # or -d
 -> Purging datasets
 # purge only reuses
-$ udata purge --reuses
+$ udata purge --reuses          # or -r
 -> Purging reuses
 # purge only organizations
-$ udata purge --organizations
+$ udata purge --organizations   # or -o
 -> Purging organizations
+# purge only dataservices
+$ udata purge --dataservices
+-> Purging dataservices
 ```
+
+> Flags can be combined (e.g. `udata purge -d -r`). When no flag is given, all
+> four models are purged.
 
 **Warning**: these operations are permanents and irreversibles
 
 **Note**: Users can't be fully purged because of the content they submitted which can't be orphaned.
 This is why they are only anonymised.
+
+### Purges without a dedicated `purge` flag
+
+The `udata purge` command (defined in `udata/commands/purge.py`) only covers
+**datasets**, **reuses**, **organizations** and **dataservices**. The remaining
+clean-up jobs have no dedicated CLI command and must be launched through
+[`udata job run`](#manage-jobs):
+
+| Job                     | What it removes                                       | Command                                  |
+| ----------------------- | ----------------------------------------------------- | ---------------------------------------- |
+| `purge-topics-elements` | Orphan topic elements (run **after** datasets/reuses) | `udata job run purge-topics-elements`    |
+| `purge-chunks`          | Temporary upload chunks                               | `udata job run purge-chunks`             |
+| `purge-harvest-jobs`    | Harvest jobs older than the retention policy          | `udata job run purge-harvest-jobs`       |
+
+Deleted harvest **sources** do have a dedicated command:
+
+```shell
+$ udata harvest purge
+-> Purging deleted harvest sources
+```
+
+This is equivalent to `udata job run purge-harvesters`.
+
+**Recommended order** (to avoid leaving orphan references behind):
+
+```shell
+$ udata purge                              # datasets, reuses, organizations, dataservices
+$ udata job run purge-topics-elements      # then topic elements
+$ udata harvest purge                      # harvest sources
+$ udata job run purge-harvest-jobs         # harvest jobs
+$ udata job run purge-chunks               # temporary upload chunks
+```
 
 
 ## Manage jobs
