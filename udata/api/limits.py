@@ -15,6 +15,14 @@ from flask_security import current_user
 #
 # These are conservative defaults sized for human use. Calibrate against
 # legitimate traffic before tightening further.
+# Identity poll (`GET /api/1/me/`). The frontend calls this on every page load
+# through a server-side proxy (`frontend/src/app/me/route.ts`), so without an
+# explicit per-endpoint limit it falls under the IP-keyed global default
+# (`RATELIMIT_DEFAULT`). Behind that proxy every user collapses into a single
+# IP bucket, exhausting the shared ceiling and returning 429 — which the
+# frontend reads as "logged out". Keyed by `user_or_ip` each authenticated user
+# gets their own generous bucket sized for legitimate navigation.
+IDENTITY_READ_LIMIT = "60 per minute; 1200 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
