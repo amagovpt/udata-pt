@@ -143,6 +143,16 @@ class Defaults(object):
     # endpoints; see `udata/api/limits.py`.
     RATELIMIT_DEFAULT = "1000 per day;200 per hour"
 
+    # Number of trusted reverse-proxy hops in front of the app that append
+    # `X-Forwarded-For`. ProxyFix uses this to recover the real client IP from
+    # the XFF chain (see `udata/app.py`). It MUST match the actual deployment
+    # topology: if it is too low, `get_remote_address()` resolves to an
+    # internal proxy IP (e.g. the Docker gateway), collapsing ALL users into a
+    # single IP-keyed rate-limit bucket and triggering spurious 429s on every
+    # endpoint (including `/api/1/me/` right after a successful SAML login).
+    # PRODUCTION (F5/WAF → nginx → app) MUST OVERRIDE THIS to 2 in udata.cfg.
+    PROXY_FIX_X_FOR = 1
+
     SECURITY_PASSWORD_SALT = "Default uData secret password salt"
     SECURITY_CONFIRM_SALT = "Default uData secret confirm salt"
     SECURITY_RESET_SALT = "Default uData secret reset salt"
