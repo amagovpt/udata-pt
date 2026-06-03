@@ -6,7 +6,7 @@ from mongoengine.queryset.visitor import Q
 from slugify import slugify
 
 from udata.api import API, api
-from udata.api.limits import UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import IDENTITY_READ_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
 from udata.utils import Paginable
 from udata.app import limiter
@@ -72,6 +72,17 @@ filter_parser.add_argument(
 
 @me.route("/", endpoint="me")
 class MeAPI(API):
+    # GET is polled by the frontend on every page load via a server-side proxy,
+    # so it must not fall under the IP-keyed global default (which collapses all
+    # users into one bucket behind the proxy). Key it per authenticated user.
+    decorators = [
+        limiter.limit(
+            IDENTITY_READ_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("get_me")
     @api.marshal_with(user_fields)
@@ -481,11 +492,11 @@ class AggregationPaginator(Paginable):
 
 def _paginate_name_sorted_users(users_qs, direction, page, page_size):
     """Sort users by name following this priority order (A→Z); reversed for Z→A:
-      0 – Latin letters, with or without diacritics (A/Á/Ã, C/Ç, N/Ñ, O/Ø ...)
-      1 – Cyrillic (А, Б, В … Я)
-      2 – all other Unicode letters (Greek, Arabic, Chinese …)
-      3 – digits (0-9)
-      4 – symbols/punctuation (+, -, !, #, @, ...)
+    0 – Latin letters, with or without diacritics (A/Á/Ã, C/Ç, N/Ñ, O/Ø ...)
+    1 – Cyrillic (А, Б, В … Я)
+    2 – all other Unicode letters (Greek, Arabic, Chinese …)
+    3 – digits (0-9)
+    4 – symbols/punctuation (+, -, !, #, @, ...)
     """
     sort_dir = 1 if direction == "" else -1
     collation_spec = {"locale": "pt", "strength": 1}
@@ -595,7 +606,9 @@ class UserListAPI(API):
             sort_field = args["sort"].lstrip("-")
             direction = "-" if args["sort"].startswith("-") else ""
             if sort_field in ("first_name", "last_name"):
-                return _paginate_name_sorted_users(users, direction, args["page"], args["page_size"])
+                return _paginate_name_sorted_users(
+                    users, direction, args["page"], args["page_size"]
+                )
             return users.order_by(args["sort"]).paginate(args["page"], args["page_size"])
         return users.order_by(DEFAULT_SORTING).paginate(args["page"], args["page_size"])
 

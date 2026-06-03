@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **fix: stop random logouts caused by IP-keyed rate limit on `/api/1/me/`**
+  - `GET /api/1/me/` is polled by the frontend through a server-side proxy,
+    so every user reached the backend from the same source IP and shared the
+    global IP-keyed ceiling (`RATELIMIT_DEFAULT`). The shared bucket was
+    exhausted by aggregated traffic, returning 429 — which the frontend reads
+    as "logged out" (re-login only worked once the window expired).
+  - `MeAPI` GET is now rate-limited per authenticated user via `user_or_ip`
+    with a generous `IDENTITY_READ_LIMIT` (`60/min; 1200/hour`), so one user's
+    polling can no longer evict another. Complements the earlier
+    `PROXY_FIX_X_FOR` fix (PR #83) on the frontend side, where the `/me`,
+    `/login` and `/logout` proxy handlers now relay `X-Forwarded-For`.
+  - Regression test: `udata/tests/api/test_me_ratelimit_regression.py`.
+
 - **security: fix critical SAML account takeover (TICKET-58 / VULN-2077)**
   - Drop the manual XML attribute fallback that read NIC/email/name from
     `<AttributeStatement>` without re-checking the signature. Attributes
