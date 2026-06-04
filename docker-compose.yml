@@ -1,6 +1,19 @@
 services:
+  # One-shot init: ensures ./logs (auto-created by Docker as root) is writable
+  # by the app user before the services start. Runs on every `up`, then exits.
+  # Also fixes ownership of pre-existing log files (e.g. created on the host).
+  init-logs:
+    container_name: udata-backend-init-logs
+    image: busybox:stable
+    command: sh -c "chown -R ${UDATA_UID:-10001}:${UDATA_GID:-10001} /logs && chmod 2775 /logs"
+    volumes:
+      - ./logs:/logs
+
   app:
     container_name: udata-backend-app
+    depends_on:
+      init-logs:
+        condition: service_completed_successfully
     build:
       context: .
       args:
@@ -24,6 +37,9 @@ services:
 
   worker:
     container_name: udata-backend-worker
+    depends_on:
+      init-logs:
+        condition: service_completed_successfully
     build:
       context: .
       args:
@@ -44,6 +60,9 @@ services:
 
   beat:
     container_name: udata-backend-beat
+    depends_on:
+      init-logs:
+        condition: service_completed_successfully
     build:
       context: .
       args:
