@@ -1,4 +1,7 @@
+import hashlib
+
 from flask import current_app, jsonify, redirect, request, url_for
+from flask_limiter.util import get_remote_address
 from flask_login import current_user, login_required
 from flask_security.utils import (
     check_and_get_token_status,
@@ -35,8 +38,51 @@ from udata.utils import wants_json
 from . import mails
 from .forms import ChangeEmailForm
 
-# Rate limit for auth endpoints: 5 attempts per minute
-auth_rate_limit = limiter.shared_limit("5 per minute", scope="auth")
+
+def _credential_key() -> str:
+    """Rate-limit key for auth attempts: remote IP + submitted email.
+
+    Keying by IP alone collapses every user behind a shared/NATed egress
+    (the PRD F5/proxy chain, see docs/infra-adc-waf-impact-ppr-prd.md §4.2
+    and §6.4) into a single 5/min bucket — legitimate users block each
+    other's logins. Adding the posted email gives each credential its own
+    bucket while keeping the original 5/min pressure on any single target
+    account (VULN-1377/1532/1533/1534 brute-force protection).
+
+    The email is read from the form body or, failing that, from a JSON
+    payload (Flask-Security accepts both). It is hashed so raw addresses
+    never land in the limiter storage keys. Requests without an email
+    (GETs, token reset POSTs) keep the plain IP key, i.e. the historical
+    behaviour.
+    """
+    email = request.form.get("email")
+    if not email:
+        payload = request.get_json(silent=True)
+        if isinstance(payload, dict):
+            email = payload.get("email")
+    email = (email or "").strip().lower() if isinstance(email, str) else ""
+    if not email:
+        return get_remote_address()
+    digest = hashlib.sha256(email.encode("utf-8")).hexdigest()[:16]
+    return f"{get_remote_address()}|{digest}"
+
+
+# Two-tier rate limit for auth endpoints (login, register, forgot/reset
+# password):
+# - 5/min per (IP, email): unchanged anti-brute-force pressure per account;
+# - 30/min per IP: ceiling against cross-email enumeration/credential
+#   stuffing from a single source, which the per-credential key alone would
+#   no longer bound.
+_auth_credential_limit = limiter.shared_limit(
+    "5 per minute", scope="auth", key_func=_credential_key
+)
+_auth_ip_ceiling = limiter.shared_limit("30 per minute", scope="auth-ip")
+
+
+def auth_rate_limit(view):
+    """Apply both auth rate-limit tiers to a view."""
+    return _auth_ip_ceiling(_auth_credential_limit(view))
+
 
 _security = LocalProxy(lambda: current_app.extensions["security"])
 _datastore = LocalProxy(lambda: _security.datastore)
