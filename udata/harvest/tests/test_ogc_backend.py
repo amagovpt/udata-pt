@@ -1,7 +1,27 @@
+import json
+
+import pytest
+
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.ogc import OGCBackend
 from .factories import HarvestSourceFactory
+
+OGC_URL = "https://geoportal.example.pt/ogc-api/collections?f=jsonld"
+
+
+def _ogc_payload(items):
+    return json.dumps({"dataset": items})
+
+
+def _item(remote_id, name, keywords):
+    return {
+        "@id": remote_id,
+        "name": name,
+        "description": "desc",
+        "keywords": keywords,
+        "distribution": [],
+    }
 
 
 class OGCBackendFilterTest(PytestOnlyDBTestCase):
@@ -59,3 +79,60 @@ class OGCBackendFilterTest(PytestOnlyDBTestCase):
         backend = self._backend([{"key": "tags", "value": "", "type": "include"}])
         assert backend._matches_filters([])
         assert backend._matches_filters(["geo"])
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCBackendHarvestTest(PytestOnlyDBTestCase):
+    def test_harvest_applies_include_tags_filter(self, rmock):
+        payload = _ogc_payload(
+            [
+                _item("a", "Dataset A", ["geo", "dados.gov"]),
+                _item("b", "Dataset B", ["transport"]),
+                _item("c", "Dataset C", ["dados.gov"]),
+            ]
+        )
+        rmock.get(OGC_URL, text=payload)
+        source = HarvestSourceFactory(
+            backend="ogc",
+            url=OGC_URL,
+            config={"filters": [{"key": "tags", "value": "dados.gov", "type": "include"}]},
+        )
+
+        job = OGCBackend(source).harvest()
+
+        remote_ids = {item.remote_id for item in job.items}
+        assert remote_ids == {"a", "c"}
+
+    def test_harvest_applies_exclude_tags_filter(self, rmock):
+        payload = _ogc_payload(
+            [
+                _item("a", "Dataset A", ["dados.gov"]),
+                _item("b", "Dataset B", ["transport"]),
+            ]
+        )
+        rmock.get(OGC_URL, text=payload)
+        source = HarvestSourceFactory(
+            backend="ogc",
+            url=OGC_URL,
+            config={"filters": [{"key": "tags", "value": "dados.gov", "type": "exclude"}]},
+        )
+
+        job = OGCBackend(source).harvest()
+
+        remote_ids = {item.remote_id for item in job.items}
+        assert remote_ids == {"b"}
+
+    def test_harvest_without_filter_keeps_all(self, rmock):
+        payload = _ogc_payload(
+            [
+                _item("a", "Dataset A", ["geo"]),
+                _item("b", "Dataset B", ["transport"]),
+            ]
+        )
+        rmock.get(OGC_URL, text=payload)
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+
+        job = OGCBackend(source).harvest()
+
+        remote_ids = {item.remote_id for item in job.items}
+        assert remote_ids == {"a", "b"}
