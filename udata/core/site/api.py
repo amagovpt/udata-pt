@@ -162,6 +162,10 @@ support_contact_fields = api.model(
         "message": fields.String(
             description="Body of the support request", required=True
         ),
+        "recaptcha_token": fields.String(
+            description="Google reCAPTCHA v3 token (verified server-side)",
+            required=False,
+        ),
     },
 )
 
