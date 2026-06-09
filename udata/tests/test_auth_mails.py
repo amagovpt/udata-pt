@@ -103,7 +103,7 @@ class AuthMailRenderingTest(APITestCase):
             reset_token="abc123token",
         )
         assert result is not None
-        assert "https://example.com/reset/abc123token" in result
+        assert "https://example.com/pages/reset-password/abc123token" in result
 
     @pytest.mark.options(DEFAULT_LANGUAGE="en", CDATA_BASE_URL="https://example.com")
     def test_reset_instructions_mail_html(self):
@@ -114,7 +114,7 @@ class AuthMailRenderingTest(APITestCase):
             reset_token="abc123token",
         )
         assert result is not None
-        assert "https://example.com/reset/abc123token" in result
+        assert "https://example.com/pages/reset-password/abc123token" in result
         assert "<" in result
 
     # --- reset_notice (password was reset) ---
@@ -127,7 +127,7 @@ class AuthMailRenderingTest(APITestCase):
             user=user,
         )
         assert result is not None
-        assert "reset" in result.lower()
+        assert "redefinid" in result.lower()
 
     @pytest.mark.options(DEFAULT_LANGUAGE="en")
     def test_reset_notice_mail_html(self):
@@ -137,7 +137,7 @@ class AuthMailRenderingTest(APITestCase):
             user=user,
         )
         assert result is not None
-        assert "reset" in result.lower()
+        assert "redefinid" in result.lower()
         assert "<" in result
 
     # --- change_notice (password was changed) ---
@@ -214,9 +214,7 @@ class AuthMailMessageBuilderTest(APITestCase):
     @pytest.mark.options(DEFAULT_LANGUAGE="en")
     def test_confirmation_instructions_subject_and_cta(self):
         """Confirmation instructions email should have confirmation CTA."""
-        msg = confirmation_instructions(
-            confirmation_link="https://example.com/confirm/token789"
-        )
+        msg = confirmation_instructions(confirmation_link="https://example.com/confirm/token789")
         assert "confirm" in str(msg.subject).lower()
         cta = next((p for p in msg.paragraphs if hasattr(p, "link")), None)
         assert cta is not None
@@ -226,7 +224,7 @@ class AuthMailMessageBuilderTest(APITestCase):
     def test_reset_instructions_subject_and_cta(self):
         """Reset instructions email should have reset link with token."""
         msg = reset_instructions(reset_token="resettoken123")
-        assert "reset" in str(msg.subject).lower()
+        assert "redefinição" in str(msg.subject).lower()
         cta = next((p for p in msg.paragraphs if hasattr(p, "link")), None)
         assert cta is not None
         assert "resettoken123" in cta.link
@@ -235,7 +233,7 @@ class AuthMailMessageBuilderTest(APITestCase):
     def test_reset_notice_subject(self):
         """Reset notice email should confirm password was reset."""
         msg = reset_notice()
-        assert "reset" in str(msg.subject).lower()
+        assert "redefinid" in str(msg.subject).lower()
         assert len(msg.paragraphs) >= 1
 
     @pytest.mark.options(DEFAULT_LANGUAGE="en", CDATA_BASE_URL="https://example.com")

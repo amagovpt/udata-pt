@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 from flask import url_for
 
@@ -10,6 +12,7 @@ from udata.core.pages.factories import PageFactory
 from udata.core.reuse.factories import ReuseFactory
 from udata.core.site.models import Site
 from udata.core.user.factories import AdminFactory, UserFactory
+from udata.mail import mail
 from udata.tests.api import APITestCase
 from udata.tests.helpers import capture_mails
 
@@ -52,7 +55,11 @@ class SiteAPITest(APITestCase):
 
 
 class SiteContactAPITest(APITestCase):
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER="support@example.org", DEFAULT_LANGUAGE="en")
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org",
+        DEFAULT_LANGUAGE="en",
+        GOOGLE_RECAPTCHA_SECRET_KEY=None,
+    )
     def test_post_contact_question_sends_email(self):
         with capture_mails() as mails:
             response = self.post(
@@ -75,7 +82,11 @@ class SiteContactAPITest(APITestCase):
         assert "user@example.org" in sent.body
         assert "I would like to publish a dataset." in sent.body
 
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER="support@example.org", DEFAULT_LANGUAGE="en")
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org",
+        DEFAULT_LANGUAGE="en",
+        GOOGLE_RECAPTCHA_SECRET_KEY=None,
+    )
     def test_post_contact_each_topic_emits_distinct_subject_prefix(self):
         prefixes = {}
         for topic, expected in (
@@ -104,7 +115,9 @@ class SiteContactAPITest(APITestCase):
         ):
             assert expected in prefixes[topic]
 
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER="support@example.org")
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org", GOOGLE_RECAPTCHA_SECRET_KEY=None
+    )
     def test_post_contact_rejects_unknown_topic(self):
         with capture_mails() as mails:
             response = self.post(
@@ -119,7 +132,9 @@ class SiteContactAPITest(APITestCase):
         self.assert400(response)
         assert mails == []
 
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER="support@example.org")
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org", GOOGLE_RECAPTCHA_SECRET_KEY=None
+    )
     def test_post_contact_rejects_invalid_email(self):
         with capture_mails() as mails:
             response = self.post(
@@ -134,7 +149,9 @@ class SiteContactAPITest(APITestCase):
         self.assert400(response)
         assert mails == []
 
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER="support@example.org")
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org", GOOGLE_RECAPTCHA_SECRET_KEY=None
+    )
     def test_post_contact_rejects_missing_fields(self):
         with capture_mails() as mails:
             response = self.post(
@@ -144,7 +161,9 @@ class SiteContactAPITest(APITestCase):
         self.assert400(response)
         assert mails == []
 
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER=None, CONTACT_EMAIL=None)
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER=None, CONTACT_EMAIL=None, GOOGLE_RECAPTCHA_SECRET_KEY=None
+    )
     def test_post_contact_returns_503_when_recipient_unconfigured(self):
         with capture_mails() as mails:
             response = self.post(
@@ -159,7 +178,11 @@ class SiteContactAPITest(APITestCase):
         self.assertStatus(response, 503)
         assert mails == []
 
-    @pytest.mark.options(MAIL_DEFAULT_RECEIVER=None, CONTACT_EMAIL="fallback@example.org")
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER=None,
+        CONTACT_EMAIL="fallback@example.org",
+        GOOGLE_RECAPTCHA_SECRET_KEY=None,
+    )
     def test_post_contact_falls_back_to_contact_email(self):
         with capture_mails() as mails:
             response = self.post(
@@ -174,6 +197,165 @@ class SiteContactAPITest(APITestCase):
         self.assertStatus(response, 204)
         assert len(mails) == 1
         assert mails[0].recipients == ["fallback@example.org"]
+
+
+# Mail configuration representative of each deployed environment. The values
+# mirror what udata.cfg builds from the per-environment .env files; only the
+# keys that influence whether the support email is actually dispatched are
+# listed here.
+ENVIRONMENT_MAIL_CONFIGS = {
+    "dev": {
+        "SERVER_NAME": "dev.dados.gov.pt",
+        "MAIL_SERVER": "localhost",
+        "MAIL_PORT": 1025,
+        "MAIL_DEFAULT_SENDER": "noreply@dev.dados.gov.pt",
+        "MAIL_DEFAULT_RECEIVER": "suporte-dev@dados.gov.pt",
+    },
+    "tst": {
+        "SERVER_NAME": "tst.dados.gov.pt",
+        "MAIL_SERVER": "smtp.tst.dados.gov.pt",
+        "MAIL_PORT": 587,
+        "MAIL_DEFAULT_SENDER": "noreply@tst.dados.gov.pt",
+        "MAIL_DEFAULT_RECEIVER": "suporte-tst@dados.gov.pt",
+    },
+    "prod": {
+        "SERVER_NAME": "dados.gov.pt",
+        "MAIL_SERVER": "smtp.dados.gov.pt",
+        "MAIL_PORT": 587,
+        "MAIL_DEFAULT_SENDER": "noreply@dados.gov.pt",
+        "MAIL_DEFAULT_RECEIVER": "suporte@dados.gov.pt",
+    },
+}
+
+SUPPORT_PAYLOAD = {
+    "topic": "question",
+    "email": "user@example.org",
+    "subject": "How do I publish?",
+    "message": "I would like to publish a dataset.",
+}
+
+
+class SiteContactEnvironmentMailTest(APITestCase):
+    """Tests that the /pages/support form actually dispatches an email in the
+    DEV, TST and production environments.
+
+    The other contact tests run under the test default ``SEND_MAIL=False`` and
+    therefore only assert the message is *built* (via the ``mail_sent`` signal).
+    They never exercise the real transport branch of ``udata.mail.send_mail``
+    (``with mail.connect() as conn: conn.send(msg)``), which is the branch used
+    in every deployed environment where ``SEND_MAIL=True``. A regression in
+    that branch — or a missing recipient/SMTP configuration — would leave those
+    tests green while no email leaves the server, exactly the symptom reported
+    for the support page.
+
+    Here we force ``SEND_MAIL=True`` (as in DEV/TST/prod) and capture the real
+    Flask-Mail outbox with ``mail.record_messages()``. ``MAIL_SUPPRESS_SEND``
+    follows ``TESTING`` so no real SMTP connection is opened, but the dispatch
+    path is fully executed and the ``email_dispatched`` signal fires.
+    """
+
+    def _dispatch_support_email(self, env_config):
+        # reCAPTCHA is disabled here (GOOGLE_RECAPTCHA_SECRET_KEY=None) so this
+        # test isolates the mail transport wiring. The reCAPTCHA gate — which is
+        # active in the real environments and is itself a likely cause of the
+        # "no email is sent" symptom — is covered by the dedicated tests below.
+        self.app.config.update(
+            SEND_MAIL=True,
+            DEFAULT_LANGUAGE="en",
+            GOOGLE_RECAPTCHA_SECRET_KEY=None,
+            **env_config,
+        )
+        with mail.record_messages() as outbox:
+            response = self.post(url_for("api.site_contact"), SUPPORT_PAYLOAD)
+        return response, outbox
+
+    def test_support_email_dispatched_in_each_environment(self):
+        """The support form must reach the SMTP transport in DEV, TST and prod."""
+        for env_name, env_config in ENVIRONMENT_MAIL_CONFIGS.items():
+            response, outbox = self._dispatch_support_email(env_config)
+
+            self.assertStatus(
+                response, 204, f"[{env_name}] expected 204, got {response.status_code}"
+            )
+            assert len(outbox) == 1, (
+                f"[{env_name}] support email was NOT dispatched (outbox size={len(outbox)})"
+            )
+            sent = outbox[0]
+            assert sent.recipients == [env_config["MAIL_DEFAULT_RECEIVER"]], (
+                f"[{env_name}] wrong recipient: {sent.recipients}"
+            )
+            # A sender must be configured for the SMTP relay to accept the
+            # message (Flask-Mail freezes MAIL_DEFAULT_SENDER at init_app, so we
+            # only assert one is present rather than its per-environment value).
+            assert sent.sender, f"[{env_name}] no sender configured"
+            # Reply-To is the citizen's address so support can answer directly.
+            assert sent.reply_to == SUPPORT_PAYLOAD["email"], f"[{env_name}] missing reply-to"
+            assert SUPPORT_PAYLOAD["subject"] in sent.subject, f"[{env_name}] subject lost"
+            assert SUPPORT_PAYLOAD["message"] in sent.body, f"[{env_name}] message body lost"
+
+    def test_support_email_not_dispatched_when_recipient_unconfigured(self):
+        """If no recipient is configured (a common cause of "no email is sent"
+        in a fresh environment) the endpoint must fail loudly with 503 instead
+        of silently dropping the message."""
+        self.app.config.update(
+            SEND_MAIL=True,
+            MAIL_SERVER="smtp.dados.gov.pt",
+            MAIL_DEFAULT_RECEIVER=None,
+            CONTACT_EMAIL=None,
+            GOOGLE_RECAPTCHA_SECRET_KEY=None,
+        )
+        with mail.record_messages() as outbox:
+            response = self.post(url_for("api.site_contact"), SUPPORT_PAYLOAD)
+        self.assertStatus(response, 503)
+        assert len(outbox) == 0
+
+    def test_support_email_blocked_when_recaptcha_token_missing(self):
+        """Regression for the reported bug: in DEV/TST/prod a reCAPTCHA secret
+        IS configured, so a request without a token (or with an unverified one)
+        is rejected with 400 by SupportContactForm and NO email is sent.
+
+        This is the most likely reason the support page "stopped sending
+        emails" after reCAPTCHA verification was wired into the form: if the
+        frontend does not attach a valid token, the message never reaches the
+        mail transport.
+        """
+        self.app.config.update(
+            SEND_MAIL=True,
+            GOOGLE_RECAPTCHA_SECRET_KEY="configured-in-tst-dev-prod",
+            **ENVIRONMENT_MAIL_CONFIGS["prod"],
+        )
+        with mail.record_messages() as outbox:
+            response = self.post(url_for("api.site_contact"), SUPPORT_PAYLOAD)
+        self.assert400(response)
+        assert response.json["errors"]["recaptcha_token"]
+        assert len(outbox) == 0, "no email must be sent when reCAPTCHA fails"
+
+    def test_support_email_sent_with_valid_recaptcha_token(self):
+        """Happy path for a configured environment: a valid reCAPTCHA token
+        passes server-side verification and the email is dispatched over the
+        real transport."""
+
+        class _FakeResponse:
+            @staticmethod
+            def json():
+                return {"success": True, "score": 0.9}
+
+        self.app.config.update(
+            SEND_MAIL=True,
+            DEFAULT_LANGUAGE="en",
+            GOOGLE_RECAPTCHA_SECRET_KEY="configured-in-tst-dev-prod",
+            **ENVIRONMENT_MAIL_CONFIGS["prod"],
+        )
+        with patch("udata.auth.forms.requests.post", return_value=_FakeResponse()):
+            with mail.record_messages() as outbox:
+                response = self.post(
+                    url_for("api.site_contact"),
+                    {**SUPPORT_PAYLOAD, "recaptcha_token": "valid-frontend-token"},
+                )
+        self.assertStatus(response, 204)
+        assert len(outbox) == 1
+        assert outbox[0].recipients == [ENVIRONMENT_MAIL_CONFIGS["prod"]["MAIL_DEFAULT_RECEIVER"]]
+        assert outbox[0].reply_to == SUPPORT_PAYLOAD["email"]
 
 
 class SiteDatasetsListingAPITest(APITestCase):
