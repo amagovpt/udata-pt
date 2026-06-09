@@ -6,7 +6,7 @@ from flask_restx import marshal
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
-from udata.api.limits import HEAVY_CREATE_LIMIT, UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import HEAVY_CREATE_LIMIT, PUBLIC_SEARCH_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.app import limiter
 from udata.auth import admin_permission, current_user
@@ -141,12 +141,20 @@ common_doc = {"params": {"org": "The organization ID or slug"}}
 class OrganizationListAPI(API):
     """Organizations collection endpoint"""
 
-    # Per-user rate-limit on POST: organization creation should be rare for
-    # legitimate users; HEAVY_CREATE_LIMIT (2/min, 5/h, 10/day) (TICKET-59).
+    # POST: per-user limit; organization creation should be rare for legitimate
+    # users; HEAVY_CREATE_LIMIT (2/min, 5/h, 10/day) (TICKET-59).
+    # GET: generous public-search limit so the listing page does not fall under
+    # the IP-keyed 200/hour default, which collapses to a shared ceiling behind
+    # the F5/WAF and blocks search for everyone (see PUBLIC_SEARCH_LIMIT).
     decorators = [
         limiter.limit(
             HEAVY_CREATE_LIMIT,
             methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_SEARCH_LIMIT,
+            methods=["GET"],
             key_func=user_or_ip,
         ),
     ]

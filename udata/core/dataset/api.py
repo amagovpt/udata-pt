@@ -39,7 +39,7 @@ from flask_security import current_user
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
-from udata.api.limits import CONTENT_CREATE_LIMIT, UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import CONTENT_CREATE_LIMIT, PUBLIC_SEARCH_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.app import limiter
 from udata.auth import admin_permission
@@ -347,11 +347,19 @@ catalog_parser.replace_argument(
 class DatasetListAPI(API):
     """Datasets collection endpoint"""
 
-    # Per-user rate-limit on POST to prevent mass-creation abuse (TICKET-59).
+    # POST: per-user limit to prevent mass-creation abuse (TICKET-59).
+    # GET: generous public-search limit so the listing page does not fall under
+    # the IP-keyed 200/hour default, which collapses to a shared ceiling behind
+    # the F5/WAF and blocks search for everyone (see PUBLIC_SEARCH_LIMIT).
     decorators = [
         limiter.limit(
             CONTENT_CREATE_LIMIT,
             methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_SEARCH_LIMIT,
+            methods=["GET"],
             key_func=user_or_ip,
         ),
     ]
