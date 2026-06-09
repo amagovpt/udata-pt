@@ -10,8 +10,9 @@ from flask import current_app, json, make_response, redirect, request, url_for
 from flask_login import current_user
 
 from udata.api import API, api, fields
+from udata.api.limits import PUBLIC_SEARCH_LIMIT, user_or_ip
 from udata.api_fields import patch
-from udata.app import cache
+from udata.app import cache, limiter
 from udata.auth import admin_permission
 from udata.core import csv
 from udata.core.dataservices.csv import DataserviceCsvAdapter
@@ -325,7 +326,22 @@ class SiteDatasetsListingAPI(API):
     (organizations, licenses, frequencies, granularities) in one response.
     Replaces 14 parallel calls with 1, removing the fan-out that triggered
     ECONNRESET errors when the dev server / proxy could not keep up.
+
+    GET: generous public-search limit. This endpoint is fetched server-side by
+    the Next.js listing page on every page load, pagination and filter change,
+    so ALL visitors reach the backend as one origin IP (the frontend server) and
+    collapse into a single bucket regardless of the F5. Without this it falls
+    under the IP-keyed 200/hour default, which then blocks the listing page
+    site-wide after 200 aggregated loads/hour (see PUBLIC_SEARCH_LIMIT).
     """
+
+    decorators = [
+        limiter.limit(
+            PUBLIC_SEARCH_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
 
     @api.doc(id="get_site_datasets_listing")
     @api.expect(dataset_parser.parser)
@@ -384,7 +400,20 @@ class SiteReusesListingAPI(API):
     Returns the paginated reuse listing, sidebar filter counts (modification
     dates) and the top organizations in one response. Replaces 6 parallel
     calls with 1.
+
+    GET: generous public-search limit — fetched server-side per page load /
+    pagination / filter, so all visitors collapse into one backend IP; without
+    it the IP-keyed 200/hour default blocks the listing site-wide (see
+    PUBLIC_SEARCH_LIMIT).
     """
+
+    decorators = [
+        limiter.limit(
+            PUBLIC_SEARCH_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
 
     @api.doc(id="get_site_reuses_listing")
     @api.expect(Reuse.__index_parser__)
@@ -428,7 +457,20 @@ class SiteOrganizationsListingAPI(API):
     Returns the paginated organization listing, the badge metadata, per-badge
     counts and the top-organizations sidebar list in a single response.
     Replaces ~3 + N (one per badge) parallel calls with 1.
+
+    GET: generous public-search limit — fetched server-side per page load /
+    pagination / filter, so all visitors collapse into one backend IP; without
+    it the IP-keyed 200/hour default blocks the listing site-wide (see
+    PUBLIC_SEARCH_LIMIT).
     """
+
+    decorators = [
+        limiter.limit(
+            PUBLIC_SEARCH_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
 
     @api.doc(id="get_site_organizations_listing")
     @api.expect(organization_parser.parser)

@@ -23,6 +23,23 @@ from flask_security import current_user
 # frontend reads as "logged out". Keyed by `user_or_ip` each authenticated user
 # gets their own generous bucket sized for legitimate navigation.
 IDENTITY_READ_LIMIT = "60 per minute; 1200 per hour"
+# Public, anonymous, idempotent search/list reads that populate the listing
+# pages (`GET /api/1/datasets|organizations|reuses/?q=...`). Without an explicit
+# per-endpoint limit these fall under the IP-keyed `RATELIMIT_DEFAULT`
+# ("200 per hour"). Behind the F5/WAF every visitor collapses into one origin IP
+# (docs/infra-adc-waf-impact-ppr-prd.md, incident 4.2), so that 200/hour becomes
+# a SHARED ceiling across all anonymous visitors per endpoint: the 200th search
+# of the hour returns 429 and the page stops populating for everyone. Anonymous
+# traffic cannot be keyed per user, so the only lever is a much higher ceiling
+# sized for aggregate public browsing; `user_or_ip` still gives logged-in users
+# their own bucket. NOTE: this is an aggregate cap under IP-collapse — calibrate
+# against real traffic and pair with response caching (ISR + Flask-Caching) so
+# repeated queries never reach the limiter. The per-minute ceiling is kept well
+# above the old 200/hour burst capacity (so a legitimate spike never regresses
+# vs the default) and there is deliberately NO per-day cap: under IP-collapse a
+# daily cap would become a site-wide ceiling that blocks every anonymous
+# visitor late in the day — exactly the failure mode this fix removes.
+PUBLIC_SEARCH_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
