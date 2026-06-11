@@ -135,6 +135,28 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         assert Organization.objects.count() == 1
         assert Organization.objects.first().description == "new description"
 
+    def test_organization_api_update_badges(self):
+        """It should update organization badges from the organization PUT payload"""
+        self.login(AdminFactory())
+        org = OrganizationFactory()
+        data = org.to_dict()
+        data["badges"] = [{"kind": "association"}, {"kind": "certified"}]
+        response = self.put(url_for("api.organization", org=org), data)
+        assert200(response)
+        org.reload()
+        assert {b.kind for b in org.badges} == {"association", "certified"}
+        assert {b["kind"] for b in response.json["badges"]} == {"association", "certified"}
+
+    def test_organization_api_update_badges_forbidden(self):
+        """Only site admins can update badges via the organization PUT payload"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        data = org.to_dict()
+        data["badges"] = [{"kind": "association"}]
+        response = self.put(url_for("api.organization", org=org), data)
+        assert403(response)
+
     def test_organization_api_update_business_number_id(self):
         """It should update an organization from the API by adding a business number id"""
         user = self.login()

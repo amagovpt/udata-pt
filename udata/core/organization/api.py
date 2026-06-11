@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from bson.objectid import ObjectId
 from flask import make_response, redirect, request, url_for
 from flask_restx import marshal
+from mongoengine.errors import ValidationError
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
@@ -67,6 +68,20 @@ from .tasks import (
 
 DEFAULT_SORTING = "-created_at"
 SUGGEST_SORTING = "-metrics.followers"
+
+
+def _parse_badge_kinds(payload):
+    if not isinstance(payload, list):
+        api.abort(400, "badges must be a list")
+    kinds = []
+    for item in payload:
+        if isinstance(item, str):
+            kinds.append(item)
+        elif isinstance(item, dict) and "kind" in item:
+            kinds.append(item["kind"])
+        else:
+            api.abort(400, "Each badge must be a kind string or an object with a kind field")
+    return kinds
 
 
 class OrgApiParser(ModelApiParser):
@@ -213,8 +228,22 @@ class OrganizationAPI(API):
         if org.deleted and request_deleted is not None:
             api.abort(410, "Organization has been deleted")
         org.permissions["edit"].test()
+        payload = request.json or {}
+        badge_kinds = None
+        if "badges" in payload:
+            admin_permission.test()
+            badge_kinds = _parse_badge_kinds(payload["badges"])
+
         form = api.validate(OrganizationForm, org)
-        return form.save()
+        org = form.save()
+
+        if badge_kinds is not None:
+            try:
+                org.set_badges(badge_kinds)
+            except ValidationError as exc:
+                api.abort(400, str(exc))
+
+        return Organization.objects.get(pk=org.pk)
 
     @api.secure
     @api.doc("delete_organization")
