@@ -201,7 +201,9 @@ markers = [
 [tool.ruff]
 lint = { extend-select = [
     "I",
-] } # ["I"] is to also sort imports with an isort rule
+], per-file-ignores = { "udata/auth/saml/saml_plugin/saml_govpt.py" = [
+    "E402", # imports interleaved with pysaml2 monkey-patching are intentional
+] } } # ["I"] is to also sort imports with an isort rule
 line-length = 100
 
 [tool.setuptools]

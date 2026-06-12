@@ -81,6 +81,13 @@ class Defaults(object):
     SESSION_COOKIE_SAMESITE = None  # Can be set to 'Lax' or 'Strict'. See https://flask.palletsprojects.com/en/2.3.x/security/#security-cookie
     SECURITY_USE_REGISTER_V2 = True
 
+    # CMD (Chave Móvel Digital) account linking: when a SAML login only
+    # matches an existing account by name, send the user to the migration
+    # wizard to prove ownership (password or email code) before linking.
+    # When disabled, a new account is created instead — a name-matched
+    # account is never logged into without proof.
+    MIGRATION_MODE_ENABLED = True
+
     # Flask-Security-Too settings
 
     SECURITY_TRACKABLE = True

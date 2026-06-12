@@ -16,7 +16,6 @@ from datetime import datetime, timedelta
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
-
 from flask import (
     Blueprint,
     current_app,
@@ -546,63 +545,8 @@ def _merge_nic_into_user(user, user_nic):
     current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
 
 
-def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
-    """Find an existing user by email/NIC/name or auto-create from SAML data.
-
-    Lookup order:
-    1. By email (exact match)
-    2. By NIC (already linked via previous SAML login)
-    3. By first_name + last_name (fallback for legacy accounts)
-
-    When a legacy account (password, no NIC) is found, the NIC is
-    automatically merged so future CMD logins resolve instantly.
-
-    Returns a tuple (user, status) where status is one of:
-    - "existing_saml" — user already has NIC, normal login
-    - "merged" — legacy account found and NIC auto-merged
-    - "new" — newly created user
-    """
-    from udata.core.user.models import User
-
-    user = None
-
-    # 1. Match by email
-    if user_email:
-        user = datastore.find_user(email=user_email)
-
-    # 2. Match by hashed NIC (use MongoEngine nested dict syntax, not find_user,
-    #    because find_user(extras={...}) matches the entire dict exactly)
-    if not user and user_nic:
-        hashed_nic = _hash_nic(user_nic)
-        user = User.objects(extras__auth_nic=hashed_nic).first()
-
-    # 3. Match by name (fallback for legacy accounts without NIC)
-    if not user and first_name and last_name:
-        candidates = User.objects(
-            first_name__iexact=first_name,
-            last_name__iexact=last_name,
-            deleted=None,
-        )
-        # Only auto-merge when the name matches exactly one account
-        if candidates.count() == 1:
-            user = candidates.first()
-            current_app.logger.info(
-                f"SAML: matched legacy account by name: {first_name} {last_name} → {user.email}"
-            )
-
-    if user:
-        stored_nic = user.extras.get("auth_nic") if user.extras else None
-        hashed_nic = _hash_nic(user_nic) if user_nic else None
-        if stored_nic and stored_nic == hashed_nic:
-            return user, "existing_saml"
-        # No NIC, legacy encrypted NIC, or unhashed NIC — update with hashed value.
-        _merge_nic_into_user(user, user_nic)
-        return user, "merged"
-
-    if not user_email and not user_nic:
-        current_app.logger.error("SAML: Cannot create user without email or NIC")
-        return None, "error"
-
+def _create_saml_user(user_email, user_nic, first_name, last_name):
+    """Create a new account from SAML attributes (scenario 4)."""
     # Generate a placeholder email when the IdP does not provide one.
     if not user_email:
         import uuid
@@ -623,11 +567,77 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     user.confirmed_at = datetime.utcnow()
     datastore.commit()
 
-    return user, "new"
+    return user
 
 
-def _handle_saml_user_login(user):
-    """Handle login/redirect after SAML authentication."""
+def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
+    """Resolve the CMD/SAML identity to an account.
+
+    Decision order:
+    1. NIC already linked → direct login (entry rule)
+    2. Email match → link the NIC automatically (scenario 1)
+    3. Name-only match → suspected existing account; the user must
+       confirm ownership through the migration wizard (scenarios 2/3)
+    4. No match → create a new account (scenario 4)
+
+    Returns a tuple (user, status) where status is one of:
+    - "existing_saml" — NIC already linked, normal login
+    - "merged" — account matched by email, NIC auto-merged
+    - "migration_candidate" — name-only match; user is the single
+      candidate account, or None when several homonyms exist
+    - "new" — newly created user
+    - "error" — neither email nor NIC available
+    """
+    from udata.core.user.models import User
+
+    # 1. CMD identity already linked: direct login, nothing else to check.
+    #    (Use MongoEngine nested dict syntax, not find_user, because
+    #    find_user(extras={...}) matches the entire dict exactly.)
+    if user_nic:
+        user = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
+        if user:
+            return user, "existing_saml"
+
+    # 2. Match by email: link automatically.
+    if user_email:
+        user = datastore.find_user(email=user_email)
+        if user:
+            _merge_nic_into_user(user, user_nic)
+            return user, "merged"
+
+    # 3. Name-only match against accounts without a linked CMD identity:
+    #    never auto-merge — ownership must be proven (password or email
+    #    code) via the migration wizard before linking.
+    if first_name and last_name:
+        candidates = User.objects(
+            first_name__iexact=first_name,
+            last_name__iexact=last_name,
+            deleted=None,
+            extras__auth_nic__exists=False,
+        )
+        count = candidates.count()
+        if count:
+            candidate = candidates.first() if count == 1 else None
+            current_app.logger.info(
+                f"SAML: name-only match for {first_name} {last_name} "
+                f"({count} candidate(s)) — ownership confirmation required"
+            )
+            return candidate, "migration_candidate"
+
+    if not user_email and not user_nic:
+        current_app.logger.error("SAML: Cannot create user without email or NIC")
+        return None, "error"
+
+    return _create_saml_user(user_email, user_nic, first_name, last_name), "new"
+
+
+def _handle_saml_user_login(user, new_account=False):
+    """Handle login/redirect after SAML authentication.
+
+    When ``new_account`` is True the redirect carries ``cmd_new_account=1``
+    so the frontend can inform the user that a new account was created
+    (scenario 4).
+    """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
 
@@ -654,6 +664,9 @@ def _handle_saml_user_login(user):
     login_user(user)
     session["saml_login"] = True
     destination = f"{frontend_url}{next_path}" if next_path else (frontend_url or "/")
+    if new_account:
+        separator = "&" if "?" in destination else "?"
+        destination = f"{destination}{separator}cmd_new_account=1"
     current_app.logger.warning(
         f"[DEBUG] _handle_saml_user_login: login_user OK, email={user.email!r}, "
         f"redirect destination={destination!r}, next_path={next_path!r}"
@@ -662,9 +675,16 @@ def _handle_saml_user_login(user):
 
 
 def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name):
-    """Store SAML data in session and redirect to migration page."""
+    """Store SAML data in session and redirect to migration page.
+
+    ``user`` is the single candidate account matched by name, or None
+    when several homonym accounts exist — in that case the wizard asks
+    the user to identify the account (login or search).
+    ``saml_email`` is always the email coming from the CMD identity,
+    never the candidate account's email.
+    """
     session["saml_migration_pending"] = {
-        "legacy_user_id": str(user.id),
+        "legacy_user_id": str(user.id) if user else None,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
@@ -1199,15 +1219,20 @@ def idp_initiated():
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
-    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
-        _audit_saml(
-            "migration_pending",
-            "cmd",
-            issuer=issuer,
-            name_id=name_id_value,
-            reason=status,
-        )
-        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+    if status == "migration_candidate":
+        if _migration_enabled():
+            _audit_saml(
+                "migration_pending",
+                "cmd",
+                issuer=issuer,
+                name_id=name_id_value,
+                reason=status,
+            )
+            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+        # Migration wizard disabled: never log into an unproven account —
+        # fall back to creating a new one (scenario 4).
+        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+        status = "new"
 
     _audit_saml(
         "success" if user else "user_not_found",
@@ -1216,7 +1241,7 @@ def idp_initiated():
         name_id=name_id_value,
         reason=status,
     )
-    return _handle_saml_user_login(user)
+    return _handle_saml_user_login(user, new_account=(status == "new"))
 
 
 #################################################################
@@ -1529,15 +1554,20 @@ def idp_eidas_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
-        _audit_saml(
-            "migration_pending",
-            "eidas",
-            issuer=issuer,
-            name_id=name_id_value,
-            reason=status,
-        )
-        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+    if status == "migration_candidate":
+        if _migration_enabled():
+            _audit_saml(
+                "migration_pending",
+                "eidas",
+                issuer=issuer,
+                name_id=name_id_value,
+                reason=status,
+            )
+            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+        # Migration wizard disabled: never log into an unproven account —
+        # fall back to creating a new one (scenario 4).
+        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+        status = "new"
 
     _audit_saml(
         "success" if user else "user_not_found",
@@ -1546,7 +1576,7 @@ def idp_eidas_initiated():
         name_id=name_id_value,
         reason=status,
     )
-    return _handle_saml_user_login(user)
+    return _handle_saml_user_login(user, new_account=(status == "new"))
 
 
 #################################################################
@@ -1648,13 +1678,14 @@ def migration_pending():
     if not pending:
         return jsonify({"pending": False})
 
-    user_email = pending.get("saml_email")
-    has_email = bool(user_email)
+    # Whether the CMD identity itself carries an email address.
+    has_email = bool(pending.get("saml_email"))
 
-    # Fetch legacy account details for user confirmation
+    # Fetch candidate (legacy) account details for user confirmation.
     legacy_user_id = pending.get("legacy_user_id")
     first_name = None
     last_name = None
+    legacy_email = None
     if legacy_user_id:
         from udata.core.user.models import User
 
@@ -1662,12 +1693,14 @@ def migration_pending():
         if user:
             first_name = user.first_name
             last_name = user.last_name
+            legacy_email = user.email
 
     return jsonify(
         {
             "pending": True,
-            "email": _mask_email(user_email) if user_email else None,
+            "email": _mask_email(legacy_email) if legacy_email else None,
             "has_email": has_email,
+            "candidate": bool(legacy_user_id),
             "first_name": first_name,
             "last_name": last_name,
         }
@@ -1694,8 +1727,10 @@ def migration_search():
     if not user:
         return jsonify({"found": False})
 
+    # Store only the candidate reference — saml_email must keep holding
+    # the email coming from the CMD identity (or None), never the
+    # legacy account's email.
     pending["legacy_user_id"] = str(user.id)
-    pending["saml_email"] = user.email
     session["saml_migration_pending"] = pending
     session.modified = True
 
@@ -1762,17 +1797,19 @@ def migration_confirm():
     data = request.get_json(silent=True) or {}
     method = data.get("method")
 
-    legacy_user_id = pending.get("legacy_user_id")
-    if not legacy_user_id:
-        return jsonify({"error": "No legacy user found"}), 400
-
     from udata.core.user.models import User
 
-    user = User.objects(id=legacy_user_id).first()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
     if method == "code":
+        # Code verification targets the candidate account found by
+        # name/search — a code was emailed to that account's address.
+        legacy_user_id = pending.get("legacy_user_id")
+        if not legacy_user_id:
+            return jsonify({"error": "No legacy user found"}), 400
+
+        user = User.objects(id=legacy_user_id).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
         code_data = session.get("migration_code")
         if not code_data:
             return jsonify({"error": "No code sent"}), 400
@@ -1792,14 +1829,33 @@ def migration_confirm():
             return jsonify({"error": "Invalid code"}), 400
 
     elif method == "password":
+        # Full default login (email + password): the linked account is
+        # the one whose credentials are proven, which may differ from
+        # the name-matched candidate (homonym case).
+        attempts = session.get("migration_password_attempts", 0)
+        if attempts >= 5:
+            return jsonify({"error": "Maximum attempts exceeded"}), 429
+        session["migration_password_attempts"] = attempts + 1
+        session.modified = True
+
+        email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        if not verify_and_update_password(password, user):
-            return jsonify({"error": "Invalid password"}), 400
+        user = datastore.find_user(email=email) if email else None
+        # Generic error on any failure to avoid account enumeration.
+        if (
+            not user
+            or user.deleted
+            or not user.password
+            or (user.extras and user.extras.get("auth_nic"))
+            or not verify_and_update_password(password, user)
+        ):
+            return jsonify({"error": "Invalid credentials"}), 400
 
     else:
         return jsonify({"error": "Invalid method"}), 400
 
-    # Merge: add NIC, clear password, update names
+    # Link: add NIC and update names. The password is kept so the
+    # account remains accessible through both login methods.
     saml_nic = pending.get("saml_nic")
     saml_first_name = pending.get("saml_first_name")
     saml_last_name = pending.get("saml_last_name")
@@ -1808,7 +1864,6 @@ def migration_confirm():
         user.extras = {}
     if saml_nic:
         user.extras["auth_nic"] = _hash_nic(saml_nic)
-    user.password = None
     if saml_first_name:
         user.first_name = saml_first_name.title()
     if saml_last_name:
@@ -1824,6 +1879,7 @@ def migration_confirm():
     session.pop("saml_migration_pending", None)
     session.pop("migration_code", None)
     session.pop("migration_send_count", None)
+    session.pop("migration_password_attempts", None)
 
     current_app.logger.info(f"Account migration completed for user {user.id}")
 
@@ -1841,26 +1897,15 @@ def migration_skip():
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
 
-    saml_nic = pending.get("saml_nic")
-    saml_first_name = pending.get("saml_first_name")
-    saml_last_name = pending.get("saml_last_name")
-
-    # Generate a unique email to avoid conflicts with the legacy account
-    import uuid
-
-    saml_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
-
-    user_data = {
-        "first_name": (saml_first_name or "").title(),
-        "last_name": (saml_last_name or "").title(),
-        "email": saml_email,
-    }
-    if saml_nic:
-        user_data["extras"] = {"auth_nic": _hash_nic(saml_nic)}
-
-    user = datastore.create_user(**user_data)
-    user.confirmed_at = datetime.utcnow()
-    datastore.commit()
+    # Use the CMD email when available (no account holds it, otherwise
+    # the email lookup would have auto-linked); a placeholder is
+    # generated by _create_saml_user when the CMD brought no email.
+    user = _create_saml_user(
+        pending.get("saml_email"),
+        pending.get("saml_nic"),
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+    )
 
     login_user(user)
     session["saml_login"] = True
@@ -1869,5 +1914,6 @@ def migration_skip():
     session.pop("saml_migration_pending", None)
     session.pop("migration_code", None)
     session.pop("migration_send_count", None)
+    session.pop("migration_password_attempts", None)
 
     return jsonify({"success": True})
