@@ -5,7 +5,7 @@ from flask import make_response, request
 from flask_login import current_user
 
 from udata.api import API, api
-from udata.api.limits import FEED_LIMIT, PUBLIC_READ_LIMIT, user_or_ip
+from udata.api.limits import FEED_LIMIT, PUBLIC_READ_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api_fields import patch, patch_and_save
 from udata.app import limiter
 from udata.auth import Permission as AdminPermission
@@ -156,6 +156,18 @@ class PublishPostAPI(API):
 
 @ns.route("/<post:post>/image/", endpoint="post_image")
 class PostImageAPI(API):
+    # Per-user rate-limit on image upload (POST) and BBox resize (PUT), both of
+    # which parse an uploaded image. Keeps the endpoint out of the IP-keyed
+    # RATELIMIT_DEFAULT that collapses site-wide behind the F5/WAF (see
+    # UPLOAD_LIMIT).
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST", "PUT"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure(admin_permission)
     @api.doc("post_image")
     @api.expect(image_parser)  # Swagger 2.0 does not support formData at path level

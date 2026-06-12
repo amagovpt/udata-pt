@@ -12,6 +12,7 @@ from udata.api.limits import (
     FEED_LIMIT,
     PUBLIC_READ_LIMIT,
     PUBLIC_SEARCH_LIMIT,
+    UPLOAD_LIMIT,
     user_or_ip,
 )
 from udata.api.parsers import ModelApiParser, normalize_search_query
@@ -451,6 +452,17 @@ class ReusesSuggestAPI(API):
 @ns.route("/<reuse:reuse>/image/", endpoint="reuse_image")
 @api.doc(**common_doc)
 class ReuseImageAPI(API):
+    # Per-user rate-limit on image upload; keeps the endpoint out of the
+    # IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the F5/WAF
+    # (see UPLOAD_LIMIT).
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("reuse_image")
     @api.expect(image_parser)  # Swagger 2.0 does not support formData at path level

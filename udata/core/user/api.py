@@ -626,6 +626,17 @@ class UserListAPI(API):
 
 @ns.route("/<user:user>/avatar/", endpoint="user_avatar")
 class UserAvatarAPI(API):
+    # Per-user rate-limit on avatar upload; keeps the endpoint out of the
+    # IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the F5/WAF
+    # (see UPLOAD_LIMIT). Mirrors the self-service /me/avatar/ endpoint.
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure(admin_permission)
     @api.doc("user_avatar")
     @api.expect(image_parser)
