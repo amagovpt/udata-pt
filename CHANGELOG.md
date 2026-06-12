@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **fix: lift authenticated file-upload endpoints out of the IP-keyed rate-limit**
+  - Third companion to the public-search (PR #89) and download/export/feed
+    (PR #90) IP-collapse fixes. Several authenticated upload endpoints carried
+    no explicit per-endpoint limit, so they fell under the IP-keyed
+    `RATELIMIT_DEFAULT` ("200 per hour"). Behind the F5/WAF every client reaches
+    the backend from one origin IP, turning that ceiling into a shared,
+    IP-keyed, site-wide cap: aggregate uploads return 429 for every editor, and
+    a single user can exhaust the bucket for everyone.
+  - Adds `user_or_ip`-keyed, method-scoped limits to the previously unprotected
+    upload endpoints (mirroring the already-protected `/datasets/<d>/upload/`,
+    `/datasets/<d>/upload/community/`, `/organizations/<org>/logo/` and
+    `/me/avatar/`):
+    - `POST /datasets/<d>/resources/<rid>/upload/` (replace a resource's file)
+      and `POST /users/<user>/avatar/`, `POST /reuses/<reuse>/image/`,
+      `POST|PUT /posts/<post>/image/` — `UPLOAD_LIMIT` (`10/min; 100/h; 500/d`);
+    - `POST /datasets/community_resources/<crid>/upload/` (re-upload a community
+      resource file) — `CONTENT_CREATE_LIMIT` (`5/min`, tighter: public content).
+  - Regression test: `udata/tests/api/test_upload_ratelimit_ip_collapse.py`.
+
 - **fix: lift public download/export/feed endpoints out of the IP-keyed rate-limit**
   - Extends the public-search IP-collapse fix (PR #89) to the endpoints that
     serve downloads. The resource "latest" download (`GET /datasets/r/<id>`),
