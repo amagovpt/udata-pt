@@ -10,7 +10,7 @@ from flask import current_app, json, make_response, redirect, request, url_for
 from flask_login import current_user
 
 from udata.api import API, api, fields
-from udata.api.limits import PUBLIC_SEARCH_LIMIT, user_or_ip
+from udata.api.limits import EXPORT_LIMIT, PUBLIC_SEARCH_LIMIT, user_or_ip
 from udata.api_fields import patch
 from udata.app import cache, limiter
 from udata.auth import admin_permission
@@ -88,15 +88,9 @@ def _serialize_dataset(dataset):
         "title": dataset.title,
         "slug": dataset.slug,
         "description": dataset.description,
-        "last_modified": (
-            dataset.last_modified.isoformat() if dataset.last_modified else None
-        ),
+        "last_modified": (dataset.last_modified.isoformat() if dataset.last_modified else None),
         "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
-        "organization": (
-            {"name": org.name, "logo": _serialize_image(org.logo)}
-            if org
-            else None
-        ),
+        "organization": ({"name": org.name, "logo": _serialize_image(org.logo)} if org else None),
         # Owner is the fallback author when no organization is set (LEDG-1861).
         # Including it on the lightweight payload lets the homepage card link
         # to /pages/users/<slug> instead of falling back to "Sem Organização".
@@ -160,9 +154,7 @@ support_contact_fields = api.model(
         ),
         "email": fields.String(description="Sender email address", required=True),
         "subject": fields.String(description="Subject line", required=True),
-        "message": fields.String(
-            description="Body of the support request", required=True
-        ),
+        "message": fields.String(description="Body of the support request", required=True),
         "recaptcha_token": fields.String(
             description="Google reCAPTCHA v3 token (verified server-side)",
             required=False,
@@ -182,9 +174,9 @@ class SiteContactAPI(API):
         """Send a support email composed from the public support form."""
         form = api.validate(SupportContactForm)
 
-        recipient = current_app.config.get(
-            "MAIL_DEFAULT_RECEIVER"
-        ) or current_app.config.get("CONTACT_EMAIL")
+        recipient = current_app.config.get("MAIL_DEFAULT_RECEIVER") or current_app.config.get(
+            "CONTACT_EMAIL"
+        )
         if not recipient:
             api.abort(503, "Support recipient is not configured")
 
@@ -359,9 +351,7 @@ class SiteDatasetsListingAPI(API):
         sort = args["sort"] or ("$text_score" if args["q"] else None) or DEFAULT_SORTING
         listing_page = listing_qs.order_by(sort).paginate(args["page"], args["page_size"])
 
-        organizations = (
-            Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
-        )
+        organizations = Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
 
         return {
             "listing": api.marshal(listing_page, dataset_page_fields),
@@ -436,9 +426,7 @@ class SiteReusesListingAPI(API):
 
         listing_page = Reuse.apply_pagination(listing_qs)
 
-        organizations = (
-            Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
-        )
+        organizations = Organization.objects(deleted=None).order_by("-metrics.datasets").limit(100)
 
         return {
             "listing": api.marshal(listing_page, Reuse.__page_fields__),
@@ -499,8 +487,16 @@ class SiteOrganizationsListingAPI(API):
         }
 
 
+# GET: public catalog exports (RDF + CSV) — keep these out of the IP-keyed
+# default that collapses site-wide behind the F5/WAF (see EXPORT_LIMIT). A fresh
+# decorator is inlined per endpoint class (flask-limiter registers the limit
+# against each decorated view), matching the existing per-class pattern.
+
+
 @api.route("/site/data.<_format>", endpoint="site_dataportal")
 class SiteDataPortal(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self, _format):
         """Root RDF endpoint with content negociation handling"""
         url = url_for("api.site_rdf_catalog_format", _format=_format)
@@ -509,6 +505,8 @@ class SiteDataPortal(API):
 
 @api.route("/site/catalog", endpoint="site_rdf_catalog")
 class SiteRdfCatalog(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.expect(catalog_parser)
     def get(self):
         """Root RDF endpoint with content negociation handling"""
@@ -521,6 +519,8 @@ class SiteRdfCatalog(API):
 
 @api.route("/site/catalog.<_format>", endpoint="site_rdf_catalog_format")
 class SiteRdfCatalogFormat(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.expect(catalog_parser)
     def get(self, _format):
         """
@@ -544,6 +544,8 @@ class SiteRdfCatalogFormat(API):
 
 @api.route("/site/datasets.csv", endpoint="site_datasets_csv")
 class SiteDatasetsCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         # redirect to EXPORT_CSV dataset if feature is enabled and no filter is set
         exported_models = current_app.config.get("EXPORT_CSV_MODELS", [])
@@ -559,6 +561,8 @@ class SiteDatasetsCsv(API):
 
 @api.route("/site/resources.csv", endpoint="site_datasets_resources_csv")
 class SiteResourcesCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         # redirect to EXPORT_CSV dataset if feature is enabled and no filter is set
         exported_models = current_app.config.get("EXPORT_CSV_MODELS", [])
@@ -573,6 +577,8 @@ class SiteResourcesCsv(API):
 
 @api.route("/site/organizations.csv", endpoint="site_organizations_csv")
 class SiteOrganizationsCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         params = multi_to_dict(request.args)
         # redirect to EXPORT_CSV dataset if feature is enabled and no filter is set
@@ -580,14 +586,14 @@ class SiteOrganizationsCsv(API):
         if not params and "organization" in exported_models:
             return redirect(get_export_url("organization"))
         params["facets"] = False
-        organizations = OrgApiParser.parse_filters(
-            get_csv_queryset(Organization), params
-        )
+        organizations = OrgApiParser.parse_filters(get_csv_queryset(Organization), params)
         return csv.stream(OrganizationCsvAdapter(organizations), "organizations")
 
 
 @api.route("/site/reuses.csv", endpoint="site_reuses_csv")
 class SiteReusesCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         params = multi_to_dict(request.args)
         # redirect to EXPORT_CSV dataset if feature is enabled and no filter is set
@@ -601,6 +607,8 @@ class SiteReusesCsv(API):
 
 @api.route("/site/dataservices.csv", endpoint="site_dataservices_csv")
 class SiteDataservicesCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         params = multi_to_dict(request.args)
         # redirect to EXPORT_CSV dataset if feature is enabled and no filter is set
@@ -614,19 +622,21 @@ class SiteDataservicesCsv(API):
 
 @api.route("/site/harvests.csv", endpoint="site_harvests_csv")
 class SiteHarvestsCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         # redirect to EXPORT_CSV dataset if feature is enabled
         exported_models = current_app.config.get("EXPORT_CSV_MODELS", [])
         if "harvest" in exported_models:
             return redirect(get_export_url("harvest"))
-        adapter = HarvestSourceCsvAdapter(
-            get_csv_queryset(HarvestSource).order_by("created_at")
-        )
+        adapter = HarvestSourceCsvAdapter(get_csv_queryset(HarvestSource).order_by("created_at"))
         return csv.stream(adapter, "harvest")
 
 
 @api.route("/site/tags.csv", endpoint="site_tags_csv")
 class SiteTagsCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self):
         adapter = TagCsvAdapter(Tag.objects.order_by("-total"))
         return csv.stream(adapter, "tags")
@@ -740,9 +750,7 @@ class SiteLogContentAPI(API):
         return {
             "name": resolved.name,
             "size": size,
-            "modified": datetime.fromtimestamp(
-                stat.st_mtime, tz=timezone.utc
-            ).isoformat(),
+            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             "truncated": truncated,
             "content": raw.decode("utf-8", errors="replace"),
         }

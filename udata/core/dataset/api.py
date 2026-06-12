@@ -39,7 +39,15 @@ from flask_security import current_user
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
-from udata.api.limits import CONTENT_CREATE_LIMIT, PUBLIC_SEARCH_LIMIT, UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import (
+    CONTENT_CREATE_LIMIT,
+    EXPORT_LIMIT,
+    FEED_LIMIT,
+    PUBLIC_SEARCH_LIMIT,
+    RESOURCE_DOWNLOAD_LIMIT,
+    UPLOAD_LIMIT,
+    user_or_ip,
+)
 from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.app import limiter
 from udata.auth import admin_permission
@@ -390,6 +398,12 @@ class DatasetListAPI(API):
 
 @ns.route("/recent.atom", endpoint="recent_datasets_atom_feed")
 class DatasetsAtomFeedAPI(API):
+    # GET: public syndication feed — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see FEED_LIMIT).
+    decorators = [
+        limiter.limit(FEED_LIMIT, methods=["GET"], key_func=user_or_ip),
+    ]
+
     @api.doc("recent_datasets_atom_feed")
     @api.expect(dataset_parser.parser)
     def get(self):
@@ -529,6 +543,12 @@ class DatasetFeaturedAPI(API):
 @api.response(404, "Dataset not found")
 @api.response(410, "Dataset has been deleted")
 class DatasetRdfAPI(API):
+    # GET: public RDF export — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see EXPORT_LIMIT).
+    decorators = [
+        limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip),
+    ]
+
     @api.doc("rdf_dataset")
     def get(self, dataset):
         _format = RDF_EXTENSIONS[negociate_content()]
@@ -540,6 +560,12 @@ class DatasetRdfAPI(API):
 @api.response(404, "Dataset not found")
 @api.response(410, "Dataset has been deleted")
 class DatasetRdfFormatAPI(API):
+    # GET: public RDF export — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see EXPORT_LIMIT).
+    decorators = [
+        limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip),
+    ]
+
     @api.doc("rdf_dataset_format")
     def get(self, dataset, _format):
         if not dataset.permissions["read"].can():
@@ -583,6 +609,14 @@ class DatasetBadgeAPI(API):
 
 @ns.route("/r/<uuid:id>", endpoint="resource_redirect")
 class ResourceRedirectAPI(API):
+    # GET: the public resource "latest" download. Highest-traffic public action
+    # and NOT cacheable, so the limiter is the only defense; keep it out of the
+    # IP-keyed default that collapses site-wide behind the F5/WAF (see
+    # RESOURCE_DOWNLOAD_LIMIT).
+    decorators = [
+        limiter.limit(RESOURCE_DOWNLOAD_LIMIT, methods=["GET"], key_func=user_or_ip),
+    ]
+
     @api.doc("redirect_resource", **common_doc)
     def get(self, id):
         """Stream the latest version of a resource as a forced download.
@@ -679,6 +713,14 @@ proxy_download_parser.add_argument(
 
 @ns.route("/proxy/download/", endpoint="proxy_download")
 class ResourceProxyDownloadAPI(API):
+    # GET: server-side download proxy for external resources. Same exposure as
+    # the resource "latest" download and NOT cacheable; keep it out of the
+    # IP-keyed default that collapses site-wide behind the F5/WAF (see
+    # RESOURCE_DOWNLOAD_LIMIT).
+    decorators = [
+        limiter.limit(RESOURCE_DOWNLOAD_LIMIT, methods=["GET"], key_func=user_or_ip),
+    ]
+
     @api.doc(
         "proxy_download_external_resource",
         **common_doc,
