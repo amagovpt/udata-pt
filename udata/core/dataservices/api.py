@@ -7,7 +7,9 @@ from flask import make_response, redirect, request, url_for
 from flask_login import current_user
 
 from udata.api import API, api, fields
+from udata.api.limits import EXPORT_LIMIT, FEED_LIMIT, user_or_ip
 from udata.api_fields import patch
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.access_type.constants import AccessType
 from udata.core.dataset.models import Dataset
@@ -57,6 +59,10 @@ class DataservicesAPI(API):
 
 @ns.route("/recent.atom", endpoint="recent_dataservices_atom_feed")
 class DataservicesAtomFeedAPI(API):
+    # GET: public syndication feed — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see FEED_LIMIT).
+    decorators = [limiter.limit(FEED_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("recent_dataservices_atom_feed")
     def get(self):
         feed = Atom1Feed(
@@ -240,6 +246,10 @@ class DataserviceDatasetAPI(API):
 @api.response(404, "Dataservice not found")
 @api.response(410, "Dataservice has been deleted")
 class DataserviceRdfAPI(API):
+    # GET: public RDF export — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see EXPORT_LIMIT).
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("rdf_dataservice")
     def get(self, dataservice):
         _format = RDF_EXTENSIONS[negociate_content()]
@@ -253,6 +263,8 @@ class DataserviceRdfAPI(API):
 @api.response(404, "Dataservice not found")
 @api.response(410, "Dataservice has been deleted")
 class DataserviceRdfFormatAPI(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("rdf_dataservice_format")
     def get(self, dataservice: Dataservice, _format):
         if not dataservice.permissions["read"].can():

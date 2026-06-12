@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix: lift public download/export/feed endpoints out of the IP-keyed rate-limit**
+  - Extends the public-search IP-collapse fix (PR #89) to the endpoints that
+    serve downloads. The resource "latest" download (`GET /datasets/r/<id>`),
+    the SSRF download proxy, the `*.csv` / RDF catalog exports and the
+    `*/recent.atom` feeds had no explicit limit, so they fell under the
+    IP-keyed `RATELIMIT_DEFAULT` ("200 per hour"). Behind the F5/WAF every
+    anonymous visitor collapses into one origin IP, turning that ceiling into
+    a shared cap that returns 429 site-wide after 200 aggregated requests/hour.
+  - Adds three `user_or_ip`-keyed limits in `udata/api/limits.py`, sized per
+    workload and with no per-day cap (a daily cap would itself become a
+    site-wide block under IP-collapse):
+    - `RESOURCE_DOWNLOAD_LIMIT` (`300/min; 6000/h`) — resource downloads /
+      proxy; the most frequent public action and not cacheable;
+    - `EXPORT_LIMIT` (`60/min; 1200/h`) — CSV/RDF catalog exports (heavy to
+      generate; pair with caching);
+    - `FEED_LIMIT` (`120/min; 2400/h`) — Atom syndication feeds.
+  - Applied to the GET of every public download/export/feed endpoint across
+    `dataset`, `site`, `organization`, `reuse`, `dataservices` and `post`.
+    Authenticated clients (e.g. harvesters) still get their own bucket.
+  - Regression test: `udata/tests/api/test_download_ratelimit_ip_collapse.py`.
+
 - **fix: stop random logouts caused by IP-keyed rate limit on `/api/1/me/`**
   - `GET /api/1/me/` is polled by the frontend through a server-side proxy,
     so every user reached the backend from the same source IP and shared the

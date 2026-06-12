@@ -6,7 +6,13 @@ from flask_restx import marshal
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api, errors
-from udata.api.limits import HEAVY_CREATE_LIMIT, PUBLIC_SEARCH_LIMIT, UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import (
+    EXPORT_LIMIT,
+    HEAVY_CREATE_LIMIT,
+    PUBLIC_SEARCH_LIMIT,
+    UPLOAD_LIMIT,
+    user_or_ip,
+)
 from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.app import limiter
 from udata.auth import admin_permission, current_user
@@ -237,6 +243,10 @@ class OrganizationAPI(API):
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class DatasetsCsvAPI(API):
+    # GET: public CSV export — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see EXPORT_LIMIT).
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self, org):
         datasets = Dataset.objects(organization=str(org.id)).visible()
         adapter = DatasetCsvAdapter(datasets)
@@ -247,6 +257,8 @@ class DatasetsCsvAPI(API):
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class DataservicesCsv(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self, org):
         dataservices = Dataservice.objects(organization=str(org.id)).visible()
         adapter = DataserviceCsvAdapter(dataservices)
@@ -257,6 +269,8 @@ class DataservicesCsv(API):
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class DiscussionsCsvAPI(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self, org):
         datasets = Dataset.objects.filter(organization=str(org.id))
         # select_related allows us to dereference subject Referencefield  as efficiently as possible
@@ -273,6 +287,8 @@ class DiscussionsCsvAPI(API):
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class DatasetsResourcesCsvAPI(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     def get(self, org):
         datasets = Dataset.objects(organization=str(org.id)).visible()
         adapter = ResourcesCsvAdapter(datasets)
@@ -283,6 +299,10 @@ class DatasetsResourcesCsvAPI(API):
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class OrganizationRdfAPI(API):
+    # GET: public RDF export — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see EXPORT_LIMIT).
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("rdf_organization")
     def get(self, org):
         _format = RDF_EXTENSIONS[negociate_content()]
@@ -296,6 +316,8 @@ class OrganizationRdfAPI(API):
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class OrganizationRdfFormatAPI(API):
+    decorators = [limiter.limit(EXPORT_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("rdf_organization_format")
     @api.expect(catalog_parser)
     def get(self, org, _format):

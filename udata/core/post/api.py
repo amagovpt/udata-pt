@@ -5,7 +5,9 @@ from flask import make_response, request
 from flask_login import current_user
 
 from udata.api import API, api
+from udata.api.limits import FEED_LIMIT, user_or_ip
 from udata.api_fields import patch, patch_and_save
+from udata.app import limiter
 from udata.auth import Permission as AdminPermission
 from udata.auth import admin_permission
 from udata.core.storages.api import (
@@ -67,6 +69,10 @@ class PostsAPI(API):
 
 @ns.route("/recent.atom", endpoint="recent_posts_atom_feed")
 class PostsAtomFeedAPI(API):
+    # GET: public syndication feed — keep it out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see FEED_LIMIT).
+    decorators = [limiter.limit(FEED_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("recent_posts_atom_feed")
     def get(self):
         feed = Atom1Feed(

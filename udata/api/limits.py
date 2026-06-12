@@ -40,6 +40,36 @@ IDENTITY_READ_LIMIT = "60 per minute; 1200 per hour"
 # daily cap would become a site-wide ceiling that blocks every anonymous
 # visitor late in the day — exactly the failure mode this fix removes.
 PUBLIC_SEARCH_LIMIT = "300 per minute; 6000 per hour"
+# Public, anonymous file downloads: the resource "latest" redirect
+# (`GET /api/1/datasets/r/<id>`) and the SSRF-guarded external download proxy
+# (`GET /api/1/datasets/proxy/download/`). These are the single most frequent
+# legitimate public action (every "download" button + harvesters/integrations
+# pulling the permanent `latest` link) and, unlike the listing pages, they are
+# NOT cacheable (each request is a distinct file/stream), so the limiter is the
+# only structural defense. Without an explicit limit they fall under the
+# IP-keyed `RATELIMIT_DEFAULT` ("200 per hour"), which collapses to a shared
+# site-wide ceiling behind the F5/WAF (docs/infra-adc-waf-impact-ppr-prd.md,
+# incident 4.2) and returns 429 to everyone after 200 aggregated downloads/hour.
+# Sized generously and keyed by `user_or_ip` (authenticated harvesters get their
+# own bucket); deliberately NO per-day cap — under IP-collapse a daily cap would
+# become a site-wide daily block, the exact failure mode this fix removes.
+RESOURCE_DOWNLOAD_LIMIT = "300 per minute; 6000 per hour"
+# Public, anonymous catalog EXPORTS: CSV dumps (`/site/*.csv`,
+# `/organizations/<org>/*.csv`) and RDF catalogs (`/site/catalog[.fmt]`,
+# `/datasets/<d>/rdf`, `/organizations/<o>/catalog`, `/dataservices/<d>/rdf`).
+# These are expensive to generate (full-collection serialization) and rarely
+# need to be fetched frequently by a single client, so they get a tighter
+# per-minute ceiling than the interactive search/download limits — while still
+# sitting far above the old IP-keyed 200/hour default that collapses site-wide
+# behind the F5/WAF. Pair with response caching where possible. Keyed by
+# `user_or_ip`; no per-day cap (see RESOURCE_DOWNLOAD_LIMIT for the rationale).
+EXPORT_LIMIT = "60 per minute; 1200 per hour"
+# Public, anonymous syndication FEEDS (`*/recent.atom` for datasets, reuses,
+# dataservices and posts). Polled by aggregators/readers, cacheable, and lighter
+# than a full export. A moderate ceiling well above the IP-keyed 200/hour default
+# so feed polling never collapses site-wide behind the F5/WAF. Keyed by
+# `user_or_ip`; no per-day cap (see RESOURCE_DOWNLOAD_LIMIT for the rationale).
+FEED_LIMIT = "120 per minute; 2400 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
