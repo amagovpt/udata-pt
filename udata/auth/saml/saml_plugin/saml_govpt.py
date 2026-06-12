@@ -534,21 +534,12 @@ def _is_nic_hashed(nic_value):
     )
 
 
-def _merge_nic_into_user(user, user_nic):
-    """Add the hashed SAML NIC to an existing user account (auto-merge)."""
-    if not user_nic:
-        return
-    if not user.extras:
-        user.extras = {}
-    user.extras["auth_nic"] = _hash_nic(user_nic)
-    user.save()
-    current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
-
-
 def _create_saml_user(user_email, user_nic, first_name, last_name):
     """Create a new account from SAML attributes (scenario 4)."""
-    # Generate a placeholder email when the IdP does not provide one.
-    if not user_email:
+    # Generate a placeholder email when the IdP does not provide one, or
+    # when the CMD email is already taken by an existing account (the
+    # user explicitly chose to create a new one in the wizard).
+    if not user_email or datastore.find_user(email=user_email):
         import uuid
 
         user_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
@@ -574,16 +565,16 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
 
     Decision order:
-    1. NIC already linked → direct login (entry rule)
-    2. Email match → link the NIC automatically (scenario 1)
-    3. Name-only match → suspected existing account; the user must
-       confirm ownership through the migration wizard (scenarios 2/3)
-    4. No match → create a new account (scenario 4)
+    1. NIC already linked → direct login (entry rule). This is the ONLY
+       path that logs the user in without ownership confirmation.
+    2. Email match → suspected existing account; the user must confirm
+       ownership through the migration wizard before linking
+    3. Name-only match → same, suspected existing account
+    4. No match → create a new account
 
     Returns a tuple (user, status) where status is one of:
     - "existing_saml" — NIC already linked, normal login
-    - "merged" — account matched by email, NIC auto-merged
-    - "migration_candidate" — name-only match; user is the single
+    - "migration_candidate" — email or name match; user is the single
       candidate account, or None when several homonyms exist
     - "new" — newly created user
     - "error" — neither email nor NIC available
@@ -598,12 +589,17 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         if user:
             return user, "existing_saml"
 
-    # 2. Match by email: link automatically.
+    # 2. Match by email: never auto-link — ownership must be proven
+    #    (password or email code) via the migration wizard. Accounts
+    #    already linked to another CMD identity are not candidates.
     if user_email:
         user = datastore.find_user(email=user_email)
-        if user:
-            _merge_nic_into_user(user, user_nic)
-            return user, "merged"
+        if user and not (user.extras and user.extras.get("auth_nic")):
+            current_app.logger.info(
+                f"SAML: email match for an existing account "
+                f"(id={user.id}) — ownership confirmation required"
+            )
+            return user, "migration_candidate"
 
     # 3. Name-only match against accounts without a linked CMD identity:
     #    never auto-merge — ownership must be proven (password or email

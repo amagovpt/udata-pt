@@ -405,6 +405,8 @@ class SAMLAutoRegistrationTest(APITestCase):
             assert user.extras.get("auth_nic") == _hash_nic("12345678")
 
     def test_finds_existing_user_by_email(self):
+        """An email match never logs in nor auto-links — the existing
+        account becomes the wizard candidate."""
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
@@ -417,7 +419,10 @@ class SAMLAutoRegistrationTest(APITestCase):
                 last_name="Name",
             )
 
+            assert status == "migration_candidate"
             assert user.id == existing.id
+            existing.reload()
+            assert not (existing.extras or {}).get("auth_nic")
 
     def test_finds_existing_user_by_nic(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
@@ -610,8 +615,10 @@ class SAMLSSOCallbackTest(APITestCase):
         assert response.status_code == 302
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_sso_callback_finds_existing_user_by_email(self, mock_client_for):
-        """If user already exists with that email, login existing user."""
+    def test_sso_callback_email_match_requires_ownership_confirmation(self, mock_client_for):
+        """An email match must NOT log the user in — only a NIC match
+        does. The user is redirected to the migration wizard instead."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
         mock_saml_client = MagicMock()
         mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
             email="existing@example.pt",
@@ -631,11 +638,14 @@ class SAMLSSOCallbackTest(APITestCase):
         )
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
-            self._post_saml_response(xml)
+            response = self._post_saml_response(xml)
 
-            assert mock_login.call_count == 1
-            logged_in_user = mock_login.call_args[0][0]
-            assert logged_in_user.id == existing.id
+            assert mock_login.call_count == 0
+
+        assert response.status_code == 302
+        assert "/pages/migrate-account" in response.headers["Location"]
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_finds_existing_user_by_nic(self, mock_client_for):
@@ -783,7 +793,12 @@ class SAMLSSOCallbackTest(APITestCase):
         )
         mock_client_for.return_value = mock_saml_client
 
-        UserFactory(email="session_test@example.pt", confirmed_at="2024-01-01")
+        # NIC already linked → direct login (the only no-wizard path).
+        UserFactory(
+            email="session_test@example.pt",
+            confirmed_at="2024-01-01",
+            extras={"auth_nic": _hash_nic("44444444")},
+        )
 
         xml = _build_saml_response_xml(
             email="session_test@example.pt",
@@ -1155,17 +1170,18 @@ class SAMLLogoutFlowTest(APITestCase):
 
 
 class SAMLAccountLinkingTest(APITestCase):
-    """Verify that a CMD (Chave Móvel Digital) login is linked to a
-    pre-existing default account (registered with email + password).
+    """Verify the CMD (Chave Móvel Digital) account resolution rules.
 
-    The existing account must be reused — never duplicated — so that the
-    user keeps the permissions, roles, organization memberships and
-    content (datasets, etc.) created before linking the CMD identity.
+    Direct login happens ONLY when the NIC is already linked. Any other
+    match (email or name) requires the user to prove ownership of the
+    default account through the migration wizard, so accounts are never
+    linked or logged into without confirmation — and never duplicated,
+    keeping permissions, roles, memberships and content.
     """
 
-    def test_cmd_login_links_to_existing_password_account(self):
-        """A CMD login with the same email merges the NIC into the
-        existing password account instead of creating a new user."""
+    def test_cmd_email_match_requires_confirmation(self):
+        """A CMD login matching an account by email does NOT auto-link:
+        the account becomes the wizard candidate, untouched."""
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
         from udata.core.user.models import User
 
@@ -1187,24 +1203,21 @@ class SAMLAccountLinkingTest(APITestCase):
                 last_name="Silva",
             )
 
-            # The existing account is linked, not duplicated.
-            assert status == "merged"
+            # The existing account is the candidate — no new account.
+            assert status == "migration_candidate"
             assert user.id == existing.id
             assert User.objects.count() == users_before
 
-            # The CMD identity (hashed NIC) is now bound to the account.
-            user.reload()
-            assert user.extras.get("auth_nic") == _hash_nic("12345678")
+            # Nothing was linked or changed — ownership not proven yet.
+            existing.reload()
+            assert not (existing.extras or {}).get("auth_nic")
+            assert existing.password == original_password_hash
+            assert existing.email == "cidadao@example.pt"
 
-            # The original credentials are untouched — the user can still
-            # log in with email + password.
-            assert user.password == original_password_hash
-            assert user.email == "cidadao@example.pt"
-
-    def test_linked_account_preserves_roles_memberships_and_content(self):
-        """Permissions and prior actions survive the CMD linking: admin
-        role, organization membership and owned datasets stay with the
-        same account."""
+    def test_email_match_candidate_account_is_left_untouched(self):
+        """Roles, memberships and content of the email-matched account
+        stay intact while ownership is not proven (the preservation
+        after wizard linking is covered by SAMLMigrationWizardTest)."""
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
         from udata.core.dataset.factories import DatasetFactory
         from udata.core.organization.factories import OrganizationFactory
@@ -1228,21 +1241,16 @@ class SAMLAccountLinkingTest(APITestCase):
                 last_name="Santos",
             )
 
-            assert status == "merged"
+            assert status == "migration_candidate"
             assert user.id == existing.id
 
-            # Admin role preserved.
-            user.reload()
-            assert user.sysadmin
-
-            # Organization membership preserved.
+            existing.reload()
+            assert not (existing.extras or {}).get("auth_nic")
+            assert existing.sysadmin
             org.reload()
-            assert org.is_member(user)
-            assert org.is_admin(user)
-
-            # Owned content preserved.
+            assert org.is_admin(existing)
             dataset.reload()
-            assert dataset.owner.id == user.id
+            assert dataset.owner.id == existing.id
 
     def test_cmd_without_email_name_match_requires_confirmation(self):
         """When the CMD identity has no email and only the name matches
@@ -1372,8 +1380,8 @@ class SAMLAccountLinkingTest(APITestCase):
             assert not (other.extras or {}).get("auth_nic")
 
     def test_subsequent_cmd_logins_resolve_to_linked_account(self):
-        """After the first merge, later CMD logins (even without email,
-        matching by NIC only) resolve to the same account."""
+        """Once the NIC is linked (after wizard confirmation), later CMD
+        logins resolve directly to the same account — even without email."""
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
         from udata.core.user.models import User
 
@@ -1381,21 +1389,22 @@ class SAMLAccountLinkingTest(APITestCase):
             existing = UserFactory(
                 email="cidadao2@example.pt",
                 password="S3cretPass!",
+                extras={"auth_nic": _hash_nic("11223344")},
             )
 
-            # First CMD login: merge.
+            # CMD login where the IdP returns only the NIC.
             user, status = _find_or_create_saml_user(
-                user_email="cidadao2@example.pt",
+                user_email=None,
                 user_nic="11223344",
                 first_name="Rui",
                 last_name="Costa",
             )
-            assert status == "merged"
+            assert status == "existing_saml"
             assert user.id == existing.id
 
-            # Second CMD login: IdP returns only the NIC.
+            # And with a different email too — the NIC always wins.
             user, status = _find_or_create_saml_user(
-                user_email=None,
+                user_email="outro@example.pt",
                 user_nic="11223344",
                 first_name="Rui",
                 last_name="Costa",
@@ -1405,74 +1414,12 @@ class SAMLAccountLinkingTest(APITestCase):
             assert User.objects.count() == 1
 
 
-class SAMLSSOLinkingCallbackTest(APITestCase):
-    """End-to-end: the /saml/sso callback links the CMD identity to the
-    pre-existing password account and logs that same account in."""
-
-    @pytest.fixture(autouse=True)
-    def _set_frontend_url(self, app):
-        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
-
-    def _post_saml_response(self, saml_xml):
-        encoded = base64.b64encode(saml_xml.encode("utf-8")).decode("utf-8")
-        return self.client.post(
-            "/saml/sso",
-            data={"SAMLResponse": encoded},
-            follow_redirects=False,
-        )
-
-    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_sso_callback_links_cmd_to_existing_password_account(self, mock_client_for):
-        from udata.core.user.models import User
-
-        mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
-            email="default@example.pt",
-            nic="12121212",
-            first_name="Ana",
-            last_name="Pereira",
-        )
-        mock_client_for.return_value = mock_saml_client
-
-        existing = UserFactory(
-            email="default@example.pt",
-            password="S3cretPass!",
-            first_name="Ana",
-            last_name="Pereira",
-            confirmed_at=datetime(2024, 1, 1),
-        )
-        original_password_hash = existing.password
-        users_before = User.objects.count()
-
-        xml = _build_saml_response_xml(
-            email="default@example.pt",
-            nic="12121212",
-            first_name="Ana",
-            last_name="Pereira",
-        )
-
-        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
-            response = self._post_saml_response(xml)
-
-            # The logged-in user is the pre-existing account.
-            assert mock_login.call_count == 1
-            logged_in_user = mock_login.call_args[0][0]
-            assert logged_in_user.id == existing.id
-
-        assert response.status_code == 302
-
-        # No duplicate account; NIC linked; password credentials intact.
-        assert User.objects.count() == users_before
-        existing.reload()
-        assert existing.extras.get("auth_nic") == _hash_nic("12121212")
-        assert existing.password == original_password_hash
-
-
 class SAMLMigrationWizardTest(APITestCase):
-    """End-to-end coverage of the account-linking wizard: a name-only
-    match redirects to /pages/migrate-account, where the user either
-    proves ownership of the default account (email + password login, or
-    emailed code) to link it, or explicitly creates a new account.
+    """End-to-end coverage of the account-linking wizard: an email or
+    name match redirects to /pages/migrate-account, where the user
+    either proves ownership of the default account (email + password
+    login, or emailed code) to link it, or explicitly creates a new
+    account. Only a NIC match logs in directly.
     """
 
     @pytest.fixture(autouse=True)
@@ -1745,6 +1692,87 @@ class SAMLMigrationWizardTest(APITestCase):
         )
         assert response.status_code == 302
         assert "cmd_new_account=1" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_email_match_links_only_after_password_confirmation(self, mock_client_for):
+        """E2E for the email-match case: redirect to the wizard with the
+        account as candidate, then linking happens only after the full
+        default login — password and account data preserved."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="default@example.pt",
+            password="S3cretPass!",
+            first_name="Ana",
+            last_name="Pereira",
+            confirmed_at=datetime(2024, 1, 1),
+        )
+        original_password_hash = existing.password
+        users_before = User.objects.count()
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                email="default@example.pt",
+                nic="12121212",
+                first_name="Ana",
+                last_name="Pereira",
+            )
+            assert mock_login.call_count == 0
+
+        assert response.status_code == 302
+        assert "/pages/migrate-account" in response.headers["Location"]
+
+        with self.client.session_transaction() as sess:
+            pending = sess.get("saml_migration_pending")
+            assert pending["legacy_user_id"] == str(existing.id)
+
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+
+        # Ownership proven with the default login → accounts linked.
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": "default@example.pt", "password": "S3cretPass!"},
+        )
+        assert response.status_code == 200
+
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert existing.extras.get("auth_nic") == _hash_nic("12121212")
+        assert existing.password == original_password_hash
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_after_email_match_uses_placeholder_email(self, mock_client_for):
+        """When the CMD email is already taken by the matched account
+        and the user chooses 'create new account', the new account gets
+        a placeholder email instead of a duplicate."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="default@example.pt",
+            password="S3cretPass!",
+            first_name="Ana",
+            last_name="Pereira",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="default@example.pt",
+            nic="12121212",
+            first_name="Ana",
+            last_name="Pereira",
+        )
+
+        response = self.client.post("/saml/migration/skip")
+        assert response.status_code == 200
+
+        new_user = User.objects(extras__auth_nic=_hash_nic("12121212")).first()
+        assert new_user is not None
+        assert new_user.id != existing.id
+        assert _SAML_PLACEHOLDER_EMAIL_RE.match(new_user.email), new_user.email
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")

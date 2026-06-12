@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **feat: CMD (Chave Móvel Digital) account linking with mandatory ownership confirmation**
+  - Direct login on a CMD/SAML callback now happens ONLY when the NIC is
+    already linked to an account. Any other match — by email or by
+    first+last name — redirects to the migration wizard
+    (`/pages/migrate-account`), where the user either proves ownership of
+    the default account (full email+password login, or a 6-digit code
+    emailed to the account) to link the CMD identity, or explicitly
+    chooses to create a new account. Linking preserves the password (both
+    login methods remain available), roles, organization memberships and
+    owned content. With no match at all, a new account is created and the
+    redirect carries `cmd_new_account=1` so the frontend informs the user.
+  - `migration/confirm` password method performs a full login
+    (email + password) capped at 5 attempts per session, with a generic
+    error to avoid account enumeration; accounts already linked to another
+    CMD identity are excluded from matching and refused by the wizard.
+  - `MIGRATION_MODE_ENABLED` now defaults to `True` (kill-switch kept);
+    when disabled, a matched account is never logged into without proof —
+    a new account is created instead.
+  - Tests: `SAMLMigrationWizardTest` end-to-end coverage plus updated
+    resolution-order unit tests in `udata/tests/frontend/test_saml.py`.
+
 - **fix: lift public READ endpoints (suggest/detail/reference) out of the IP-keyed rate-limit**
   - Fourth IP-collapse fix after public-search (#89), download/export/feed (#90)
     and uploads (#91). Many anonymous GET endpoints the SSR/public pages hit
