@@ -323,6 +323,34 @@ class Organization(
     def local_authority(self):
         return any(b.kind == LOCAL_AUTHORITY for b in self.badges)
 
+    def set_badges(self, kinds):
+        """Replace badges with the given kinds (site-admin API use)."""
+        from udata.auth import current_user
+
+        seen = set()
+        ordered_kinds = []
+        for kind in kinds:
+            if kind not in seen:
+                if kind not in self.available_badges():
+                    msg = "Unknown badge type for {model}: {kind}"
+                    raise ValidationError(msg.format(model=self.__class__.__name__, kind=kind))
+                seen.add(kind)
+                ordered_kinds.append(kind)
+
+        existing_by_kind = {badge.kind: badge for badge in self.badges}
+        new_badges = []
+        for kind in ordered_kinds:
+            if kind in existing_by_kind:
+                new_badges.append(existing_by_kind[kind])
+                continue
+            badge = self._fields["badges"].field.document_type(kind=kind)
+            if current_user and current_user.is_authenticated:
+                badge.created_by = current_user.id
+            new_badges.append(badge)
+
+        self.badges = new_badges
+        self.save()
+
     def member(self, user):
         for member in self.members:
             if member.user == user:
