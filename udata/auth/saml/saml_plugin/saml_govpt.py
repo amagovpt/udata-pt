@@ -1728,6 +1728,9 @@ def migration_search():
     # legacy account's email.
     pending["legacy_user_id"] = str(user.id)
     session["saml_migration_pending"] = pending
+    # Any code previously emailed was issued for a different target —
+    # invalidate it so it cannot be replayed against the new candidate.
+    session.pop("migration_code", None)
     session.modified = True
 
     return jsonify(
@@ -1767,6 +1770,9 @@ def migration_send_code():
     code = str(random.randint(100000, 999999))
     session["migration_code"] = {
         "code": code,
+        # Bind the code to the account it was emailed to, so it cannot be
+        # replayed against a different candidate re-pointed via search.
+        "legacy_user_id": legacy_user_id,
         "expires": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
         "attempts": 0,
     }
@@ -1808,6 +1814,13 @@ def migration_confirm():
 
         code_data = session.get("migration_code")
         if not code_data:
+            return jsonify({"error": "No code sent"}), 400
+
+        # The code is only valid for the account it was emailed to. If the
+        # candidate was re-pointed (via search) after the code was issued,
+        # refuse it — otherwise a code sent to an attacker-controlled
+        # mailbox could link the NIC to a victim account.
+        if code_data.get("legacy_user_id") != legacy_user_id:
             return jsonify({"error": "No code sent"}), 400
 
         if code_data["attempts"] >= 5:

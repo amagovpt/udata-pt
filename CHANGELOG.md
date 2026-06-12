@@ -22,6 +22,16 @@
     a new account is created instead.
   - Tests: `SAMLMigrationWizardTest` end-to-end coverage plus updated
     resolution-order unit tests in `udata/tests/frontend/test_saml.py`.
+  - **security: bind the email verification code to its target account.**
+    The migration code was stored in the session without recording which
+    account it was emailed to, while `migration/search` can re-point the
+    candidate. An attacker could request a code to their own account, then
+    re-point the candidate to a victim and replay the known code to link
+    their CMD identity to — and log in as — the victim (account takeover).
+    The code now carries the `legacy_user_id` it was issued for, `confirm`
+    rejects a code whose target no longer matches, and `search` clears any
+    pending code on re-point. Regression: `SAMLMigrationSecurityTest` in
+    `udata/tests/frontend/test_saml.py`.
 
 - **fix: lift public READ endpoints (suggest/detail/reference) out of the IP-keyed rate-limit**
   - Fourth IP-collapse fix after public-search (#89), download/export/feed (#90)

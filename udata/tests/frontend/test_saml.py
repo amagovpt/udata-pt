@@ -1811,3 +1811,118 @@ class SAMLMigrationWizardTest(APITestCase):
             assert not (existing.extras or {}).get("auth_nic")
         finally:
             self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+
+class SAMLMigrationSecurityTest(APITestCase):
+    """Adversarial tests for the account-linking wizard.
+
+    The security boundary: an attacker must never link their CMD (NIC)
+    to — or log into — a victim account without proving ownership of
+    that account (its password, or a code emailed to it).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+        app.config["MIGRATION_MODE_ENABLED"] = True
+
+    def _sso_with(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_emailed_code_cannot_link_a_re_targeted_account(self, mock_client_for):
+        """Target-confusion / account takeover: a code emailed to the
+        attacker's own account must not be accepted to link the CMD
+        identity to a DIFFERENT account after migration/search re-points
+        the candidate to a victim."""
+        # Victim: legacy account (password, no NIC). The attacker cannot
+        # read the victim's mailbox nor knows its password.
+        victim = UserFactory(
+            email="victim@gov.pt",
+            password="VictimPass1!",
+            first_name="Vic",
+            last_name="Tim",
+        )
+        # Attacker's own legacy account, matched by name from their CMD.
+        UserFactory(
+            email="attacker@evil.com",
+            password="AttackerPass1!",
+            first_name="Mallory",
+            last_name="Evil",
+        )
+
+        # 1. Attacker authenticates with their real CMD (name match → own
+        #    account becomes the pending candidate).
+        resp = self._sso_with(
+            mock_client_for, nic="66667777", first_name="Mallory", last_name="Evil"
+        )
+        assert "/pages/migrate-account" in resp.headers["Location"]
+
+        # 2. Attacker requests a code — emailed to their OWN address. We
+        #    capture it as the attacker would read it from their inbox.
+        captured = {}
+
+        def _capture(user, code):
+            captured["code"] = code
+
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
+            side_effect=_capture,
+        ):
+            r = self.client.post("/saml/migration/send-code")
+            assert r.status_code == 200
+        assert "code" in captured
+
+        # 3. Attacker re-targets the candidate to the victim via search.
+        r = self.client.post("/saml/migration/search", json={"email": "victim@gov.pt"})
+        assert r.status_code == 200 and r.json["found"] is True
+
+        # 4. Attacker submits the code they received. It must NOT link the
+        #    NIC to the victim, nor log the attacker in as the victim.
+        r = self.client.post(
+            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
+        )
+        assert r.status_code != 200, "Account takeover: re-targeted code was accepted"
+
+        victim.reload()
+        assert not (victim.extras or {}).get("auth_nic"), "Victim account was taken over"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_password_brute_force_is_capped_per_session(self, mock_client_for):
+        """Online password guessing against a candidate is capped."""
+        UserFactory(
+            email="pedro@example.pt",
+            password="S3cretPass1!",
+            first_name="Pedro",
+            last_name="Almeida",
+        )
+        self._sso_with(mock_client_for, nic="55667788", first_name="Pedro", last_name="Almeida")
+
+        for _ in range(5):
+            r = self.client.post(
+                "/saml/migration/confirm",
+                json={"method": "password", "email": "pedro@example.pt", "password": "x"},
+            )
+            assert r.status_code == 400
+        r = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": "pedro@example.pt", "password": "x"},
+        )
+        assert r.status_code == 429
+
+    def test_confirm_requires_a_pending_migration(self):
+        """No pending SAML migration in session → confirm is refused."""
+        UserFactory(email="pedro@example.pt", password="S3cretPass1!")
+        r = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": "pedro@example.pt", "password": "S3cretPass1!"},
+        )
+        assert r.status_code == 400
