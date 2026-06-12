@@ -7,7 +7,13 @@ from flask import make_response, request
 from flask_login import current_user
 
 from udata.api import API, api, errors
-from udata.api.limits import CONTENT_CREATE_LIMIT, FEED_LIMIT, PUBLIC_SEARCH_LIMIT, user_or_ip
+from udata.api.limits import (
+    CONTENT_CREATE_LIMIT,
+    FEED_LIMIT,
+    PUBLIC_SEARCH_LIMIT,
+    UPLOAD_LIMIT,
+    user_or_ip,
+)
 from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.api_fields import patch, patch_and_save
 from udata.app import limiter
@@ -434,6 +440,17 @@ class ReusesSuggestAPI(API):
 @ns.route("/<reuse:reuse>/image/", endpoint="reuse_image")
 @api.doc(**common_doc)
 class ReuseImageAPI(API):
+    # Per-user rate-limit on image upload; keeps the endpoint out of the
+    # IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the F5/WAF
+    # (see UPLOAD_LIMIT).
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("reuse_image")
     @api.expect(image_parser)  # Swagger 2.0 does not support formData at path level

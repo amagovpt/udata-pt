@@ -902,6 +902,18 @@ class ResourceMixin(object):
 )
 @api.param("rid", "The resource unique identifier")
 class UploadDatasetResource(ResourceMixin, UploadMixin, API):
+    # Per-user rate-limit on file upload to prevent abuse and keep the endpoint
+    # out of the IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the
+    # F5/WAF (see UPLOAD_LIMIT). Mirrors UploadNewDatasetResource: replacing the
+    # file of an existing resource is as frequent as creating one.
+    decorators = [
+        limiter.limit(
+            UPLOAD_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc(
         "upload_dataset_resource",
@@ -929,6 +941,18 @@ class UploadDatasetResource(ResourceMixin, UploadMixin, API):
 )
 @api.param("community", "The community resource unique identifier")
 class ReuploadCommunityResource(ResourceMixin, UploadMixin, API):
+    # Tighter than UPLOAD_LIMIT and consistent with UploadNewCommunityResources:
+    # community resources are publicly visible content. Keeps the re-upload out
+    # of the IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the
+    # F5/WAF (see CONTENT_CREATE_LIMIT).
+    decorators = [
+        limiter.limit(
+            CONTENT_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc(
         "upload_community_resource",
