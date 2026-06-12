@@ -6,7 +6,7 @@ from mongoengine.queryset.visitor import Q
 from slugify import slugify
 
 from udata.api import API, api
-from udata.api.limits import IDENTITY_READ_LIMIT, UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import IDENTITY_READ_LIMIT, PUBLIC_SEARCH_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
 from udata.utils import Paginable
 from udata.app import limiter
@@ -844,6 +844,10 @@ suggest_parser.add_argument(
 
 @ns.route("/suggest/", endpoint="suggest_users")
 class SuggestUsersAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_users")
     @api.expect(suggest_parser)
     @api.marshal_list_with(user_suggestion_fields)

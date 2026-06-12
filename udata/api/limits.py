@@ -70,6 +70,21 @@ EXPORT_LIMIT = "60 per minute; 1200 per hour"
 # so feed polling never collapses site-wide behind the F5/WAF. Keyed by
 # `user_or_ip`; no per-day cap (see RESOURCE_DOWNLOAD_LIMIT for the rationale).
 FEED_LIMIT = "120 per minute; 2400 per hour"
+# Public, anonymous READ endpoints that the SSR/public pages hit live (not ISR
+# cached): typeahead `*/suggest/` (fired per keystroke), entity detail reads
+# (`/datasets/<id>/`, `/organizations/<org>/`, `/reuses/<reuse>/`,
+# `/dataservices/<id>/` and their sub-resources) and the small reference-data
+# lists used to build filters (`/datasets/licenses|frequencies|schemas|...`).
+# Without an explicit limit these fall under the IP-keyed `RATELIMIT_DEFAULT`
+# ("200 per hour"), which behind the F5/WAF collapses to a single site-wide
+# bucket (docs/infra-adc-waf-impact-ppr-prd.md §4.2): once aggregate read volume
+# crosses it, every anonymous visitor gets 429 and the public pages stop
+# rendering. Same generous shape as PUBLIC_SEARCH_LIMIT (these are the same
+# class of cheap, high-frequency public reads); keyed by `user_or_ip` so
+# logged-in users get their own bucket, and deliberately NO per-day cap (under
+# IP-collapse a daily cap becomes a site-wide daily block). Suggest/typeahead
+# reuses PUBLIC_SEARCH_LIMIT (it is search-backed); this covers the rest.
+PUBLIC_READ_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"

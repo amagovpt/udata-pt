@@ -5,7 +5,12 @@ from flask_restx.inputs import boolean
 from flask_security import current_user
 
 from udata.api import API, api, fields
-from udata.api.limits import COMMENT_CREATE_LIMIT, DISCUSSION_CREATE_LIMIT, user_or_ip
+from udata.api.limits import (
+    COMMENT_CREATE_LIMIT,
+    DISCUSSION_CREATE_LIMIT,
+    PUBLIC_READ_LIMIT,
+    user_or_ip,
+)
 from udata.api.parsers import normalize_search_query
 from udata.app import limiter
 from udata.core.dataservices.models import Dataservice
@@ -174,10 +179,17 @@ class DiscussionAPI(API):
     """
 
     # Per-user rate-limit on POST (comment) to prevent spam (TICKET-59).
+    # GET: public read shown on dataset/reuse pages — keep out of the IP-keyed
+    # default that collapses site-wide behind the F5/WAF (see PUBLIC_READ_LIMIT).
     decorators = [
         limiter.limit(
             COMMENT_CREATE_LIMIT,
             methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_READ_LIMIT,
+            methods=["GET"],
             key_func=user_or_ip,
         ),
     ]
@@ -324,10 +336,17 @@ class DiscussionsAPI(API):
     # create profile is tighter than COMMENT_CREATE_LIMIT because opening a
     # new thread is a much rarer human action than commenting on an existing
     # one — see TICKET-1728 / VULN-2083 (Burp Intruder mass-creation).
+    # GET: public listing shown on dataset/reuse pages — keep out of the IP-keyed
+    # default that collapses site-wide behind the F5/WAF (see PUBLIC_READ_LIMIT).
     decorators = [
         limiter.limit(
             DISCUSSION_CREATE_LIMIT,
             methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_READ_LIMIT,
+            methods=["GET"],
             key_func=user_or_ip,
         ),
     ]
