@@ -4,6 +4,8 @@ from flask_restx import inputs
 from mongoengine.queryset.visitor import Q
 
 from udata.api import API, api
+from udata.api.limits import PUBLIC_READ_LIMIT, PUBLIC_SEARCH_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.core.dataset.api_fields import dataset_ref_fields
 from udata.i18n import _
 from udata.models import Dataset
@@ -48,6 +50,10 @@ def legacy_geoid(legacy_id):
 
 @ns.route("/zones/suggest/", endpoint="suggest_zones")
 class SuggestZonesAPI(API):
+    # GET: public typeahead fired per keystroke; keep it out of the IP-keyed
+    # default that collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.marshal_list_with(zone_suggestion_fields)
     @api.expect(suggest_parser)
     @api.doc("suggest_zones")
@@ -85,6 +91,9 @@ dataset_parser.add_argument(
 
 @ns.route("/zones/<list:ids>/", endpoint="zones")
 class ZonesAPI(API):
+    # GET: public read; keep out of the IP-keyed default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("spatial_zones", params={"ids": "A zone identifiers list (comma separated)"})
     @api.marshal_with(feature_collection_fields)
     def get(self, ids):
@@ -100,6 +109,9 @@ class ZonesAPI(API):
 
 @ns.route("/zone/<id>/datasets/", endpoint="zone_datasets")
 class ZoneDatasetsAPI(API):
+    # GET: public read; keep out of the IP-keyed default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("spatial_zone_datasets", params={"id": "A zone identifier"})
     @api.expect(dataset_parser)
     @api.marshal_with(dataset_ref_fields)
@@ -115,6 +127,9 @@ class ZoneDatasetsAPI(API):
 
 @ns.route("/zone/<id>/", endpoint="zone")
 class ZoneAPI(API):
+    # GET: public read; keep out of the IP-keyed default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("spatial_zone", params={"id": "A zone identifier"})
     def get(self, id):
         """Fetch a zone"""
@@ -125,6 +140,9 @@ class ZoneAPI(API):
 
 @ns.route("/levels/", endpoint="spatial_levels")
 class SpatialLevelsAPI(API):
+    # GET: public reference list; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("spatial_levels")
     @api.marshal_list_with(level_fields)
     def get(self):
@@ -134,6 +152,9 @@ class SpatialLevelsAPI(API):
 
 @ns.route("/granularities/", endpoint="spatial_granularities")
 class SpatialGranularitiesAPI(API):
+    # GET: public reference list; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("spatial_granularities")
     @api.marshal_list_with(granularity_fields)
     def get(self):
@@ -149,6 +170,9 @@ class SpatialGranularitiesAPI(API):
 
 @ns.route("/coverage/<level>/", endpoint="spatial_coverage")
 class SpatialCoverageAPI(API):
+    # GET: public read; keep out of the IP-keyed default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("spatial_coverage")
     @api.marshal_list_with(feature_collection_fields)
     def get(self, level):

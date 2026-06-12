@@ -1,4 +1,6 @@
 from udata.api import API, api
+from udata.api.limits import PUBLIC_SEARCH_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.models import Tag
 from udata.tags import slug  # TODO: merge this into this package
 
@@ -21,6 +23,10 @@ parser.add_argument(
 
 @ns.route("/suggest/", endpoint="suggest_tags")
 class SuggestTagsAPI(API):
+    # GET: public typeahead fired per keystroke; keep it out of the IP-keyed
+    # default that collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_tags")
     @api.expect(parser)
     def get(self):

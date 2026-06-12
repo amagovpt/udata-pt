@@ -7,7 +7,13 @@ from flask import make_response, redirect, request, url_for
 from flask_login import current_user
 
 from udata.api import API, api, fields
-from udata.api.limits import EXPORT_LIMIT, FEED_LIMIT, user_or_ip
+from udata.api.limits import (
+    EXPORT_LIMIT,
+    FEED_LIMIT,
+    PUBLIC_READ_LIMIT,
+    PUBLIC_SEARCH_LIMIT,
+    user_or_ip,
+)
 from udata.api_fields import patch
 from udata.app import limiter
 from udata.auth import admin_permission
@@ -31,6 +37,10 @@ common_doc = {"params": {"dataservice": "The dataservice ID or slug"}}
 @ns.route("/", endpoint="dataservices")
 class DataservicesAPI(API):
     """Dataservices collection endpoint"""
+
+    # GET: public listing/search — keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
 
     @api.doc("list_dataservices")
     @api.expect(Dataservice.__index_parser__)
@@ -100,6 +110,9 @@ dataservice_delete_parser = add_send_legal_notice_argument(api.parser())
 
 @ns.route("/<dataservice:dataservice>/", endpoint="dataservice")
 class DataserviceAPI(API):
+    # GET: public detail read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("get_dataservice")
     @api.marshal_with(Dataservice.__read_fields__)
     def get(self, dataservice):

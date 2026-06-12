@@ -43,6 +43,7 @@ from udata.api.limits import (
     CONTENT_CREATE_LIMIT,
     EXPORT_LIMIT,
     FEED_LIMIT,
+    PUBLIC_READ_LIMIT,
     PUBLIC_SEARCH_LIMIT,
     RESOURCE_DOWNLOAD_LIMIT,
     UPLOAD_LIMIT,
@@ -473,6 +474,9 @@ dataset_delete_parser = add_send_legal_notice_argument(api.parser())
 @api.response(404, "Dataset not found")
 @api.response(410, "Dataset has been deleted")
 class DatasetAPI(API):
+    # GET: public detail read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("get_dataset")
     @api.marshal_with(dataset_fields)
     def get(self, dataset: Dataset):
@@ -581,6 +585,10 @@ class DatasetRdfFormatAPI(API):
 
 @ns.route("/badges/", endpoint="available_dataset_badges")
 class AvailableDatasetBadgesAPI(API):
+    # GET: public reference list used to build filters; keep out of the IP-keyed
+    # default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("available_dataset_badges")
     def get(self):
         """List all available dataset badges and their labels"""
@@ -755,10 +763,17 @@ class ResourceProxyDownloadAPI(API):
 class ResourcesAPI(API):
     # Per-user rate-limit on POST to prevent mass-creation abuse (TICKET-59).
     # PUT (re-order) and DELETE remain unaffected — limit is method-scoped.
+    # GET (public listing on the dataset page): keep out of the IP-keyed default
+    # that collapses site-wide behind the F5/WAF (see PUBLIC_READ_LIMIT).
     decorators = [
         limiter.limit(
             UPLOAD_LIMIT,
             methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_READ_LIMIT,
+            methods=["GET"],
             key_func=user_or_ip,
         ),
     ]
@@ -974,6 +989,9 @@ class ReuploadCommunityResource(ResourceMixin, UploadMixin, API):
 @ns.route("/<dataset:dataset>/resources/<uuid:rid>/", endpoint="resource", doc=common_doc)
 @api.param("rid", "The resource unique identifier")
 class ResourceAPI(ResourceMixin, API):
+    # GET: public resource read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("get_resource")
     @api.marshal_with(resource_fields)
     def get(self, dataset, rid):
@@ -1035,11 +1053,17 @@ class ResourceAPI(ResourceMixin, API):
 @ns.route("/community_resources/", endpoint="community_resources")
 class CommunityResourcesAPI(API):
     # Per-user rate-limit on POST to prevent mass-submission abuse (VULN-2078).
-    # GET (listing) is unaffected because the limit is method-scoped.
+    # GET (public listing): keep out of the IP-keyed default that collapses
+    # site-wide behind the F5/WAF (see PUBLIC_READ_LIMIT).
     decorators = [
         limiter.limit(
             CONTENT_CREATE_LIMIT,
             methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_READ_LIMIT,
+            methods=["GET"],
             key_func=user_or_ip,
         ),
     ]
@@ -1105,6 +1129,9 @@ class CommunityResourcesAPI(API):
 @ns.route("/community_resources/<crid:community>/", endpoint="community_resource", doc=common_doc)
 @api.param("community", "The community resource unique identifier")
 class CommunityResourceAPI(API):
+    # GET: public read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("retrieve_community_resource")
     @api.marshal_with(community_resource_fields)
     def get(self, community):
@@ -1163,6 +1190,10 @@ suggest_parser.add_argument(
 
 @ns.route("/suggest/", endpoint="suggest_datasets")
 class DatasetSuggestAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_datasets")
     @api.expect(suggest_parser)
     @api.marshal_with(dataset_suggestion_fields)
@@ -1194,6 +1225,10 @@ class DatasetSuggestAPI(API):
 
 @ns.route("/suggest/formats/", endpoint="suggest_formats")
 class FormatsSuggestAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_formats")
     @api.expect(suggest_parser)
     def get(self):
@@ -1210,6 +1245,10 @@ class FormatsSuggestAPI(API):
 
 @ns.route("/suggest/mime/", endpoint="suggest_mime")
 class MimesSuggestAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_mime")
     @api.expect(suggest_parser)
     def get(self):
@@ -1224,6 +1263,10 @@ class MimesSuggestAPI(API):
 
 @ns.route("/licenses/", endpoint="licenses")
 class LicensesAPI(API):
+    # GET: public reference list used to build filters; keep out of the IP-keyed
+    # default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("list_licenses")
     @api.marshal_list_with(license_fields)
     def get(self):
@@ -1233,6 +1276,10 @@ class LicensesAPI(API):
 
 @ns.route("/frequencies/", endpoint="dataset_frequencies")
 class FrequenciesAPI(API):
+    # GET: public reference list used to build filters; keep out of the IP-keyed
+    # default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("list_frequencies")
     @api.marshal_list_with(frequency_fields)
     def get(self):
@@ -1242,6 +1289,9 @@ class FrequenciesAPI(API):
 
 @ns.route("/extensions/", endpoint="allowed_extensions")
 class AllowedExtensionsAPI(API):
+    # GET: public reference list; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("allowed_extensions")
     @api.response(200, "Success", [str])
     def get(self):
@@ -1251,6 +1301,9 @@ class AllowedExtensionsAPI(API):
 
 @ns.route("/resource_types/", endpoint="resource_types")
 class ResourceTypesAPI(API):
+    # GET: public reference list; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("resource_types")
     @api.marshal_list_with(resource_type_fields)
     def get(self):
@@ -1260,6 +1313,10 @@ class ResourceTypesAPI(API):
 
 @ns.route("/schemas/", endpoint="schemas")
 class SchemasAPI(API):
+    # GET: public reference list used to build filters; keep out of the IP-keyed
+    # default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("schemas")
     @api.marshal_list_with(catalog_schema_fields)
     def get(self):

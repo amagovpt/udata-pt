@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **fix: lift public READ endpoints (suggest/detail/reference) out of the IP-keyed rate-limit**
+  - Fourth IP-collapse fix after public-search (#89), download/export/feed (#90)
+    and uploads (#91). Many anonymous GET endpoints the SSR/public pages hit
+    live (not ISR cached) carried no explicit limit, so they fell under the
+    IP-keyed `RATELIMIT_DEFAULT` ("200 per hour"). Behind the F5/WAF every
+    visitor reaches the backend from one origin IP, so that ceiling became a
+    shared site-wide cap: once aggregate read volume crossed it, every anonymous
+    visitor got 429 and the public pages stopped rendering. The worst offenders
+    are the `*/suggest/` typeahead endpoints (fired per keystroke).
+  - Adds `PUBLIC_READ_LIMIT` (`300/min; 6000/h`, `user_or_ip`, no per-day cap)
+    and applies it, method-scoped to GET, to entity detail reads
+    (`/datasets/<id>/`, `/organizations/<org>/`, `/reuses/<reuse>/`,
+    `/dataservices/<id>/`, resources, community resources), public sub-listings
+    (`/organizations/<org>/datasets|reuses|discussions/`, discussions list,
+    posts) and reference-data lists (`licenses`, `frequencies`, `schemas`,
+    `resource_types`, `extensions`, `badges`, spatial `levels`/`granularities`,
+    reuse `types`/`topics`). The `*/suggest/` typeahead endpoints reuse
+    `PUBLIC_SEARCH_LIMIT` (they are search-backed).
+  - Regression test: `udata/tests/api/test_public_read_ratelimit_ip_collapse.py`.
+
 - **fix: lift authenticated file-upload endpoints out of the IP-keyed rate-limit**
   - Third companion to the public-search (PR #89) and download/export/feed
     (PR #90) IP-collapse fixes. Several authenticated upload endpoints carried

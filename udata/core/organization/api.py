@@ -9,6 +9,7 @@ from udata.api import API, api, errors
 from udata.api.limits import (
     EXPORT_LIMIT,
     HEAVY_CREATE_LIMIT,
+    PUBLIC_READ_LIMIT,
     PUBLIC_SEARCH_LIMIT,
     UPLOAD_LIMIT,
     user_or_ip,
@@ -195,6 +196,9 @@ org_delete_parser = add_send_legal_notice_argument(api.parser())
 @api.response(404, "Organization not found")
 @api.response(410, "Organization has been deleted")
 class OrganizationAPI(API):
+    # GET: public detail read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("get_organization")
     @api.marshal_with(org_fields)
     def get(self, org):
@@ -342,6 +346,10 @@ class OrganizationRdfFormatAPI(API):
 
 @ns.route("/badges/", endpoint="available_organization_badges")
 class AvailableOrganizationBadgesAPI(API):
+    # GET: public reference list used to build filters; keep out of the IP-keyed
+    # default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("available_organization_badges")
     def get(self):
         """List all available organization badges and their labels"""
@@ -393,6 +401,10 @@ suggest_parser.add_argument(
 
 @ns.route("/<org:org>/contacts/suggest/", endpoint="suggest_org_contact_points")
 class ContactPointSuggestAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_org_contact_points")
     @api.expect(suggest_parser)
     @api.marshal_list_with(ContactPoint.__read_fields__)
@@ -825,6 +837,10 @@ class FollowOrgAPI(FollowAPI):
 
 @ns.route("/suggest/", endpoint="suggest_organizations")
 class OrganizationSuggestAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_organizations")
     @api.expect(suggest_parser)
     @api.marshal_list_with(org_suggestion_fields)
@@ -886,6 +902,10 @@ dataset_parser = DatasetApiParser()
 
 @ns.route("/<org:org>/datasets/", endpoint="org_datasets")
 class OrgDatasetsAPI(API):
+    # GET: public sub-listing on the org page; keep out of the IP-keyed default
+    # (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("list_organization_datasets")
     @api.expect(dataset_parser.parser)
     @api.marshal_with(dataset_page_fields)
@@ -901,6 +921,10 @@ class OrgDatasetsAPI(API):
 
 @ns.route("/<org:org>/reuses/", endpoint="org_reuses")
 class OrgReusesAPI(API):
+    # GET: public sub-listing on the org page; keep out of the IP-keyed default
+    # (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("list_organization_reuses")
     @api.marshal_list_with(Reuse.__read_fields__)
     def get(self, org):
@@ -913,6 +937,10 @@ class OrgReusesAPI(API):
 
 @ns.route("/<org:org>/discussions/", endpoint="org_discussions")
 class OrgDiscussionsAPI(API):
+    # GET: public sub-listing on the org page; keep out of the IP-keyed default
+    # (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("list_organization_discussions")
     @api.marshal_list_with(discussion_fields)
     def get(self, org):

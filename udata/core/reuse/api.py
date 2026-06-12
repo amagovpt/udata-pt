@@ -10,6 +10,7 @@ from udata.api import API, api, errors
 from udata.api.limits import (
     CONTENT_CREATE_LIMIT,
     FEED_LIMIT,
+    PUBLIC_READ_LIMIT,
     PUBLIC_SEARCH_LIMIT,
     UPLOAD_LIMIT,
     user_or_ip,
@@ -236,6 +237,9 @@ reuse_delete_parser = add_send_legal_notice_argument(api.parser())
 @api.response(404, "Reuse not found")
 @api.response(410, "Reuse has been deleted")
 class ReuseAPI(API):
+    # GET: public detail read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("get_reuse")
     @api.marshal_with(Reuse.__read_fields__)
     def get(self, reuse):
@@ -349,6 +353,10 @@ class ReuseDataservicesAPI(API):
 
 @ns.route("/badges/", endpoint="available_reuse_badges")
 class AvailableDatasetBadgesAPI(API):
+    # GET: public reference list used to build filters; keep out of the IP-keyed
+    # default (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("available_reuse_badges")
     def get(self):
         """List all available reuse badges and their labels"""
@@ -416,6 +424,10 @@ suggest_parser.add_argument(
 
 @ns.route("/suggest/", endpoint="suggest_reuses")
 class ReusesSuggestAPI(API):
+    # GET: typeahead fired per keystroke; keep out of the IP-keyed default that
+    # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
+    decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("suggest_reuses")
     @api.expect(suggest_parser)
     @api.marshal_list_with(reuse_suggestion_fields)
@@ -466,6 +478,9 @@ class ReuseImageAPI(API):
 
 @ns.route("/types/", endpoint="reuse_types")
 class ReuseTypesAPI(API):
+    # GET: public reference list; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("reuse_types")
     @api.marshal_list_with(reuse_type_fields)
     def get(self):
@@ -475,6 +490,9 @@ class ReuseTypesAPI(API):
 
 @ns.route("/topics/", endpoint="reuse_topics")
 class ReuseTopicsAPI(API):
+    # GET: public reference list; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("reuse_topics")
     @api.marshal_list_with(reuse_topic_fields)
     def get(self):

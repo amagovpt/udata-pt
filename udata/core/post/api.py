@@ -5,7 +5,7 @@ from flask import make_response, request
 from flask_login import current_user
 
 from udata.api import API, api
-from udata.api.limits import FEED_LIMIT, UPLOAD_LIMIT, user_or_ip
+from udata.api.limits import FEED_LIMIT, PUBLIC_READ_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api_fields import patch, patch_and_save
 from udata.app import limiter
 from udata.auth import Permission as AdminPermission
@@ -36,6 +36,10 @@ parser.add_argument(
 
 @ns.route("/", endpoint="posts")
 class PostsAPI(API):
+    # GET: public posts listing; keep out of the IP-keyed default that collapses
+    # site-wide behind the F5/WAF (see PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("list_posts")
     @api.expect(parser)
     @api.marshal_with(Post.__page_fields__)
@@ -103,6 +107,9 @@ class PostsAtomFeedAPI(API):
 @api.response(404, "Object not found")
 @api.param("post", "The post ID or slug")
 class PostAPI(API):
+    # GET: public detail read; keep out of the IP-keyed default (PUBLIC_READ_LIMIT).
+    decorators = [limiter.limit(PUBLIC_READ_LIMIT, methods=["GET"], key_func=user_or_ip)]
+
     @api.doc("get_post")
     @api.marshal_with(Post.__read_fields__)
     def get(self, post):
