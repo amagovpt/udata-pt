@@ -1889,6 +1889,18 @@ msgstr "Coletividades ultramarinas francesas"
 msgid "French arrondissement"
 msgstr "Quarteirão francês"
 
+#: udata/core/spatial/translations.py:24
+msgid "District"
+msgstr "Distrito"
+
+#: udata/core/spatial/translations.py:25
+msgid "County"
+msgstr "Concelho"
+
+#: udata/core/spatial/translations.py:26
+msgid "Parish"
+msgstr "Freguesia"
+
 #: udata/core/topic/activities.py:27
 msgid "created a topic"
 msgstr "criou um tema"
