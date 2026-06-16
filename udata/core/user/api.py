@@ -8,7 +8,6 @@ from slugify import slugify
 from udata.api import API, api
 from udata.api.limits import IDENTITY_READ_LIMIT, PUBLIC_SEARCH_LIMIT, UPLOAD_LIMIT, user_or_ip
 from udata.api.parsers import ModelApiParser
-from udata.utils import Paginable
 from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.api_token.api import apitoken_created_fields
@@ -26,7 +25,16 @@ from udata.core.storages.api import (
     uploaded_image_fields,
 )
 from udata.core.user.models import Role
-from udata.models import CommunityResource, Dataset, Follow, Organization, Reuse, User
+from udata.models import (
+    CommunityResource,
+    Dataservice,
+    Dataset,
+    Follow,
+    Organization,
+    Reuse,
+    User,
+)
+from udata.utils import Paginable
 
 from .api_fields import (
     me_metrics_fields,
@@ -171,6 +179,16 @@ class MyDatasetsAPI(API):
     def get(self):
         """List all my datasets (including private ones)"""
         return list(Dataset.objects.owned_by(current_user.id))
+
+
+@me.route("/dataservices/", endpoint="my_dataservices")
+class MyDataservicesAPI(API):
+    @api.secure
+    @api.doc("my_dataservices")
+    @api.marshal_list_with(Dataservice.__read_fields__)
+    def get(self):
+        """List all my dataservices (including private ones)"""
+        return list(Dataservice.objects.owned_by(current_user.id))
 
 
 @me.route("/metrics/", endpoint="my_metrics")
