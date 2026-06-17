@@ -213,7 +213,7 @@ class Organization(
 
     meta = {
         "indexes": [
-            "$name",
+            {"fields": ["$name", "$description", "$acronym"]},
             "created_at",
             "slug",
             "metrics.reuses",

@@ -193,7 +193,7 @@ class Reuse(
 
     meta = {
         "indexes": [
-            "$title",
+            {"fields": ["$title", "$description"]},
             "created_at",
             "last_modified",
             "metrics.datasets",

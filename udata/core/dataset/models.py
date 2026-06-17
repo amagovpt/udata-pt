@@ -660,7 +660,7 @@ class Dataset(
 
     meta = {
         "indexes": [
-            "$title",
+            {"fields": ["$title", "$description", "$acronym"]},
             "created_at_internal",
             "last_modified_internal",
             "metrics.reuses",

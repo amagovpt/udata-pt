@@ -2365,6 +2365,51 @@ class DatasetResourceAPITest(APITestCase):
         self.assert200(response)
         self.assertEqual(len(response.json), 0)
 
+    def test_suggest_datasets_api_description(self):
+        """It should suggest datasets that match in the description field"""
+        for i in range(3):
+            DatasetFactory(
+                title=faker.unique_string(),
+                acronym=None,
+                description="irrelevant-content",
+                visible=True,
+            )
+        target = DatasetFactory(
+            title=faker.unique_string(),
+            acronym=None,
+            description="xdesctoken-abc unique term in description",
+            visible=True,
+            metrics={"followers": 10},
+        )
+
+        response = self.get(url_for("api.suggest_datasets", q="xdesctoken-abc", size=5))
+        self.assert200(response)
+
+        ids = [s["id"] for s in response.json]
+        self.assertIn(str(target.id), ids)
+
+    def test_suggest_datasets_api_description_only(self):
+        """It should suggest a dataset when query matches only description, not title or acronym"""
+        DatasetFactory(
+            title="quite-different-title-w",
+            acronym=None,
+            description="unrelated-content-z",
+            visible=True,
+        )
+        target = DatasetFactory(
+            title="quite-different-title-z",
+            acronym=None,
+            description="ydesconly-xyz appears only in the description field",
+            visible=True,
+        )
+
+        response = self.get(url_for("api.suggest_datasets", q="ydesconly-xyz", size=5))
+        self.assert200(response)
+
+        self.assertEqual(len(response.json), 1)
+        self.assertEqual(response.json[0]["id"], str(target.id))
+        self.assertNotIn("ydesconly-xyz", response.json[0]["title"])
+
 
 class DatasetReferencesAPITest(APITestCase):
     def test_dataset_licenses_list(self):

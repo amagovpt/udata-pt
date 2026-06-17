@@ -136,7 +136,9 @@ class OrgApiParser(ModelApiParser):
         if args.get("q"):
             query_str = normalize_search_query(args["q"])
             organizations = organizations.filter(
-                Q(name__icontains=query_str) | Q(acronym__icontains=query_str)
+                Q(name__icontains=query_str)
+                | Q(acronym__icontains=query_str)
+                | Q(description__icontains=query_str)
             )
         if args.get("badge"):
             organizations = organizations.filter(badges__kind__in=args["badge"])
@@ -877,7 +879,10 @@ class OrganizationSuggestAPI(API):
         """Organizations suggest endpoint using mongoDB contains"""
         args = suggest_parser.parse_args()
         orgs = Organization.objects(
-            Q(name__icontains=args["q"]) | Q(acronym__icontains=args["q"]), deleted=None
+            Q(name__icontains=args["q"])
+            | Q(acronym__icontains=args["q"])
+            | Q(description__icontains=args["q"]),
+            deleted=None,
         )
         return [
             {
