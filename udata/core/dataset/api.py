@@ -1202,7 +1202,9 @@ class DatasetSuggestAPI(API):
         args = suggest_parser.parse_args()
         datasets_query = Dataset.objects(archived=None, deleted=None, private=False)
         datasets = datasets_query.filter(
-            Q(title__icontains=args["q"]) | Q(acronym__icontains=args["q"])
+            Q(title__icontains=args["q"])
+            | Q(acronym__icontains=args["q"])
+            | Q(description__icontains=args["q"])
         )
         return [
             {
