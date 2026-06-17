@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from udata.app import create_app
+
 # Pre-register all referenced documents — Reuse references Dataservice, etc.
 from udata.core.dataservices.models import Dataservice  # noqa: F401
 from udata.core.dataset.models import Dataset, License, Resource
@@ -39,6 +40,8 @@ DATASET_TITLE = "E2E Test Dataset"
 DATASET_SLUG = "e2e-test-dataset"
 REUSE_TITLE = "E2E Test Reuse"
 REUSE_SLUG = "e2e-test-reuse"
+DATASERVICE_TITLE = "E2E Test Dataservice"
+DATASERVICE_SLUG = "e2e-test-dataservice"
 RESOURCE_TITLE = "E2E Test Resource"
 
 # XSS regression fixtures (consumed by tests/e2e/frontend-vulnerabilities/).
@@ -159,6 +162,25 @@ def get_or_create_reuse(org: Organization, dataset: Dataset) -> Reuse:
     return reuse
 
 
+def get_or_create_dataservice(org: Organization) -> Dataservice:
+    dataservice = Dataservice.objects(slug=DATASERVICE_SLUG).first()
+    if dataservice:
+        return dataservice
+
+    dataservice = Dataservice(
+        title=DATASERVICE_TITLE,
+        slug=DATASERVICE_SLUG,
+        description="Dataservice auto-created by the e2e seed script.",
+        base_api_url="https://example.com/e2e-api",
+        access_type="open",
+        organization=org,
+        tags=["e2e", "test-fixture"],
+        private=False,
+    )
+    dataservice.save()
+    return dataservice
+
+
 def get_or_create_xss_org(admin: User, editor: User) -> Organization:
     org = Organization.objects(slug=XSS_ORG_SLUG).first()
     if org is None:
@@ -256,8 +278,7 @@ def main() -> int:
         editor = User.objects(email=EDITOR_EMAIL).first()
         if editor is None:
             print(
-                f"ERROR: editor user {EDITOR_EMAIL!r} not found — run "
-                "`udata user create` first.",
+                f"ERROR: editor user {EDITOR_EMAIL!r} not found — run `udata user create` first.",
                 file=sys.stderr,
             )
             return 1
@@ -265,6 +286,7 @@ def main() -> int:
         org = get_or_create_org(admin, editor)
         dataset = get_or_create_dataset(org)
         reuse = get_or_create_reuse(org, dataset)
+        dataservice = get_or_create_dataservice(org)
         xss_org = get_or_create_xss_org(admin, editor)
         xss_dataset = get_or_create_xss_dataset(xss_org)
         xss_reuse = get_or_create_xss_reuse(xss_org, xss_dataset)
@@ -287,6 +309,11 @@ def main() -> int:
                 "id": str(reuse.id),
                 "slug": reuse.slug,
                 "title": reuse.title,
+            },
+            "dataservice": {
+                "id": str(dataservice.id),
+                "slug": dataservice.slug,
+                "title": dataservice.title,
             },
             "xss_organization": {
                 "id": str(xss_org.id),
