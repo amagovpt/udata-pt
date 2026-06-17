@@ -162,9 +162,14 @@ def get_or_create_reuse(org: Organization, dataset: Dataset) -> Reuse:
     return reuse
 
 
-def get_or_create_dataservice(org: Organization) -> Dataservice:
+def get_or_create_dataservice(org: Organization, dataset: Dataset) -> Dataservice:
     dataservice = Dataservice.objects(slug=DATASERVICE_SLUG).first()
     if dataservice:
+        # Ensure the dataservice references the e2e dataset so the dataset's
+        # "Reutilizações e APIs" tab has an API to display.
+        if dataset.id not in [d.id for d in (dataservice.datasets or [])]:
+            dataservice.datasets.append(dataset)
+            dataservice.save()
         return dataservice
 
     dataservice = Dataservice(
@@ -175,6 +180,7 @@ def get_or_create_dataservice(org: Organization) -> Dataservice:
         access_type="open",
         organization=org,
         tags=["e2e", "test-fixture"],
+        datasets=[dataset],
         private=False,
     )
     dataservice.save()
@@ -286,7 +292,7 @@ def main() -> int:
         org = get_or_create_org(admin, editor)
         dataset = get_or_create_dataset(org)
         reuse = get_or_create_reuse(org, dataset)
-        dataservice = get_or_create_dataservice(org)
+        dataservice = get_or_create_dataservice(org, dataset)
         xss_org = get_or_create_xss_org(admin, editor)
         xss_dataset = get_or_create_xss_dataset(xss_org)
         xss_reuse = get_or_create_xss_reuse(xss_org, xss_dataset)
