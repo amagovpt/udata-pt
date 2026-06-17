@@ -84,6 +84,41 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         assert200(response)
         assert len(response.json["data"]) == 0
 
+    def test_organization_api_search_by_name_and_acronym(self):
+        """The q search should match name and acronym, ignoring case and accents."""
+        arte = OrganizationFactory(
+            name="Agência para a Reforma Tecnológica do Estado", acronym="ARTE"
+        )
+        OrganizationFactory(name="Some other organization", acronym="SOO")
+
+        def search_ids(q):
+            response = self.get(url_for("api.organizations", q=q))
+            assert200(response)
+            return {o["id"] for o in response.json["data"]}
+
+        # Acronym match (the ARTE -> Agência... acceptance case).
+        assert str(arte.id) in search_ids("ARTE")
+        assert str(arte.id) in search_ids("arte")
+        # Accent-insensitive name match: accent-less input finds the accented name.
+        assert str(arte.id) in search_ids("agencia")
+        assert str(arte.id) in search_ids("Agência")
+        assert str(arte.id) in search_ids("reforma tecnologica")
+
+    def test_organization_suggest_by_name_and_acronym(self):
+        """The suggest endpoint should match name and acronym, ignoring accents."""
+        arte = OrganizationFactory(
+            name="Agência para a Reforma Tecnológica do Estado", acronym="ARTE"
+        )
+
+        def suggest_ids(q):
+            response = self.get(url_for("api.suggest_organizations", q=q))
+            assert200(response)
+            return {o["id"] for o in response.json}
+
+        assert str(arte.id) in suggest_ids("ARTE")
+        assert str(arte.id) in suggest_ids("agencia")
+        assert str(arte.id) in suggest_ids("Agência")
+
     def test_organization_role_api_get(self):
         """It should fetch an organization's roles list from the API"""
         response = self.get(url_for("api.org_roles"))
