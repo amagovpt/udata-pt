@@ -99,18 +99,24 @@ def get_or_create_org(admin: User, editor: User) -> Organization:
         if wanted:
             org.members.extend(wanted)
             org.save()
-        return org
+    else:
+        org = Organization(
+            name=ORG_NAME,
+            slug=ORG_SLUG,
+            description="Organisation auto-created by the e2e seed script.",
+            members=[
+                Member(user=admin, role="admin"),
+                Member(user=editor, role="editor"),
+            ],
+        )
+        org.save()
 
-    org = Organization(
-        name=ORG_NAME,
-        slug=ORG_SLUG,
-        description="Organisation auto-created by the e2e seed script.",
-        members=[
-            Member(user=admin, role="admin"),
-            Member(user=editor, role="editor"),
-        ],
-    )
-    org.save()
+    # Ensure the org carries badges (etiquetas) so the frontoffice badge
+    # visibility tests (LEDG-1919) have deterministic data. add_badge is
+    # idempotent.
+    for kind in ("public-service", "certified"):
+        org.add_badge(kind)
+
     return org
 
 
