@@ -30,6 +30,11 @@ REUSE_TOPICS = {
 }
 
 
+# Lifecycle statuses used by the admin/backoffice listing to filter reuses
+# server-side. Mirrors the frontend `StatusFilter` union (StatusFilterSelect).
+REUSE_STATUSES = ("public", "draft", "archived", "deleted")
+
+
 IMAGE_SIZES = [500, 100, 50, 25]
 IMAGE_MAX_SIZE = 800
 

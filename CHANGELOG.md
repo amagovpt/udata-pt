@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **feat: add server-side `status` filter to `GET /api/1/reuses/`**
+  - The admin/backoffice reuses listing previously filtered by lifecycle status
+    (public/draft/archived/deleted) client-side, over the current page only, so
+    "show deleted" missed every match outside the visible page.
+  - Adds a `status` standalone filter (enum `public`, `draft`, `archived`,
+    `deleted`) wired through the existing `api_fields` parser, so it is enforced
+    in MongoDB and auto-documented in Swagger. It only narrows the base query
+    (which already enforces ownership/visibility via `visible_by_user`), so a
+    non-admin can never widen what they see; an unknown value returns `400`.
+  - Regression tests in `udata/tests/api/test_reuses_api.py`
+    (`test_reuse_api_list_filter_status*`).
+
 - **fix: lift public READ endpoints (suggest/detail/reference) out of the IP-keyed rate-limit**
   - Fourth IP-collapse fix after public-search (#89), download/export/feed (#90)
     and uploads (#91). Many anonymous GET endpoints the SSR/public pages hit

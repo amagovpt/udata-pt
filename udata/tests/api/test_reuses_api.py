@@ -236,6 +236,61 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         assert200(response)
         assert len(response.json["data"]) == 0
 
+    def test_reuse_api_list_filter_status(self) -> None:
+        """Should filter reuses by lifecycle status for the admin/backoffice."""
+        public_reuse: Reuse = ReuseFactory()
+        draft_reuse: Reuse = ReuseFactory(private=True)
+        archived_reuse: Reuse = ReuseFactory(archived=datetime.now(UTC))
+        deleted_reuse: Reuse = ReuseFactory(deleted=datetime.now(UTC))
+
+        # A sysadmin sees every reuse by default (no status filter).
+        self.login(AdminFactory())
+        response: TestResponse = self.get(url_for("api.reuses"))
+        assert200(response)
+        assert len(response.json["data"]) == 4
+
+        # status=public -> only the public reuse
+        response = self.get(url_for("api.reuses", status="public"))
+        assert200(response)
+        assert len(response.json["data"]) == 1
+        assert reuse_in_response(response, public_reuse)
+
+        # status=draft -> only the private reuse
+        response = self.get(url_for("api.reuses", status="draft"))
+        assert200(response)
+        assert len(response.json["data"]) == 1
+        assert reuse_in_response(response, draft_reuse)
+
+        # status=archived -> only the archived reuse
+        response = self.get(url_for("api.reuses", status="archived"))
+        assert200(response)
+        assert len(response.json["data"]) == 1
+        assert reuse_in_response(response, archived_reuse)
+
+        # status=deleted -> only the deleted reuse
+        response = self.get(url_for("api.reuses", status="deleted"))
+        assert200(response)
+        assert len(response.json["data"]) == 1
+        assert reuse_in_response(response, deleted_reuse)
+
+    def test_reuse_api_list_filter_status_invalid(self) -> None:
+        """An unknown status value should be rejected."""
+        ReuseFactory()
+        response: TestResponse = self.get(url_for("api.reuses", status="bogus"))
+        assert400(response)
+
+    def test_reuse_api_list_filter_status_scoped_to_visibility(self) -> None:
+        """status=deleted must not leak reuses the user cannot see."""
+        user = UserFactory()
+        own_deleted: Reuse = ReuseFactory(deleted=datetime.now(UTC), owner=user)
+        other_deleted: Reuse = ReuseFactory(deleted=datetime.now(UTC))
+
+        self.login(user)
+        response: TestResponse = self.get(url_for("api.reuses", status="deleted"))
+        assert200(response)
+        assert reuse_in_response(response, own_deleted)
+        assert not reuse_in_response(response, other_deleted)
+
     def test_reuse_api_get(self):
         """It should fetch a reuse from the API"""
         reuse = ReuseFactory()

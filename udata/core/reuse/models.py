@@ -39,7 +39,7 @@ from udata.mongo.url_field import URLField
 from udata.uris import cdata_url
 from udata.utils import hash_url
 
-from .constants import IMAGE_MAX_SIZE, IMAGE_SIZES, REUSE_TOPICS, REUSE_TYPES
+from .constants import IMAGE_MAX_SIZE, IMAGE_SIZES, REUSE_STATUSES, REUSE_TOPICS, REUSE_TYPES
 
 __all__ = ("Reuse",)
 
@@ -58,6 +58,24 @@ def check_url_does_not_exists(url, **_kwargs):
     """Ensure a reuse URL is not yet registered"""
     if url and Reuse.url_exists(url):
         raise FieldValidationError(_("This URL is already registered"), field="url")
+
+
+def filter_by_status(base_query, filter_value):
+    """Filter reuses by lifecycle status for the admin/backoffice listing.
+
+    Mirrors the frontend `filterByStatus` semantics. Only narrows the base
+    queryset (which already enforces ownership/visibility via
+    `visible_by_user`), so a non-admin can never widen their visibility here.
+    """
+    if filter_value == "public":
+        return base_query.filter(private__ne=True, archived=None, deleted=None)
+    elif filter_value == "draft":
+        return base_query.filter(private=True, archived=None, deleted=None)
+    elif filter_value == "archived":
+        return base_query.filter(archived__ne=None, deleted=None)
+    elif filter_value == "deleted":
+        return base_query.filter(deleted__ne=None)
+    return base_query
 
 
 # Uses __badges__ (not available_badges) so that existing badges in DB
@@ -86,6 +104,14 @@ class ReuseBadgeMixin(BadgeMixin):
         {"key": "views", "value": "metrics.views"},
     ],
     nested_filters={"organization_badge": "organization.badges"},
+    standalone_filters=[
+        {
+            "key": "status",
+            "query": filter_by_status,
+            "type": str,
+            "choices": list(REUSE_STATUSES),
+        },
+    ],
     mask="*,datasets{id,title,uri,page}",
 )
 class Reuse(
