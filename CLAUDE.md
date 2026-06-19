@@ -62,10 +62,62 @@ uv run ruff format .
 ## Key Conventions
 
 - Pre-commit hooks: ruff check, ruff format, trailing whitespace, end-of-file fixer
-- Commit messages: readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
+- Commit messages: follow [Conventional Commits](#branch--commit-conventions), readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
+- Branches: follow [Conventional Branch](#branch--commit-conventions) (`<type>/<kebab-case-description>`).
 - Update CHANGELOG.md when making notable changes
 - Tests use pytest with MongoDB (port 27018 via docker-compose.test.yml)
 - Coverage config in `coverage.rc` (branch coverage, excludes test dirs)
+
+## Branch & Commit Conventions
+
+All contributors must follow these conventions. References:
+[Conventional Branch](https://conventionalbranch.org/) and [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
+
+### Branches — Conventional Branch
+
+Format: `<type>/<description>`
+
+- **Description** in `kebab-case`, lowercase, alphanumerics and hyphens only (no spaces, `_`, uppercase, or special chars).
+- Optionally include the issue/ticket number: `feature/issue-123-public-search-ratelimit`.
+
+| Prefix     | Use                                                       |
+| ---------- | --------------------------------------------------------- |
+| `main`     | Main production branch (no prefix).                       |
+| `feature/` | New feature.                                              |
+| `bugfix/`  | Bug fix.                                                  |
+| `hotfix/`  | Urgent fix (typically against production).                |
+| `release/` | Release preparation.                                      |
+| `chore/`   | Tasks with no production-code impact (deps, config).      |
+
+Examples: `feature/aggregated-home-endpoint`, `bugfix/csrf-session-overwrite`, `chore/bump-backend-submodule`, `hotfix/download-ratelimit`.
+
+### Commits — Conventional Commits 1.0.0
+
+Format:
+
+```
+<type>[optional scope][!]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+- **type** (required): `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+- **scope** (optional): affected area, e.g. `feat(dataset):`, `fix(api):`.
+- **description**: imperative, lowercase, in English, no trailing period.
+- **`feat`** → _MINOR_ bump; **`fix`** → _PATCH_ bump.
+- **Breaking changes**: `!` after type/scope (e.g. `feat(api)!:`) and/or a `BREAKING CHANGE: <description>` footer.
+- Reference issues in the footer or description: `(fix #XXX)`.
+
+Examples:
+
+```
+feat(search): add user_or_ip rate-limit to public GET endpoints
+fix(auth): mint CSRF server-side on authenticated POSTs (fix #42)
+chore: bump backend submodule for public download rate-limit fix
+refactor(home): add aggregated /api/1/site/home/ endpoint
+```
 
 ## Important Paths
 
