@@ -22,7 +22,7 @@ inv beat
 udata init
 
 # Run migrations
-udata db upgrade
+udata db migrate
 
 # Run tests (needs MongoDB on port 27018)
 docker compose -f docker-compose.test.yml up -d
