@@ -81,6 +81,27 @@ def api_upload_status(status):
     return on_upload_status(status)
 
 
+def is_chunk_part():
+    """Return True when the current request is an intermediate chunk part of a
+    chunked upload (a part that carries file bytes), as opposed to the final
+    combine request or a whole-file upload.
+
+    Used as `exempt_when` on the upload rate-limiters: a chunked upload splits
+    one logical upload into N small part-POSTs plus a final combine-POST, and
+    only the combine (or a whole-file upload) actually creates the resource.
+    Without this, a single large file would burst far past UPLOAD_LIMIT and get
+    429'd mid-upload; exempting the cheap parts keeps the limit a per-upload
+    abuse ceiling regardless of file size.
+    """
+    from flask import request
+
+    try:
+        totalparts = int(request.form.get("totalparts") or 0)
+    except (TypeError, ValueError):
+        totalparts = 0
+    return totalparts > 1 and "file" in request.files
+
+
 def chunk_filename(uuid, part):
     return os.path.join(str(uuid), str(part))
 
