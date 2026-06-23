@@ -22,7 +22,7 @@ inv beat
 udata init
 
 # Run migrations
-udata db upgrade
+udata db migrate
 
 # Run tests (needs MongoDB on port 27018)
 docker compose -f docker-compose.test.yml up -d
@@ -90,6 +90,18 @@ Format: `<type>/<description>`
 | `chore/`   | Tasks with no production-code impact (deps, config).      |
 
 Examples: `feature/aggregated-home-endpoint`, `bugfix/csrf-session-overwrite`, `chore/bump-backend-submodule`, `hotfix/download-ratelimit`.
+
+### Environment Promotion Flow
+
+This backend repo (`github.com/amagovpt/udata-pt`) has long-lived environment branches `develop`, `tst`, `ppr`, `main`. Promote changes upwards through PRs, one environment at a time:
+
+1. Branch **from `develop`** (using the Conventional Branch naming above).
+2. When ready, open a PR back **into `develop`**; integrate and test there.
+3. Then a PR **into `tst`**; test in tst.
+4. Then a PR **into `ppr`**; test in ppr.
+5. Then a PR **into `main`** (production).
+
+> The PR base is always the **next environment up**, not always `main`. Apply this flow only when the change touches this repo. GitHub CLI (`gh`) is not installed here — open PRs via the compare URL `https://github.com/amagovpt/udata-pt/compare/<base>...<head>?expand=1`. See the monorepo `CLAUDE.md` for the cross-repo rule.
 
 ### Commits — Conventional Commits 1.0.0
 
