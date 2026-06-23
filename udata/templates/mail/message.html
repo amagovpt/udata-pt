@@ -24,7 +24,9 @@
                 <p style="margin-bottom: 15px;"><strong>{{ item.label }}</strong> {{ item.truncated_content }}</p>
             {% else %}
                 <p style="margin-bottom: 5px; font-weight: bold;">{{ item.label }}</p>
-                <p style="margin-bottom: 15px; margin-top: 0; font-style: italic;">{{ item.truncated_content }}</p>
+                {% for paragraph in item.truncated_content.replace('\r\n', '\n').replace('\r', '\n').split('\n\n') %}
+                <p style="margin-bottom: 15px; margin-top: 0; font-style: italic;">{% for line in paragraph.split('\n') %}{{ line }}{% if not loop.last %}<br>{% endif %}{% endfor %}</p>
+                {% endfor %}
             {% endif %}
         {% elif item.__class__.__name__ == 'ParagraphWithLinks' %}
             <p style="margin-bottom: 15px;">{{ item.html|safe }}</p>
