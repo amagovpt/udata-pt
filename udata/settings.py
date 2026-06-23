@@ -516,6 +516,11 @@ class Defaults(object):
     # How much time upload chunks are kept before cleanup
     UPLOAD_MAX_RETENTION = 24 * HOUR
 
+    # Maximum size (bytes) for an uploaded resource file. Enforced server-side
+    # in storages.api.handle_upload (the client-side guard in the frontend is
+    # bypassable). Applies to the reassembled file for chunked uploads.
+    RESOURCES_FILE_MAX_SIZE = 800 * 1024 * 1024
+
     # Avatar providers parameters
     # Overrides themes and default parameters
     # if set to anything else than `None`
