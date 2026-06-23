@@ -19,12 +19,19 @@ def support_contact(
     """Mail composed when a portal visitor submits the support form."""
     topic_label = SUPPORT_TOPIC_LABELS.get(topic, _("Support"))
     return MailMessage(
-        subject=_("[%(site)s] %(topic)s — %(subject)s", site="dados.gov.pt", topic=topic_label, subject=subject),
+        subject=_(
+            "[%(site)s] %(topic)s — %(subject)s",
+            site="dados.gov.pt",
+            topic=topic_label,
+            subject=subject,
+        ),
         paragraphs=[
             _("A portal visitor submitted the support form."),
             LabelledContent(_("Topic:"), str(topic_label), inline=True),
             LabelledContent(_("From:"), sender_email, inline=True),
             LabelledContent(_("Subject:"), subject, inline=True),
-            LabelledContent(_("Message:"), message),
+            # Keep the full message: the support form allows up to 5000 chars
+            # and the body carries the structured header (category, URL, datetime).
+            LabelledContent(_("Message:"), message, truncated_at=5000),
         ],
     )
