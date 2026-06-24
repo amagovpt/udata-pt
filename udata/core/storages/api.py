@@ -141,19 +141,52 @@ def combine_chunks(storage, args, prefix=None):
     Goes through each part, in order,
     and appends that part's bytes to another destination file.
     Chunks are stored in the chunks storage.
+
+    Aborts early (without leaving the partial file behind) if the reassembled
+    size would exceed RESOURCES_FILE_MAX_SIZE, so an oversized upload never gets
+    fully written to disk.
     """
     uuid = args["uuid"]
+    max_size = current_app.config.get("RESOURCES_FILE_MAX_SIZE")
     # Normalize filename including extension
     target = utils.normalize(args["filename"])
     if prefix:
         target = os.path.join(prefix, target)
+    written = 0
+    too_large = False
     with storage.open(target, "wb") as out:
         for i in range(args["totalparts"]):
-            partname = chunk_filename(uuid, i)
-            out.write(chunks.read(partname))
-            chunks.delete(partname)
+            data = chunks.read(chunk_filename(uuid, i))
+            written += len(data)
+            if max_size and written > max_size:
+                too_large = True
+                break
+            out.write(data)
+    if too_large:
+        storage.delete(target)
+        _purge_chunks(uuid, args["totalparts"])
+        raise UploadError(_max_size_error(max_size))
+    for i in range(args["totalparts"]):
+        chunks.delete(chunk_filename(uuid, i))
     chunks.delete(chunk_filename(uuid, META))
     return target
+
+
+def _purge_chunks(uuid, totalparts):
+    """Best-effort removal of any leftover chunk parts and metadata."""
+    for i in range(totalparts):
+        try:
+            chunks.delete(chunk_filename(uuid, i))
+        except Exception:
+            pass
+    try:
+        chunks.delete(chunk_filename(uuid, META))
+    except Exception:
+        pass
+
+
+def _max_size_error(max_size):
+    return f"O ficheiro excede o tamanho máximo permitido de {max_size // (1024 * 1024)} MB."
 
 
 def handle_upload(storage, prefix=None):
@@ -174,6 +207,15 @@ def handle_upload(storage, prefix=None):
         fs_filename = storage.save(uploaded_file, prefix=prefix, filename=filename, overwrite=True)
 
     metadata = storage.metadata(fs_filename)
+
+    # Enforce the maximum resource file size server-side (the client-side guard
+    # is bypassable). The chunked path is already capped in combine_chunks; this
+    # also covers single-shot uploads.
+    max_size = current_app.config.get("RESOURCES_FILE_MAX_SIZE")
+    if max_size and metadata.get("size", 0) > max_size:
+        storage.delete(fs_filename)
+        api.abort(413, _max_size_error(max_size))
+
     metadata["last_modified_internal"] = metadata.pop("modified")
     metadata["fs_filename"] = fs_filename
     checksum = metadata.pop("checksum")

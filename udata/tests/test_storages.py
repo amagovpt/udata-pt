@@ -214,6 +214,54 @@ class StorageUploadViewTest(PytestOnlyAPITestCase):
 
         assert list(storages.chunks.list_files()) == []
 
+    @pytest.mark.options(RESOURCES_FILE_MAX_SIZE=2)
+    def test_standard_upload_too_large(self):
+        self.login()
+        response = self.post(
+            url_for("storage.upload", name="resources"),
+            {"file": (BytesIO(b"aaa"), "test.txt")},  # 3 bytes > 2
+            json=False,
+        )
+
+        assert response.status_code == 413
+        # The oversized file must not be left behind.
+        assert list(storages.resources.list_files()) == []
+
+    @pytest.mark.options(RESOURCES_FILE_MAX_SIZE=2)
+    def test_chunked_upload_too_large(self):
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4  # 4 * 1 byte = 4 bytes > 2
+
+        for i in range(parts):
+            response = self.post(
+                url,
+                {
+                    "file": (BytesIO(b"a"), "blob"),
+                    "uuid": uuid,
+                    "filename": "test.txt",
+                    "partindex": i,
+                    "partbyteoffset": 0,
+                    "totalparts": parts,
+                    "chunksize": 1,
+                },
+                json=False,
+            )
+            assert200(response)
+
+        response = self.post(
+            url,
+            {"uuid": uuid, "filename": "test.txt", "totalparts": parts},
+            json=False,
+        )
+
+        assert400(response)
+        assert not response.json["success"]
+        # Neither the combined file nor the chunk parts must be left behind.
+        assert list(storages.tmp.list_files()) == []
+        assert list(storages.chunks.list_files()) == []
+
     def test_upload_resource_bad_request(self):
         self.login()
         response = self.post(
