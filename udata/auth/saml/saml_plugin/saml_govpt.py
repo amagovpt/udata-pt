@@ -255,6 +255,92 @@ def _first_value(identity, key):
     return None
 
 
+# ---------------------------------------------------------------------------
+# TEMP DIAG (remove once the SAML signature issue is resolved): when pysaml2
+# rejects the Response signature, log the certificate(s) embedded in the
+# SAMLResponse <ds:KeyInfo> against the certificate(s) in our configured IdP
+# metadata. Matching fingerprints rule out an IdP key rotation and point at a
+# canonicalization/xmlsec issue; differing fingerprints confirm the IdP rotated
+# its signing key and our metadata.xml is stale.
+# ---------------------------------------------------------------------------
+def _diag_describe_cert(der):
+    """Return a 'subject/serial/sha256' description for a DER cert blob.
+
+    The sha256 is formatted exactly like ``openssl x509 -fingerprint -sha256``
+    so it can be eyeballed against the values we computed on the host.
+    """
+    sha = ":".join(hashlib.sha256(der).hexdigest()[i : i + 2] for i in range(0, 64, 2)).upper()
+    subject = serial = "?"
+    try:
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(der)
+        subject = cert.subject.rfc4514_string()
+        serial = format(cert.serial_number, "X")
+    except Exception:
+        pass
+    return f"subject={subject!r} serial={serial} sha256={sha}"
+
+
+def _diag_extract_certs(xml_text):
+    """Extract every X509Certificate DER blob from an XML/metadata string."""
+    certs = []
+    for m in re.finditer(
+        r"<(?:ds:)?X509Certificate>([^<]+)</(?:ds:)?X509Certificate>", xml_text, re.S
+    ):
+        try:
+            certs.append(base64.b64decode(re.sub(r"\s+", "", m.group(1))))
+        except (binascii.Error, ValueError):
+            continue
+    return certs
+
+
+def _diag_log_signature_certs(raw_saml_response, auth_servers):
+    """Log embedded-vs-metadata signing certs on a signature failure."""
+    try:
+        try:
+            xml_text = base64.b64decode(raw_saml_response).decode("utf-8", "replace")
+        except Exception:
+            current_app.logger.warning("SAML SIG-DIAG: could not base64-decode response")
+            return
+
+        resp_certs = _diag_extract_certs(xml_text)
+        current_app.logger.warning("SAML SIG-DIAG: response embeds %d cert(s)", len(resp_certs))
+        resp_fps = set()
+        for i, der in enumerate(resp_certs):
+            desc = _diag_describe_cert(der)
+            resp_fps.add(desc.rsplit("sha256=", 1)[-1])
+            current_app.logger.warning("SAML SIG-DIAG: response[%d] %s", i, desc)
+
+        meta_fps = set()
+        for server in auth_servers:
+            server = server.strip()
+            if not server:
+                continue
+            try:
+                with open(_resolve_path(server), encoding="utf-8") as f:
+                    meta_text = f.read()
+            except OSError as exc:
+                current_app.logger.warning(
+                    "SAML SIG-DIAG: cannot read metadata %s: %s", server, exc
+                )
+                continue
+            for i, der in enumerate(_diag_extract_certs(meta_text)):
+                desc = _diag_describe_cert(der)
+                meta_fps.add(desc.rsplit("sha256=", 1)[-1])
+                current_app.logger.warning("SAML SIG-DIAG: metadata(%s)[%d] %s", server, i, desc)
+
+        current_app.logger.warning(
+            "SAML SIG-DIAG: VERDICT match=%s (a match => NOT a key rotation) "
+            "response_fps=%s meta_fps=%s",
+            bool(resp_fps & meta_fps),
+            sorted(resp_fps),
+            sorted(meta_fps),
+        )
+    except Exception as exc:  # diagnostics must never break the auth flow
+        current_app.logger.warning("SAML SIG-DIAG: failed: %s", exc)
+
+
 def _trusted_saml_issuers():
     """Return the set of SAML Issuer entityIDs we trust.
 
@@ -1048,6 +1134,7 @@ def idp_initiated():
         break
 
     if authn_response is None:
+        _diag_log_signature_certs(raw_saml_response, auth_servers)  # TEMP DIAG
         return _reject_saml_login(
             "SAML SSO rejeitado: nenhum IdP validou a resposta assinada "
             f"(último erro: {last_validation_error})",
