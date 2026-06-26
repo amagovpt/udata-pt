@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix: translate `EU_HVD_CATEGORIES` labels to Portuguese**
+  - The HVD category labels in `udata/rdf.py` were inherited from upstream in
+    French (`Météorologiques`, `Mobilité`, …). `TAG_TO_EU_HVD_CATEGORIES`
+    reverse-maps the *slugified* labels back to the EU BNA category URIs, so the
+    keys were French slugs (`mobilite`, `statistiques`, …) while the datasets are
+    tagged with Portuguese slugs (`mobilidade`, `estatisticas`,
+    `observacao-da-terra-e-do-ambiente`, …). The keys never matched, so
+    `dcatap:hvdCategory` was never emitted in the DCAT-AP HVD catalog harvested by
+    data.europa.eu.
+  - Translates the six category labels to Portuguese so the reverse map matches
+    the tags actually stored on datasets (both export in
+    `core/dataset/rdf.py` / `core/dataservices/rdf.py` and import in
+    `theme_labels_from_rdf`). The category URIs are unchanged.
+
 - **feat: add server-side `status` filter to `GET /api/1/reuses/`**
   - The admin/backoffice reuses listing previously filtered by lifecycle status
     (public/draft/archived/deleted) client-side, over the current page only, so
