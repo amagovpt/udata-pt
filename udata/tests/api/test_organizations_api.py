@@ -1161,6 +1161,33 @@ class OrganizationDatasetsAPITest(PytestOnlyAPITestCase):
         assert200(response)
         assert len(response.json["data"]) == len(datasets)
 
+    def test_list_org_datasets_hide_deleted_and_archived(self):
+        """Deleted/archived datasets must never show on the public org tab,
+        even when public, for anonymous or logged-in users."""
+        org = OrganizationFactory()
+        visible = DatasetFactory.create_batch(2, organization=org)
+        DatasetFactory(organization=org, deleted=datetime.now(UTC))
+        DatasetFactory(organization=org, archived=datetime.now(UTC))
+
+        response = self.get(url_for("api.org_datasets", org=org))
+
+        assert200(response)
+        assert len(response.json["data"]) == len(visible)
+        assert response.json["total"] == len(visible)
+
+    def test_list_org_datasets_member_can_request_deleted(self):
+        """A member may still request deleted datasets explicitly (back office)."""
+        user = self.login()
+        org = OrganizationFactory(members=[Member(user=user, role="admin")])
+        DatasetFactory.create_batch(2, organization=org)
+        deleted = DatasetFactory(organization=org, deleted=datetime.now(UTC))
+
+        response = self.get(url_for("api.org_datasets", org=org, deleted=True))
+
+        assert200(response)
+        ids = {d["id"] for d in response.json["data"]}
+        assert str(deleted.id) in ids
+
     def test_list_org_datasets_with_size(self):
         """Should list organization datasets"""
         org = OrganizationFactory()
