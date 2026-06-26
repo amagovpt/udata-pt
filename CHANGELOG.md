@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **fix: never expose deleted/archived datasets on the public organization tab**
+  - `GET /api/1/organizations/<org>/datasets/` did `Dataset.objects.owned_by(org)`
+    and only stripped `private` for non-members, so a public (non-private) but
+    **deleted** dataset of an organization showed on the org's datasets tab to
+    everyone (anonymous included), and inflated the tab count.
+  - The endpoint now hides `deleted`/`archived` datasets by default, while still
+    letting the admin org-management listing request them explicitly via the
+    `?deleted=true` / `?archived=true` status filters (which require auth).
+    Members still see the org's private drafts.
+
 - **fix: translate `EU_HVD_CATEGORIES` labels to Portuguese**
   - The HVD category labels in `udata/rdf.py` were inherited from upstream in
     French (`Météorologiques`, `Mobilité`, …). `TAG_TO_EU_HVD_CATEGORIES`
