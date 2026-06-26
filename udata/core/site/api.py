@@ -337,7 +337,7 @@ class SiteDatasetsListingAPI(API):
 
     @api.doc(id="get_site_datasets_listing")
     @api.expect(dataset_parser.parser)
-    @cache.cached(timeout=60, query_string=True)
+    @cache.cached(timeout=60, query_string=True, unless=lambda: not current_user.is_anonymous)
     def get(self):
         """Aggregated payload for the datasets listing page."""
         args = dataset_parser.parse()
@@ -407,7 +407,7 @@ class SiteReusesListingAPI(API):
 
     @api.doc(id="get_site_reuses_listing")
     @api.expect(Reuse.__index_parser__)
-    @cache.cached(timeout=60, query_string=True)
+    @cache.cached(timeout=60, query_string=True, unless=lambda: not current_user.is_anonymous)
     def get(self):
         """Aggregated payload for the reuses listing page."""
         base_qs = Reuse.objects.visible_by_user(
