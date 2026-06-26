@@ -88,7 +88,14 @@ PUBLIC_READ_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
-UPLOAD_LIMIT = "10 per minute; 100 per hour; 500 per day"
+# File upload on existing/new dataset resources. Keyed by `user_or_ip` and the
+# endpoint is authenticated (`@api.secure`), so the key is always `user:{id}` —
+# each publisher gets their own bucket (no IP-collapse sharing behind the F5/WAF,
+# unlike anonymous read endpoints). Sized for bulk publication: data providers
+# routinely upload dozens of files in one session (e.g. 46 xlsx + 46 json), so
+# the previous 10/min ceiling 429'd legitimate batch uploads after the 10th file.
+# Chunk parts are exempt (see is_chunk_part) so a chunked upload counts once.
+UPLOAD_LIMIT = "120 per minute; 600 per hour; 2000 per day"
 # Opening a brand-new discussion thread is a much rarer human action than
 # adding a comment to an existing one, so it gets a tighter ceiling than
 # COMMENT_CREATE_LIMIT. Sized for VULN-2083 audit pattern (100+ Burp
