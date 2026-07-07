@@ -11,6 +11,12 @@ from werkzeug.wrappers import Request
 from udata.core import storages
 from udata.core.storages import utils
 from udata.core.storages.api import META, chunk_filename
+from udata.core.storages.validation import (
+    PLAIN_TEXT_DANGEROUS_PATTERNS,
+    XML_DANGEROUS_PATTERNS,
+    _SCAN_CHUNK_SIZE,
+    _scan_for_dangerous_content,
+)
 from udata.core.storages.tasks import purge_chunks
 from udata.tests import PytestOnlyTestCase
 from udata.tests.api import PytestOnlyAPITestCase
@@ -314,3 +320,39 @@ class ChunksRetentionTest(PytestOnlyTestCase):
         expected.add(chunk_filename(active_uuid, META))
         assert set(storages.chunks.list_files()) == expected
         assert not storages.chunks.exists(expired_uuid)  # Directory should be removed too
+
+
+class DangerousContentScanTest(PytestOnlyTestCase):
+    """Regression tests for the streaming dangerous-content scanner.
+
+    A previous implementation read the whole file into memory (f.read().lower())
+    and raised MemoryError on large resource uploads. The scanner now reads in
+    fixed-size chunks with an overlap so boundary-straddling patterns are still
+    caught while memory stays bounded.
+    """
+
+    def test_large_clean_file_is_not_flagged(self, tmpdir):
+        # A few chunks worth of legitimate data must scan cleanly without
+        # loading the whole file into memory.
+        target = tmpdir.join("big.csv")
+        with open(str(target), "w") as f:
+            for _ in range(4 * _SCAN_CHUNK_SIZE // 12):
+                f.write("a,b,c,d,e,f\n")
+        assert _scan_for_dangerous_content(str(target), PLAIN_TEXT_DANGEROUS_PATTERNS) is None
+
+    def test_pattern_straddling_chunk_boundary_is_detected(self, tmpdir):
+        # A dangerous token split across the chunk boundary must still match.
+        target = tmpdir.join("boundary.txt")
+        with open(str(target), "w") as f:
+            f.write("x" * (_SCAN_CHUNK_SIZE - 4))
+            f.write("<script>alert(1)</script>")
+        match = _scan_for_dangerous_content(str(target), PLAIN_TEXT_DANGEROUS_PATTERNS)
+        assert match is not None
+        assert match[0] == r"<script"
+
+    def test_xxe_pattern_is_matched_case_insensitively(self, tmpdir):
+        target = tmpdir.join("x.xml")
+        with open(str(target), "w") as f:
+            f.write("<!ENTITY foo SYSTEM 'file:///etc/passwd'>")
+        match = _scan_for_dangerous_content(str(target), XML_DANGEROUS_PATTERNS)
+        assert match is not None
