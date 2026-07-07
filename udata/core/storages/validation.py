@@ -108,20 +108,44 @@ def _check_magic_bytes(filepath, expected_mime):
     return header.startswith(magic)
 
 
+# Read the file in fixed-size chunks so validation memory usage stays constant
+# regardless of the uploaded file size. A plain f.read() loads the whole file
+# (plus a second copy via .lower()) into memory and raises MemoryError on large
+# resource uploads (up to RESOURCES_FILE_MAX_SIZE), turning the request into an
+# HTTP 500.
+_SCAN_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+# Overlap kept between consecutive chunks so a dangerous pattern straddling a
+# chunk boundary is still detected. Must comfortably exceed the longest pattern.
+_SCAN_OVERLAP = 1024
+
+
 def _scan_for_dangerous_content(filepath, patterns):
     """Scan file content for dangerous patterns (scripts, XXE, etc.).
 
+    The file is read incrementally in chunks (with a small overlap between
+    chunks so boundary-straddling matches are not missed) to keep memory usage
+    bounded on large uploads.
+
     Returns a tuple (pattern, description) if a match is found, or None if clean.
     """
+    compiled = [
+        (re.compile(pattern), pattern, description) for pattern, description in patterns.items()
+    ]
     try:
         with open(filepath, "r", errors="ignore") as f:
-            content = f.read().lower()
+            tail = ""
+            while True:
+                chunk = f.read(_SCAN_CHUNK_SIZE)
+                if not chunk:
+                    break
+                window = (tail + chunk).lower()
+                for regex, pattern, description in compiled:
+                    if regex.search(window):
+                        return (pattern, description)
+                tail = chunk[-_SCAN_OVERLAP:]
     except OSError:
         return None
 
-    for pattern, description in patterns.items():
-        if re.search(pattern, content):
-            return (pattern, description)
     return None
 
 

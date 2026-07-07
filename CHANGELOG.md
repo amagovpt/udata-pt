@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix: stream upload content validation to avoid `MemoryError` on large files**
+  - `validate_upload()` scans every uploaded resource for dangerous content
+    (`<script`, `javascript:`, XXE, …). `_scan_for_dangerous_content()` did
+    `f.read().lower()`, loading the whole file (plus a lowercased copy) into
+    memory. On large resource uploads (up to `RESOURCES_FILE_MAX_SIZE`, 800 MB)
+    this raised `MemoryError` in the uWSGI worker and returned HTTP 500 — this is
+    distinct from, and not fixed by, the chunked-upload transport work (PR #102)
+    or the server-side max-size enforcement (PR #115), both of which run before
+    this content scan.
+  - The scanner now reads the file in fixed 1 MiB chunks with a 1 KiB overlap
+    between chunks, so patterns straddling a chunk boundary are still detected
+    while peak memory stays bounded regardless of file size. Detection behaviour
+    is unchanged.
+
 - **fix: never expose deleted/archived datasets on the public organization tab**
   - `GET /api/1/organizations/<org>/datasets/` did `Dataset.objects.owned_by(org)`
     and only stripped `private` for non-members, so a public (non-private) but
