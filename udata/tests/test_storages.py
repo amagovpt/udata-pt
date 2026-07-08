@@ -11,13 +11,14 @@ from werkzeug.wrappers import Request
 from udata.core import storages
 from udata.core.storages import utils
 from udata.core.storages.api import META, chunk_filename
+from udata.core.storages.tasks import purge_chunks
 from udata.core.storages.validation import (
+    _SCAN_CHUNK_SIZE,
     PLAIN_TEXT_DANGEROUS_PATTERNS,
     XML_DANGEROUS_PATTERNS,
-    _SCAN_CHUNK_SIZE,
     _scan_for_dangerous_content,
+    validate_upload,
 )
-from udata.core.storages.tasks import purge_chunks
 from udata.tests import PytestOnlyTestCase
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.utils import faker
@@ -356,3 +357,48 @@ class DangerousContentScanTest(PytestOnlyTestCase):
             f.write("<!ENTITY foo SYSTEM 'file:///etc/passwd'>")
         match = _scan_for_dangerous_content(str(target), XML_DANGEROUS_PATTERNS)
         assert match is not None
+
+
+class ValidateUploadDataFormatTest(PytestOnlyTestCase):
+    """Inert data formats (CSV, JSON, …) are served as attachments and never
+    rendered inline, so legitimate data that merely contains an HTML-looking
+    substring must not be rejected as "dangerous". Only browser-renderable HTML
+    documents and XML/SVG keep the HTML/script scan.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "content"),
+        [
+            ("data.csv", "col1,col2\nvalue,<iframe src=x>\n"),
+            ("data.csv", "url\nhttps://x?u=javascript:alert(1)\n"),
+            ("data.json", '{"note": "use <script> to embed"}'),
+            ("dump.sql", "INSERT INTO t VALUES ('<object data=x>');"),
+            ("notes.txt", "example of an <embed> tag in prose"),
+        ],
+    )
+    def test_data_file_with_html_substring_is_allowed(self, tmpdir, name, content):
+        target = tmpdir.join(name)
+        with open(str(target), "w") as f:
+            f.write(content)
+        ext = name.rsplit(".", 1)[-1]
+        assert validate_upload(str(target), "", ext) is None
+        # The file must be kept on disk (not deleted as a rejected upload).
+        assert target.check(file=1)
+
+    @pytest.mark.parametrize("ext", ["html", "htm", "shtml", "xht"])
+    def test_html_document_with_script_is_rejected(self, tmpdir, ext):
+        target = tmpdir.join(f"page.{ext}")
+        with open(str(target), "w") as f:
+            f.write("<html><body><script>alert(1)</script></body></html>")
+        error = validate_upload(str(target), "", ext)
+        assert error is not None
+        # Rejected uploads are removed from disk.
+        assert not target.check()
+
+    def test_svg_with_script_is_still_rejected(self, tmpdir):
+        target = tmpdir.join("logo.svg")
+        with open(str(target), "w") as f:
+            f.write('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+        error = validate_upload(str(target), "image/svg+xml", "svg")
+        assert error is not None
+        assert not target.check()

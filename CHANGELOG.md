@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **fix: stop rejecting valid data files that contain HTML-looking substrings**
+  - `validate_upload()` scanned every non-image, non-XML upload for HTML/script
+    tokens (`<script`, `javascript:`, `<iframe`, `<object`, `<embed`). This is a
+    substring scan with no awareness of the file format, so a legitimate data
+    file — most visibly a large `.csv` — was rejected with HTTP 415 ("conteúdo
+    perigoso embutido") whenever a cell happened to hold one of those tokens
+    (e.g. an embedded HTML fragment or a `javascript:` URL). The larger the file,
+    the likelier the false positive.
+  - Resource files are always served with `Content-Disposition: attachment`
+    (see `udata/core/dataset/download_proxy.py` and the resource download
+    endpoint) — they are downloaded, never rendered inline — so the XSS vector
+    the scan defends against does not apply to inert data formats. The HTML/script
+    scan is now restricted to browser-renderable documents
+    (`HTML_RENDERABLE_EXTENSIONS`). Images keep magic-byte + Pillow + embedded
+    script checks, XML/SVG keep the XSS+XXE scan, and HTML MIME types are still
+    blocked outright — only inert data formats stop being scanned.
+
 - **fix: stream upload content validation to avoid `MemoryError` on large files**
   - `validate_upload()` scans every uploaded resource for dangerous content
     (`<script`, `javascript:`, XXE, …). `_scan_for_dangerous_content()` did
