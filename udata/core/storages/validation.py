@@ -60,6 +60,19 @@ PLAIN_TEXT_DANGEROUS_PATTERNS = {
     r"<embed": "tag embed embutida (<embed>)",
 }
 
+# Extensions of documents a browser could execute as active HTML/JS if it ever
+# rendered the file inline. Everything else that reaches the generic branch of
+# validate_upload() is an inert data format (CSV, JSON, geo, office, archives,
+# SQL dumps, …). Resource files are always served with
+# `Content-Disposition: attachment` (see udata/core/dataset/download_proxy.py
+# and the resource download endpoint) — they are downloaded, never rendered
+# inline — so scanning inert data for HTML/script tokens only produces false
+# positives on legitimate data (e.g. a CSV cell holding "<iframe", or a
+# "javascript:" URL in a column). We therefore keep the HTML/script scan only
+# for browser-renderable documents; XML/SVG are already scanned above and HTML
+# MIME types are blocked outright at the top of validate_upload().
+HTML_RENDERABLE_EXTENSIONS = {"htm", "html", "shtml", "xht"}
+
 # Additional patterns specific to XML files (XXE)
 XXE_PATTERNS = {
     r"<!entity\s": "declaração de entidade XML (<!ENTITY>)",
@@ -225,9 +238,13 @@ def validate_upload(filepath, mime, extension):
                 "externas."
             )
 
-    # 4. For all other files: scan for HTML/script injection only (no event
-    # handler heuristic — too many false positives on legitimate text data).
-    else:
+    # 4. For browser-renderable HTML documents: scan for HTML/script injection
+    # only (no event handler heuristic — too many false positives on legitimate
+    # text data). Inert data formats (CSV, JSON, geo, office, archives, …) are
+    # served as attachments and never rendered inline, so they are intentionally
+    # left unscanned here to avoid rejecting valid data that merely contains an
+    # HTML-looking substring.
+    elif extension in HTML_RENDERABLE_EXTENSIONS:
         match = _scan_for_dangerous_content(filepath, PLAIN_TEXT_DANGEROUS_PATTERNS)
         if match:
             _, description = match
