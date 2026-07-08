@@ -12,6 +12,13 @@ from udata.core import storages
 from udata.core.storages import utils
 from udata.core.storages.api import META, chunk_filename
 from udata.core.storages.tasks import purge_chunks
+from udata.core.storages.validation import (
+    _SCAN_CHUNK_SIZE,
+    PLAIN_TEXT_DANGEROUS_PATTERNS,
+    XML_DANGEROUS_PATTERNS,
+    _scan_for_dangerous_content,
+    validate_upload,
+)
 from udata.tests import PytestOnlyTestCase
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.utils import faker
@@ -314,3 +321,84 @@ class ChunksRetentionTest(PytestOnlyTestCase):
         expected.add(chunk_filename(active_uuid, META))
         assert set(storages.chunks.list_files()) == expected
         assert not storages.chunks.exists(expired_uuid)  # Directory should be removed too
+
+
+class DangerousContentScanTest(PytestOnlyTestCase):
+    """Regression tests for the streaming dangerous-content scanner.
+
+    A previous implementation read the whole file into memory (f.read().lower())
+    and raised MemoryError on large resource uploads. The scanner now reads in
+    fixed-size chunks with an overlap so boundary-straddling patterns are still
+    caught while memory stays bounded.
+    """
+
+    def test_large_clean_file_is_not_flagged(self, tmpdir):
+        # A few chunks worth of legitimate data must scan cleanly without
+        # loading the whole file into memory.
+        target = tmpdir.join("big.csv")
+        with open(str(target), "w") as f:
+            for _ in range(4 * _SCAN_CHUNK_SIZE // 12):
+                f.write("a,b,c,d,e,f\n")
+        assert _scan_for_dangerous_content(str(target), PLAIN_TEXT_DANGEROUS_PATTERNS) is None
+
+    def test_pattern_straddling_chunk_boundary_is_detected(self, tmpdir):
+        # A dangerous token split across the chunk boundary must still match.
+        target = tmpdir.join("boundary.txt")
+        with open(str(target), "w") as f:
+            f.write("x" * (_SCAN_CHUNK_SIZE - 4))
+            f.write("<script>alert(1)</script>")
+        match = _scan_for_dangerous_content(str(target), PLAIN_TEXT_DANGEROUS_PATTERNS)
+        assert match is not None
+        assert match[0] == r"<script"
+
+    def test_xxe_pattern_is_matched_case_insensitively(self, tmpdir):
+        target = tmpdir.join("x.xml")
+        with open(str(target), "w") as f:
+            f.write("<!ENTITY foo SYSTEM 'file:///etc/passwd'>")
+        match = _scan_for_dangerous_content(str(target), XML_DANGEROUS_PATTERNS)
+        assert match is not None
+
+
+class ValidateUploadDataFormatTest(PytestOnlyTestCase):
+    """Inert data formats (CSV, JSON, …) are served as attachments and never
+    rendered inline, so legitimate data that merely contains an HTML-looking
+    substring must not be rejected as "dangerous". Only browser-renderable HTML
+    documents and XML/SVG keep the HTML/script scan.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "content"),
+        [
+            ("data.csv", "col1,col2\nvalue,<iframe src=x>\n"),
+            ("data.csv", "url\nhttps://x?u=javascript:alert(1)\n"),
+            ("data.json", '{"note": "use <script> to embed"}'),
+            ("dump.sql", "INSERT INTO t VALUES ('<object data=x>');"),
+            ("notes.txt", "example of an <embed> tag in prose"),
+        ],
+    )
+    def test_data_file_with_html_substring_is_allowed(self, tmpdir, name, content):
+        target = tmpdir.join(name)
+        with open(str(target), "w") as f:
+            f.write(content)
+        ext = name.rsplit(".", 1)[-1]
+        assert validate_upload(str(target), "", ext) is None
+        # The file must be kept on disk (not deleted as a rejected upload).
+        assert target.check(file=1)
+
+    @pytest.mark.parametrize("ext", ["html", "htm", "shtml", "xht"])
+    def test_html_document_with_script_is_rejected(self, tmpdir, ext):
+        target = tmpdir.join(f"page.{ext}")
+        with open(str(target), "w") as f:
+            f.write("<html><body><script>alert(1)</script></body></html>")
+        error = validate_upload(str(target), "", ext)
+        assert error is not None
+        # Rejected uploads are removed from disk.
+        assert not target.check()
+
+    def test_svg_with_script_is_still_rejected(self, tmpdir):
+        target = tmpdir.join("logo.svg")
+        with open(str(target), "w") as f:
+            f.write('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+        error = validate_upload(str(target), "image/svg+xml", "svg")
+        assert error is not None
+        assert not target.check()

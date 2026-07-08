@@ -12,12 +12,12 @@ exhaust the shared bucket for everyone.
 The endpoints that were lifted out of the default (this fix):
 
 * ``POST /datasets/<d>/resources/<rid>/upload/`` — replace an existing
-  resource's file (as frequent as creating one) -> UPLOAD_LIMIT (10/min);
+  resource's file (as frequent as creating one) -> UPLOAD_LIMIT (120/min);
 * ``POST /datasets/community_resources/<crid>/upload/`` — re-upload a community
   resource file -> CONTENT_CREATE_LIMIT (5/min, public content);
-* ``POST /users/<user>/avatar/`` -> UPLOAD_LIMIT (10/min);
-* ``POST /reuses/<reuse>/image/`` -> UPLOAD_LIMIT (10/min);
-* ``POST /posts/<post>/image/`` (and the PUT resize) -> UPLOAD_LIMIT (10/min).
+* ``POST /users/<user>/avatar/`` -> UPLOAD_LIMIT (120/min);
+* ``POST /reuses/<reuse>/image/`` -> UPLOAD_LIMIT (120/min);
+* ``POST /posts/<post>/image/`` (and the PUT resize) -> UPLOAD_LIMIT (120/min).
 
 All limits are keyed by ``user_or_ip`` and method-scoped, matching the already
 protected ``/datasets/<d>/upload/``, ``/datasets/<d>/upload/community/``,
@@ -49,7 +49,7 @@ from udata.tests.api import PytestOnlyAPITestCase
 RATELIMIT_OPTIONS = dict(RATELIMIT_ENABLED=True)
 
 # Mirrored from udata/api/limits.py.
-UPLOAD_PER_MIN = 10  # UPLOAD_LIMIT = "10 per minute; 100 per hour; 500 per day"
+UPLOAD_PER_MIN = 120  # UPLOAD_LIMIT = "120 per minute; 600 per hour; 2000 per day"
 CONTENT_CREATE_PER_MIN = 5  # CONTENT_CREATE_LIMIT = "5 per minute; ..."
 
 BLOCK_STATUSES = (429, 403)
@@ -85,7 +85,7 @@ def _assert_throttled_at(statuses, threshold, endpoint):
 
 
 class ResourceReuploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
-    """Replacing an existing resource's file must carry UPLOAD_LIMIT (10/min),
+    """Replacing an existing resource's file must carry UPLOAD_LIMIT (120/min),
     not the IP-keyed 200/h default that collapses site-wide behind the F5/WAF."""
 
     @pytest.mark.options(**RATELIMIT_OPTIONS)
@@ -109,7 +109,7 @@ class CommunityResourceReuploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
 
 
 class UserAvatarUploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
-    """Admin avatar upload for a user must carry UPLOAD_LIMIT (10/min)."""
+    """Admin avatar upload for a user must carry UPLOAD_LIMIT (120/min)."""
 
     @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_user_avatar_upload_throttles_at_upload_limit(self):
@@ -120,7 +120,7 @@ class UserAvatarUploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
 
 
 class ReuseImageUploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
-    """Reuse image upload must carry UPLOAD_LIMIT (10/min)."""
+    """Reuse image upload must carry UPLOAD_LIMIT (120/min)."""
 
     @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_reuse_image_upload_throttles_at_upload_limit(self):
@@ -131,7 +131,7 @@ class ReuseImageUploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
 
 
 class PostImageUploadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
-    """Post image upload must carry UPLOAD_LIMIT (10/min)."""
+    """Post image upload must carry UPLOAD_LIMIT (120/min)."""
 
     @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_post_image_upload_throttles_at_upload_limit(self):

@@ -944,11 +944,25 @@ class OrgDatasetsAPI(API):
     @api.expect(dataset_parser.parser)
     @api.marshal_with(dataset_page_fields)
     def get(self, org):
-        """List organization datasets (including private ones when member)"""
+        """List organization datasets for the org page.
+
+        Deleted and archived datasets are never exposed here unless the caller
+        explicitly asks for them via the back-office status filters
+        (``?deleted=true`` / ``?archived=true``, which require authentication),
+        so the public datasets tab never shows them regardless of who is
+        viewing. Members may still see the org's private drafts.
+        """
         args = dataset_parser.parse()
         qs = Dataset.objects.owned_by(org)
         if not org.permissions["private"].can():
             qs = qs(private__ne=True)
+        # Hide deleted/archived by default (back-office only). The explicit
+        # status filters handled by parse_filters still let the admin
+        # org-management listing request them.
+        if args.get("deleted") is None:
+            qs = qs(deleted=None)
+        if args.get("archived") is None:
+            qs = qs(archived=None)
         qs = dataset_parser.parse_filters(qs, args)
         return qs.order_by(args["sort"]).paginate(args["page"], args["page_size"])
 

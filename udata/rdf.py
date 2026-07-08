@@ -121,12 +121,12 @@ ILLEGAL_XML_CHARS = "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
 
 # Map High Value Datasets URIs to keyword categories
 EU_HVD_CATEGORIES = {
-    "http://data.europa.eu/bna/c_164e0bf5": "Météorologiques",
-    "http://data.europa.eu/bna/c_a9135398": "Entreprises et propriété d'entreprises",
-    "http://data.europa.eu/bna/c_ac64a52d": "Géospatiales",
-    "http://data.europa.eu/bna/c_b79e35eb": "Mobilité",
-    "http://data.europa.eu/bna/c_dd313021": "Observation de la terre et environnement",
-    "http://data.europa.eu/bna/c_e1da4e07": "Statistiques",
+    "http://data.europa.eu/bna/c_164e0bf5": "Meteorológicas",
+    "http://data.europa.eu/bna/c_a9135398": "Empresas e propriedade de empresas",
+    "http://data.europa.eu/bna/c_ac64a52d": "Geoespaciais",
+    "http://data.europa.eu/bna/c_b79e35eb": "Mobilidade",
+    "http://data.europa.eu/bna/c_dd313021": "Observação da Terra e do ambiente",
+    "http://data.europa.eu/bna/c_e1da4e07": "Estatísticas",
 }
 HVD_LEGISLATION = "http://data.europa.eu/eli/reg_impl/2023/138/oj"
 TAG_TO_EU_HVD_CATEGORIES = {slugify_tag(EU_HVD_CATEGORIES[uri]): uri for uri in EU_HVD_CATEGORIES}
