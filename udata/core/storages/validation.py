@@ -60,6 +60,19 @@ PLAIN_TEXT_DANGEROUS_PATTERNS = {
     r"<embed": "tag embed embutida (<embed>)",
 }
 
+# Extensions of documents a browser could execute as active HTML/JS if it ever
+# rendered the file inline. Everything else that reaches the generic branch of
+# validate_upload() is an inert data format (CSV, JSON, geo, office, archives,
+# SQL dumps, …). Resource files are always served with
+# `Content-Disposition: attachment` (see udata/core/dataset/download_proxy.py
+# and the resource download endpoint) — they are downloaded, never rendered
+# inline — so scanning inert data for HTML/script tokens only produces false
+# positives on legitimate data (e.g. a CSV cell holding "<iframe", or a
+# "javascript:" URL in a column). We therefore keep the HTML/script scan only
+# for browser-renderable documents; XML/SVG are already scanned above and HTML
+# MIME types are blocked outright at the top of validate_upload().
+HTML_RENDERABLE_EXTENSIONS = {"htm", "html", "shtml", "xht"}
+
 # Additional patterns specific to XML files (XXE)
 XXE_PATTERNS = {
     r"<!entity\s": "declaração de entidade XML (<!ENTITY>)",
@@ -108,20 +121,44 @@ def _check_magic_bytes(filepath, expected_mime):
     return header.startswith(magic)
 
 
+# Read the file in fixed-size chunks so validation memory usage stays constant
+# regardless of the uploaded file size. A plain f.read() loads the whole file
+# (plus a second copy via .lower()) into memory and raises MemoryError on large
+# resource uploads (up to RESOURCES_FILE_MAX_SIZE), turning the request into an
+# HTTP 500.
+_SCAN_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+# Overlap kept between consecutive chunks so a dangerous pattern straddling a
+# chunk boundary is still detected. Must comfortably exceed the longest pattern.
+_SCAN_OVERLAP = 1024
+
+
 def _scan_for_dangerous_content(filepath, patterns):
     """Scan file content for dangerous patterns (scripts, XXE, etc.).
 
+    The file is read incrementally in chunks (with a small overlap between
+    chunks so boundary-straddling matches are not missed) to keep memory usage
+    bounded on large uploads.
+
     Returns a tuple (pattern, description) if a match is found, or None if clean.
     """
+    compiled = [
+        (re.compile(pattern), pattern, description) for pattern, description in patterns.items()
+    ]
     try:
         with open(filepath, "r", errors="ignore") as f:
-            content = f.read().lower()
+            tail = ""
+            while True:
+                chunk = f.read(_SCAN_CHUNK_SIZE)
+                if not chunk:
+                    break
+                window = (tail + chunk).lower()
+                for regex, pattern, description in compiled:
+                    if regex.search(window):
+                        return (pattern, description)
+                tail = chunk[-_SCAN_OVERLAP:]
     except OSError:
         return None
 
-    for pattern, description in patterns.items():
-        if re.search(pattern, content):
-            return (pattern, description)
     return None
 
 
@@ -201,9 +238,13 @@ def validate_upload(filepath, mime, extension):
                 "externas."
             )
 
-    # 4. For all other files: scan for HTML/script injection only (no event
-    # handler heuristic — too many false positives on legitimate text data).
-    else:
+    # 4. For browser-renderable HTML documents: scan for HTML/script injection
+    # only (no event handler heuristic — too many false positives on legitimate
+    # text data). Inert data formats (CSV, JSON, geo, office, archives, …) are
+    # served as attachments and never rendered inline, so they are intentionally
+    # left unscanned here to avoid rejecting valid data that merely contains an
+    # HTML-looking substring.
+    elif extension in HTML_RENDERABLE_EXTENSIONS:
         match = _scan_for_dangerous_content(filepath, PLAIN_TEXT_DANGEROUS_PATTERNS)
         if match:
             _, description = match

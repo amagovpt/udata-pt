@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- **fix: stop rejecting valid data files that contain HTML-looking substrings**
+  - `validate_upload()` scanned every non-image, non-XML upload for HTML/script
+    tokens (`<script`, `javascript:`, `<iframe`, `<object`, `<embed`). This is a
+    substring scan with no awareness of the file format, so a legitimate data
+    file — most visibly a large `.csv` — was rejected with HTTP 415 ("conteúdo
+    perigoso embutido") whenever a cell happened to hold one of those tokens
+    (e.g. an embedded HTML fragment or a `javascript:` URL). The larger the file,
+    the likelier the false positive.
+  - Resource files are always served with `Content-Disposition: attachment`
+    (see `udata/core/dataset/download_proxy.py` and the resource download
+    endpoint) — they are downloaded, never rendered inline — so the XSS vector
+    the scan defends against does not apply to inert data formats. The HTML/script
+    scan is now restricted to browser-renderable documents
+    (`HTML_RENDERABLE_EXTENSIONS`). Images keep magic-byte + Pillow + embedded
+    script checks, XML/SVG keep the XSS+XXE scan, and HTML MIME types are still
+    blocked outright — only inert data formats stop being scanned.
+
+- **fix: stream upload content validation to avoid `MemoryError` on large files**
+  - `validate_upload()` scans every uploaded resource for dangerous content
+    (`<script`, `javascript:`, XXE, …). `_scan_for_dangerous_content()` did
+    `f.read().lower()`, loading the whole file (plus a lowercased copy) into
+    memory. On large resource uploads (up to `RESOURCES_FILE_MAX_SIZE`, 800 MB)
+    this raised `MemoryError` in the uWSGI worker and returned HTTP 500 — this is
+    distinct from, and not fixed by, the chunked-upload transport work (PR #102)
+    or the server-side max-size enforcement (PR #115), both of which run before
+    this content scan.
+  - The scanner now reads the file in fixed 1 MiB chunks with a 1 KiB overlap
+    between chunks, so patterns straddling a chunk boundary are still detected
+    while peak memory stays bounded regardless of file size. Detection behaviour
+    is unchanged.
+
+- **fix: never expose deleted/archived datasets on the public organization tab**
+  - `GET /api/1/organizations/<org>/datasets/` did `Dataset.objects.owned_by(org)`
+    and only stripped `private` for non-members, so a public (non-private) but
+    **deleted** dataset of an organization showed on the org's datasets tab to
+    everyone (anonymous included), and inflated the tab count.
+  - The endpoint now hides `deleted`/`archived` datasets by default, while still
+    letting the admin org-management listing request them explicitly via the
+    `?deleted=true` / `?archived=true` status filters (which require auth).
+    Members still see the org's private drafts.
+
+- **fix: translate `EU_HVD_CATEGORIES` labels to Portuguese**
+  - The HVD category labels in `udata/rdf.py` were inherited from upstream in
+    French (`Météorologiques`, `Mobilité`, …). `TAG_TO_EU_HVD_CATEGORIES`
+    reverse-maps the *slugified* labels back to the EU BNA category URIs, so the
+    keys were French slugs (`mobilite`, `statistiques`, …) while the datasets are
+    tagged with Portuguese slugs (`mobilidade`, `estatisticas`,
+    `observacao-da-terra-e-do-ambiente`, …). The keys never matched, so
+    `dcatap:hvdCategory` was never emitted in the DCAT-AP HVD catalog harvested by
+    data.europa.eu.
+  - Translates the six category labels to Portuguese so the reverse map matches
+    the tags actually stored on datasets (both export in
+    `core/dataset/rdf.py` / `core/dataservices/rdf.py` and import in
+    `theme_labels_from_rdf`). The category URIs are unchanged.
+
 - **feat: add server-side `status` filter to `GET /api/1/reuses/`**
   - The admin/backoffice reuses listing previously filtered by lifecycle status
     (public/draft/archived/deleted) client-side, over the current page only, so
