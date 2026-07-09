@@ -34,6 +34,7 @@ class INEBackend(BaseBackend):
     - Gera slug a partir do título sanitizado para novos datasets.
     """
 
+    name = "ine"
     display_name = "Instituto nacional de estatística"
 
     # HTTP Configuration
