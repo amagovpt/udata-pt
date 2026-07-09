@@ -7,6 +7,8 @@ from flask_restx import marshal
 
 from udata import search
 from udata.api import API, apiv2, fields
+from udata.api.limits import CRAWLER_WRITE_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.core.access_type.models import AccessAudience
 from udata.core.badges.models import Badge
 from udata.core.contact_point.models import ContactPoint
@@ -355,6 +357,19 @@ class DatasetAPI(API):
 @apiv2.response(404, "Dataset not found")
 @apiv2.response(410, "Dataset has been deleted")
 class DatasetExtrasAPI(API):
+    # Metadata writeback from the Hydra crawler (PUT/DELETE) — one authenticated
+    # bot re-checking the whole catalog. Keyed by `user_or_ip` (always `user:{id}`
+    # here since the endpoint is `@apiv2.secure`) so the bot gets its own generous
+    # bucket instead of exhausting the IP-keyed default and 429'ing mid-crawl
+    # (see CRAWLER_WRITE_LIMIT).
+    decorators = [
+        limiter.limit(
+            CRAWLER_WRITE_LIMIT,
+            methods=["PUT", "DELETE"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @apiv2.doc("get_dataset_extras")
     def get(self, dataset):
         """Get a dataset extras given its identifier"""
@@ -526,6 +541,20 @@ class ResourceAPI(API):
 @apiv2.response(404, "Key not found in existing extras")
 @apiv2.response(410, "Dataset has been deleted")
 class ResourceExtrasAPI(ResourceMixin, API):
+    # Primary Hydra writeback target: `PUT .../resources/<rid>/extras/` fired
+    # after every check/analysis (udata_hydra/utils/http.py `send()`). Keyed by
+    # `user_or_ip` (always `user:{id}` here since `@apiv2.secure`) so the crawler
+    # bot gets its own generous per-bot bucket instead of colliding with the
+    # IP-keyed default and 429'ing under absurd resource volume (see
+    # CRAWLER_WRITE_LIMIT).
+    decorators = [
+        limiter.limit(
+            CRAWLER_WRITE_LIMIT,
+            methods=["PUT", "DELETE"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @apiv2.doc("get_resource_extras")
     def get(self, dataset, rid):
         """Get a resource extras given its identifier"""
