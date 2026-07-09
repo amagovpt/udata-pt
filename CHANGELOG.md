@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix: stop the Hydra crawler from 429'ing on metadata writeback under IP-collapse**
+  - The `hydra-pt` crawler writes check/analysis results back to udata after
+    every resource check via authenticated callbacks
+    (`PUT/DELETE /api/2/datasets/<d>/resources/<rid>/extras/` and the
+    dataset-level `.../extras/`). These endpoints carried no explicit
+    per-endpoint limit, so they fell under the IP-keyed `RATELIMIT_DEFAULT`
+    ("200 per hour"). The crawler runs from a single origin IP (and behind the
+    F5/WAF everything collapses to one IP anyway), so a full-catalog crawl
+    exhausted the shared hourly ceiling almost immediately and every subsequent
+    callback returned `429 TOO MANY REQUESTS` — the bot then dropped its analysis
+    results on the floor.
+  - Added `CRAWLER_WRITE_LIMIT` ("1200 per minute; 60000 per hour") in
+    `udata/api/limits.py`, sized for absurd resource volume and keyed by
+    `user_or_ip`. Because both extras endpoints are `@apiv2.secure`, the key is
+    always `user:{id}` (the Hydra bot's API-token identity), so the crawler gets
+    its own per-bot bucket that neither collapses with nor starves other traffic.
+    Applied to the `PUT`/`DELETE` methods of `ResourceExtrasAPI` and
+    `DatasetExtrasAPI`. No per-day cap (a daily cap would become a bot-wide daily
+    block mid-crawl). Regression suite in
+    `test_extras_writeback_ratelimit_ip_collapse.py`.
+
 - **fix: stop rejecting valid data files that contain HTML-looking substrings**
   - `validate_upload()` scanned every non-image, non-XML upload for HTML/script
     tokens (`<script`, `javascript:`, `<iframe`, `<object`, `<embed`). This is a
