@@ -22,7 +22,7 @@ from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License, Resource
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import normalize_url_slashes, with_http_retry
 
 # backend = 'https://sniambgeoportal.apambiente.pt/geoportal/csw'
 
@@ -52,13 +52,14 @@ class PortalAmbienteBackend(BaseBackend):
         # owslib issues its own HTTP requests, bypassing BaseBackend.get:
         # re-check the URL against the SSRF guard first (LEDG-1729 / VULN-2084).
         self._guard_url(self.source.url)
-        # Generous timeout: government servers can be slow
-        csw = CatalogueServiceWeb(self.source.url, timeout=60)
-        csw.getrecords2(maxrecords=1)
+        # Generous timeout: government servers can be slow.
+        # The constructor performs a GetCapabilities request, so retry it too.
+        csw = with_http_retry(self, CatalogueServiceWeb, self.source.url, timeout=60)
+        with_http_retry(self, csw.getrecords2, maxrecords=1)
         matches = csw.results.get("matches")
 
         while startposition <= matches:
-            csw.getrecords2(maxrecords=100, startposition=startposition)
+            with_http_retry(self, csw.getrecords2, maxrecords=100, startposition=startposition)
             startposition = csw.results.get("nextrecord")
             for rec in csw.records:
                 item = {}

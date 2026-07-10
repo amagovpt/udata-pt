@@ -28,6 +28,8 @@ from udata.harvest.filters import (
 from udata.harvest.models import HarvestItem
 from udata.models import License, Resource, SpatialCoverage
 
+from .tools.harvester_utils import with_http_retry
+
 log = logging.getLogger(__name__)
 
 
@@ -67,8 +69,9 @@ class CSWUdataBackend(BaseBackend):
         # owslib issues its own HTTP requests, bypassing BaseBackend.get:
         # re-check the (possibly redirected) URL against the SSRF guard first.
         self._guard_url(base_url)
-        # Set a generous timeout for the CSW client as government servers can be slow
-        csw = CatalogueServiceWeb(base_url, timeout=60)
+        # Set a generous timeout for the CSW client as government servers can be slow.
+        # The constructor performs a GetCapabilities request, so retry it too.
+        csw = with_http_retry(self, CatalogueServiceWeb, base_url, timeout=60)
 
         # Force all operations to use https if our base_url is https
         # This is needed because some servers (like GeoNetwork) advertise http URLs in GetCapabilities
@@ -88,13 +91,15 @@ class CSWUdataBackend(BaseBackend):
                     self._guard_url(method["url"])
 
         # First request to get matches and validate endpoint
-        csw.getrecords2(maxrecords=1, esn="full")
+        with_http_retry(self, csw.getrecords2, maxrecords=1, esn="full")
         matches = int(csw.results.get("matches", 0) or 0)
         log.info(f"Found {matches} records in CSW endpoint")
 
         startposition = 1  # CSW is 1-based
         while matches > 0 and startposition <= matches:
-            csw.getrecords2(maxrecords=page_size, startposition=startposition, esn="full")
+            with_http_retry(
+                self, csw.getrecords2, maxrecords=page_size, startposition=startposition, esn="full"
+            )
             nextrecord = int(csw.results.get("nextrecord", 0) or 0)
             log.debug(
                 f"Processing records {startposition} to {startposition + len(csw.records) - 1}"

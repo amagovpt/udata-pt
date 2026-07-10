@@ -9,7 +9,8 @@ from .tools.harvester_utils import normalize_url_slashes
 
 class DGTBackend(BaseBackend):
     name = "dgt"
-    verify_ssl = False
+    # verify_ssl inherits True from BaseBackend: the configured sources
+    # (snig.dgterritorio.gov.pt) present a valid certificate (checked 2026-07).
     display_name = "Harvester DGT"
 
     def __init__(self, *args, **kwargs):
