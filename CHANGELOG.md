@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**
+  - A security assessment (VULN-2092, Broken Access Control / CWE-284) found the
+    user read endpoints reachable by unauthenticated clients:
+    `GET /users/<id>/`, `/users/<id>/contacts/`, `/users/<id>/following/`,
+    `/users/<id>/followers/`, `/users/suggest/` and `/users/roles/`. The
+    `contacts` endpoint additionally exposed contact-point emails (unmasked PII),
+    and the consistent 200-vs-404 responses enabled user enumeration
+    (VULN-2090 / CWE-203).
+  - Added `@api.secure` to each of these GETs in `udata/core/user/api.py` so
+    anonymous requests get `401`; authenticated users are unaffected. The
+    followers GET is inherited from `FollowAPI` (shared with dataset/reuse/org
+    followers, which stay public), so it is overridden only on `FollowUserAPI`.
+  - **Breaking (frontend):** the public user profile, followers and following
+    pages must now call these endpoints through the authenticated proxy and
+    gate anonymous visitors to login. Tracked in the companion `dadosgov-fe`
+    change.
+  - Regression coverage in `test_user_api.py`
+    (`test_users_read_endpoints_require_authentication`).
+
 - **perf: index harvest.remote_id and batch the INE harvester's Mongo access**
   - Phase 2 of the INE harvester (change detection + writes) was dominated by
     unindexed lookups: `get_dataset()` ran one `harvest.remote_id` query per
