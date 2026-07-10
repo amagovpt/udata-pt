@@ -39,6 +39,13 @@
     `theme` import was dropped) together with its only caller, the never-invoked
     `CkanPTBackend.finalize()` (the `finalize` hook no longer exists in the
     harvest lifecycle); assorted lint cleanup in the touched legacy backends.
+  - Removed the defunct `dadosGov` harvester (`dadosgov.py`,
+    `dadosgovBackend.py` and its entry point): a one-shot migration backend for
+    the legacy servico.dados.gov.pt portal that can no longer run — Python 2
+    era code (`reload(sys)`/`setdefaultencoding`), pre-refactor
+    `initialize/process` API, and a base-class constructor incompatible with
+    the current `BaseBackend` signature (raises `TypeError` on instantiation).
+    No harvest source uses the `dadosGov` backend.
     [#147](https://github.com/amagovpt/udata-pt/pull/147)
 
 - **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**
