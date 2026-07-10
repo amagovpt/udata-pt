@@ -2,6 +2,80 @@
 
 ## Unreleased
 
+- **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**
+  - A security assessment (VULN-2092, Broken Access Control / CWE-284) found the
+    user read endpoints reachable by unauthenticated clients:
+    `GET /users/<id>/`, `/users/<id>/contacts/`, `/users/<id>/following/`,
+    `/users/<id>/followers/`, `/users/suggest/` and `/users/roles/`. The
+    `contacts` endpoint additionally exposed contact-point emails (unmasked PII),
+    and the consistent 200-vs-404 responses enabled user enumeration
+    (VULN-2090 / CWE-203).
+  - Added `@api.secure` to each of these GETs in `udata/core/user/api.py` so
+    anonymous requests get `401`; authenticated users are unaffected. The
+    followers GET is inherited from `FollowAPI` (shared with dataset/reuse/org
+    followers, which stay public), so it is overridden only on `FollowUserAPI`.
+  - **Breaking (frontend):** the public user profile, followers and following
+    pages must now call these endpoints through the authenticated proxy and
+    gate anonymous visitors to login. Tracked in the companion `dadosgov-fe`
+    change.
+  - Regression coverage in `test_user_api.py`
+    (`test_users_read_endpoints_require_authentication`).
+
+- **perf: index harvest.remote_id and batch the INE harvester's Mongo access**
+  - Phase 2 of the INE harvester (change detection + writes) was dominated by
+    unindexed lookups: `get_dataset()` ran one `harvest.remote_id` query per
+    item (~8500 COLLSCANs over the whole dataset collection), the bulk upsert
+    filters ran one more COLLSCAN per created dataset, and the post-create id
+    lookup another one. Downloading vs. streaming was **not** the issue —
+    parsing the full 21 MB XML takes 0.6s; the time went to MongoDB.
+  - Added an index on `dataset.harvest.remote_id` (migration
+    `2026-07-10-add-harvest-remote-id-index.py`) — this also benefits every
+    other harvester, since `BaseBackend.get_dataset()` runs the same query.
+  - INE backend now prefetches each chunk's datasets with a single `$in`
+    query (`_prefetch_datasets`), resolves created dataset ids with a single
+    `$in` query per chunk, and appends job items with a `$push` delta instead
+    of rewriting the ever-growing `job.items` array on every save. Benchmark
+    (local DB, 23k datasets, chunk of 500): 5362 ms → 77 ms per chunk (~70×).
+  - Also fixes a latent bug: the bulk flush now always happens before the
+    created-ids lookup, so HarvestItems no longer end up without a dataset
+    reference when a chunk had fewer than BULK_SIZE writes.
+
+- **fix: make the INE harvester resilient to truncated XML downloads**
+  - The INE endpoint (`xml_indic.jsp`) streams a large (~21 MB) catalog very
+    slowly (~6 min) and frequently drops the connection mid-stream (SSL EOF /
+    `ConnectionReset` / `ChunkedEncodingError`). The previous download loop only
+    retried the initial GET, not the streamed body, and did no integrity check,
+    so a mid-stream drop left a truncated `/tmp/ine.xml` that broke
+    `ET.iterparse` with `ParseError: unclosed CDATA section` and failed the whole
+    job.
+  - Added `INEBackend._download_to_file()` which retries the full transfer
+    (request + body), writes to a `.part` file, and only accepts a download that
+    matches `Content-Length` (when advertised) and ends with the closing
+    `</catalog>` root tag. When all attempts fail it reuses the last cached valid
+    file instead of aborting the job. The in-memory download path now validates
+    completeness too. Regression suite in `test_ine_backend.py`.
+
+- **fix: stop the Hydra crawler from 429'ing on metadata writeback under IP-collapse**
+  - The `hydra-pt` crawler writes check/analysis results back to udata after
+    every resource check via authenticated callbacks
+    (`PUT/DELETE /api/2/datasets/<d>/resources/<rid>/extras/` and the
+    dataset-level `.../extras/`). These endpoints carried no explicit
+    per-endpoint limit, so they fell under the IP-keyed `RATELIMIT_DEFAULT`
+    ("200 per hour"). The crawler runs from a single origin IP (and behind the
+    F5/WAF everything collapses to one IP anyway), so a full-catalog crawl
+    exhausted the shared hourly ceiling almost immediately and every subsequent
+    callback returned `429 TOO MANY REQUESTS` — the bot then dropped its analysis
+    results on the floor.
+  - Added `CRAWLER_WRITE_LIMIT` ("1200 per minute; 60000 per hour") in
+    `udata/api/limits.py`, sized for absurd resource volume and keyed by
+    `user_or_ip`. Because both extras endpoints are `@apiv2.secure`, the key is
+    always `user:{id}` (the Hydra bot's API-token identity), so the crawler gets
+    its own per-bot bucket that neither collapses with nor starves other traffic.
+    Applied to the `PUT`/`DELETE` methods of `ResourceExtrasAPI` and
+    `DatasetExtrasAPI`. No per-day cap (a daily cap would become a bot-wide daily
+    block mid-crawl). Regression suite in
+    `test_extras_writeback_ratelimit_ip_collapse.py`.
+
 - **fix: stop rejecting valid data files that contain HTML-looking substrings**
   - `validate_upload()` scanned every non-image, non-XML upload for HTML/script
     tokens (`<script`, `javascript:`, `<iframe`, `<object`, `<embed`). This is a

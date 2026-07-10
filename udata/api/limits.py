@@ -102,6 +102,23 @@ UPLOAD_LIMIT = "120 per minute; 600 per hour; 2000 per day"
 # Intruder POSTs on a single dataset): only the first few succeed inside
 # the per-minute window, hourly/daily caps absorb burst-then-pause attacks.
 DISCUSSION_CREATE_LIMIT = "3 per minute; 10 per hour; 30 per day"
+# Machine-driven metadata writeback from the Hydra crawler (`hydra-pt`): the
+# authenticated `PUT/DELETE /api/2/datasets/<d>/resources/<rid>/extras/` (and
+# the dataset-level `.../extras/`) callbacks it fires after every check/analysis
+# (udata_hydra/utils/http.py `send()`, authenticated via `X-API-KEY`). Unlike a
+# human publisher this is one bot re-checking the ENTIRE catalog: a full crawl
+# emits a writeback per changed resource, so with many workers it bursts into
+# the thousands per minute. Without an explicit limit these writes fall under
+# the IP-keyed `RATELIMIT_DEFAULT` ("200 per hour"): the crawler runs from a
+# single origin IP, so it exhausts that shared hourly ceiling almost immediately
+# and every subsequent callback returns 429 (the bot then drops analysis results
+# on the floor). Keyed by `user_or_ip`; because the endpoint is `@apiv2.secure`
+# the key is always `user:{id}` (the Hydra bot's API-token identity), so this is
+# a per-bot bucket that never collapses with — or starves — other traffic behind
+# the F5/WAF. Sized for absurd resource volume; deliberately NO per-day cap (a
+# daily cap would become a bot-wide daily block mid-crawl, the exact failure mode
+# this fixes). Calibrate against real crawl throughput.
+CRAWLER_WRITE_LIMIT = "1200 per minute; 60000 per hour"
 
 
 def user_or_ip() -> str:

@@ -690,6 +690,7 @@ delete_parser.add_argument(
 @api.response(404, "User not found")
 @api.response(410, "User is not active or has been deleted")
 class UserAPI(API):
+    @api.secure
     @api.doc("get_user")
     @api.marshal_with(user_fields)
     def get(self, user):
@@ -741,6 +742,7 @@ contact_point_parser = ContactPoint.__index_parser__
 
 @ns.route("/<user:user>/contacts/", endpoint="user_contact_points")
 class OrgContactAPI(API):
+    @api.secure
     @api.doc("get_user_contact_point")
     @api.marshal_with(ContactPoint.__page_fields__)
     def get(self, user):
@@ -753,6 +755,7 @@ class OrgContactAPI(API):
 @ns.route("/<user:user>/following/", endpoint="user_following")
 @api.response(404, "User not found")
 class UserFollowingAPI(API):
+    @api.secure
     @api.doc("user_following")
     def get(self, user):
         """List all objects followed by a given user"""
@@ -830,6 +833,16 @@ class FollowUserAPI(FollowAPI):
     model = User
 
     @api.secure
+    @api.doc("list_user_followers")
+    def get(self, id):
+        """List all followers of a given user (authenticated only)"""
+        # Override the public FollowAPI.get to require authentication: the
+        # user followers list exposes the social graph and must not be
+        # reachable anonymously (LEDG-2113 / VULN-2092). The base GET stays
+        # public for dataset/reuse/organization followers.
+        return super().get(id)
+
+    @api.secure
     @api.doc(notes="You can't follow yourself.")
     @api.response(403, "When trying to follow yourself")
     def post(self, id):
@@ -877,6 +890,7 @@ class SuggestUsersAPI(API):
     # collapses site-wide behind the F5/WAF (see PUBLIC_SEARCH_LIMIT).
     decorators = [limiter.limit(PUBLIC_SEARCH_LIMIT, methods=["GET"], key_func=user_or_ip)]
 
+    @api.secure
     @api.doc("suggest_users")
     @api.expect(suggest_parser)
     @api.marshal_list_with(user_suggestion_fields)
@@ -908,6 +922,7 @@ class SuggestUsersAPI(API):
 
 @ns.route("/roles/", endpoint="user_roles")
 class UserRolesAPI(API):
+    @api.secure
     @api.doc("user_roles")
     @api.marshal_list_with(user_role_fields)
     def get(self):

@@ -65,6 +65,7 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_first_name(self):
         """It should suggest users based on first name"""
+        self.login()
         for i in range(4):
             UserFactory(first_name="first-name-test-{0}".format(i) if i % 2 else faker.word())
 
@@ -84,6 +85,7 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_last_name(self):
         """It should suggest users based on last name"""
+        self.login()
         for i in range(4):
             UserFactory(last_name="last-name-test-{0}".format(i) if i % 2 else faker.word())
 
@@ -102,6 +104,7 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_unicode(self):
         """It should suggest users with special characters"""
+        self.login()
         for i in range(4):
             UserFactory(last_name="last-name-testé-{0}".format(i) if i % 2 else faker.word())
 
@@ -120,6 +123,7 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_no_match(self):
         """It should not provide user suggestion if no match"""
+        self.login()
         UserFactory.create_batch(3)
 
         response = self.get(url_for("api.suggest_users", q="xxxxxx", size=5))
@@ -128,12 +132,14 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_empty(self):
         """It should not provide user suggestion if no data"""
+        self.login()
         response = self.get(url_for("api.suggest_users", q="xxxxxx", size=5))
         self.assert200(response)
         self.assertEqual(len(response.json), 0)
 
     def test_suggest_users_api_email(self):
         """It should suggest users based on email"""
+        self.login()
         user = UserFactory(email="alice@example.pt")
         UserFactory(email="bob@other.pt")
 
@@ -144,14 +150,19 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_empty_query_returns_recent(self):
         """Empty query should return the most recent users"""
+        # The endpoint now requires authentication (LEDG-2113 / VULN-2092), so
+        # the logged-in user is itself a recent user: expect the 3 created plus
+        # the authenticated one.
+        self.login()
         UserFactory.create_batch(3)
 
         response = self.get(url_for("api.suggest_users", size=5))
         self.assert200(response)
-        self.assertEqual(len(response.json), 3)
+        self.assertEqual(len(response.json), 4)
 
     def test_suggest_users_api_no_dedup(self):
         """It should suggest users without deduplicating homonyms"""
+        self.login()
         UserFactory.create_batch(2, first_name="test", last_name="homonym")
 
         response = self.get(url_for("api.suggest_users", q="homonym", size=5))
@@ -165,6 +176,7 @@ class UserAPITest(APITestCase):
 
     def test_suggest_users_api_size_validation(self):
         """It should validate that the size parameter is between 1 and 50."""
+        self.login()
         response = self.get(url_for("api.suggest_users", q="foobar", size=0))
         self.assert400(response)
         self.assertIn("between 1 and 50", response.json["errors"]["size"])
@@ -274,12 +286,14 @@ class UserAPITest(APITestCase):
 
     def test_get_user(self):
         """It should get a user"""
+        self.login()
         user = UserFactory()
         response = self.get(url_for("api.user", user=user))
         self.assert200(response)
 
     def test_get_inactive_user(self):
-        """It should raise a 410"""
+        """It should raise a 410 for an authenticated non-admin"""
+        self.login()
         user = UserFactory(active=False)
         response = self.get(url_for("api.user", user=user))
         self.assert410(response)
@@ -508,6 +522,7 @@ class UserAPITest(APITestCase):
 
     def test_user_detail_exposes_datasets_count_and_reuses_count_flat(self):
         """Same contract on the single-user endpoint, since both share `user_fields`."""
+        self.login()
         target = UserFactory()
         DatasetFactory(owner=target)
         target.count_datasets()
@@ -548,6 +563,37 @@ class UserAPITest(APITestCase):
         self.assert200(response)
         assert response.json["reuses_count"] == 2
         assert response.json["metrics"]["reuses"] == 2
+
+    def test_users_read_endpoints_require_authentication(self):
+        """LEDG-2113 / VULN-2092: the /users/* read endpoints must not be
+        reachable anonymously (broken access control). An unauthenticated
+        request must return 401 on every one of them; an authenticated user
+        gets through.
+        """
+        user = UserFactory()
+        anonymous_urls = [
+            url_for("api.user", user=user),
+            url_for("api.user_contact_points", user=user),
+            url_for("api.user_following", user=user),
+            url_for("api.user_followers", id=user.id),
+            url_for("api.suggest_users", q="a"),
+            url_for("api.user_roles"),
+        ]
+
+        # Anonymous: every endpoint is locked.
+        for endpoint_url in anonymous_urls:
+            response = self.get(endpoint_url)
+            self.assertStatus(
+                response, 401, message=f"{endpoint_url} should require authentication"
+            )
+
+        # Authenticated (non-admin): access is granted.
+        self.login()
+        for endpoint_url in anonymous_urls:
+            response = self.get(endpoint_url)
+            self.assertStatus(
+                response, 200, message=f"{endpoint_url} should be reachable when authenticated"
+            )
 
 
 class OrgInvitationsAPITest(APITestCase):

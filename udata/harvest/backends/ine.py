@@ -12,10 +12,19 @@ from flask import current_app
 from slugify import slugify
 
 from udata.harvest.backends.base import BaseBackend
-from udata.harvest.models import HarvestItem
+from udata.harvest.models import HarvestItem, HarvestJob
 from udata.models import Dataset, License, Resource
 
 from .tools.harvester_utils import normalize_url_slashes
+
+
+class INEDownloadIncomplete(Exception):
+    """Raised when the downloaded XML is truncated (partial/aborted transfer).
+
+    The INE endpoint is slow and frequently drops the connection mid-stream,
+    leaving a truncated file that later breaks ET.iterparse. This is treated as
+    a retryable error so the whole download (request + body) can be retried.
+    """
 
 
 class INEBackend(BaseBackend):
@@ -117,6 +126,129 @@ class INEBackend(BaseBackend):
                 raise
 
         raise requests.exceptions.RequestException("Falha desconhecida na requisição")
+
+    # --------------------------
+    # Download robusto com validação de integridade
+    # --------------------------
+    def _is_complete_xml(self, path: str, root_tag: str = "catalog") -> bool:
+        """Cheap completeness check: the file must end with the closing root tag.
+
+        A truncated download (connection dropped mid-stream) will not contain the
+        closing </catalog> tag, so we can detect it without parsing the whole file.
+        """
+        import os
+
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size == 0:
+            return False
+        tail_bytes = min(size, 8192)
+        with open(path, "rb") as f:
+            f.seek(-tail_bytes, os.SEEK_END)
+            tail = f.read().decode("utf-8", errors="ignore")
+        return f"</{root_tag}>" in tail
+
+    @staticmethod
+    def _safe_remove(path: str) -> None:
+        import os
+
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _download_to_file(self, url: str, dest_path: str) -> None:
+        """Download the XML to a local file, retrying the full transfer (request +
+        streamed body) and validating the result before accepting it.
+
+        `_make_request_with_retry` only protects the initial GET, not the body
+        streaming via `iter_content`. The INE endpoint drops the connection
+        mid-stream (SSL EOF / ConnectionReset / ChunkedEncodingError) or times
+        out, leaving a truncated XML that breaks `ET.iterparse` with a
+        ParseError. Here we retry the whole download and only accept a file that
+        ends with the closing root tag (and matches Content-Length when the
+        server advertises it). As a last resort we reuse a previously cached
+        valid file so a transient INE outage does not fail the whole job.
+        """
+        import os
+
+        tmp_path = f"{dest_path}.part"
+        delay = self.INITIAL_RETRY_DELAY
+        last_exc: Exception | None = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                resp = self._session.get(
+                    url,
+                    headers={},
+                    stream=True,
+                    timeout=(self.TIMEOUT_CONNECT, self.TIMEOUT_READ),
+                )
+                resp.raise_for_status()
+
+                cl = resp.headers.get("Content-Length")
+                expected = int(cl) if cl and cl.isdigit() else None
+
+                written = 0
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+
+                if expected is not None and written != expected:
+                    raise INEDownloadIncomplete(f"tamanho incompleto: {written}/{expected} bytes")
+                if not self._is_complete_xml(tmp_path):
+                    raise INEDownloadIncomplete("XML truncado: root <catalog> não fechado")
+
+                os.replace(tmp_path, dest_path)
+                self._log.info(
+                    "[INE] Download completo e validado: %s bytes (tentativa %s)",
+                    written,
+                    attempt,
+                )
+                return
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                INEDownloadIncomplete,
+            ) as e:
+                last_exc = e
+                self._safe_remove(tmp_path)
+                self._log.warning(
+                    "[INE] Download falhou/truncado (tentativa %s/%s): %s",
+                    attempt,
+                    self.MAX_RETRIES,
+                    e,
+                )
+                if attempt >= self.MAX_RETRIES:
+                    break
+                jitter = random.uniform(0, 0.1 * delay)
+                time.sleep(min(delay + jitter, self.MAX_RETRY_DELAY))
+                delay = min(delay * 2, self.MAX_RETRY_DELAY)
+            except requests.exceptions.RequestException:
+                self._safe_remove(tmp_path)
+                raise
+
+        # Todas as tentativas falharam: reutilizar último ficheiro válido em cache
+        if os.path.exists(dest_path) and self._is_complete_xml(dest_path):
+            self._log.warning(
+                "[INE] Download falhou após %s tentativas; a reutilizar ficheiro válido em cache: %s",
+                self.MAX_RETRIES,
+                dest_path,
+            )
+            return
+
+        raise last_exc or requests.exceptions.RequestException(
+            "[INE] Falha no download do XML após todas as tentativas"
+        )
 
     # --------------------------
     # Normalização de tags
@@ -229,6 +361,58 @@ class INEBackend(BaseBackend):
         md["tags_norm"] = sorted(tags_norm)
 
         return md
+
+    # --------------------------
+    # Prefetch em lote (1 query por chunk em vez de 1 por item)
+    # --------------------------
+    def _prefetch_datasets(self, remote_ids: list[str]) -> dict[str, Dataset]:
+        """Fetch all existing datasets for a chunk in a single query.
+
+        Equivalent to calling `self.get_dataset()` once per item (INE remote
+        ids are never URIs, so only the domain/source_id branch applies), but
+        with one `$in` query per chunk instead of one round-trip per item.
+        """
+        found = Dataset.objects(
+            __raw__={
+                "harvest.remote_id": {"$in": remote_ids},
+                "$or": [
+                    {"harvest.domain": self.source.domain},
+                    {"harvest.source_id": str(self.source.id)},
+                ],
+            }
+        )
+        by_remote_id: dict[str, Dataset] = {}
+        for dataset in found:
+            rid = dataset.harvest.remote_id if dataset.harvest else None
+            # Keep the first match per remote_id (mirrors `.first()`)
+            if rid and rid not in by_remote_id:
+                by_remote_id[rid] = dataset
+        return by_remote_id
+
+    def _new_dataset(self) -> Dataset:
+        """Build an empty dataset owned like `BaseBackend.get_dataset` does."""
+        if self.source.organization:
+            return Dataset(organization=self.source.organization)
+        elif self.source.owner:
+            return Dataset(owner=self.source.owner)
+        return Dataset()
+
+    # --------------------------
+    # Job items: $push incremental em vez de reescrever o documento
+    # --------------------------
+    def _append_job_items(self, items: list[HarvestItem]) -> None:
+        """Append HarvestItems to the job with a `$push` delta.
+
+        `job.items.extend()` + `job.save()` rewrites (and re-validates) the
+        ever-growing items array on every flush; a `push_all` update only
+        sends the new items. The local list is kept in sync because
+        `BaseBackend.harvest()` inspects `self.job.items` afterwards.
+        """
+        if not items:
+            return
+        if not self.dryrun and self.job.pk:
+            HarvestJob.objects(pk=self.job.pk).update_one(push_all__items=items)
+        self.job.items.extend(items)
 
     # --------------------------
     # Change detection (barato + deep size check)
@@ -430,24 +614,26 @@ class INEBackend(BaseBackend):
                 )
                 source_context = self.LOCAL_FILE_PATH
             elif self.USE_LOCAL_FILE:
-                # Modo produção com ficheiro local: baixa, processa e remove
+                # Modo produção com ficheiro local: baixa (com retry + validação de
+                # integridade), processa e remove.
                 self._log.info(
                     "[INE] Baixando XML e salvando em %s (será removido após processamento)...",
                     self.LOCAL_FILE_PATH,
                 )
-                # Usar _make_request_with_retry para robustez e stream=True para memória
-                resp = self._make_request_with_retry(self.source.url, stream=True)
-                with open(self.LOCAL_FILE_PATH, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+                self._download_to_file(self.source.url, self.LOCAL_FILE_PATH)
                 self._log.info("[INE] Download concluído.")
                 source_context = self.LOCAL_FILE_PATH
             else:
                 # Modo memória: baixa direto para RAM
                 self._log.info("[INE] Baixando XML para memória...")
                 resp = self._make_request_with_retry(self.source.url, stream=False)
-                source_context = BytesIO(resp.content)
+                content = resp.content
+                # Validação de integridade: rejeitar transferência truncada
+                if b"</catalog>" not in content[-8192:]:
+                    raise INEDownloadIncomplete(
+                        "XML truncado em memória: root <catalog> não fechado"
+                    )
+                source_context = BytesIO(content)
 
             # Fase 1: Criação do iterador sobre o XML
             # source_context pode ser file path ou file-like object (BytesIO)
@@ -540,9 +726,10 @@ class INEBackend(BaseBackend):
         for i in range(0, total_items, self.BULK_SIZE):
             chunk = all_items[i : i + self.BULK_SIZE]
 
-            # --- Passo A: Pré-buscar datasets ---
+            # --- Passo A: Pré-buscar datasets (1 query para o chunk inteiro) ---
+            existing = self._prefetch_datasets([remote_id for remote_id, _ in chunk])
             for remote_id, md in chunk:
-                md["__dataset_obj"] = self.get_dataset(remote_id)
+                md["__dataset_obj"] = existing.get(remote_id) or self._new_dataset()
 
             # --- Passo B: Processamento do chunk ---
             # Guarda remote_ids de datasets criados para buscar IDs depois
@@ -632,40 +819,42 @@ class INEBackend(BaseBackend):
 
             # --- Fim do loop do chunk ---
 
-            # Flush Ops
-            if len(ops) >= self.BULK_SIZE and dataset_collection is not None:
+            # Flush Ops por chunk. Tem de acontecer ANTES do lookup dos IDs
+            # criados, senão os upserts ainda não estão na BD e os
+            # HarvestItems ficam sem referência ao dataset.
+            if ops and dataset_collection is not None:
                 self._flush_bulk(dataset_collection, ops, op_ids)
                 ops, op_ids = [], []
 
-            # Buscar IDs dos datasets criados e criar HarvestItems
+            # Buscar IDs dos datasets criados (1 query por chunk) e criar HarvestItems
             if self.job and created_remote_ids and dataset_collection is not None:
+                id_by_rid = {}
+                try:
+                    cursor = dataset_collection.find(
+                        {
+                            "harvest.remote_id": {"$in": [str(r) for r in created_remote_ids]},
+                            "harvest.source_id": (str(self.source.id) if self.source.id else None),
+                        },
+                        {"_id": 1, "harvest.remote_id": 1},
+                    )
+                    id_by_rid = {doc["harvest"]["remote_id"]: doc["_id"] for doc in cursor}
+                except Exception:
+                    self._log.warning(
+                        "[INE] Não foi possível buscar IDs dos datasets criados neste chunk"
+                    )
                 for rid in created_remote_ids:
-                    try:
-                        ds_doc = dataset_collection.find_one(
-                            {"harvest.remote_id": str(rid)}, {"_id": 1}
-                        )
-                        h_item = HarvestItem(remote_id=rid, status="done")
-                        if ds_doc:
-                            h_item.dataset = ds_doc["_id"]
-                        batch_harvest_items.append(h_item)
-                    except Exception:
-                        self._log.warning(
-                            "[INE] Não foi possível buscar ID do dataset criado: %s",
-                            rid,
-                        )
-                        h_item = HarvestItem(remote_id=rid, status="done")
-                        batch_harvest_items.append(h_item)
+                    h_item = HarvestItem(remote_id=rid, status="done")
+                    if str(rid) in id_by_rid:
+                        h_item.dataset = id_by_rid[str(rid)]
+                    batch_harvest_items.append(h_item)
 
             if self.job and len(batch_harvest_items) >= (self.BULK_SIZE * 2):
-                before_len = len(self.job.items)
-                self.job.items.extend(batch_harvest_items)
-                self.job.save()
-                after_len = len(self.job.items)
+                added = len(batch_harvest_items)
+                self._append_job_items(batch_harvest_items)
                 self._log.info(
-                    "[INE] Job Save: items grew from %s to %s (added %s)",
-                    before_len,
-                    after_len,
-                    len(batch_harvest_items),
+                    "[INE] Job items: +%s (total %s)",
+                    added,
+                    len(self.job.items),
                 )
                 batch_harvest_items = []
 
@@ -685,15 +874,12 @@ class INEBackend(BaseBackend):
 
         # Final Flush Job Items
         if self.job and batch_harvest_items:
-            before_len = len(self.job.items)
-            self.job.items.extend(batch_harvest_items)
-            self.job.save()
-            after_len = len(self.job.items)
+            added = len(batch_harvest_items)
+            self._append_job_items(batch_harvest_items)
             self._log.info(
-                "[INE] Final Job Save: items grew from %s to %s (added %s)",
-                before_len,
-                after_len,
-                len(batch_harvest_items),
+                "[INE] Final job items: +%s (total %s)",
+                added,
+                len(self.job.items),
             )
 
         total_time = time.time() - start_time
