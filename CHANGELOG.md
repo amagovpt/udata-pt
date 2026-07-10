@@ -21,6 +21,40 @@
   - Regression coverage in `test_user_api.py`
     (`test_users_read_endpoints_require_authentication`).
 
+- **perf: index harvest.remote_id and batch the INE harvester's Mongo access**
+  - Phase 2 of the INE harvester (change detection + writes) was dominated by
+    unindexed lookups: `get_dataset()` ran one `harvest.remote_id` query per
+    item (~8500 COLLSCANs over the whole dataset collection), the bulk upsert
+    filters ran one more COLLSCAN per created dataset, and the post-create id
+    lookup another one. Downloading vs. streaming was **not** the issue —
+    parsing the full 21 MB XML takes 0.6s; the time went to MongoDB.
+  - Added an index on `dataset.harvest.remote_id` (migration
+    `2026-07-10-add-harvest-remote-id-index.py`) — this also benefits every
+    other harvester, since `BaseBackend.get_dataset()` runs the same query.
+  - INE backend now prefetches each chunk's datasets with a single `$in`
+    query (`_prefetch_datasets`), resolves created dataset ids with a single
+    `$in` query per chunk, and appends job items with a `$push` delta instead
+    of rewriting the ever-growing `job.items` array on every save. Benchmark
+    (local DB, 23k datasets, chunk of 500): 5362 ms → 77 ms per chunk (~70×).
+  - Also fixes a latent bug: the bulk flush now always happens before the
+    created-ids lookup, so HarvestItems no longer end up without a dataset
+    reference when a chunk had fewer than BULK_SIZE writes.
+
+- **fix: make the INE harvester resilient to truncated XML downloads**
+  - The INE endpoint (`xml_indic.jsp`) streams a large (~21 MB) catalog very
+    slowly (~6 min) and frequently drops the connection mid-stream (SSL EOF /
+    `ConnectionReset` / `ChunkedEncodingError`). The previous download loop only
+    retried the initial GET, not the streamed body, and did no integrity check,
+    so a mid-stream drop left a truncated `/tmp/ine.xml` that broke
+    `ET.iterparse` with `ParseError: unclosed CDATA section` and failed the whole
+    job.
+  - Added `INEBackend._download_to_file()` which retries the full transfer
+    (request + body), writes to a `.part` file, and only accepts a download that
+    matches `Content-Length` (when advertised) and ends with the closing
+    `</catalog>` root tag. When all attempts fail it reuses the last cached valid
+    file instead of aborting the job. The in-memory download path now validates
+    completeness too. Regression suite in `test_ine_backend.py`.
+
 - **fix: stop the Hydra crawler from 429'ing on metadata writeback under IP-collapse**
   - The `hydra-pt` crawler writes check/analysis results back to udata after
     every resource check via authenticated callbacks
