@@ -20,6 +20,12 @@
   - Converted backends previously followed redirects silently; they now inherit
     the secure `allow_redirects=False` default, so a 3xx from a source raises
     instead of silently leaving the checked host.
+  - The INE backend now consumes the same `HARVEST_HTTP_*` settings instead of
+    its own hardcoded `MAX_RETRIES`/`TIMEOUT_*` constants: its private session
+    and duplicated retry helper were removed in favour of the guarded
+    `BaseBackend` helpers (also closing its own SSRF guard bypass). Only
+    `DOWNLOAD_MAX_RETRIES = 5` remains INE-specific, for the flaky full-file
+    catalog download where each retry re-transfers the whole body.
     [#147](https://github.com/amagovpt/udata-pt/pull/147)
 
 - **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**

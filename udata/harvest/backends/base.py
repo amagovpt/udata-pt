@@ -136,6 +136,22 @@ class BaseBackend(object):
             raise HarvestException(str(e))
 
     @property
+    def http_max_retries(self):
+        return current_app.config.get("HARVEST_HTTP_MAX_RETRIES") or 1
+
+    @property
+    def http_retry_initial_delay(self):
+        return current_app.config.get("HARVEST_HTTP_RETRY_INITIAL_DELAY") or 0
+
+    @property
+    def http_retry_max_delay(self):
+        return current_app.config.get("HARVEST_HTTP_RETRY_MAX_DELAY") or 60
+
+    @property
+    def http_timeout(self):
+        return current_app.config.get("HARVEST_HTTP_TIMEOUT")
+
+    @property
     def http_session(self):
         """Pooled HTTP session shared by all requests of a harvest job."""
         session = getattr(self, "_http_session", None)
@@ -164,11 +180,11 @@ class BaseBackend(object):
         headers = {**self.get_headers(), **headers}
         kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
         kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)
-        kwargs.setdefault("timeout", current_app.config.get("HARVEST_HTTP_TIMEOUT"))
+        kwargs.setdefault("timeout", self.http_timeout)
 
-        max_retries = current_app.config.get("HARVEST_HTTP_MAX_RETRIES") or 1
-        delay = current_app.config.get("HARVEST_HTTP_RETRY_INITIAL_DELAY") or 0
-        max_delay = current_app.config.get("HARVEST_HTTP_RETRY_MAX_DELAY") or 60
+        max_retries = self.http_max_retries
+        delay = self.http_retry_initial_delay
+        max_delay = self.http_retry_max_delay
 
         for attempt in range(1, max_retries + 1):
             try:
