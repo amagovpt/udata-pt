@@ -46,12 +46,12 @@ class INEBackend(BaseBackend):
     name = "ine"
     display_name = "Instituto nacional de estatística"
 
-    # HTTP Configuration
-    MAX_RETRIES = 5
-    INITIAL_RETRY_DELAY = 2
-    MAX_RETRY_DELAY = 60
-    TIMEOUT_CONNECT = 15
-    TIMEOUT_READ = 300
+    # HTTP retry/backoff/timeout comes from the HARVEST_HTTP_* settings via
+    # BaseBackend (http_max_retries, http_retry_*_delay, http_timeout).
+    # Only the full-file catalog download keeps a more generous retry budget:
+    # the INE endpoint frequently drops the connection mid-stream, so each
+    # retry re-transfers the whole (large) body.
+    DOWNLOAD_MAX_RETRIES = 5
 
     # Harvester Configuration
     IS_TEST_MODE = False  # True: usa ficheiro em /tmp/ine.xml (você gere) | False: download automático com limpeza
@@ -73,11 +73,6 @@ class INEBackend(BaseBackend):
 
         self._cc_by_license = None
 
-        self._session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
-
         try:
             self._log = current_app.logger
         except Exception:
@@ -91,41 +86,6 @@ class INEBackend(BaseBackend):
             self.LOG_EVERY,
             self.CHECK_CHANGES,
         )
-
-    # --------------------------
-    # HTTP com retry
-    # --------------------------
-    def _make_request_with_retry(self, url: str, headers=None, stream=True, **kwargs):
-        """Faz request HTTP com retry automático em caso de falhas de rede."""
-        if headers is None:
-            headers = {}
-        if "timeout" not in kwargs:
-            kwargs["timeout"] = (self.TIMEOUT_CONNECT, self.TIMEOUT_READ)
-
-        delay = self.INITIAL_RETRY_DELAY
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            try:
-                resp = self._session.get(url, headers=headers, stream=stream, **kwargs)
-                resp.raise_for_status()
-                return resp
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.ChunkedEncodingError,
-                ConnectionResetError,
-                ConnectionAbortedError,
-            ) as e:
-                if attempt >= self.MAX_RETRIES:
-                    self._log.error("[INE] Falha após %s tentativas: %s", attempt, e)
-                    raise
-
-                jitter = random.uniform(0, 0.1 * delay)
-                time.sleep(min(delay + jitter, self.MAX_RETRY_DELAY))
-                delay = min(delay * 2, self.MAX_RETRY_DELAY)
-            except requests.exceptions.RequestException:
-                raise
-
-        raise requests.exceptions.RequestException("Falha desconhecida na requisição")
 
     # --------------------------
     # Download robusto com validação de integridade
@@ -164,7 +124,7 @@ class INEBackend(BaseBackend):
         """Download the XML to a local file, retrying the full transfer (request +
         streamed body) and validating the result before accepting it.
 
-        `_make_request_with_retry` only protects the initial GET, not the body
+        `BaseBackend.get` only protects the initial GET, not the body
         streaming via `iter_content`. The INE endpoint drops the connection
         mid-stream (SSL EOF / ConnectionReset / ChunkedEncodingError) or times
         out, leaving a truncated XML that breaks `ET.iterparse` with a
@@ -172,21 +132,24 @@ class INEBackend(BaseBackend):
         ends with the closing root tag (and matches Content-Length when the
         server advertises it). As a last resort we reuse a previously cached
         valid file so a transient INE outage does not fail the whole job.
+
+        Delays/timeouts come from the HARVEST_HTTP_* settings; only the retry
+        budget is INE-specific (`DOWNLOAD_MAX_RETRIES`) because each retry
+        re-transfers the whole catalog.
         """
         import os
 
         tmp_path = f"{dest_path}.part"
-        delay = self.INITIAL_RETRY_DELAY
+        delay = self.http_retry_initial_delay
+        max_delay = self.http_retry_max_delay
         last_exc: Exception | None = None
 
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        for attempt in range(1, self.DOWNLOAD_MAX_RETRIES + 1):
             try:
-                resp = self._session.get(
-                    url,
-                    headers={},
-                    stream=True,
-                    timeout=(self.TIMEOUT_CONNECT, self.TIMEOUT_READ),
-                )
+                # Guarded fetch (SSRF check, LEDG-1729 / VULN-2084): the
+                # connection-setup retry lives in BaseBackend; the loop here
+                # retries the full body transfer on truncation.
+                resp = self.get(url, stream=True, timeout=self.http_timeout)
                 resp.raise_for_status()
 
                 cl = resp.headers.get("Content-Length")
@@ -225,14 +188,14 @@ class INEBackend(BaseBackend):
                 self._log.warning(
                     "[INE] Download falhou/truncado (tentativa %s/%s): %s",
                     attempt,
-                    self.MAX_RETRIES,
+                    self.DOWNLOAD_MAX_RETRIES,
                     e,
                 )
-                if attempt >= self.MAX_RETRIES:
+                if attempt >= self.DOWNLOAD_MAX_RETRIES:
                     break
                 jitter = random.uniform(0, 0.1 * delay)
-                time.sleep(min(delay + jitter, self.MAX_RETRY_DELAY))
-                delay = min(delay * 2, self.MAX_RETRY_DELAY)
+                time.sleep(min(delay + jitter, max_delay))
+                delay = min(delay * 2, max_delay) if delay else 1
             except requests.exceptions.RequestException:
                 self._safe_remove(tmp_path)
                 raise
@@ -241,7 +204,7 @@ class INEBackend(BaseBackend):
         if os.path.exists(dest_path) and self._is_complete_xml(dest_path):
             self._log.warning(
                 "[INE] Download falhou após %s tentativas; a reutilizar ficheiro válido em cache: %s",
-                self.MAX_RETRIES,
+                self.DOWNLOAD_MAX_RETRIES,
                 dest_path,
             )
             return
@@ -270,7 +233,9 @@ class INEBackend(BaseBackend):
     def _fetch_hvd_ids(self) -> set[str]:
         url = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
         try:
-            resp = self._make_request_with_retry(url, timeout=30, stream=False)
+            # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
+            resp = self.get(url, timeout=30)
+            resp.raise_for_status()
             root = ET.fromstring(resp.content)
             ids = {ind.attrib["id"] for ind in root.findall(".//indicator") if "id" in ind.attrib}
             self._log.info("[INE] HVD IDs carregados: %s", len(ids))
@@ -626,7 +591,9 @@ class INEBackend(BaseBackend):
             else:
                 # Modo memória: baixa direto para RAM
                 self._log.info("[INE] Baixando XML para memória...")
-                resp = self._make_request_with_retry(self.source.url, stream=False)
+                # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
+                resp = self.get(self.source.url)
+                resp.raise_for_status()
                 content = resp.content
                 # Validação de integridade: rejeitar transferência truncada
                 if b"</catalog>" not in content[-8192:]:
