@@ -64,7 +64,7 @@ uv run ruff format .
 - Pre-commit hooks: ruff check, ruff format, trailing whitespace, end-of-file fixer
 - Commit messages: follow [Conventional Commits](#branch--commit-conventions), readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
 - Branches: follow [Conventional Branch](#branch--commit-conventions) (`<type>/<kebab-case-description>`).
-- Update CHANGELOG.md when making notable changes
+- **Update `CHANGELOG.md` after every notable change** (mandatory once the implementation is done). Add the entry at the top under `## Unreleased`, in the existing style: a **bold one-line summary**, optionally followed by indented sub-bullets explaining the *why/how* (not just a PR link), and a link to the PR — e.g. `[#143](https://github.com/amagovpt/udata-pt/pull/143)`. Describe the behaviour that changed and the reasoning. Reference the PR, not Jira ticket ids.
 - Tests use pytest with MongoDB (port 27018 via docker-compose.test.yml)
 - Coverage config in `coverage.rc` (branch coverage, excludes test dirs)
 
