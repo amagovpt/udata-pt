@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **fix: make the INE harvester resilient to truncated XML downloads**
+  - The INE endpoint (`xml_indic.jsp`) streams a large (~21 MB) catalog very
+    slowly (~6 min) and frequently drops the connection mid-stream (SSL EOF /
+    `ConnectionReset` / `ChunkedEncodingError`). The previous download loop only
+    retried the initial GET, not the streamed body, and did no integrity check,
+    so a mid-stream drop left a truncated `/tmp/ine.xml` that broke
+    `ET.iterparse` with `ParseError: unclosed CDATA section` and failed the whole
+    job.
+  - Added `INEBackend._download_to_file()` which retries the full transfer
+    (request + body), writes to a `.part` file, and only accepts a download that
+    matches `Content-Length` (when advertised) and ends with the closing
+    `</catalog>` root tag. When all attempts fail it reuses the last cached valid
+    file instead of aborting the job. The in-memory download path now validates
+    completeness too. Regression suite in `test_ine_backend.py`.
+
 - **fix: stop the Hydra crawler from 429'ing on metadata writeback under IP-collapse**
   - The `hydra-pt` crawler writes check/analysis results back to udata after
     every resource check via authenticated callbacks

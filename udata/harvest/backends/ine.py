@@ -18,6 +18,15 @@ from udata.models import Dataset, License, Resource
 from .tools.harvester_utils import normalize_url_slashes
 
 
+class INEDownloadIncomplete(Exception):
+    """Raised when the downloaded XML is truncated (partial/aborted transfer).
+
+    The INE endpoint is slow and frequently drops the connection mid-stream,
+    leaving a truncated file that later breaks ET.iterparse. This is treated as
+    a retryable error so the whole download (request + body) can be retried.
+    """
+
+
 class INEBackend(BaseBackend):
     """
     INE Harvester - modo FAST (2 fases):
@@ -117,6 +126,129 @@ class INEBackend(BaseBackend):
                 raise
 
         raise requests.exceptions.RequestException("Falha desconhecida na requisição")
+
+    # --------------------------
+    # Download robusto com validação de integridade
+    # --------------------------
+    def _is_complete_xml(self, path: str, root_tag: str = "catalog") -> bool:
+        """Cheap completeness check: the file must end with the closing root tag.
+
+        A truncated download (connection dropped mid-stream) will not contain the
+        closing </catalog> tag, so we can detect it without parsing the whole file.
+        """
+        import os
+
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size == 0:
+            return False
+        tail_bytes = min(size, 8192)
+        with open(path, "rb") as f:
+            f.seek(-tail_bytes, os.SEEK_END)
+            tail = f.read().decode("utf-8", errors="ignore")
+        return f"</{root_tag}>" in tail
+
+    @staticmethod
+    def _safe_remove(path: str) -> None:
+        import os
+
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _download_to_file(self, url: str, dest_path: str) -> None:
+        """Download the XML to a local file, retrying the full transfer (request +
+        streamed body) and validating the result before accepting it.
+
+        `_make_request_with_retry` only protects the initial GET, not the body
+        streaming via `iter_content`. The INE endpoint drops the connection
+        mid-stream (SSL EOF / ConnectionReset / ChunkedEncodingError) or times
+        out, leaving a truncated XML that breaks `ET.iterparse` with a
+        ParseError. Here we retry the whole download and only accept a file that
+        ends with the closing root tag (and matches Content-Length when the
+        server advertises it). As a last resort we reuse a previously cached
+        valid file so a transient INE outage does not fail the whole job.
+        """
+        import os
+
+        tmp_path = f"{dest_path}.part"
+        delay = self.INITIAL_RETRY_DELAY
+        last_exc: Exception | None = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                resp = self._session.get(
+                    url,
+                    headers={},
+                    stream=True,
+                    timeout=(self.TIMEOUT_CONNECT, self.TIMEOUT_READ),
+                )
+                resp.raise_for_status()
+
+                cl = resp.headers.get("Content-Length")
+                expected = int(cl) if cl and cl.isdigit() else None
+
+                written = 0
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+
+                if expected is not None and written != expected:
+                    raise INEDownloadIncomplete(f"tamanho incompleto: {written}/{expected} bytes")
+                if not self._is_complete_xml(tmp_path):
+                    raise INEDownloadIncomplete("XML truncado: root <catalog> não fechado")
+
+                os.replace(tmp_path, dest_path)
+                self._log.info(
+                    "[INE] Download completo e validado: %s bytes (tentativa %s)",
+                    written,
+                    attempt,
+                )
+                return
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                INEDownloadIncomplete,
+            ) as e:
+                last_exc = e
+                self._safe_remove(tmp_path)
+                self._log.warning(
+                    "[INE] Download falhou/truncado (tentativa %s/%s): %s",
+                    attempt,
+                    self.MAX_RETRIES,
+                    e,
+                )
+                if attempt >= self.MAX_RETRIES:
+                    break
+                jitter = random.uniform(0, 0.1 * delay)
+                time.sleep(min(delay + jitter, self.MAX_RETRY_DELAY))
+                delay = min(delay * 2, self.MAX_RETRY_DELAY)
+            except requests.exceptions.RequestException:
+                self._safe_remove(tmp_path)
+                raise
+
+        # Todas as tentativas falharam: reutilizar último ficheiro válido em cache
+        if os.path.exists(dest_path) and self._is_complete_xml(dest_path):
+            self._log.warning(
+                "[INE] Download falhou após %s tentativas; a reutilizar ficheiro válido em cache: %s",
+                self.MAX_RETRIES,
+                dest_path,
+            )
+            return
+
+        raise last_exc or requests.exceptions.RequestException(
+            "[INE] Falha no download do XML após todas as tentativas"
+        )
 
     # --------------------------
     # Normalização de tags
@@ -430,24 +562,26 @@ class INEBackend(BaseBackend):
                 )
                 source_context = self.LOCAL_FILE_PATH
             elif self.USE_LOCAL_FILE:
-                # Modo produção com ficheiro local: baixa, processa e remove
+                # Modo produção com ficheiro local: baixa (com retry + validação de
+                # integridade), processa e remove.
                 self._log.info(
                     "[INE] Baixando XML e salvando em %s (será removido após processamento)...",
                     self.LOCAL_FILE_PATH,
                 )
-                # Usar _make_request_with_retry para robustez e stream=True para memória
-                resp = self._make_request_with_retry(self.source.url, stream=True)
-                with open(self.LOCAL_FILE_PATH, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+                self._download_to_file(self.source.url, self.LOCAL_FILE_PATH)
                 self._log.info("[INE] Download concluído.")
                 source_context = self.LOCAL_FILE_PATH
             else:
                 # Modo memória: baixa direto para RAM
                 self._log.info("[INE] Baixando XML para memória...")
                 resp = self._make_request_with_retry(self.source.url, stream=False)
-                source_context = BytesIO(resp.content)
+                content = resp.content
+                # Validação de integridade: rejeitar transferência truncada
+                if b"</catalog>" not in content[-8192:]:
+                    raise INEDownloadIncomplete(
+                        "XML truncado em memória: root <catalog> não fechado"
+                    )
+                source_context = BytesIO(content)
 
             # Fase 1: Criação do iterador sobre o XML
             # source_context pode ser file path ou file-like object (BytesIO)
