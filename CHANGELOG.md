@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **fix: route all harvest backend HTTP through a guarded session with retries (VULN-2084 follow-up)**
+  - The SSRF guard from LEDG-1729 / VULN-2084 only protected requests issued
+    through `BaseBackend.get/head/post`, but several PT-custom backends fetched
+    with bare `requests.get` (`dgt`, `ogc`, `inehvd`, `cswudata`), unguarded
+    `owslib` CSW clients (`apambiente`, `cswudata`) or a `subprocess curl` to
+    `/tmp` (`dgtIne`) — all bypassing `_guard_url`. They now go through the
+    guarded helpers; the CSW backends also re-check the resolved endpoint and
+    every server-advertised operation URL before `owslib` issues requests.
+  - `BaseBackend.get/head/post` were promoted to a pooled `requests.Session`
+    with a default `(connect, read)` timeout and retry of connection-level
+    failures with exponential backoff and jitter (SSL errors and HTTP status
+    codes are never retried) — the pattern proven in the INE FAST harvester.
+    Tunable via `HARVEST_HTTP_MAX_RETRIES`, `HARVEST_HTTP_RETRY_INITIAL_DELAY`,
+    `HARVEST_HTTP_RETRY_MAX_DELAY` and `HARVEST_HTTP_TIMEOUT`; disabled in the
+    Testing profile so simulated-error tests keep failing fast.
+  - Converted backends previously followed redirects silently; they now inherit
+    the secure `allow_redirects=False` default, so a 3xx from a source raises
+    instead of silently leaving the checked host.
+    [#147](https://github.com/amagovpt/udata-pt/pull/147)
+
 - **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**
   - A security assessment (VULN-2092, Broken Access Control / CWE-284) found the
     user read endpoints reachable by unauthenticated clients:
