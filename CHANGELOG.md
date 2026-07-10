@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix: close user enumeration on `/api/1/users/<id>` (VULN-2090 / CWE-203)**
+  - After the VULN-2092 fix required authentication on the user read endpoints,
+    an anonymous caller could still enumerate accounts (by id or, more usefully,
+    by slug): an existing user returned `401` while a missing one returned `404`,
+    because the `ModelConverter` resolves the user in the routing layer (and
+    404s) *before* the view's `@api.secure` runs.
+  - Added a `SafeNotFound` marker returned by `UserConverter` for a missing user;
+    `lazy_raise_or_redirect` now answers an anonymous request with `401` (identical
+    to the response for an existing user) instead of `404`, so existence is no
+    longer observable. Authenticated (session) callers still get a normal `404`.
+    Fixes the whole user route family (`/<id>/`, `/contacts/`, `/following/`).
+  - Regression coverage in `test_user_api.py`
+    (`test_user_detail_no_enumeration_for_anonymous`).
+
 - **fix: route all harvest backend HTTP through a guarded session with retries (VULN-2084 follow-up)**
   - The SSRF guard from LEDG-1729 / VULN-2084 only protected requests issued
     through `BaseBackend.get/head/post`, but several PT-custom backends fetched
