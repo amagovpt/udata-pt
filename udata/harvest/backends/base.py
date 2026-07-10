@@ -1,4 +1,6 @@
 import logging
+import random
+import time
 import traceback
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
@@ -133,35 +135,93 @@ class BaseBackend(object):
         except HarvestURLForbidden as e:
             raise HarvestException(str(e))
 
-    def head(self, url, headers={}, **kwargs):
+    @property
+    def http_max_retries(self):
+        return current_app.config.get("HARVEST_HTTP_MAX_RETRIES") or 1
+
+    @property
+    def http_retry_initial_delay(self):
+        return current_app.config.get("HARVEST_HTTP_RETRY_INITIAL_DELAY") or 0
+
+    @property
+    def http_retry_max_delay(self):
+        return current_app.config.get("HARVEST_HTTP_RETRY_MAX_DELAY") or 60
+
+    @property
+    def http_timeout(self):
+        return current_app.config.get("HARVEST_HTTP_TIMEOUT")
+
+    @property
+    def http_session(self):
+        """Pooled HTTP session shared by all requests of a harvest job."""
+        session = getattr(self, "_http_session", None)
+        if session is None:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=16, pool_maxsize=16, max_retries=0
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._http_session = session
+        return session
+
+    def _request_with_retry(self, method, url, headers, **kwargs):
+        """Issue a guarded HTTP request, retrying connection-level failures.
+
+        Every request goes through `_guard_url` (SSRF guard, see
+        LEDG-1729 / VULN-2084) and gets a default (connect, read) timeout.
+        Connection errors and timeouts are retried with exponential backoff
+        and jitter; SSL errors and HTTP status codes are never retried.
+        Tunables: `HARVEST_HTTP_MAX_RETRIES`, `HARVEST_HTTP_RETRY_INITIAL_DELAY`,
+        `HARVEST_HTTP_RETRY_MAX_DELAY` and `HARVEST_HTTP_TIMEOUT`.
+        """
         self._guard_url(url)
-        headers.update(self.get_headers())
+        # Explicit caller headers win over the backend defaults.
+        headers = {**self.get_headers(), **headers}
         kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
         kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)
-        response = requests.head(url, headers=headers, **kwargs)
+        kwargs.setdefault("timeout", self.http_timeout)
+
+        max_retries = self.http_max_retries
+        delay = self.http_retry_initial_delay
+        max_delay = self.http_retry_max_delay
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.http_session.request(method, url, headers=headers, **kwargs)
+                break
+            except requests.exceptions.SSLError:
+                # Certificate errors are not transient: fail immediately.
+                raise
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as e:
+                if attempt >= max_retries:
+                    raise
+                log.warning(
+                    "HTTP %s %s failed (attempt %s/%s), retrying: %s",
+                    method.upper(),
+                    url,
+                    attempt,
+                    max_retries,
+                    e,
+                )
+                time.sleep(min(delay + random.uniform(0, 0.1 * delay), max_delay))
+                delay = min(delay * 2, max_delay) if delay else 1
         if not kwargs["allow_redirects"]:
             raise_if_redirect(response)
         return response
+
+    def head(self, url, headers={}, **kwargs):
+        return self._request_with_retry("head", url, headers, **kwargs)
 
     def get(self, url, headers={}, **kwargs):
-        self._guard_url(url)
-        headers.update(self.get_headers())
-        kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
-        kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)
-        response = requests.get(url, headers=headers, **kwargs)
-        if not kwargs["allow_redirects"]:
-            raise_if_redirect(response)
-        return response
+        return self._request_with_retry("get", url, headers, **kwargs)
 
     def post(self, url, data, headers={}, **kwargs):
-        self._guard_url(url)
-        headers.update(self.get_headers())
-        kwargs["verify"] = kwargs.get("verify", self.verify_ssl)
-        kwargs["allow_redirects"] = kwargs.get("allow_redirects", self.allow_redirects)
-        response = requests.post(url, data=data, headers=headers, **kwargs)
-        if not kwargs["allow_redirects"]:
-            raise_if_redirect(response)
-        return response
+        return self._request_with_retry("post", url, headers, data=data, **kwargs)
 
     def get_headers(self):
         return {
