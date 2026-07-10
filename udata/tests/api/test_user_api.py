@@ -595,6 +595,27 @@ class UserAPITest(APITestCase):
                 response, 200, message=f"{endpoint_url} should be reachable when authenticated"
             )
 
+    def test_user_detail_no_enumeration_for_anonymous(self):
+        """LEDG-2132 / VULN-2090: an anonymous caller must not be able to tell an
+        existing user from a missing one. Both return 401 (not 401-vs-404), so the
+        response is identical whether or not the user exists (CWE-203). An
+        authenticated caller still gets a real 404 for a genuinely missing user.
+        """
+        user = UserFactory()
+        missing_id = "000000000000000000000000"
+
+        # Anonymous: existing and missing are indistinguishable.
+        existing = self.get(url_for("api.user", user=user))
+        missing = self.get(url_for("api.user", user=missing_id))
+        self.assert401(existing)
+        self.assert401(missing)
+        self.assertEqual(existing.status_code, missing.status_code)
+
+        # Authenticated (session): a genuinely missing user is a normal 404.
+        self.login()
+        self.assert200(self.get(url_for("api.user", user=user)))
+        self.assertStatus(self.get(url_for("api.user", user=missing_id)), 404)
+
 
 class OrgInvitationsAPITest(APITestCase):
     def test_list_org_invitations(self):
