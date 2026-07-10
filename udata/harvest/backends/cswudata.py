@@ -14,19 +14,21 @@ Usage:
 """
 
 import logging
-import requests
 
-from udata.harvest.backends.base import BaseBackend
-from udata.models import Resource, Dataset, License, SpatialCoverage
+import requests
 from owslib.csw import CatalogueServiceWeb
 
-from udata.harvest.models import HarvestItem
+from udata.harvest.backends.base import BaseBackend
 from udata.harvest.exceptions import HarvestException
 from udata.harvest.filters import (
-    to_date,
-    normalize_tag,
     normalize_string,
+    normalize_tag,
+    to_date,
 )
+from udata.harvest.models import HarvestItem
+from udata.models import License, Resource, SpatialCoverage
+
+from .tools.harvester_utils import with_http_retry
 
 log = logging.getLogger(__name__)
 
@@ -52,11 +54,9 @@ class CSWUdataBackend(BaseBackend):
 
         # Discover the final URL to avoid POST -> GET conversion on redirects (common in GeoNetwork)
         try:
-            # We use a GET request with stream=True to follow redirects and find the actual endpoint
-            # without downloading the whole body.
-            response = requests.get(
-                base_url, timeout=30, allow_redirects=True, stream=True
-            )
+            # Guarded GET (SSRF check + retry/timeout) with stream=True to follow
+            # redirects and find the actual endpoint without downloading the body.
+            response = self.get(base_url, timeout=30, allow_redirects=True, stream=True)
             base_url = response.url
             response.close()
             log.debug(f"Resolved CSW endpoint URL: {base_url}")
@@ -66,8 +66,12 @@ class CSWUdataBackend(BaseBackend):
             pass
 
         page_size = 100
-        # Set a generous timeout for the CSW client as government servers can be slow
-        csw = CatalogueServiceWeb(base_url, timeout=60)
+        # owslib issues its own HTTP requests, bypassing BaseBackend.get:
+        # re-check the (possibly redirected) URL against the SSRF guard first.
+        self._guard_url(base_url)
+        # Set a generous timeout for the CSW client as government servers can be slow.
+        # The constructor performs a GetCapabilities request, so retry it too.
+        csw = with_http_retry(self, CatalogueServiceWeb, base_url, timeout=60)
 
         # Force all operations to use https if our base_url is https
         # This is needed because some servers (like GeoNetwork) advertise http URLs in GetCapabilities
@@ -78,15 +82,23 @@ class CSWUdataBackend(BaseBackend):
                     if method.get("url", "").startswith("http://"):
                         method["url"] = method["url"].replace("http://", "https://", 1)
 
+        # The server-advertised operation URLs are attacker-controllable input:
+        # owslib will POST GetRecords to them, so re-check each against the
+        # SSRF guard before any further request (LEDG-1729 / VULN-2084).
+        for op in getattr(csw, "operations", []):
+            for method in op.methods:
+                if method.get("url"):
+                    self._guard_url(method["url"])
+
         # First request to get matches and validate endpoint
-        csw.getrecords2(maxrecords=1, esn="full")
+        with_http_retry(self, csw.getrecords2, maxrecords=1, esn="full")
         matches = int(csw.results.get("matches", 0) or 0)
         log.info(f"Found {matches} records in CSW endpoint")
 
         startposition = 1  # CSW is 1-based
         while matches > 0 and startposition <= matches:
-            csw.getrecords2(
-                maxrecords=page_size, startposition=startposition, esn="full"
+            with_http_retry(
+                self, csw.getrecords2, maxrecords=page_size, startposition=startposition, esn="full"
             )
             nextrecord = int(csw.results.get("nextrecord", 0) or 0)
             log.debug(
@@ -126,7 +138,7 @@ class CSWUdataBackend(BaseBackend):
                 self.process_dataset(data["id"], items=data)
 
                 if self.has_reached_max_items():
-                    log.info(f"Reached maximum items limit")
+                    log.info("Reached maximum items limit")
                     return
 
             if nextrecord == 0 or nextrecord <= startposition:
@@ -148,9 +160,7 @@ class CSWUdataBackend(BaseBackend):
 
         data = kwargs.get("items")
         if not data:
-            raise HarvestException(
-                "Missing data for dataset {0}".format(item.remote_id)
-            )
+            raise HarvestException("Missing data for dataset {0}".format(item.remote_id))
 
         # Set basic dataset fields
         dataset.title = normalize_string(data["title"])

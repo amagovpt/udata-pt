@@ -1,65 +1,53 @@
 # -*- coding: utf-8 -*-
 import logging
-from datetime import datetime
-from udata.i18n import lazy_gettext as _
-
-from flask import current_app, render_template
-from flask_mail import Message
+import random
 import re
+import time
 
-#from udata import theme
-# from udata_front import theme
-from udata.models import (
-    Dataset, User, Role
-)
+import requests
 
 log = logging.getLogger(__name__)
 
-'''
-Checks for missing datasets in source
-'''
-def missing_datasets_warning(job_items, source):
 
-    job_datasets = [item.dataset.id for item in job_items]
+def with_http_retry(backend, func, *args, **kwargs):
+    """Call `func` retrying connection-level failures, like `BaseBackend.get`.
 
-    domain_harvested_datasets = Dataset.objects(__raw__={
-        'extras.harvest:domain': source.domain,
-        'private': False,
-        'deleted': None
-    }).all()
-    
-    missing_datasets = []
-    for dataset in domain_harvested_datasets:
-        if dataset.id not in job_datasets:
-            dataset.private = True
-            missing_datasets.append(dataset)
-            dataset.save()
-    
-    if missing_datasets:
-        org_recipients = [ member.user.email for member in source.organization.members if member.role == 'admin' ]
-        admin_role = Role.objects.filter(name='admin').first()
-        recipients = [ user.email for user in User.objects.filter(roles=admin_role).all() ]
+    For network calls issued by third-party clients (e.g. owslib's
+    `CatalogueServiceWeb` / `getrecords2`, which use `requests` internally
+    but bypass the guarded `BaseBackend` session). Retries the same
+    exception set as `BaseBackend._request_with_retry` — connection errors,
+    timeouts and truncated bodies — with exponential backoff and jitter,
+    driven by the same `HARVEST_HTTP_*` settings via the backend properties.
+    SSL errors, HTTP status errors and OGC ServiceExceptions are never
+    retried. The caller remains responsible for `_guard_url` checks.
+    """
+    delay = backend.http_retry_initial_delay
+    max_delay = backend.http_retry_max_delay
+    max_retries = backend.http_max_retries
 
-        #recipients = list(set(org_recipients + recipients))
-
-        subject = 'Relatório harvesting dados.gov - {}.'.format(source)
-
-        context = {
-            'subject': subject,
-            'harvester': source,
-            'datasets': missing_datasets,
-            'server': current_app.config.get('SERVER_NAME')
-        }
-
-        msg = Message(subject=subject, sender='dados@ama.pt', recipients=org_recipients, cc=['dados@ama.pt'], bcc=recipients)
-        msg.body = theme.render('mail/harvester_warning.txt', **context)
-        msg.html = theme.render('mail/harvester_warning.html', **context)
-
-        mail = current_app.extensions.get('mail')
+    for attempt in range(1, max_retries + 1):
         try:
-            mail.send(msg)
-        except:
-            pass
+            return func(*args, **kwargs)
+        except requests.exceptions.SSLError:
+            # Certificate errors are not transient: fail immediately.
+            raise
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+            if attempt >= max_retries:
+                raise
+            log.warning(
+                "%s failed (attempt %s/%s), retrying: %s",
+                getattr(func, "__name__", repr(func)),
+                attempt,
+                max_retries,
+                e,
+            )
+            time.sleep(min(delay + random.uniform(0, 0.1 * delay), max_delay))
+            delay = min(delay * 2, max_delay) if delay else 1
+
 
 def normalize_url_slashes(url: str) -> str:
     """
@@ -74,7 +62,7 @@ def normalize_url_slashes(url: str) -> str:
     parts = url.split("://", 1)
     if len(parts) == 2:
         # Remove múltiplos slashes seguidos no caminho (mas não no protocolo)
-        parts[1] = re.sub(r'/+', '/', parts[1])
+        parts[1] = re.sub(r"/+", "/", parts[1])
         return "://".join(parts)
     else:
-        return re.sub(r'/+', '/', url)
+        return re.sub(r"/+", "/", url)

@@ -377,6 +377,15 @@ class Defaults(object):
     # It should be a dedicated service account
     HARVEST_ACTIVITY_USER_ID = None
 
+    # HTTP behaviour of the guarded `BaseBackend.get/head/post` helpers.
+    # Retries only cover connection-level failures (connection reset,
+    # timeout, truncated body) — never SSL errors nor HTTP status codes —
+    # and back off exponentially with jitter between attempts.
+    HARVEST_HTTP_MAX_RETRIES = 3
+    HARVEST_HTTP_RETRY_INITIAL_DELAY = 2  # seconds
+    HARVEST_HTTP_RETRY_MAX_DELAY = 60  # seconds
+    HARVEST_HTTP_TIMEOUT = (15, 300)  # (connect, read) seconds
+
     # S3 connection details
     ###########################################################################
     S3_URL = None
@@ -810,6 +819,9 @@ class Testing(object):
     URLS_ALLOW_LOCAL = True  # Test server URL is local.test
     URLS_RESOLVE_HOSTNAME = False
     URLS_ALLOWED_TLDS = tld_set | set(["test"])
+    # No harvest HTTP retries in tests: keeps simulated connection errors
+    # failing fast and log assertions (single warning) accurate.
+    HARVEST_HTTP_MAX_RETRIES = 1
     URLS_ALLOW_PRIVATE = False
     FS_IMAGES_OPTIMIZE = True
     SECURITY_EMAIL_VALIDATOR_ARGS = {

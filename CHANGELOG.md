@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **fix: route all harvest backend HTTP through a guarded session with retries (VULN-2084 follow-up)**
+  - The SSRF guard from LEDG-1729 / VULN-2084 only protected requests issued
+    through `BaseBackend.get/head/post`, but several PT-custom backends fetched
+    with bare `requests.get` (`dgt`, `ogc`, `inehvd`, `cswudata`), unguarded
+    `owslib` CSW clients (`apambiente`, `cswudata`) or a `subprocess curl` to
+    `/tmp` (`dgtIne`) — all bypassing `_guard_url`. They now go through the
+    guarded helpers; the CSW backends also re-check the resolved endpoint and
+    every server-advertised operation URL before `owslib` issues requests.
+  - `BaseBackend.get/head/post` were promoted to a pooled `requests.Session`
+    with a default `(connect, read)` timeout and retry of connection-level
+    failures with exponential backoff and jitter (SSL errors and HTTP status
+    codes are never retried) — the pattern proven in the INE FAST harvester.
+    Tunable via `HARVEST_HTTP_MAX_RETRIES`, `HARVEST_HTTP_RETRY_INITIAL_DELAY`,
+    `HARVEST_HTTP_RETRY_MAX_DELAY` and `HARVEST_HTTP_TIMEOUT`; disabled in the
+    Testing profile so simulated-error tests keep failing fast.
+  - Converted backends previously followed redirects silently; they now inherit
+    the secure `allow_redirects=False` default, so a 3xx from a source raises
+    instead of silently leaving the checked host.
+  - The INE backend now consumes the same `HARVEST_HTTP_*` settings instead of
+    its own hardcoded `MAX_RETRIES`/`TIMEOUT_*` constants: its private session
+    and duplicated retry helper were removed in favour of the guarded
+    `BaseBackend` helpers (also closing its own SSRF guard bypass). Only
+    `DOWNLOAD_MAX_RETRIES = 5` remains INE-specific, for the flaky full-file
+    catalog download where each retry re-transfers the whole body.
+  - owslib CSW calls (`CatalogueServiceWeb` constructor and `getrecords2` in
+    `cswudata` and `apambiente`) now retry connection-level failures too, via a
+    new `with_http_retry` helper in `harvester_utils` driven by the same
+    `HARVEST_HTTP_*` settings — owslib issues its own HTTP requests, so it did
+    not benefit from the `BaseBackend` retry.
+  - Re-enabled TLS certificate verification on the `odspt` and `dgt` backends
+    (`verify_ssl = False` removed): their configured sources
+    (transparencia.sns.gov.pt, snig.dgterritorio.gov.pt) present valid
+    Let's Encrypt certificates, verified against the requests/certifi bundle.
+  - Removed the dead `missing_datasets_warning` helper (broken since its
+    `theme` import was dropped) together with its only caller, the never-invoked
+    `CkanPTBackend.finalize()` (the `finalize` hook no longer exists in the
+    harvest lifecycle); assorted lint cleanup in the touched legacy backends.
+  - Removed the defunct `dadosGov` harvester (`dadosgov.py`,
+    `dadosgovBackend.py` and its entry point): a one-shot migration backend for
+    the legacy servico.dados.gov.pt portal that can no longer run — Python 2
+    era code (`reload(sys)`/`setdefaultencoding`), pre-refactor
+    `initialize/process` API, and a base-class constructor incompatible with
+    the current `BaseBackend` signature (raises `TypeError` on instantiation).
+    No harvest source uses the `dadosGov` backend.
+    [#147](https://github.com/amagovpt/udata-pt/pull/147)
+
 - **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**
   - A security assessment (VULN-2092, Broken Access Control / CWE-284) found the
     user read endpoints reachable by unauthenticated clients:
