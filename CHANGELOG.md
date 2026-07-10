@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **perf: index harvest.remote_id and batch the INE harvester's Mongo access**
+  - Phase 2 of the INE harvester (change detection + writes) was dominated by
+    unindexed lookups: `get_dataset()` ran one `harvest.remote_id` query per
+    item (~8500 COLLSCANs over the whole dataset collection), the bulk upsert
+    filters ran one more COLLSCAN per created dataset, and the post-create id
+    lookup another one. Downloading vs. streaming was **not** the issue —
+    parsing the full 21 MB XML takes 0.6s; the time went to MongoDB.
+  - Added an index on `dataset.harvest.remote_id` (migration
+    `2026-07-10-add-harvest-remote-id-index.py`) — this also benefits every
+    other harvester, since `BaseBackend.get_dataset()` runs the same query.
+  - INE backend now prefetches each chunk's datasets with a single `$in`
+    query (`_prefetch_datasets`), resolves created dataset ids with a single
+    `$in` query per chunk, and appends job items with a `$push` delta instead
+    of rewriting the ever-growing `job.items` array on every save. Benchmark
+    (local DB, 23k datasets, chunk of 500): 5362 ms → 77 ms per chunk (~70×).
+  - Also fixes a latent bug: the bulk flush now always happens before the
+    created-ids lookup, so HarvestItems no longer end up without a dataset
+    reference when a chunk had fewer than BULK_SIZE writes.
+
 - **fix: make the INE harvester resilient to truncated XML downloads**
   - The INE endpoint (`xml_indic.jsp`) streams a large (~21 MB) catalog very
     slowly (~6 min) and frequently drops the connection mid-stream (SSL EOF /

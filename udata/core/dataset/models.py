@@ -670,6 +670,10 @@ class Dataset(
             "slug",
             "resources.id",
             "resources.urlhash",
+            # Harvesters look datasets up by remote_id on every run (see
+            # BaseBackend.get_dataset and the INE backend bulk upserts);
+            # without this index each lookup is a full collection scan.
+            "harvest.remote_id",
         ]
         + Owned.meta["indexes"],
         "ordering": ["-created_at_internal"],

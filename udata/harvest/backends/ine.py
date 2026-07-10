@@ -12,7 +12,7 @@ from flask import current_app
 from slugify import slugify
 
 from udata.harvest.backends.base import BaseBackend
-from udata.harvest.models import HarvestItem
+from udata.harvest.models import HarvestItem, HarvestJob
 from udata.models import Dataset, License, Resource
 
 from .tools.harvester_utils import normalize_url_slashes
@@ -363,6 +363,58 @@ class INEBackend(BaseBackend):
         return md
 
     # --------------------------
+    # Prefetch em lote (1 query por chunk em vez de 1 por item)
+    # --------------------------
+    def _prefetch_datasets(self, remote_ids: list[str]) -> dict[str, Dataset]:
+        """Fetch all existing datasets for a chunk in a single query.
+
+        Equivalent to calling `self.get_dataset()` once per item (INE remote
+        ids are never URIs, so only the domain/source_id branch applies), but
+        with one `$in` query per chunk instead of one round-trip per item.
+        """
+        found = Dataset.objects(
+            __raw__={
+                "harvest.remote_id": {"$in": remote_ids},
+                "$or": [
+                    {"harvest.domain": self.source.domain},
+                    {"harvest.source_id": str(self.source.id)},
+                ],
+            }
+        )
+        by_remote_id: dict[str, Dataset] = {}
+        for dataset in found:
+            rid = dataset.harvest.remote_id if dataset.harvest else None
+            # Keep the first match per remote_id (mirrors `.first()`)
+            if rid and rid not in by_remote_id:
+                by_remote_id[rid] = dataset
+        return by_remote_id
+
+    def _new_dataset(self) -> Dataset:
+        """Build an empty dataset owned like `BaseBackend.get_dataset` does."""
+        if self.source.organization:
+            return Dataset(organization=self.source.organization)
+        elif self.source.owner:
+            return Dataset(owner=self.source.owner)
+        return Dataset()
+
+    # --------------------------
+    # Job items: $push incremental em vez de reescrever o documento
+    # --------------------------
+    def _append_job_items(self, items: list[HarvestItem]) -> None:
+        """Append HarvestItems to the job with a `$push` delta.
+
+        `job.items.extend()` + `job.save()` rewrites (and re-validates) the
+        ever-growing items array on every flush; a `push_all` update only
+        sends the new items. The local list is kept in sync because
+        `BaseBackend.harvest()` inspects `self.job.items` afterwards.
+        """
+        if not items:
+            return
+        if not self.dryrun and self.job.pk:
+            HarvestJob.objects(pk=self.job.pk).update_one(push_all__items=items)
+        self.job.items.extend(items)
+
+    # --------------------------
     # Change detection (barato + deep size check)
     # --------------------------
     def _has_changed(self, dataset, new_md: dict, remote_id: str) -> bool:
@@ -674,9 +726,10 @@ class INEBackend(BaseBackend):
         for i in range(0, total_items, self.BULK_SIZE):
             chunk = all_items[i : i + self.BULK_SIZE]
 
-            # --- Passo A: Pré-buscar datasets ---
+            # --- Passo A: Pré-buscar datasets (1 query para o chunk inteiro) ---
+            existing = self._prefetch_datasets([remote_id for remote_id, _ in chunk])
             for remote_id, md in chunk:
-                md["__dataset_obj"] = self.get_dataset(remote_id)
+                md["__dataset_obj"] = existing.get(remote_id) or self._new_dataset()
 
             # --- Passo B: Processamento do chunk ---
             # Guarda remote_ids de datasets criados para buscar IDs depois
@@ -766,40 +819,42 @@ class INEBackend(BaseBackend):
 
             # --- Fim do loop do chunk ---
 
-            # Flush Ops
-            if len(ops) >= self.BULK_SIZE and dataset_collection is not None:
+            # Flush Ops por chunk. Tem de acontecer ANTES do lookup dos IDs
+            # criados, senão os upserts ainda não estão na BD e os
+            # HarvestItems ficam sem referência ao dataset.
+            if ops and dataset_collection is not None:
                 self._flush_bulk(dataset_collection, ops, op_ids)
                 ops, op_ids = [], []
 
-            # Buscar IDs dos datasets criados e criar HarvestItems
+            # Buscar IDs dos datasets criados (1 query por chunk) e criar HarvestItems
             if self.job and created_remote_ids and dataset_collection is not None:
+                id_by_rid = {}
+                try:
+                    cursor = dataset_collection.find(
+                        {
+                            "harvest.remote_id": {"$in": [str(r) for r in created_remote_ids]},
+                            "harvest.source_id": (str(self.source.id) if self.source.id else None),
+                        },
+                        {"_id": 1, "harvest.remote_id": 1},
+                    )
+                    id_by_rid = {doc["harvest"]["remote_id"]: doc["_id"] for doc in cursor}
+                except Exception:
+                    self._log.warning(
+                        "[INE] Não foi possível buscar IDs dos datasets criados neste chunk"
+                    )
                 for rid in created_remote_ids:
-                    try:
-                        ds_doc = dataset_collection.find_one(
-                            {"harvest.remote_id": str(rid)}, {"_id": 1}
-                        )
-                        h_item = HarvestItem(remote_id=rid, status="done")
-                        if ds_doc:
-                            h_item.dataset = ds_doc["_id"]
-                        batch_harvest_items.append(h_item)
-                    except Exception:
-                        self._log.warning(
-                            "[INE] Não foi possível buscar ID do dataset criado: %s",
-                            rid,
-                        )
-                        h_item = HarvestItem(remote_id=rid, status="done")
-                        batch_harvest_items.append(h_item)
+                    h_item = HarvestItem(remote_id=rid, status="done")
+                    if str(rid) in id_by_rid:
+                        h_item.dataset = id_by_rid[str(rid)]
+                    batch_harvest_items.append(h_item)
 
             if self.job and len(batch_harvest_items) >= (self.BULK_SIZE * 2):
-                before_len = len(self.job.items)
-                self.job.items.extend(batch_harvest_items)
-                self.job.save()
-                after_len = len(self.job.items)
+                added = len(batch_harvest_items)
+                self._append_job_items(batch_harvest_items)
                 self._log.info(
-                    "[INE] Job Save: items grew from %s to %s (added %s)",
-                    before_len,
-                    after_len,
-                    len(batch_harvest_items),
+                    "[INE] Job items: +%s (total %s)",
+                    added,
+                    len(self.job.items),
                 )
                 batch_harvest_items = []
 
@@ -819,15 +874,12 @@ class INEBackend(BaseBackend):
 
         # Final Flush Job Items
         if self.job and batch_harvest_items:
-            before_len = len(self.job.items)
-            self.job.items.extend(batch_harvest_items)
-            self.job.save()
-            after_len = len(self.job.items)
+            added = len(batch_harvest_items)
+            self._append_job_items(batch_harvest_items)
             self._log.info(
-                "[INE] Final Job Save: items grew from %s to %s (added %s)",
-                before_len,
-                after_len,
-                len(batch_harvest_items),
+                "[INE] Final job items: +%s (total %s)",
+                added,
+                len(self.job.items),
             )
 
         total_time = time.time() - start_time
