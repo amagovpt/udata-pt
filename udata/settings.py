@@ -377,15 +377,6 @@ class Defaults(object):
     # It should be a dedicated service account
     HARVEST_ACTIVITY_USER_ID = None
 
-    # HTTP behaviour of the guarded `BaseBackend.get/head/post` helpers.
-    # Retries only cover connection-level failures (connection reset,
-    # timeout, truncated body) — never SSL errors nor HTTP status codes —
-    # and back off exponentially with jitter between attempts.
-    HARVEST_HTTP_MAX_RETRIES = 3
-    HARVEST_HTTP_RETRY_INITIAL_DELAY = 2  # seconds
-    HARVEST_HTTP_RETRY_MAX_DELAY = 60  # seconds
-    HARVEST_HTTP_TIMEOUT = (15, 300)  # (connect, read) seconds
-
     # S3 connection details
     ###########################################################################
     S3_URL = None
