@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **perf(harvest): lightweight jobs list endpoint (counts + failed items only)**
+  - `GET /api/1/harvest/source/<id>/jobs/` used to serialize the full `items`
+    array of every job. For large harvesters (e.g. INE, ~13k items per job)
+    that was ~8.4 MB and ~29 s per page, so the admin harvester page timed out
+    and showed no jobs.
+  - The list now returns a lightweight shape: job metadata, per-status
+    `item_counts` computed in MongoDB via aggregation (the items array is never
+    loaded or transferred), and only `error_items` (the items that actually
+    have errors). Measured on the same INE job: 477 bytes / 0.03 s.
+  - The full items array remains available on the detail endpoint
+    `GET /api/1/harvest/source/.../job/<id>/` (unchanged). Companion
+    `dadosgov-fe` change consumes `item_counts`/`error_items`.
+    [#153](https://github.com/amagovpt/udata-pt/pull/153)
+
 - **fix: close user enumeration on `/api/1/users/<id>` (VULN-2090 / CWE-203)**
   - After the VULN-2092 fix required authentication on the user read endpoints,
     an anonymous caller could still enumerate accounts (by id or, more usefully,
