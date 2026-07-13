@@ -12,6 +12,7 @@ from flask import url_for
 from udata.api import API, api
 from udata.api.oauth2 import OAuth2Client, OAuth2Token
 from udata.auth import PermissionDenied
+from udata.auth.views import _datastore
 from udata.core.user.factories import UserFactory
 from udata.forms import Form, fields, validators
 from udata.tests.api import PytestOnlyAPITestCase
@@ -825,3 +826,62 @@ class APIAuthTest(PytestOnlyAPITestCase):
 
         assert403(response)
         assert "message" in response.json
+
+    def test_logout_invalidates_server_side_session(self):
+        """LEDG-2134 / VULN-2088: logging out must rotate the user's
+        fs_uniquifier so every previously-issued session/remember cookie is
+        invalidated server-side — a cookie captured before logout no longer
+        authenticates.
+        """
+        user = self.login()
+        old_uniquifier = user.fs_uniquifier
+        assert old_uniquifier is not None
+
+        response = self.get(url_for("security.logout"))
+        assert response.status_code in (200, 302)
+
+        user.reload()
+        assert user.fs_uniquifier != old_uniquifier, (
+            "logout must rotate fs_uniquifier to invalidate outstanding sessions"
+        )
+
+    def test_captured_session_is_rejected_after_logout(self):
+        """LEDG-2134 / VULN-2088 (report PoC): a session captured before logout
+        must stop working afterwards. Rotating fs_uniquifier means the old
+        session id no longer resolves to a user, so replaying it yields 401.
+
+        This also covers the multi-device case: any outstanding session (any
+        device) carrying the old id is invalidated at once.
+        """
+        user = self.login()
+        old_uniquifier = user.fs_uniquifier
+
+        # Control: a session carrying this id authenticates *before* logout.
+        with self.client.session_transaction() as sess:
+            sess["_user_id"] = old_uniquifier
+            sess["_fresh"] = True
+        assert200(self.get(url_for("api.me")))
+
+        # Logout rotates the uniquifier and clears the cookie.
+        self.get(url_for("security.logout"))
+
+        # Replaying the captured session (old id) is now rejected.
+        with self.client.session_transaction() as sess:
+            sess["_user_id"] = old_uniquifier
+            sess["_fresh"] = True
+        assert401(self.get(url_for("api.me")))
+
+    def test_api_token_survives_session_logout(self):
+        """The VULN-2088 fix must not touch udata API tokens: they are a separate
+        model that does not depend on fs_uniquifier, so rotating it on logout
+        leaves token auth working.
+        """
+        with self.api_user() as user:
+            assert200(self.get(url_for("api.me")))  # token authenticates
+
+            old_uniquifier = user.fs_uniquifier
+            _datastore.set_uniquifier(user)  # simulate the session-logout rotation
+            user.reload()
+            assert user.fs_uniquifier != old_uniquifier
+
+            assert200(self.get(url_for("api.me")))  # token STILL authenticates

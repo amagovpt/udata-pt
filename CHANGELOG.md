@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **fix: invalidate the server-side session on logout (VULN-2088)**
+  - Sessions are stateless signed cookies, so `logout()` only cleared the client
+    cookie: a session cookie captured before logout kept authenticating
+    server-side (the PoC replayed it on `POST /api/1/discussions/` after logout).
+  - The logout endpoint (`logout_with_proconnect_url`) now rotates the user's
+    `fs_uniquifier` (`_datastore.set_uniquifier`) before `logout()`, which
+    immediately invalidates every outstanding session and "remember me" cookie
+    for that user. Scoped to the logout endpoint only. udata API tokens are a
+    separate model and are unaffected.
+  - Side effect (intended): logging out ends the user's sessions on all devices.
+  - Regression coverage in `test_auth_api.py`
+    (`test_logout_invalidates_server_side_session`).
+
 - **perf(harvest): lightweight jobs list endpoint (counts + failed items only)**
   - `GET /api/1/harvest/source/<id>/jobs/` used to serialize the full `items`
     array of every job. For large harvesters (e.g. INE, ~13k items per job)
