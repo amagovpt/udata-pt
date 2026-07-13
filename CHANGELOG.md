@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **fix: keep API error responses generic — no route hints (VULN-2091 hardening)**
+  - The pentest flagged "stack trace disclosure" on `/api/1/users/<value>`, but
+    the app already returns generic errors with `DEBUG=False` (a real traceback
+    would only appear if an environment set `DEBUG=true`). As defense-in-depth,
+    set `RESTX_ERROR_404_HELP = False` so Flask-RestX never appends
+    "did you mean <route> ?" hints (which disclose valid route prefixes) to 404s.
+  - Added regression tests (`test_error_disclosure.py`) asserting that 404 and
+    500 responses contain no traceback, no internal exception detail and no
+    route-prefix hints.
+
 - **fix: invalidate the server-side session on logout (VULN-2088)**
   - Sessions are stateless signed cookies, so `logout()` only cleared the client
     cookie: a session cookie captured before logout kept authenticating
