@@ -825,3 +825,21 @@ class APIAuthTest(PytestOnlyAPITestCase):
 
         assert403(response)
         assert "message" in response.json
+
+    def test_logout_invalidates_server_side_session(self):
+        """LEDG-2134 / VULN-2088: logging out must rotate the user's
+        fs_uniquifier so every previously-issued session/remember cookie is
+        invalidated server-side — a cookie captured before logout no longer
+        authenticates.
+        """
+        user = self.login()
+        old_uniquifier = user.fs_uniquifier
+        assert old_uniquifier is not None
+
+        response = self.get(url_for("security.logout"))
+        assert response.status_code in (200, 302)
+
+        user.reload()
+        assert user.fs_uniquifier != old_uniquifier, (
+            "logout must rotate fs_uniquifier to invalidate outstanding sessions"
+        )

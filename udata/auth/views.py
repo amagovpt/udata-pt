@@ -311,6 +311,15 @@ def logout_with_proconnect_url():
                 }
             )
 
+    # Invalidate every server-side session before clearing the client cookie:
+    # rotating the user's fs_uniquifier immediately renders all outstanding
+    # session/remember cookies invalid — including one captured before logout —
+    # closing the "session still valid after logout" hole (LEDG-2134 / VULN-2088).
+    # Scoped to this endpoint on purpose (not the internal logout_user() calls).
+    # udata API tokens are a separate model and are unaffected.
+    if current_user.is_authenticated:
+        _datastore.set_uniquifier(current_user._get_current_object())
+
     # Calling the flask-security logout endpoint
     logout()
 
