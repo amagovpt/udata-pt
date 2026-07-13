@@ -94,6 +94,80 @@ job_fields = api.model(
 
 job_page_fields = api.model("HarvestJobPage", fields.pager(job_fields))
 
+# --- Lightweight job listing (avoids serializing the full `items` array) ---
+# The jobs LIST only needs per-status counts and the (few) items that failed;
+# shipping every HarvestItem makes large jobs (e.g. INE, ~13k items) return
+# multi-MB payloads and time out. See the aggregation in `JobsAPI.get`.
+item_counts_fields = api.model(
+    "HarvestJobItemCounts",
+    {
+        status: fields.Integer(description=f"Number of {status} items")
+        for status in HARVEST_ITEM_STATUS
+    }
+    | {"total": fields.Integer(description="Total number of items")},
+)
+
+error_light_fields = api.model(
+    "HarvestErrorLight",
+    {
+        "message": fields.String(description="The error short message"),
+        "details": fields.String(description="Optional details (only for super-admins)"),
+    },
+)
+
+error_item_fields = api.model(
+    "HarvestJobErrorItem",
+    {
+        "remote_id": fields.String(description="The item remote ID"),
+        "remote_url": fields.String(description="The item remote url (if available)"),
+        "status": fields.String(description="The item status"),
+        "dataset": fields.Nested(
+            api.model(
+                "HarvestJobErrorItemDataset",
+                {
+                    "id": fields.String(),
+                    "title": fields.String(),
+                    "page": fields.String(),
+                },
+            ),
+            allow_null=True,
+            description="The processed dataset (if any)",
+        ),
+        "errors": fields.List(fields.Nested(error_light_fields), description="The item errors"),
+    },
+)
+
+job_light_fields = api.model(
+    "HarvestJobLight",
+    {
+        "id": fields.String(description="The job execution ID", required=True),
+        "created": fields.ISODateTime(description="The job creation date", required=True),
+        "started": fields.ISODateTime(description="The job start date"),
+        "ended": fields.ISODateTime(description="The job end date"),
+        "status": fields.String(description="The job status", required=True),
+        "errors": fields.List(
+            fields.Nested(error_light_fields), description="The job initialization errors"
+        ),
+        "source": fields.String(description="The source owning the job", required=True),
+        "item_counts": fields.Nested(item_counts_fields, description="Per-status item counts"),
+        "error_items": fields.List(
+            fields.Nested(error_item_fields), description="Only the items that have errors"
+        ),
+    },
+)
+
+job_light_page_fields = api.model(
+    "HarvestJobLightPage",
+    {
+        "data": fields.List(fields.Nested(job_light_fields)),
+        "total": fields.Integer(description="Total number of jobs"),
+        "page": fields.Integer(description="The current page"),
+        "page_size": fields.Integer(description="The page size"),
+        "next_page": fields.String(description="The next page URL if any"),
+        "previous_page": fields.String(description="The previous page URL if any"),
+    },
+)
+
 validation_fields = api.model(
     "HarvestSourceValidation",
     {
@@ -446,17 +520,134 @@ parser.add_argument(
 )
 
 
+def _serialize_light_job(doc, dataset_map, source_id, show_details):
+    """Serialize an aggregation result row into the lightweight job shape.
+
+    `doc` comes from the `$project` in `JobsAPI.get`: it carries the job
+    metadata, pre-computed `item_counts` and only the `error_items` (items
+    with a non-empty `errors` array). `dataset_map` resolves the referenced
+    datasets in one batched query. `show_details` gates error details to
+    super-admins, mirroring `error_fields`.
+    """
+
+    def _errors(raw):
+        return [
+            {"message": e.get("message"), "details": e.get("details") if show_details else None}
+            for e in (raw or [])
+        ]
+
+    error_items = []
+    for it in doc.get("error_items") or []:
+        ds = dataset_map.get(it.get("dataset"))
+        error_items.append(
+            {
+                "remote_id": it.get("remote_id"),
+                "remote_url": it.get("remote_url"),
+                "status": it.get("status"),
+                "dataset": ds,
+                "errors": _errors(it.get("errors")),
+            }
+        )
+
+    return {
+        "id": str(doc["_id"]),
+        "created": doc.get("created"),
+        "started": doc.get("started"),
+        "ended": doc.get("ended"),
+        "status": doc.get("status"),
+        "errors": _errors(doc.get("errors")),
+        "source": source_id,
+        "item_counts": doc.get("item_counts"),
+        "error_items": error_items,
+    }
+
+
 @ns.route("/source/<harvest_source:source>/jobs/", endpoint="harvest_jobs")
 class JobsAPI(API):
     @api.doc("list_harvest_jobs")
     @api.expect(parser)
-    @api.marshal_with(job_page_fields)
+    @api.marshal_with(job_light_page_fields)
     def get(self, source: HarvestSource):
-        """List all jobs for a given source"""
+        """List all jobs for a given source (lightweight: counts + failed items only).
+
+        The full `items` array is never serialized here — it can be tens of
+        thousands of entries (e.g. INE) and would blow up the payload. Per-status
+        counts are computed in MongoDB via aggregation and only the items that
+        actually have errors are returned. Use `/job/<id>/` for the full detail.
+        """
         args = parser.parse_args()
+        page = max(args["page"], 1)
+        page_size = args["page_size"]
+
         qs = HarvestJob.objects(source=source)
-        qs = qs.order_by("-created")
-        return qs.paginate(args["page"], args["page_size"])
+        total = qs.count()
+
+        counts = {
+            status: {
+                "$size": {
+                    "$filter": {
+                        "input": {"$ifNull": ["$items", []]},
+                        "as": "i",
+                        "cond": {"$eq": ["$$i.status", status]},
+                    }
+                }
+            }
+            for status in HARVEST_ITEM_STATUS
+        }
+        counts["total"] = {"$size": {"$ifNull": ["$items", []]}}
+        project = {
+            "$project": {
+                "created": 1,
+                "started": 1,
+                "ended": 1,
+                "status": 1,
+                "errors": 1,
+                "item_counts": counts,
+                "error_items": {
+                    "$filter": {
+                        "input": {"$ifNull": ["$items", []]},
+                        "as": "i",
+                        "cond": {"$gt": [{"$size": {"$ifNull": ["$$i.errors", []]}}, 0]},
+                    }
+                },
+            }
+        }
+
+        docs = list(
+            qs.order_by("-created")
+            .skip((page - 1) * page_size)
+            .limit(page_size)
+            .aggregate([project])
+        )
+
+        # Batch-resolve datasets referenced by the (few) error items.
+        dataset_ids = {
+            it.get("dataset")
+            for doc in docs
+            for it in (doc.get("error_items") or [])
+            if it.get("dataset")
+        }
+        dataset_map = {}
+        if dataset_ids:
+            for ds in Dataset.objects(id__in=list(dataset_ids)):
+                dataset_map[ds.id] = {
+                    "id": str(ds.id),
+                    "title": ds.title,
+                    "page": ds.self_web_url(),
+                }
+
+        show_details = admin_permission.can()
+        source_id = str(source.id)
+        data = [_serialize_light_job(doc, dataset_map, source_id, show_details) for doc in docs]
+
+        return {
+            "data": data,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "next_page": None,
+            "previous_page": None,
+        }
 
 
 @ns.route("/job/<string:ident>/", endpoint="harvest_job")
