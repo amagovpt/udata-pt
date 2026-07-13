@@ -239,6 +239,11 @@ class Defaults(object):
     API_TOKEN_PREFIX = "udata_"
     API_TOKEN_SECRET = ""
 
+    # Don't let Flask-RestX append "did you mean <route> or <route> ?" hints to
+    # 404 responses: they disclose valid route prefixes to anonymous callers
+    # (VULN-2091). Errors stay a plain, generic message.
+    RESTX_ERROR_404_HELP = False
+
     # OAuth 2 settings
     OAUTH2_PROVIDER_ERROR_ENDPOINT = "oauth.oauth_error"
     OAUTH2_REFRESH_TOKEN_GENERATOR = True
