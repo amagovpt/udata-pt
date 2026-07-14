@@ -23,8 +23,11 @@ services:
     ports:
       - '7000:7000'
     volumes:
-      - ./:/app
+      - ./udata.cfg:/app/udata.cfg:ro
+      - ./uwsgi:/app/uwsgi:ro
+      - ./udata/auth/saml/credentials:/app/udata/auth/saml/credentials
       - ${FS_ROOT:-/opt/dadosgov/fs}:/dadosgov/fs
+      - ./logs:/logs
     env_file:
       - .env
     environment:
