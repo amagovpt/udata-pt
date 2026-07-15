@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **fix: rate-limit the public contact form against submission floods (VULN-2089)**
+  - `POST /api/1/site/contact/` had no per-endpoint throttle, so it could be
+    flooded (the pentest sent bursts of submissions, spamming the support
+    inbox). reCAPTCHA v3 is already validated on the form but is a no-op unless
+    the keys are configured per environment.
+  - Added `CONTACT_SUBMIT_LIMIT` ("20 per minute; 200 per hour", keyed by
+    `user_or_ip`) as a structural backstop on `SiteContactAPI` that throttles
+    floods even when reCAPTCHA is not configured. No per-day cap (would become a
+    site-wide daily block under F5/WAF IP-collapse). reCAPTCHA remains the
+    primary anti-automation control; configuring `GOOGLE_RECAPTCHA_SECRET_KEY`
+    (backend) and `NEXT_PUBLIC_RECAPTCHA_SITE_KEY` (frontend) per environment is
+    the primary fix.
+  - Regression test in `test_site_api.py`
+    (`test_post_contact_is_rate_limited_against_flooding`).
+
 - **fix(docker): drop `./:/app` source bind mount, restore explicit config mounts** [#162](https://github.com/amagovpt/udata-pt/pull/162)
   - PR #161 had replaced the specific read-only mounts (`udata.cfg`, `uwsgi`,
     SAML credentials) and `logs` with a single `./:/app` bind mount. That

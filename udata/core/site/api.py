@@ -10,7 +10,7 @@ from flask import current_app, json, make_response, redirect, request, url_for
 from flask_login import current_user
 
 from udata.api import API, api, fields
-from udata.api.limits import EXPORT_LIMIT, PUBLIC_SEARCH_LIMIT, user_or_ip
+from udata.api.limits import CONTACT_SUBMIT_LIMIT, EXPORT_LIMIT, PUBLIC_SEARCH_LIMIT, user_or_ip
 from udata.api_fields import patch
 from udata.app import cache, limiter
 from udata.auth import admin_permission
@@ -165,6 +165,18 @@ support_contact_fields = api.model(
 
 @api.route("/site/contact/", endpoint="site_contact")
 class SiteContactAPI(API):
+    # Anti-automation backstop for the public contact form (VULN-2089): a
+    # per-endpoint rate-limit that throttles submission floods even when
+    # reCAPTCHA is not configured. Keyed by user_or_ip so it doesn't fall under
+    # the IP-keyed global default. reCAPTCHA remains the primary control.
+    decorators = [
+        limiter.limit(
+            CONTACT_SUBMIT_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc("submit_support_contact")
     @api.expect(support_contact_fields)
     @api.response(204, "Email sent")
