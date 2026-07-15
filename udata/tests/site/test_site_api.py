@@ -3,6 +3,7 @@ from unittest.mock import patch
 import pytest
 from flask import url_for
 
+from udata.app import limiter
 from udata.core.dataservices.factories import (
     DataserviceFactory,  # noqa: F401 - registers Dataservice model
 )
@@ -55,6 +56,12 @@ class SiteAPITest(APITestCase):
 
 
 class SiteContactAPITest(APITestCase):
+    def setUp(self):
+        super().setUp() if hasattr(super(), "setUp") else None
+        # The contact endpoint is rate-limited (VULN-2089); reset the shared
+        # in-memory limiter window so counters don't leak between tests.
+        limiter.reset()
+
     @pytest.mark.options(
         MAIL_DEFAULT_RECEIVER="support@example.org",
         DEFAULT_LANGUAGE="en",
@@ -81,6 +88,34 @@ class SiteContactAPITest(APITestCase):
         assert "How do I publish?" in sent.subject
         assert "user@example.org" in sent.body
         assert "I would like to publish a dataset." in sent.body
+
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org",
+        DEFAULT_LANGUAGE="en",
+        GOOGLE_RECAPTCHA_SECRET_KEY=None,
+    )
+    def test_post_contact_is_rate_limited_against_flooding(self):
+        """LEDG-2137 / VULN-2089: the public contact form must throttle a
+        submission flood even with reCAPTCHA disabled. Once the per-minute cap
+        (CONTACT_SUBMIT_LIMIT = 20/min) is exceeded, further submissions get 429.
+        """
+        from udata.app import limiter
+
+        limiter.reset()
+        payload = {
+            "topic": "question",
+            "email": "user@example.org",
+            "subject": "Flood",
+            "message": "flood attempt",
+        }
+        statuses = []
+        with capture_mails():
+            for _ in range(25):
+                statuses.append(self.post(url_for("api.site_contact"), payload).status_code)
+
+        assert 429 in statuses, f"contact form was not rate-limited: {sorted(set(statuses))}"
+        # Legitimate submissions still go through below the cap.
+        assert statuses.count(204) >= 1
 
     @pytest.mark.options(
         MAIL_DEFAULT_RECEIVER="support@example.org",
@@ -253,6 +288,12 @@ class SiteContactEnvironmentMailTest(APITestCase):
     follows ``TESTING`` so no real SMTP connection is opened, but the dispatch
     path is fully executed and the ``email_dispatched`` signal fires.
     """
+
+    def setUp(self):
+        super().setUp() if hasattr(super(), "setUp") else None
+        # The contact endpoint is rate-limited (VULN-2089); reset the shared
+        # in-memory limiter window so counters don't leak between tests.
+        limiter.reset()
 
     def _dispatch_support_email(self, env_config):
         # reCAPTCHA is disabled here (GOOGLE_RECAPTCHA_SECRET_KEY=None) so this
