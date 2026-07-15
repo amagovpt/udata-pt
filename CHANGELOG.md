@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **fix(storages): harden chunked uploads against intermittent file corruption** [#167](https://github.com/amagovpt/udata-pt/pull/167)
+  - Resource files uploaded/replaced via the admin were sometimes corrupted in
+    production. Root causes: the destination prefix had a 1-second resolution,
+    so a retried combine racing the original request (dropped connection behind
+    the F5/WAF) wrote interleaved into the same path; `combine_chunks` wrote
+    straight to the final target with no atomicity, no verification that every
+    part existed nor that the reassembled size matched; and a client retry of
+    an already-persisted part failed with `FileExists` → 500.
+  - `save_chunk` now overwrites by `uuid`+`partindex` (idempotent retries) and
+    records the optional `totalfilesize` field (historical fineuploader name;
+    legacy clients that omit it keep working).
+  - `combine_chunks` now: rejects replayed/unknown combines cleanly
+    (`upload-not-found`, `combine-in-progress` via an in-progress marker file),
+    verifies all parts exist before writing (`chunks-missing`), verifies the
+    reassembled size against `totalfilesize` (`size-mismatch`, chunks purged),
+    and on local storage writes to a temp name then renames atomically so
+    readers never observe a half-written file. Upload error responses gain an
+    additive machine-readable `code` field.
+  - The per-upload destination prefix gains a random fragment
+    (`slug/YYYYMMDD-HHMMSS-<hex8>`) so two same-second uploads of the same
+    filename can never collide.
+  - Regression tests in `test_storages.py` (part-retry idempotency, size
+    mismatch, missing part, double combine, in-progress/stale marker, legacy
+    protocol) and `test_datasets_api.py` (unique paths for same filename).
+
 - **fix: rate-limit the public contact form against submission floods (VULN-2089)**
   - `POST /api/1/site/contact/` had no per-endpoint throttle, so it could be
     flooded (the pentest sent bursts of submissions, spamming the support
