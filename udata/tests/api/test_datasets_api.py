@@ -1916,6 +1916,29 @@ class DatasetResourceAPITest(APITestCase):
         data = json.loads(response.data)
         self.assertEqual(data["title"], "test.txt")
 
+    def test_upload_same_filename_gets_unique_paths(self):
+        """Two uploads of the same filename must never share a storage path.
+
+        The prefix used to have a 1-second resolution, so two concurrent
+        uploads (e.g. a retried combine racing the original request) of the
+        same filename wrote interleaved into the same file and corrupted it.
+        """
+        user = self.login()
+        org = OrganizationFactory(members=[Member(user=user, role="admin")])
+        dataset = DatasetFactory(organization=org)
+        url = url_for("api.upload_new_dataset_resource", dataset=dataset)
+
+        first = self.post(url, {"file": (BytesIO(b"aaa"), "test.txt")}, json=False)
+        self.assert201(first)
+        second = self.post(url, {"file": (BytesIO(b"bbb"), "test.txt")}, json=False)
+        self.assert201(second)
+
+        first_url = json.loads(first.data)["url"]
+        second_url = json.loads(second.data)["url"]
+        assert first_url.endswith("test.txt")
+        assert second_url.endswith("test.txt")
+        assert first_url != second_url
+
     def test_reorder(self):
         # Register an extra field in order to test
         # https://github.com/opendatateam/udata/issues/1794
