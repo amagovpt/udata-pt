@@ -20,6 +20,7 @@ These changes might lead to backward compatibility breakage meaning:
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import mongoengine
 import requests
@@ -830,7 +831,14 @@ class ResourcesAPI(API):
 
 class UploadMixin(object):
     def handle_upload(self, dataset):
-        prefix = "/".join((dataset.slug, datetime.now(UTC).strftime("%Y%m%d-%H%M%S")))
+        # The prefix must be unique per upload: with a 1-second resolution two
+        # concurrent uploads (e.g. a retried combine racing the original
+        # request) of the same filename resolved to the same path and
+        # interleaved their writes, corrupting the stored file. The random
+        # fragment removes that collision; the timestamp is kept for
+        # readability/traceability of the storage layout.
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        prefix = "/".join((dataset.slug, f"{timestamp}-{uuid4().hex[:8]}"))
         infos = handle_upload(storages.resources, prefix)
         # Content validation (HTML, XML/XXE, image magic bytes, script scanning)
         # is handled centrally in storages.api.handle_upload() via validate_upload()

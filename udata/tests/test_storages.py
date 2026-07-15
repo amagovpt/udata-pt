@@ -10,7 +10,7 @@ from werkzeug.wrappers import Request
 
 from udata.core import storages
 from udata.core.storages import utils
-from udata.core.storages.api import META, chunk_filename
+from udata.core.storages.api import COMBINE_MARKER, META, chunk_filename
 from udata.core.storages.tasks import purge_chunks
 from udata.core.storages.validation import (
     _SCAN_CHUNK_SIZE,
@@ -190,6 +190,160 @@ class StorageUploadViewTest(PytestOnlyAPITestCase):
         assert storages.tmp.read(filename) == b"aaaa"
         assert list(storages.chunks.list_files()) == []
 
+    def send_part(self, url, uuid, index, parts, filename="test.txt", content=b"a", **extra):
+        payload = {
+            "file": (BytesIO(content), "blob"),
+            "uuid": uuid,
+            "filename": filename,
+            "partindex": index,
+            "partbyteoffset": index * len(content),
+            "totalparts": parts,
+            "chunksize": len(content),
+        }
+        payload.update(extra)
+        return self.post(url, payload, json=False)
+
+    def send_combine(self, url, uuid, parts, filename="test.txt", **extra):
+        payload = {"uuid": uuid, "filename": filename, "totalparts": parts}
+        payload.update(extra)
+        return self.post(url, payload, json=False)
+
+    def test_chunked_upload_part_retry_is_idempotent(self):
+        # A client retry of an already-persisted part (dropped connection after
+        # the server saved it) must overwrite the part instead of failing.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        assert200(self.send_part(url, uuid, 0, parts, content=b"a"))
+        # Retry of part 0 with different bytes (same size) must win.
+        assert200(self.send_part(url, uuid, 0, parts, content=b"b"))
+        for i in range(1, parts):
+            assert200(self.send_part(url, uuid, i, parts, content=b"a"))
+
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"baaa"
+        assert list(storages.chunks.list_files()) == []
+
+    def test_chunked_upload_totalfilesize_mismatch(self):
+        # A reassembled size differing from the announced file size means some
+        # part holds the wrong bytes: fail deterministically, leave nothing
+        # behind (no target, no temp file) and purge the chunks.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts, totalfilesize=parts + 1))
+
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts + 1)
+        assert400(response)
+        assert not response.json["success"]
+        assert response.json["code"] == "size-mismatch"
+        assert list(storages.tmp.list_files()) == []
+        assert list(storages.chunks.list_files()) == []
+
+    def test_chunked_upload_totalfilesize_from_meta(self):
+        # The expected size announced on the parts is remembered in the chunk
+        # metadata and enforced even when the combine request omits it.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts, totalfilesize=parts + 1))
+
+        response = self.send_combine(url, uuid, parts)
+        assert400(response)
+        assert response.json["code"] == "size-mismatch"
+
+    def test_chunked_upload_missing_part(self):
+        # A combine must verify every part exists before writing anything;
+        # chunks are kept so the client can re-send the missing part.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in (0, 1, 3):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert400(response)
+        assert not response.json["success"]
+        assert response.json["code"] == "chunks-missing"
+        assert list(storages.tmp.list_files()) == []
+        # The uploaded parts are kept for a retry (purged later by retention).
+        assert storages.chunks.exists(chunk_filename(uuid, 0))
+        # No stale in-progress marker is left behind.
+        assert not storages.chunks.exists(chunk_filename(uuid, COMBINE_MARKER))
+
+    def test_chunked_upload_double_combine(self):
+        # A replayed combine (client network retry after a lost response) must
+        # fail cleanly instead of re-reading deleted chunks or writing twice.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        first = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert200(first)
+
+        second = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert400(second)
+        assert not second.json["success"]
+        assert second.json["code"] == "upload-not-found"
+        # Exactly one file was produced.
+        assert list(storages.tmp.list_files()) == [first.json["filename"]]
+
+    def test_chunked_upload_combine_in_progress(self):
+        # A fresh in-progress marker means another combine is running: back
+        # off. A stale marker (crashed worker) is taken over.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        marker = chunk_filename(uuid, COMBINE_MARKER)
+        storages.chunks.write(marker, datetime.now(UTC).isoformat())
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert400(response)
+        assert response.json["code"] == "combine-in-progress"
+        # Chunks must be untouched so the running combine can finish.
+        assert storages.chunks.exists(chunk_filename(uuid, 0))
+
+        stale = datetime.now(UTC) - timedelta(hours=1)
+        storages.chunks.write(marker, stale.isoformat(), overwrite=True)
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"aaaa"
+        assert list(storages.chunks.list_files()) == []
+
+    def test_chunked_upload_without_totalfilesize(self):
+        # Legacy clients that never send totalfilesize must keep working.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        response = self.send_combine(url, uuid, parts)
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"aaaa"
+        assert list(storages.chunks.list_files()) == []
+
     def test_chunked_upload_bad_chunk(self):
         self.login()
         url = url_for("storage.upload", name="tmp")
@@ -306,6 +460,15 @@ class ChunksRetentionTest(PytestOnlyTestCase):
         purge_chunks.apply()
         assert list(storages.chunks.list_files()) == []
         assert not storages.chunks.exists(uuid)  # Directory should be removed too
+
+    @pytest.mark.options(UPLOAD_MAX_RETENTION=0)
+    def test_chunks_cleanup_removes_combine_marker(self, client):
+        uuid = str(uuid4())
+        self.create_chunks(uuid)
+        storages.chunks.write(chunk_filename(uuid, COMBINE_MARKER), datetime.now(UTC).isoformat())
+        purge_chunks.apply()
+        assert list(storages.chunks.list_files()) == []
+        assert not storages.chunks.exists(uuid)
 
     @pytest.mark.options(UPLOAD_MAX_RETENTION=60 * 60)  # 1 hour
     def test_chunks_kept_before_max_retention(self, client):
