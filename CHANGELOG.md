@@ -17,6 +17,14 @@
   - Regression test in `test_site_api.py`
     (`test_post_contact_is_rate_limited_against_flooding`).
 
+- **fix(docker): drop `./:/app` source bind mount, restore explicit config mounts** [#162](https://github.com/amagovpt/udata-pt/pull/162)
+  - PR #161 had replaced the specific read-only mounts (`udata.cfg`, `uwsgi`,
+    SAML credentials) and `logs` with a single `./:/app` bind mount. That
+    overlays the whole repo on `/app` and, critically, drops the
+    environment-specific config mounts, so the container loses its
+    `udata.cfg`/`uwsgi` configuration. Restored the explicit mounts and kept
+    `${FS_ROOT}:/dadosgov/fs`.
+
 - **fix: keep API error responses generic — no route hints (VULN-2091 hardening)**
   - The pentest flagged "stack trace disclosure" on `/api/1/users/<value>`, but
     the app already returns generic errors with `DEBUG=False` (a real traceback
