@@ -1,7 +1,5 @@
 import logging
 
-import requests
-
 from udata.core.contact_point.models import ContactPoint
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.models import HarvestItem
@@ -64,7 +62,8 @@ class OGCBackend(BaseBackend):
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
 
         try:
-            res = requests.get(self.source.url, headers=headers)
+            # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
+            res = self.get(self.source.url, headers=headers)
             res.encoding = "utf-8"
             data = res.json()
         except Exception as e:

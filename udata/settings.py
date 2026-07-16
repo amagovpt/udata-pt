@@ -239,6 +239,11 @@ class Defaults(object):
     API_TOKEN_PREFIX = "udata_"
     API_TOKEN_SECRET = ""
 
+    # Don't let Flask-RestX append "did you mean <route> or <route> ?" hints to
+    # 404 responses: they disclose valid route prefixes to anonymous callers
+    # (VULN-2091). Errors stay a plain, generic message.
+    RESTX_ERROR_404_HELP = False
+
     # OAuth 2 settings
     OAUTH2_PROVIDER_ERROR_ENDPOINT = "oauth.oauth_error"
     OAUTH2_REFRESH_TOKEN_GENERATOR = True
@@ -810,6 +815,9 @@ class Testing(object):
     URLS_ALLOW_LOCAL = True  # Test server URL is local.test
     URLS_RESOLVE_HOSTNAME = False
     URLS_ALLOWED_TLDS = tld_set | set(["test"])
+    # No harvest HTTP retries in tests: keeps simulated connection errors
+    # failing fast and log assertions (single warning) accurate.
+    HARVEST_HTTP_MAX_RETRIES = 1
     URLS_ALLOW_PRIVATE = False
     FS_IMAGES_OPTIMIZE = True
     SECURITY_EMAIL_VALIDATOR_ARGS = {
