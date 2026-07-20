@@ -113,7 +113,7 @@ def reset_instructions(reset_token: str, **kwargs) -> MailMessage:
             "Caso não tenha efetuado este pedido, ignore este e-mail.",
             MailCTA(
                 "Redefinir a sua palavra-passe",
-                cdata_url(f"/pages/reset-password/{reset_token}"),
+                cdata_url(f"/reset-password/{reset_token}"),
             ),
         ],
     )

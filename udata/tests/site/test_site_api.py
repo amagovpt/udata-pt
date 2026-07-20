@@ -271,7 +271,7 @@ SUPPORT_PAYLOAD = {
 
 
 class SiteContactEnvironmentMailTest(APITestCase):
-    """Tests that the /pages/support form actually dispatches an email in the
+    """Tests that the support form (/ajuda-e-contactos) actually dispatches an email in the
     DEV, TST and production environments.
 
     The other contact tests run under the test default ``SEND_MAIL=False`` and
@@ -587,7 +587,7 @@ class SiteHomeCacheInvalidationTest(APITestCase):
 
 class SiteHomeOwnerSerializationTest(APITestCase):
     """LEDG-1861: /site/home/ must expose dataset.owner so user-authored
-    datasets can be attributed (and linked to /pages/users/<slug>) on the
+    datasets can be attributed (and linked to /users/<slug>) on the
     homepage card instead of falling back to "Sem Organização"."""
 
     def test_dataset_owner_present_when_no_organization(self):
