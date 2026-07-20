@@ -103,7 +103,7 @@ class AuthMailRenderingTest(APITestCase):
             reset_token="abc123token",
         )
         assert result is not None
-        assert "https://example.com/pages/reset-password/abc123token" in result
+        assert "https://example.com/reset-password/abc123token" in result
 
     @pytest.mark.options(DEFAULT_LANGUAGE="en", CDATA_BASE_URL="https://example.com")
     def test_reset_instructions_mail_html(self):
@@ -114,7 +114,7 @@ class AuthMailRenderingTest(APITestCase):
             reset_token="abc123token",
         )
         assert result is not None
-        assert "https://example.com/pages/reset-password/abc123token" in result
+        assert "https://example.com/reset-password/abc123token" in result
         assert "<" in result
 
     # --- reset_notice (password was reset) ---
