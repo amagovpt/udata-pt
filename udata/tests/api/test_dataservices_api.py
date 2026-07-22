@@ -127,8 +127,17 @@ class DataserviceAPITest(APITestCase):
         assert400(response)
         assert "`reuse` must be an identifier" in response.json["message"]
 
+    def _public_service_org(self, user):
+        """An organization the user administers, carrying the `public-service`
+        badge — the only kind an API may be published in the name of
+        (LEDG-2190)."""
+        org = OrganizationFactory(members=[Member(user=user, role="admin")])
+        org.add_badge(org_constants.PUBLIC_SERVICE)
+        return org
+
     def test_dataservice_api_create(self):
         user = self.login()
+        org = self._public_service_org(user)
         datasets = DatasetFactory.create_batch(3)
         license = LicenseFactory.create()
 
@@ -137,6 +146,7 @@ class DataserviceAPITest(APITestCase):
             {
                 "title": "My API",
                 "base_api_url": "https://example.org",
+                "organization": str(org.id),
             },
         )
         self.assert201(response)
@@ -149,7 +159,8 @@ class DataserviceAPITest(APITestCase):
 
         self.assertEqual(response.json["title"], "My API")
         self.assertEqual(response.json["base_api_url"], "https://example.org")
-        self.assertEqual(response.json["owner"]["id"], str(user.id))
+        self.assertEqual(response.json["organization"]["id"], str(org.id))
+        self.assertIsNone(response.json["owner"])
 
         response = self.patch(
             url_for("api.dataservice", dataservice=dataservice),
@@ -339,7 +350,8 @@ class DataserviceAPITest(APITestCase):
         dataset_a = DatasetFactory(title="Dataset A")
         dataset_b = DatasetFactory(title="Dataset B")
 
-        self.login()
+        user = self.login()
+        org = self._public_service_org(user)
         self.post(
             url_for("api.dataservices"),
             {
@@ -347,6 +359,7 @@ class DataserviceAPITest(APITestCase):
                 "base_api_url": "https://example.org/B",
                 "datasets": [dataset_b.id],
                 "access_type": AccessType.OPEN,
+                "organization": str(org.id),
             },
         )
         self.post(
@@ -356,6 +369,7 @@ class DataserviceAPITest(APITestCase):
                 "base_api_url": "https://example.org/C",
                 "datasets": [dataset_a.id, dataset_b.id],
                 "access_type": AccessType.OPEN_WITH_ACCOUNT,
+                "organization": str(org.id),
             },
         )
         self.post(
@@ -365,6 +379,7 @@ class DataserviceAPITest(APITestCase):
                 "base_api_url": "https://example.org/A",
                 "datasets": [dataset_a.id],
                 "access_type": AccessType.RESTRICTED,
+                "organization": str(org.id),
             },
         )
         self.post(
@@ -374,6 +389,7 @@ class DataserviceAPITest(APITestCase):
                 "base_api_url": "https://example.org/X",
                 "private": True,
                 "datasets": [dataset_a.id],
+                "organization": str(org.id),
             },
         )
 
@@ -504,25 +520,59 @@ class DataserviceAPITest(APITestCase):
         response = self.get(url_for("api.dataservices", sort="title", dataset=str("xxx")))
         self.assert400(response)
 
+    def test_dataservice_api_create_admin_not_exempt(self):
+        """Portal admins are not exempt (LEDG-2190): no personal ownership, and
+        the organization must carry the public-service badge — but an admin may
+        publish for any such organization without being a member."""
+        self.login(AdminFactory())
+
+        # No organization → rejected even for an admin.
+        response = self.post(
+            url_for("api.dataservices"),
+            {"title": "X", "base_api_url": "https://example.org"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Organization without the public-service badge → rejected.
+        org = OrganizationFactory()
+        response = self.post(
+            url_for("api.dataservices"),
+            {"title": "X", "base_api_url": "https://example.org", "organization": org.id},
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Organization with the badge → accepted.
+        org.add_badge(org_constants.PUBLIC_SERVICE)
+        response = self.post(
+            url_for("api.dataservices"),
+            {"title": "X", "base_api_url": "https://example.org", "organization": org.id},
+        )
+        self.assert201(response)
+        self.assertEqual(Dataservice.objects.count(), 1)
+
     def test_dataservice_api_create_with_validation_error(self):
-        self.login()
+        user = self.login()
+        org = self._public_service_org(user)
         response = self.post(
             url_for("api.dataservices"),
             {
                 "base_api_url": "https://example.org",
+                "organization": str(org.id),
             },
         )
         self.assert400(response)
         self.assertEqual(Dataservice.objects.count(), 0)
 
     def test_dataservice_api_create_with_unkwown_license(self):
-        self.login()
+        user = self.login()
+        org = self._public_service_org(user)
         response = self.post(
             url_for("api.dataservices"),
             {
                 "title": "My title",
                 "base_api_url": "https://example.org",
                 "license": "unwkown-license",
+                "organization": str(org.id),
             },
         )
         self.assert400(response)
@@ -530,7 +580,8 @@ class DataserviceAPITest(APITestCase):
         self.assertEqual(Dataservice.objects.count(), 0)
 
     def test_dataservice_api_create_with_unkwown_contact_point(self):
-        self.login()
+        user = self.login()
+        org = self._public_service_org(user)
 
         response = self.post(
             url_for("api.dataservices"),
@@ -538,6 +589,7 @@ class DataserviceAPITest(APITestCase):
                 "title": "My title",
                 "base_api_url": "https://example.org",
                 "contact_points": ["66212433e42ab56639ad516e"],
+                "organization": str(org.id),
             },
         )
         self.assert400(response)
@@ -583,6 +635,7 @@ class DataserviceAPITest(APITestCase):
         )
         self.assertEqual(Dataservice.objects.count(), 0)
 
+        # Personal (owner) publishing is no longer allowed (LEDG-2190).
         response = self.post(
             url_for("api.dataservices"),
             {
@@ -591,11 +644,24 @@ class DataserviceAPITest(APITestCase):
                 "owner": me.id,
             },
         )
-        self.assert201(response)
-        dataservice = Dataservice.objects(id=response.json["id"]).first()
-        self.assertEqual(dataservice.owner.id, me.id)
-        self.assertEqual(dataservice.organization, None)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Dataservice.objects.count(), 0)
 
+        # An organization without the public-service badge is rejected.
+        response = self.post(
+            url_for("api.dataservices"),
+            {
+                "title": "My title",
+                "base_api_url": "https://example.org",
+                "organization": me_org.id,
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Dataservice.objects.count(), 0)
+
+        # An organization the user belongs to and carrying the public-service
+        # badge is accepted, and the owner is never kept alongside it.
+        me_org.add_badge(org_constants.PUBLIC_SERVICE)
         response = self.post(
             url_for("api.dataservices"),
             {
@@ -611,7 +677,8 @@ class DataserviceAPITest(APITestCase):
 
     def test_dataservice_api_create_with_multiple_conditions_for_a_role(self):
         """It shouldn't create a dataservice with multiple conditions for the same role"""
-        self.login()
+        user = self.login()
+        org = self._public_service_org(user)
 
         response = self.post(
             url_for("api.dataservices"),
@@ -629,6 +696,7 @@ class DataserviceAPITest(APITestCase):
                         "condition": AccessAudienceCondition.UNDER_CONDITIONS,
                     },
                 ],
+                "organization": str(org.id),
             },
         )
         self.assert400(response)

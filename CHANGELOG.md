@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **feat(dataservices)!: restrict API creation to public-service organizations** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+  - `POST /api/1/dataservices/` now returns 403 unless the API is published in
+    the name of an organization carrying the `public-service` badge and the
+    caller belongs to it (portal admins may publish for any eligible
+    organization). Personal (owner) publishing is no longer allowed — the old
+    `owner = current_user` fallback was removed and any owner sent alongside an
+    organization is dropped. The rule applies to everyone, including admins
+    (LEDG-2190). Enforced at the endpoint so it also covers direct API calls,
+    not just the back office.
+
+- **fix(urls): drop the legacy `/pages` segment from every frontend URL the backend generates** [#171](https://github.com/amagovpt/udata-pt/pull/171)
+  - The frontend moved its public routes from `src/app/pages/...` to the
+    `[locale]/(pages)` route group, so URLs no longer carry a `/pages`
+    segment — but the backend kept generating `/pages/...` links, which now
+    land on a 404.
+  - Updated: `self_web_url` on Dataset/Reuse/Organization/User/Post models
+    (Post keeps the canonical English `/posts/<slug>` path, consistent with
+    the other entities),
+    membership/invitation mail CTAs (`/admin/org/...`, `/register`),
+    password-reset mail links (`/reset-password/<token>`), SAML login &
+    account-migration redirects (`/login`, `/migrate-account`), and the
+    Flask-Security SPA redirect targets in `udata.cfg`
+    (`SECURITY_RESET_VIEW`, `SECURITY_RESET_ERROR_VIEW`,
+    `SECURITY_POST_RESET_VIEW`).
+  - The frontend adds permanent redirects for old `/pages/*` URLs (links in
+    already-sent emails, bookmarks, indexed pages), so stale links keep
+    working.
+
 - **fix(storages): harden chunked uploads against intermittent file corruption** [#167](https://github.com/amagovpt/udata-pt/pull/167)
   - Resource files uploaded/replaced via the admin were sometimes corrupted in
     production. Root causes: the destination prefix had a 1-second resolution,
