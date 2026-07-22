@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **feat(dataservices)!: restrict API creation to public-service organizations** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+  - `POST /api/1/dataservices/` now returns 403 unless the API is published in
+    the name of an organization carrying the `public-service` badge and the
+    caller belongs to it (portal admins may publish for any eligible
+    organization). Personal (owner) publishing is no longer allowed — the old
+    `owner = current_user` fallback was removed and any owner sent alongside an
+    organization is dropped. The rule applies to everyone, including admins
+    (LEDG-2190). Enforced at the endpoint so it also covers direct API calls,
+    not just the back office.
+
 - **fix(urls): drop the legacy `/pages` segment from every frontend URL the backend generates** [#171](https://github.com/amagovpt/udata-pt/pull/171)
   - The frontend moved its public routes from `src/app/pages/...` to the
     `[locale]/(pages)` route group, so URLs no longer carry a `/pages`

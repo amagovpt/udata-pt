@@ -21,6 +21,8 @@ from udata.core.access_type.constants import AccessType
 from udata.core.dataset.models import Dataset
 from udata.core.followers.api import FollowAPI
 from udata.core.legal.mails import add_send_legal_notice_argument, send_legal_notice_on_deletion
+from udata.core.organization.constants import PUBLIC_SERVICE
+from udata.core.organization.permissions import OrganizationPrivatePermission
 from udata.frontend.markdown import md
 from udata.i18n import gettext as _
 from udata.rdf import RDF_EXTENSIONS, graph_response, negociate_content
@@ -59,8 +61,28 @@ class DataservicesAPI(API):
     @api.marshal_with(Dataservice.__read_fields__, code=201)
     def post(self):
         dataservice = patch(Dataservice(), request)
-        if not dataservice.owner and not dataservice.organization:
-            dataservice.owner = current_user._get_current_object()
+        # An API may only be published in the name of an organization that is a
+        # certified public service (the `public-service` badge). Personal
+        # (owner) publishing is not allowed, and the rule applies to everyone,
+        # including portal administrators (LEDG-2190).
+        org = dataservice.organization
+        if org is None:
+            api.abort(
+                403,
+                "Uma API só pode ser publicada em nome de uma organização "
+                "com o emblema 'Serviço público'.",
+            )
+        if not any(badge.kind == PUBLIC_SERVICE for badge in org.badges):
+            api.abort(
+                403,
+                "A organização selecionada não tem o emblema 'Serviço público'.",
+            )
+        # The publisher must belong to the organization (portal admins may
+        # publish on behalf of any eligible organization).
+        if not (OrganizationPrivatePermission(org).can() or admin_permission.can()):
+            api.abort(403, "Não pertence à organização selecionada.")
+        # Never keep a personal owner alongside the organization.
+        dataservice.owner = None
         if dataservice.access_type != AccessType.RESTRICTED:
             dataservice.access_audiences = []
         dataservice.save()
