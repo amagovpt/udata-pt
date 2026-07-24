@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **chore(uwsgi): enable honour-range for static-map downloads** [#176](https://github.com/amagovpt/udata-pt/pull/176)
+  - Files under `/s/` are served by the uWSGI static-map, which ignores the
+    HTTP `Range` header unless `honour-range` is set — every response was a
+    full `200`, so interrupted downloads of large resources (e.g. the 634 MB
+    RGG gpkg, cut off by the upstream WAF's ~15s response timeout) could
+    never be resumed and always restarted from zero.
+  - With `honour-range = true`, uWSGI answers `206 Partial Content`, letting
+    browsers, `wget -c` and download managers resume where they left off.
+    The root fix (raising the WAF response timeout for `/s/`) is tracked
+    separately with the infrastructure team.
+
 - **feat(dataservices)!: restrict API creation to public-service organizations** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
   - `POST /api/1/dataservices/` now returns 403 unless the API is published in
     the name of an organization carrying the `public-service` badge and the
