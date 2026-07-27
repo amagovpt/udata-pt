@@ -16,7 +16,6 @@ from datetime import datetime, timedelta
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
-
 from flask import (
     Blueprint,
     current_app,
@@ -598,7 +597,7 @@ def _reject_saml_login(
     _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason=reason or log_message)
     do_flash(flash_message, "error")
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-    return redirect(f"{frontend_url}/pages/login")
+    return redirect(f"{frontend_url}/login")
 
 
 def _hash_nic(nic):
@@ -719,11 +718,11 @@ def _handle_saml_user_login(user):
 
     if user is None:
         current_app.logger.warning(
-            f"[DEBUG] _handle_saml_user_login: user is None -> redirect /pages/login "
+            f"[DEBUG] _handle_saml_user_login: user is None -> redirect /login "
             f"(frontend_url={frontend_url!r})"
         )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
-        return redirect(f"{frontend_url}/pages/login")
+        return redirect(f"{frontend_url}/login")
 
     if requires_confirmation(user):
         # Auto-confirm on SAML login — autenticação.gov already verified the user.
@@ -759,7 +758,7 @@ def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
     no_email_param = "" if has_email else "?no_email=true"
-    return redirect(f"{frontend_url}/pages/migrate-account{no_email_param}")
+    return redirect(f"{frontend_url}/migrate-account{no_email_param}")
 
 
 def _mask_email(email):
@@ -853,7 +852,7 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
         # `http://interop.gov.pt/MDC/Cidadao/*` namespace, which is not part
         # of pysaml2's default URI converters. With allow_unknown_attributes
         # disabled the parser silently drops those attributes and get_identity()
-        # returns {}, yielding a `user_not_found` redirect to /pages/login
+        # returns {}, yielding a `user_not_found` redirect to /login
         # without an error. Allow unknown attributes so they reach the
         # extraction code in idp_initiated.
         "allow_unknown_attributes": True,
@@ -1070,7 +1069,7 @@ def idp_initiated():
                     )
                     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
                     do_flash(f"Autenticação rejeitada: {display_msg}", "error")
-                    return redirect(f"{frontend_url}/pages/login")
+                    return redirect(f"{frontend_url}/login")
     except Exception as e:
         current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
 

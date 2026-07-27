@@ -93,7 +93,7 @@ def _serialize_dataset(dataset):
         "organization": ({"name": org.name, "logo": _serialize_image(org.logo)} if org else None),
         # Owner is the fallback author when no organization is set (LEDG-1861).
         # Including it on the lightweight payload lets the homepage card link
-        # to /pages/users/<slug> instead of falling back to "Sem Organização".
+        # to /users/<slug> instead of falling back to "Sem Organização".
         "owner": _serialize_user_ref(dataset.owner),
         "quality": dataset.quality,
         "metrics": dataset.metrics or {},
@@ -285,7 +285,7 @@ class SiteHomeReusesAPI(API):
         return [_serialize_reuse(r) for r in reuses]
 
 
-# Format groups for the /pages/datasets sidebar filters. Kept in sync with
+# Format groups for the /datasets sidebar filters. Kept in sync with
 # FORMAT_GROUP_MAP in frontend/src/components/datasets/DatasetsFilters.tsx.
 _DATASET_FORMAT_GROUPS: dict[str, list[str]] = {
     "tabular": ["csv", "xls", "xlsx", "ods", "parquet", "tsv"],
@@ -324,7 +324,7 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
 
 @api.route("/site/datasets-listing/", endpoint="site_datasets_listing")
 class SiteDatasetsListingAPI(API):
-    """Aggregated data for the /pages/datasets listing (LEDG-1836).
+    """Aggregated data for the /datasets listing (LEDG-1836).
 
     Combines the paginated listing, sidebar filter counts and metadata
     (organizations, licenses, frequencies, granularities) in one response.
@@ -397,7 +397,7 @@ def _compute_reuse_filter_counts(base_qs) -> dict[str, int]:
 
 @api.route("/site/reuses-listing/", endpoint="site_reuses_listing")
 class SiteReusesListingAPI(API):
-    """Aggregated data for the /pages/reuses listing (LEDG-1836).
+    """Aggregated data for the /reuses listing (LEDG-1836).
 
     Returns the paginated reuse listing, sidebar filter counts (modification
     dates) and the top organizations in one response. Replaces 6 parallel
@@ -452,7 +452,7 @@ _ORG_DEFAULT_SORTING = "-created_at"
 
 @api.route("/site/organizations-listing/", endpoint="site_organizations_listing")
 class SiteOrganizationsListingAPI(API):
-    """Aggregated data for the /pages/organizations listing (LEDG-1836).
+    """Aggregated data for the /organizations listing (LEDG-1836).
 
     Returns the paginated organization listing, the badge metadata, per-badge
     counts and the top-organizations sidebar list in a single response.
