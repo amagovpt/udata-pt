@@ -1076,6 +1076,56 @@ class MembershipAPITest(PytestOnlyAPITestCase):
             assert "UDATA" in suggestion["acronym"]
             assert response.json[0]["id"] == str(max_follower_organization.id)
 
+    def test_suggest_organizations_description(self):
+        """It should suggest organizations that match in the description field"""
+        for i in range(3):
+            OrganizationFactory(name=faker.word(), description="other content")
+        target = OrganizationFactory(
+            name=faker.word(),
+            description="xorgdesc-token-unique phrase in description",
+            metrics={"followers": 10},
+        )
+
+        response = self.get(url_for("api.suggest_organizations", q="xorgdesc-token-unique", size=5))
+        assert200(response)
+
+        ids = [s["id"] for s in response.json]
+        assert str(target.id) in ids
+
+    def test_suggest_organizations_description_only_no_name_match(self):
+        """It should suggest organizations when query matches only description, not name or acronym"""
+        OrganizationFactory(
+            name="completely-unrelated-org-name-b",
+            description="different content",
+        )
+        target = OrganizationFactory(
+            name="completely-unrelated-org-name-a",
+            description="yorgdesconly-abc found only in the description",
+        )
+
+        response = self.get(url_for("api.suggest_organizations", q="yorgdesconly-abc", size=5))
+        assert200(response)
+
+        assert len(response.json) == 1
+        assert response.json[0]["id"] == str(target.id)
+        assert "yorgdesconly-abc" not in response.json[0]["name"]
+
+    def test_search_organizations_list_by_description(self):
+        """The list endpoint should find organizations when query matches description but not name"""
+        for i in range(3):
+            OrganizationFactory(name=faker.word(), description="unrelated text")
+        target = OrganizationFactory(
+            name=faker.word(),
+            description="zorgsearch-unique-descr-term in organization description",
+        )
+
+        response = self.get(url_for("api.organizations", q="zorgsearch-unique-descr-term"))
+        assert200(response)
+
+        assert response.json["total"] >= 1
+        ids = [o["id"] for o in response.json["data"]]
+        assert str(target.id) in ids
+
 
 class OrganizationDatasetsAPITest(PytestOnlyAPITestCase):
     def test_list_org_datasets(self):
@@ -1110,6 +1160,33 @@ class OrganizationDatasetsAPITest(PytestOnlyAPITestCase):
 
         assert200(response)
         assert len(response.json["data"]) == len(datasets)
+
+    def test_list_org_datasets_hide_deleted_and_archived(self):
+        """Deleted/archived datasets must never show on the public org tab,
+        even when public, for anonymous or logged-in users."""
+        org = OrganizationFactory()
+        visible = DatasetFactory.create_batch(2, organization=org)
+        DatasetFactory(organization=org, deleted=datetime.now(UTC))
+        DatasetFactory(organization=org, archived=datetime.now(UTC))
+
+        response = self.get(url_for("api.org_datasets", org=org))
+
+        assert200(response)
+        assert len(response.json["data"]) == len(visible)
+        assert response.json["total"] == len(visible)
+
+    def test_list_org_datasets_member_can_request_deleted(self):
+        """A member may still request deleted datasets explicitly (back office)."""
+        user = self.login()
+        org = OrganizationFactory(members=[Member(user=user, role="admin")])
+        DatasetFactory.create_batch(2, organization=org)
+        deleted = DatasetFactory(organization=org, deleted=datetime.now(UTC))
+
+        response = self.get(url_for("api.org_datasets", org=org, deleted=True))
+
+        assert200(response)
+        ids = {d["id"] for d in response.json["data"]}
+        assert str(deleted.id) in ids
 
     def test_list_org_datasets_with_size(self):
         """Should list organization datasets"""

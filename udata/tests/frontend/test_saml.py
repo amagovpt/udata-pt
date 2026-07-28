@@ -929,7 +929,7 @@ class SAMLVuln2077RegressionTest(APITestCase):
             response = self._post_saml_response(xml)
             mock_login.assert_not_called()
         assert response.status_code == 302
-        assert "/pages/login" in response.headers["Location"]
+        assert "/login" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_rejects_response_signed_by_unknown_key(self, mock_client_for):

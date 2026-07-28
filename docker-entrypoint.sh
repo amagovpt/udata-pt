@@ -28,8 +28,9 @@ RETRY=0
 while ! nc -z "$MONGO_HOST" "$MONGO_PORT" 2>/dev/null; do
     RETRY=$((RETRY + 1))
     if [ "$RETRY" -ge "$MAX_RETRIES" ]; then
-        echo "[entrypoint] ERROR: MongoDB not reachable after ${MAX_RETRIES}s. Skipping migrations."
-        exec "$@"
+        echo "[entrypoint] ERROR: MongoDB not reachable after ${MAX_RETRIES}s. Aborting startup."
+        echo "[entrypoint] Refusing to start without applying pending migrations (would risk stale-index 500s)."
+        exit 1
     fi
     sleep 1
 done

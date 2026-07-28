@@ -174,12 +174,22 @@ def filter_by_reuse(base_query, filter_value):
         return base_query.filter(id__in=[dataservice.id for dataservice in reuse.dataservices])
 
 
+def filter_by_modified_since(base_query, filter_value):
+    """Filter dataservices modified on/after the given ISO date (e.g. 2024-01-01)."""
+    try:
+        since = datetime.fromisoformat(filter_value).replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return base_query
+    return base_query.filter(metadata_modified_at__gte=since)
+
+
 @generate_fields(
     searchable=True,
     nested_filters={"organization_badge": "organization.badges"},
     standalone_filters=[
         {"key": "topic", "constraints": ["objectid"], "query": filter_by_topic, "type": str},
         {"key": "reuse", "constraints": ["objectid"], "query": filter_by_reuse, "type": str},
+        {"key": "modified_since", "query": filter_by_modified_since, "type": str},
     ],
     additional_sorts=[
         {"key": "followers", "value": "metrics.followers"},

@@ -1916,6 +1916,29 @@ class DatasetResourceAPITest(APITestCase):
         data = json.loads(response.data)
         self.assertEqual(data["title"], "test.txt")
 
+    def test_upload_same_filename_gets_unique_paths(self):
+        """Two uploads of the same filename must never share a storage path.
+
+        The prefix used to have a 1-second resolution, so two concurrent
+        uploads (e.g. a retried combine racing the original request) of the
+        same filename wrote interleaved into the same file and corrupted it.
+        """
+        user = self.login()
+        org = OrganizationFactory(members=[Member(user=user, role="admin")])
+        dataset = DatasetFactory(organization=org)
+        url = url_for("api.upload_new_dataset_resource", dataset=dataset)
+
+        first = self.post(url, {"file": (BytesIO(b"aaa"), "test.txt")}, json=False)
+        self.assert201(first)
+        second = self.post(url, {"file": (BytesIO(b"bbb"), "test.txt")}, json=False)
+        self.assert201(second)
+
+        first_url = json.loads(first.data)["url"]
+        second_url = json.loads(second.data)["url"]
+        assert first_url.endswith("test.txt")
+        assert second_url.endswith("test.txt")
+        assert first_url != second_url
+
     def test_reorder(self):
         # Register an extra field in order to test
         # https://github.com/opendatateam/udata/issues/1794
@@ -2364,6 +2387,51 @@ class DatasetResourceAPITest(APITestCase):
         response = self.get(url_for("api.suggest_datasets", q="xxxxxx", size=5))
         self.assert200(response)
         self.assertEqual(len(response.json), 0)
+
+    def test_suggest_datasets_api_description(self):
+        """It should suggest datasets that match in the description field"""
+        for i in range(3):
+            DatasetFactory(
+                title=faker.unique_string(),
+                acronym=None,
+                description="irrelevant-content",
+                visible=True,
+            )
+        target = DatasetFactory(
+            title=faker.unique_string(),
+            acronym=None,
+            description="xdesctoken-abc unique term in description",
+            visible=True,
+            metrics={"followers": 10},
+        )
+
+        response = self.get(url_for("api.suggest_datasets", q="xdesctoken-abc", size=5))
+        self.assert200(response)
+
+        ids = [s["id"] for s in response.json]
+        self.assertIn(str(target.id), ids)
+
+    def test_suggest_datasets_api_description_only(self):
+        """It should suggest a dataset when query matches only description, not title or acronym"""
+        DatasetFactory(
+            title="quite-different-title-w",
+            acronym=None,
+            description="unrelated-content-z",
+            visible=True,
+        )
+        target = DatasetFactory(
+            title="quite-different-title-z",
+            acronym=None,
+            description="ydesconly-xyz appears only in the description field",
+            visible=True,
+        )
+
+        response = self.get(url_for("api.suggest_datasets", q="ydesconly-xyz", size=5))
+        self.assert200(response)
+
+        self.assertEqual(len(response.json), 1)
+        self.assertEqual(response.json[0]["id"], str(target.id))
+        self.assertNotIn("ydesconly-xyz", response.json[0]["title"])
 
 
 class DatasetReferencesAPITest(APITestCase):

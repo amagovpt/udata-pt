@@ -660,7 +660,7 @@ class Dataset(
 
     meta = {
         "indexes": [
-            "$title",
+            {"fields": ["$title", "$description", "$acronym"]},
             "created_at_internal",
             "last_modified_internal",
             "metrics.reuses",
@@ -670,6 +670,10 @@ class Dataset(
             "slug",
             "resources.id",
             "resources.urlhash",
+            # Harvesters look datasets up by remote_id on every run (see
+            # BaseBackend.get_dataset and the INE backend bulk upserts);
+            # without this index each lookup is a full collection scan.
+            "harvest.remote_id",
         ]
         + Owned.meta["indexes"],
         "ordering": ["-created_at_internal"],
@@ -790,7 +794,7 @@ class Dataset(
         }
 
     def self_web_url(self, **kwargs):
-        return cdata_url(f"/pages/datasets/{self._link_id(**kwargs)}", **kwargs)
+        return cdata_url(f"/datasets/{self._link_id(**kwargs)}", **kwargs)
 
     def self_api_url(self, **kwargs):
         return url_for(

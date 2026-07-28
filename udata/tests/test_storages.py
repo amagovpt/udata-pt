@@ -10,8 +10,15 @@ from werkzeug.wrappers import Request
 
 from udata.core import storages
 from udata.core.storages import utils
-from udata.core.storages.api import META, chunk_filename
+from udata.core.storages.api import COMBINE_MARKER, META, chunk_filename
 from udata.core.storages.tasks import purge_chunks
+from udata.core.storages.validation import (
+    _SCAN_CHUNK_SIZE,
+    PLAIN_TEXT_DANGEROUS_PATTERNS,
+    XML_DANGEROUS_PATTERNS,
+    _scan_for_dangerous_content,
+    validate_upload,
+)
 from udata.tests import PytestOnlyTestCase
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.utils import faker
@@ -183,6 +190,160 @@ class StorageUploadViewTest(PytestOnlyAPITestCase):
         assert storages.tmp.read(filename) == b"aaaa"
         assert list(storages.chunks.list_files()) == []
 
+    def send_part(self, url, uuid, index, parts, filename="test.txt", content=b"a", **extra):
+        payload = {
+            "file": (BytesIO(content), "blob"),
+            "uuid": uuid,
+            "filename": filename,
+            "partindex": index,
+            "partbyteoffset": index * len(content),
+            "totalparts": parts,
+            "chunksize": len(content),
+        }
+        payload.update(extra)
+        return self.post(url, payload, json=False)
+
+    def send_combine(self, url, uuid, parts, filename="test.txt", **extra):
+        payload = {"uuid": uuid, "filename": filename, "totalparts": parts}
+        payload.update(extra)
+        return self.post(url, payload, json=False)
+
+    def test_chunked_upload_part_retry_is_idempotent(self):
+        # A client retry of an already-persisted part (dropped connection after
+        # the server saved it) must overwrite the part instead of failing.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        assert200(self.send_part(url, uuid, 0, parts, content=b"a"))
+        # Retry of part 0 with different bytes (same size) must win.
+        assert200(self.send_part(url, uuid, 0, parts, content=b"b"))
+        for i in range(1, parts):
+            assert200(self.send_part(url, uuid, i, parts, content=b"a"))
+
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"baaa"
+        assert list(storages.chunks.list_files()) == []
+
+    def test_chunked_upload_totalfilesize_mismatch(self):
+        # A reassembled size differing from the announced file size means some
+        # part holds the wrong bytes: fail deterministically, leave nothing
+        # behind (no target, no temp file) and purge the chunks.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts, totalfilesize=parts + 1))
+
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts + 1)
+        assert400(response)
+        assert not response.json["success"]
+        assert response.json["code"] == "size-mismatch"
+        assert list(storages.tmp.list_files()) == []
+        assert list(storages.chunks.list_files()) == []
+
+    def test_chunked_upload_totalfilesize_from_meta(self):
+        # The expected size announced on the parts is remembered in the chunk
+        # metadata and enforced even when the combine request omits it.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts, totalfilesize=parts + 1))
+
+        response = self.send_combine(url, uuid, parts)
+        assert400(response)
+        assert response.json["code"] == "size-mismatch"
+
+    def test_chunked_upload_missing_part(self):
+        # A combine must verify every part exists before writing anything;
+        # chunks are kept so the client can re-send the missing part.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in (0, 1, 3):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert400(response)
+        assert not response.json["success"]
+        assert response.json["code"] == "chunks-missing"
+        assert list(storages.tmp.list_files()) == []
+        # The uploaded parts are kept for a retry (purged later by retention).
+        assert storages.chunks.exists(chunk_filename(uuid, 0))
+        # No stale in-progress marker is left behind.
+        assert not storages.chunks.exists(chunk_filename(uuid, COMBINE_MARKER))
+
+    def test_chunked_upload_double_combine(self):
+        # A replayed combine (client network retry after a lost response) must
+        # fail cleanly instead of re-reading deleted chunks or writing twice.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        first = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert200(first)
+
+        second = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert400(second)
+        assert not second.json["success"]
+        assert second.json["code"] == "upload-not-found"
+        # Exactly one file was produced.
+        assert list(storages.tmp.list_files()) == [first.json["filename"]]
+
+    def test_chunked_upload_combine_in_progress(self):
+        # A fresh in-progress marker means another combine is running: back
+        # off. A stale marker (crashed worker) is taken over.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        marker = chunk_filename(uuid, COMBINE_MARKER)
+        storages.chunks.write(marker, datetime.now(UTC).isoformat())
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert400(response)
+        assert response.json["code"] == "combine-in-progress"
+        # Chunks must be untouched so the running combine can finish.
+        assert storages.chunks.exists(chunk_filename(uuid, 0))
+
+        stale = datetime.now(UTC) - timedelta(hours=1)
+        storages.chunks.write(marker, stale.isoformat(), overwrite=True)
+        response = self.send_combine(url, uuid, parts, totalfilesize=parts)
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"aaaa"
+        assert list(storages.chunks.list_files()) == []
+
+    def test_chunked_upload_without_totalfilesize(self):
+        # Legacy clients that never send totalfilesize must keep working.
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        response = self.send_combine(url, uuid, parts)
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"aaaa"
+        assert list(storages.chunks.list_files()) == []
+
     def test_chunked_upload_bad_chunk(self):
         self.login()
         url = url_for("storage.upload", name="tmp")
@@ -212,6 +373,54 @@ class StorageUploadViewTest(PytestOnlyAPITestCase):
         assert "sha1" not in response.json
         assert "url" not in response.json
 
+        assert list(storages.chunks.list_files()) == []
+
+    @pytest.mark.options(RESOURCES_FILE_MAX_SIZE=2)
+    def test_standard_upload_too_large(self):
+        self.login()
+        response = self.post(
+            url_for("storage.upload", name="resources"),
+            {"file": (BytesIO(b"aaa"), "test.txt")},  # 3 bytes > 2
+            json=False,
+        )
+
+        assert response.status_code == 413
+        # The oversized file must not be left behind.
+        assert list(storages.resources.list_files()) == []
+
+    @pytest.mark.options(RESOURCES_FILE_MAX_SIZE=2)
+    def test_chunked_upload_too_large(self):
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4  # 4 * 1 byte = 4 bytes > 2
+
+        for i in range(parts):
+            response = self.post(
+                url,
+                {
+                    "file": (BytesIO(b"a"), "blob"),
+                    "uuid": uuid,
+                    "filename": "test.txt",
+                    "partindex": i,
+                    "partbyteoffset": 0,
+                    "totalparts": parts,
+                    "chunksize": 1,
+                },
+                json=False,
+            )
+            assert200(response)
+
+        response = self.post(
+            url,
+            {"uuid": uuid, "filename": "test.txt", "totalparts": parts},
+            json=False,
+        )
+
+        assert400(response)
+        assert not response.json["success"]
+        # Neither the combined file nor the chunk parts must be left behind.
+        assert list(storages.tmp.list_files()) == []
         assert list(storages.chunks.list_files()) == []
 
     def test_upload_resource_bad_request(self):
@@ -252,6 +461,15 @@ class ChunksRetentionTest(PytestOnlyTestCase):
         assert list(storages.chunks.list_files()) == []
         assert not storages.chunks.exists(uuid)  # Directory should be removed too
 
+    @pytest.mark.options(UPLOAD_MAX_RETENTION=0)
+    def test_chunks_cleanup_removes_combine_marker(self, client):
+        uuid = str(uuid4())
+        self.create_chunks(uuid)
+        storages.chunks.write(chunk_filename(uuid, COMBINE_MARKER), datetime.now(UTC).isoformat())
+        purge_chunks.apply()
+        assert list(storages.chunks.list_files()) == []
+        assert not storages.chunks.exists(uuid)
+
     @pytest.mark.options(UPLOAD_MAX_RETENTION=60 * 60)  # 1 hour
     def test_chunks_kept_before_max_retention(self, client):
         not_expired = datetime.now(UTC)
@@ -266,3 +484,84 @@ class ChunksRetentionTest(PytestOnlyTestCase):
         expected.add(chunk_filename(active_uuid, META))
         assert set(storages.chunks.list_files()) == expected
         assert not storages.chunks.exists(expired_uuid)  # Directory should be removed too
+
+
+class DangerousContentScanTest(PytestOnlyTestCase):
+    """Regression tests for the streaming dangerous-content scanner.
+
+    A previous implementation read the whole file into memory (f.read().lower())
+    and raised MemoryError on large resource uploads. The scanner now reads in
+    fixed-size chunks with an overlap so boundary-straddling patterns are still
+    caught while memory stays bounded.
+    """
+
+    def test_large_clean_file_is_not_flagged(self, tmpdir):
+        # A few chunks worth of legitimate data must scan cleanly without
+        # loading the whole file into memory.
+        target = tmpdir.join("big.csv")
+        with open(str(target), "w") as f:
+            for _ in range(4 * _SCAN_CHUNK_SIZE // 12):
+                f.write("a,b,c,d,e,f\n")
+        assert _scan_for_dangerous_content(str(target), PLAIN_TEXT_DANGEROUS_PATTERNS) is None
+
+    def test_pattern_straddling_chunk_boundary_is_detected(self, tmpdir):
+        # A dangerous token split across the chunk boundary must still match.
+        target = tmpdir.join("boundary.txt")
+        with open(str(target), "w") as f:
+            f.write("x" * (_SCAN_CHUNK_SIZE - 4))
+            f.write("<script>alert(1)</script>")
+        match = _scan_for_dangerous_content(str(target), PLAIN_TEXT_DANGEROUS_PATTERNS)
+        assert match is not None
+        assert match[0] == r"<script"
+
+    def test_xxe_pattern_is_matched_case_insensitively(self, tmpdir):
+        target = tmpdir.join("x.xml")
+        with open(str(target), "w") as f:
+            f.write("<!ENTITY foo SYSTEM 'file:///etc/passwd'>")
+        match = _scan_for_dangerous_content(str(target), XML_DANGEROUS_PATTERNS)
+        assert match is not None
+
+
+class ValidateUploadDataFormatTest(PytestOnlyTestCase):
+    """Inert data formats (CSV, JSON, …) are served as attachments and never
+    rendered inline, so legitimate data that merely contains an HTML-looking
+    substring must not be rejected as "dangerous". Only browser-renderable HTML
+    documents and XML/SVG keep the HTML/script scan.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "content"),
+        [
+            ("data.csv", "col1,col2\nvalue,<iframe src=x>\n"),
+            ("data.csv", "url\nhttps://x?u=javascript:alert(1)\n"),
+            ("data.json", '{"note": "use <script> to embed"}'),
+            ("dump.sql", "INSERT INTO t VALUES ('<object data=x>');"),
+            ("notes.txt", "example of an <embed> tag in prose"),
+        ],
+    )
+    def test_data_file_with_html_substring_is_allowed(self, tmpdir, name, content):
+        target = tmpdir.join(name)
+        with open(str(target), "w") as f:
+            f.write(content)
+        ext = name.rsplit(".", 1)[-1]
+        assert validate_upload(str(target), "", ext) is None
+        # The file must be kept on disk (not deleted as a rejected upload).
+        assert target.check(file=1)
+
+    @pytest.mark.parametrize("ext", ["html", "htm", "shtml", "xht"])
+    def test_html_document_with_script_is_rejected(self, tmpdir, ext):
+        target = tmpdir.join(f"page.{ext}")
+        with open(str(target), "w") as f:
+            f.write("<html><body><script>alert(1)</script></body></html>")
+        error = validate_upload(str(target), "", ext)
+        assert error is not None
+        # Rejected uploads are removed from disk.
+        assert not target.check()
+
+    def test_svg_with_script_is_still_rejected(self, tmpdir):
+        target = tmpdir.join("logo.svg")
+        with open(str(target), "w") as f:
+            f.write('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+        error = validate_upload(str(target), "image/svg+xml", "svg")
+        assert error is not None
+        assert not target.check()

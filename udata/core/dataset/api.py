@@ -20,6 +20,7 @@ These changes might lead to backward compatibility breakage meaning:
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import mongoengine
 import requests
@@ -63,7 +64,7 @@ from udata.core.followers.models import Follow
 from udata.core.legal.mails import add_send_legal_notice_argument, send_legal_notice_on_deletion
 from udata.core.organization.models import Organization
 from udata.core.reuse.models import Reuse
-from udata.core.storages.api import handle_upload, upload_parser
+from udata.core.storages.api import handle_upload, is_chunk_part, upload_parser
 from udata.core.topic.models import Topic
 from udata.frontend.markdown import md
 from udata.i18n import gettext as _
@@ -830,7 +831,14 @@ class ResourcesAPI(API):
 
 class UploadMixin(object):
     def handle_upload(self, dataset):
-        prefix = "/".join((dataset.slug, datetime.now(UTC).strftime("%Y%m%d-%H%M%S")))
+        # The prefix must be unique per upload: with a 1-second resolution two
+        # concurrent uploads (e.g. a retried combine racing the original
+        # request) of the same filename resolved to the same path and
+        # interleaved their writes, corrupting the stored file. The random
+        # fragment removes that collision; the timestamp is kept for
+        # readability/traceability of the storage layout.
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        prefix = "/".join((dataset.slug, f"{timestamp}-{uuid4().hex[:8]}"))
         infos = handle_upload(storages.resources, prefix)
         # Content validation (HTML, XML/XXE, image magic bytes, script scanning)
         # is handled centrally in storages.api.handle_upload() via validate_upload()
@@ -848,11 +856,14 @@ class UploadMixin(object):
 @api.doc(**common_doc)
 class UploadNewDatasetResource(UploadMixin, API):
     # Per-user rate-limit on file upload to prevent abuse (TICKET-59).
+    # Chunk parts are exempt so a single large (chunked) upload counts once,
+    # not once per ~2 MB part (see is_chunk_part).
     decorators = [
         limiter.limit(
             UPLOAD_LIMIT,
             methods=["POST"],
             key_func=user_or_ip,
+            exempt_when=is_chunk_part,
         ),
     ]
 
@@ -877,12 +888,14 @@ class UploadNewDatasetResource(UploadMixin, API):
 class UploadNewCommunityResources(UploadMixin, API):
     # Per-user rate-limit on community resource upload (TICKET-59 / VULN-2078).
     # Tighter than UPLOAD_LIMIT because community resources are publicly
-    # visible content, not just files attached to a dataset.
+    # visible content, not just files attached to a dataset. Chunk parts are
+    # exempt so a chunked upload counts once, not once per part (is_chunk_part).
     decorators = [
         limiter.limit(
             CONTENT_CREATE_LIMIT,
             methods=["POST"],
             key_func=user_or_ip,
+            exempt_when=is_chunk_part,
         ),
     ]
 
@@ -920,12 +933,14 @@ class UploadDatasetResource(ResourceMixin, UploadMixin, API):
     # Per-user rate-limit on file upload to prevent abuse and keep the endpoint
     # out of the IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the
     # F5/WAF (see UPLOAD_LIMIT). Mirrors UploadNewDatasetResource: replacing the
-    # file of an existing resource is as frequent as creating one.
+    # file of an existing resource is as frequent as creating one. Chunk parts
+    # are exempt so a chunked upload counts once, not once per part.
     decorators = [
         limiter.limit(
             UPLOAD_LIMIT,
             methods=["POST"],
             key_func=user_or_ip,
+            exempt_when=is_chunk_part,
         ),
     ]
 
@@ -959,12 +974,14 @@ class ReuploadCommunityResource(ResourceMixin, UploadMixin, API):
     # Tighter than UPLOAD_LIMIT and consistent with UploadNewCommunityResources:
     # community resources are publicly visible content. Keeps the re-upload out
     # of the IP-keyed RATELIMIT_DEFAULT that collapses site-wide behind the
-    # F5/WAF (see CONTENT_CREATE_LIMIT).
+    # F5/WAF (see CONTENT_CREATE_LIMIT). Chunk parts are exempt so a chunked
+    # upload counts once, not once per part (see is_chunk_part).
     decorators = [
         limiter.limit(
             CONTENT_CREATE_LIMIT,
             methods=["POST"],
             key_func=user_or_ip,
+            exempt_when=is_chunk_part,
         ),
     ]
 
@@ -1202,7 +1219,9 @@ class DatasetSuggestAPI(API):
         args = suggest_parser.parse_args()
         datasets_query = Dataset.objects(archived=None, deleted=None, private=False)
         datasets = datasets_query.filter(
-            Q(title__icontains=args["q"]) | Q(acronym__icontains=args["q"])
+            Q(title__icontains=args["q"])
+            | Q(acronym__icontains=args["q"])
+            | Q(description__icontains=args["q"])
         )
         return [
             {

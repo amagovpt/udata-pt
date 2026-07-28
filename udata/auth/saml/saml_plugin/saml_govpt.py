@@ -254,6 +254,92 @@ def _first_value(identity, key):
     return None
 
 
+# ---------------------------------------------------------------------------
+# TEMP DIAG (remove once the SAML signature issue is resolved): when pysaml2
+# rejects the Response signature, log the certificate(s) embedded in the
+# SAMLResponse <ds:KeyInfo> against the certificate(s) in our configured IdP
+# metadata. Matching fingerprints rule out an IdP key rotation and point at a
+# canonicalization/xmlsec issue; differing fingerprints confirm the IdP rotated
+# its signing key and our metadata.xml is stale.
+# ---------------------------------------------------------------------------
+def _diag_describe_cert(der):
+    """Return a 'subject/serial/sha256' description for a DER cert blob.
+
+    The sha256 is formatted exactly like ``openssl x509 -fingerprint -sha256``
+    so it can be eyeballed against the values we computed on the host.
+    """
+    sha = ":".join(hashlib.sha256(der).hexdigest()[i : i + 2] for i in range(0, 64, 2)).upper()
+    subject = serial = "?"
+    try:
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(der)
+        subject = cert.subject.rfc4514_string()
+        serial = format(cert.serial_number, "X")
+    except Exception:
+        pass
+    return f"subject={subject!r} serial={serial} sha256={sha}"
+
+
+def _diag_extract_certs(xml_text):
+    """Extract every X509Certificate DER blob from an XML/metadata string."""
+    certs = []
+    for m in re.finditer(
+        r"<(?:ds:)?X509Certificate>([^<]+)</(?:ds:)?X509Certificate>", xml_text, re.S
+    ):
+        try:
+            certs.append(base64.b64decode(re.sub(r"\s+", "", m.group(1))))
+        except (binascii.Error, ValueError):
+            continue
+    return certs
+
+
+def _diag_log_signature_certs(raw_saml_response, auth_servers):
+    """Log embedded-vs-metadata signing certs on a signature failure."""
+    try:
+        try:
+            xml_text = base64.b64decode(raw_saml_response).decode("utf-8", "replace")
+        except Exception:
+            current_app.logger.warning("SAML SIG-DIAG: could not base64-decode response")
+            return
+
+        resp_certs = _diag_extract_certs(xml_text)
+        current_app.logger.warning("SAML SIG-DIAG: response embeds %d cert(s)", len(resp_certs))
+        resp_fps = set()
+        for i, der in enumerate(resp_certs):
+            desc = _diag_describe_cert(der)
+            resp_fps.add(desc.rsplit("sha256=", 1)[-1])
+            current_app.logger.warning("SAML SIG-DIAG: response[%d] %s", i, desc)
+
+        meta_fps = set()
+        for server in auth_servers:
+            server = server.strip()
+            if not server:
+                continue
+            try:
+                with open(_resolve_path(server), encoding="utf-8") as f:
+                    meta_text = f.read()
+            except OSError as exc:
+                current_app.logger.warning(
+                    "SAML SIG-DIAG: cannot read metadata %s: %s", server, exc
+                )
+                continue
+            for i, der in enumerate(_diag_extract_certs(meta_text)):
+                desc = _diag_describe_cert(der)
+                meta_fps.add(desc.rsplit("sha256=", 1)[-1])
+                current_app.logger.warning("SAML SIG-DIAG: metadata(%s)[%d] %s", server, i, desc)
+
+        current_app.logger.warning(
+            "SAML SIG-DIAG: VERDICT match=%s (a match => NOT a key rotation) "
+            "response_fps=%s meta_fps=%s",
+            bool(resp_fps & meta_fps),
+            sorted(resp_fps),
+            sorted(meta_fps),
+        )
+    except Exception as exc:  # diagnostics must never break the auth flow
+        current_app.logger.warning("SAML SIG-DIAG: failed: %s", exc)
+
+
 def _trusted_saml_issuers():
     """Return the set of SAML Issuer entityIDs we trust.
 
@@ -511,7 +597,7 @@ def _reject_saml_login(
     _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason=reason or log_message)
     do_flash(flash_message, "error")
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-    return redirect(f"{frontend_url}/pages/login")
+    return redirect(f"{frontend_url}/login")
 
 
 def _hash_nic(nic):
@@ -639,11 +725,11 @@ def _handle_saml_user_login(user, new_account=False):
 
     if user is None:
         current_app.logger.warning(
-            f"[DEBUG] _handle_saml_user_login: user is None -> redirect /pages/login "
+            f"[DEBUG] _handle_saml_user_login: user is None -> redirect /login "
             f"(frontend_url={frontend_url!r})"
         )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
-        return redirect(f"{frontend_url}/pages/login")
+        return redirect(f"{frontend_url}/login")
 
     if requires_confirmation(user):
         # Auto-confirm on SAML login — autenticação.gov already verified the user.
@@ -689,7 +775,7 @@ def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
     no_email_param = "" if has_email else "?no_email=true"
-    return redirect(f"{frontend_url}/pages/migrate-account{no_email_param}")
+    return redirect(f"{frontend_url}/migrate-account{no_email_param}")
 
 
 def _mask_email(email):
@@ -783,7 +869,7 @@ def _build_sp_settings(acs_url, out_url, metadata_file):
         # `http://interop.gov.pt/MDC/Cidadao/*` namespace, which is not part
         # of pysaml2's default URI converters. With allow_unknown_attributes
         # disabled the parser silently drops those attributes and get_identity()
-        # returns {}, yielding a `user_not_found` redirect to /pages/login
+        # returns {}, yielding a `user_not_found` redirect to /login
         # without an error. Allow unknown attributes so they reach the
         # extraction code in idp_initiated.
         "allow_unknown_attributes": True,
@@ -1000,7 +1086,7 @@ def idp_initiated():
                     )
                     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
                     do_flash(f"Autenticação rejeitada: {display_msg}", "error")
-                    return redirect(f"{frontend_url}/pages/login")
+                    return redirect(f"{frontend_url}/login")
     except Exception as e:
         current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
 
@@ -1064,6 +1150,7 @@ def idp_initiated():
         break
 
     if authn_response is None:
+        _diag_log_signature_certs(raw_saml_response, auth_servers)  # TEMP DIAG
         return _reject_saml_login(
             "SAML SSO rejeitado: nenhum IdP validou a resposta assinada "
             f"(último erro: {last_validation_error})",

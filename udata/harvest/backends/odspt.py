@@ -1,36 +1,36 @@
 import mimetypes
 import os
+from urllib.parse import urlparse
 
 from dateutil.parser import parse as parse_date
 
 from udata.frontend.markdown import parse_html
-from udata.i18n import gettext as _
-from udata.harvest.backends.base import BaseBackend, HarvestFilter, HarvestFeature
+from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
-from udata.models import License, Resource, Organization
+from udata.harvest.models import HarvestItem
+from udata.i18n import gettext as _
+from udata.models import License, Organization, Resource
 from udata.utils import get_by
 
-from urllib.parse import urlparse
-
-from udata.harvest.models import HarvestItem
 from .tools.harvester_utils import normalize_url_slashes
 
+
 def guess_format(mimetype, url=None):
-    '''
+    """
     Guess a file format given a MIME type and/or an url
-    '''
+    """
     # TODO: factorize in udata
     ext = mimetypes.guess_extension(mimetype)
     if not ext and url:
         parts = os.path.splitext(url)
         ext = parts[1] if parts[1] else None
-    return ext[1:] if ext and ext.startswith('.') else ext
+    return ext[1:] if ext and ext.startswith(".") else ext
 
 
 def guess_mimetype(mimetype, url=None):
-    '''
+    """
     Guess a MIME type given a string or and URL
-    '''
+    """
     # TODO: factorize in udata
     if mimetype in mimetypes.types_map.values():
         return mimetype
@@ -41,21 +41,25 @@ def guess_mimetype(mimetype, url=None):
 
 class OdsBackendPT(BaseBackend):
     name = "odspt"
-    display_name = 'OpenDataSoft PT'
-    verify_ssl = False
+    display_name = "OpenDataSoft PT"
+    # verify_ssl inherits True from BaseBackend: the configured source
+    # (transparencia.sns.gov.pt) presents a valid certificate (checked 2026-07).
     filters = (
-        HarvestFilter(_('Tag'), 'tags', str, _('A tag name')),
-        HarvestFilter(_('Publisher'), 'publisher', str, _('A publisher name')),
+        HarvestFilter(_("Tag"), "tags", str, _("A tag name")),
+        HarvestFilter(_("Publisher"), "publisher", str, _("A publisher name")),
     )
     features = (
-        HarvestFeature('inspire', _('Harvest Inspire datasets'),
-                       _('Whether this harvester should import datasets coming from Inspire')),
+        HarvestFeature(
+            "inspire",
+            _("Harvest Inspire datasets"),
+            _("Whether this harvester should import datasets coming from Inspire"),
+        ),
     )
 
     # Map filters key to ODS facets
     FILTERS = {
-        'tags': 'keyword',
-        'publisher': 'publisher',
+        "tags": "keyword",
+        "publisher": "publisher",
     }
 
     # above this records count limit, shapefile export will be disabled
@@ -63,43 +67,43 @@ class OdsBackendPT(BaseBackend):
     SHAPEFILE_RECORDS_LIMIT = 50000
 
     LICENSES = {
-        'Open Database License (ODbL)': 'odc-odbl',
-        'Licence Ouverte (Etalab)': 'fr-lo',
-        'Licence ouverte / Open Licence': 'fr-lo',
-        'CC BY-SA': 'cc-by-sa',
-        'Public Domain': 'other-pd'
+        "Open Database License (ODbL)": "odc-odbl",
+        "Licence Ouverte (Etalab)": "fr-lo",
+        "Licence ouverte / Open Licence": "fr-lo",
+        "CC BY-SA": "cc-by-sa",
+        "Public Domain": "other-pd",
     }
 
     FORMATS = {
-        'csv': ('CSV', 'csv', 'text/csv'),
-        'geojson': ('GeoJSON', 'json', 'application/vnd.geo+json'),
-        'json': ('JSON', 'json', 'application/json'),
-        'shp': ('Shapefile', 'shp', None),
+        "csv": ("CSV", "csv", "text/csv"),
+        "geojson": ("GeoJSON", "json", "application/vnd.geo+json"),
+        "json": ("JSON", "json", "application/json"),
+        "shp": ("Shapefile", "shp", None),
     }
 
     @property
     def source_url(self):
-        return self.source.url.rstrip('/')
+        return self.source.url.rstrip("/")
 
     @property
     def api_url(self):
-        return '{0}/api/datasets/1.0/search/'.format(self.source_url)
+        return "{0}/api/datasets/1.0/search/".format(self.source_url)
 
     def explore_url(self, dataset_id):
-        return '{0}/explore/dataset/{1}/'.format(self.source_url, dataset_id)
+        return "{0}/explore/dataset/{1}/".format(self.source_url, dataset_id)
 
     def extra_file_url(self, dataset_id, file_id, plural_type):
-        return '{0}/api/datasets/1.0/{1}/{2}/{3}'.format(
+        return "{0}/api/datasets/1.0/{1}/{2}/{3}".format(
             self.source_url, dataset_id, plural_type, file_id
         )
 
     def download_url(self, dataset_id, format):
-        return ('{0}download?format={1}&timezone=Europe/Berlin'
-                '&use_labels_for_header=true'
-                ).format(self.explore_url(dataset_id), format)
+        return ("{0}download?format={1}&timezone=Europe/Berlin&use_labels_for_header=true").format(
+            self.explore_url(dataset_id), format
+        )
 
     def export_url(self, dataset_id):
-        return '{0}?tab=export'.format(self.explore_url(dataset_id))
+        return "{0}?tab=export".format(self.explore_url(dataset_id))
 
     def inner_harvest(self):
         count = 0
@@ -113,51 +117,51 @@ class OdsBackendPT(BaseBackend):
 
         while should_fetch():
             params = {
-                'start': count,
-                'rows': 50,
-                'interopmetas': 'true',
+                "start": count,
+                "rows": 50,
+                "interopmetas": "true",
             }
             for f in self.get_filters():
-                ods_key = self.FILTERS.get(f['key'], f['key'])
-                op = 'exclude' if f.get('type') == 'exclude' else 'refine'
-                key = '.'.join((op, ods_key))
+                ods_key = self.FILTERS.get(f["key"], f["key"])
+                op = "exclude" if f.get("type") == "exclude" else "refine"
+                key = ".".join((op, ods_key))
                 param = params.get(key, set())
-                param.add(f['value'])
+                param.add(f["value"])
                 params[key] = param
             response = self.get(self.api_url, params=params)
             response.raise_for_status()
             data = response.json()
-            nhits = data['nhits']
-            for dataset in data['datasets']:
+            nhits = data["nhits"]
+            for dataset in data["datasets"]:
                 count += 1
-                #self.add_item(dataset['datasetid'], dataset=dataset)
-                self.process_dataset(dataset['datasetid'], dataset=dataset)
+                # self.add_item(dataset['datasetid'], dataset=dataset)
+                self.process_dataset(dataset["datasetid"], dataset=dataset)
 
     def inner_process_dataset(self, item: HarvestItem, **kwargs):
-        ods_dataset = kwargs.get('dataset')
-        dataset_id = ods_dataset['datasetid']
-        ods_metadata = ods_dataset['metas']
-        ods_interopmetas = ods_dataset.get('interop_metas', {})
+        ods_dataset = kwargs.get("dataset")
+        dataset_id = ods_dataset["datasetid"]
+        ods_metadata = ods_dataset["metas"]
+        ods_interopmetas = ods_dataset.get("interop_metas", {})
 
-        if not ods_dataset.get('has_records'):
-            msg = 'Dataset {datasetid} has no record'.format(**ods_dataset)
+        if not ods_dataset.get("has_records"):
+            msg = "Dataset {datasetid} has no record".format(**ods_dataset)
             raise HarvestSkipException(msg)
 
-        if 'inspire' in ods_interopmetas and not self.has_feature('inspire'):
-            msg = 'Dataset {datasetid} has INSPIRE metadata'
+        if "inspire" in ods_interopmetas and not self.has_feature("inspire"):
+            msg = "Dataset {datasetid} has INSPIRE metadata"
             raise HarvestSkipException(msg.format(**ods_dataset))
 
         dataset = self.get_dataset(item.remote_id)
 
-        dataset.title = ods_metadata['title']
-        dataset.frequency = 'unknown'
-        description = ods_metadata.get('description', '').strip()
+        dataset.title = ods_metadata["title"]
+        dataset.frequency = "unknown"
+        description = ods_metadata.get("description", "").strip()
         dataset.description = parse_html(description)
         dataset.private = False
 
         # Detect Organization
         try:
-            organization_acronym = ods_metadata['publisher']
+            organization_acronym = ods_metadata["publisher"]
         except KeyError:
             pass
         else:
@@ -174,18 +178,18 @@ class OdsBackendPT(BaseBackend):
                 dataset.organization = orgObj
 
         tags = set()
-        if 'keyword' in ods_metadata:
-            if isinstance(ods_metadata['keyword'], list):
-                tags |= set(ods_metadata['keyword'])
+        if "keyword" in ods_metadata:
+            if isinstance(ods_metadata["keyword"], list):
+                tags |= set(ods_metadata["keyword"])
             else:
-                tags.add(ods_metadata['keyword'])
+                tags.add(ods_metadata["keyword"])
 
-        if 'theme' in ods_metadata:
-            if isinstance(ods_metadata['theme'], list):
-                for theme in ods_metadata['theme']:
-                    tags.update([t.strip().lower() for t in theme.split(',')])
+        if "theme" in ods_metadata:
+            if isinstance(ods_metadata["theme"], list):
+                for theme in ods_metadata["theme"]:
+                    tags.update([t.strip().lower() for t in theme.split(",")])
             else:
-                themes = ods_metadata['theme'].split(',')
+                themes = ods_metadata["theme"].split(",")
                 tags.update([t.strip().lower() for t in themes])
 
         dataset.tags = list(tags)
@@ -193,87 +197,85 @@ class OdsBackendPT(BaseBackend):
 
         # Detect license
         default_license = dataset.license or License.default()
-        license_id = ods_metadata.get('license')
-        dataset.license = License.guess(license_id,
-                                        self.LICENSES.get(license_id),
-                                        default=default_license)
+        license_id = ods_metadata.get("license")
+        dataset.license = License.guess(
+            license_id, self.LICENSES.get(license_id), default=default_license
+        )
 
-        self.process_resources(dataset, ods_dataset, ('csv', 'json'))
+        self.process_resources(dataset, ods_dataset, ("csv", "json"))
 
-        if 'geo' in ods_dataset['features']:
-            exports = ['geojson']
-            if ods_metadata['records_count'] <= self.SHAPEFILE_RECORDS_LIMIT:
-                exports.append('shp')
+        if "geo" in ods_dataset["features"]:
+            exports = ["geojson"]
+            if ods_metadata["records_count"] <= self.SHAPEFILE_RECORDS_LIMIT:
+                exports.append("shp")
             self.process_resources(dataset, ods_dataset, exports)
 
-        self.process_extra_files(dataset, ods_dataset, 'alternative_export')
-        self.process_extra_files(dataset, ods_dataset, 'attachment')
+        self.process_extra_files(dataset, ods_dataset, "alternative_export")
+        self.process_extra_files(dataset, ods_dataset, "attachment")
 
-        dataset.extras['ods:url'] = self.explore_url(dataset_id)
-        dataset.extras['harvest:name'] = self.source.name
-        
-        if 'references' in ods_metadata:
-            dataset.extras['ods:references'] = ods_metadata['references']
-        dataset.extras['ods:has_records'] = ods_dataset['has_records']
-        dataset.extras['ods:geo'] = 'geo' in ods_dataset['features']
+        dataset.extras["ods:url"] = self.explore_url(dataset_id)
+        dataset.extras["harvest:name"] = self.source.name
+
+        if "references" in ods_metadata:
+            dataset.extras["ods:references"] = ods_metadata["references"]
+        dataset.extras["ods:has_records"] = ods_dataset["has_records"]
+        dataset.extras["ods:geo"] = "geo" in ods_dataset["features"]
 
         return dataset
 
     def process_extra_files(self, dataset, data, data_type):
-        dataset_id = data['datasetid']
-        modified_at = self.parse_date(data['metas']['modified'])
-        plural_type = '{0}s'.format(data_type)
+        dataset_id = data["datasetid"]
+        modified_at = self.parse_date(data["metas"]["modified"])
+        plural_type = "{0}s".format(data_type)
         for export in data.get(plural_type, []):
-            url = self.extra_file_url(dataset_id, export['id'], plural_type)
+            url = self.extra_file_url(dataset_id, export["id"], plural_type)
             created, resource = self.get_resource(dataset, url)
-            resource.title = export.get('title', 'No title')
-            resource.description = export.get('description')
-            resource.format = guess_format(export.get('mimetype'),
-                                           export['url'])
-            resource.mime = guess_mimetype(export.get('mimetype'),
-                                           export['url'])
+            resource.title = export.get("title", "No title")
+            resource.description = export.get("description")
+            resource.format = guess_format(export.get("mimetype"), export["url"])
+            resource.mime = guess_mimetype(export.get("mimetype"), export["url"])
             resource.modified = modified_at
-            resource.extras['ods:type'] = data_type
+            resource.extras["ods:type"] = data_type
             if created:
                 dataset.resources.append(resource)
 
     def get_resource(self, dataset, url):
         url = normalize_url_slashes(url)
-        resource = get_by(dataset.resources, 'url', url)
+        resource = get_by(dataset.resources, "url", url)
         if not resource:
             return True, Resource(url=url)
         return False, resource
 
     def process_resources(self, dataset, data, formats):
-        dataset_id = data['datasetid']
-        ods_metadata = data['metas']
-        modified_at = self.parse_date(ods_metadata['modified'])
-        description = self.description_from_fields(data['fields'])
+        dataset_id = data["datasetid"]
+        ods_metadata = data["metas"]
+        modified_at = self.parse_date(ods_metadata["modified"])
+        description = self.description_from_fields(data["fields"])
         for _format in formats:
             label, udata_format, mime = self.FORMATS[_format]
             url = self.download_url(dataset_id, _format)
             created, resource = self.get_resource(dataset, url)
-            resource.title = _('Export to {format}').format(format=label)
+            resource.title = _("Export to {format}").format(format=label)
             resource.description = description
-            resource.filetype = 'remote'
+            resource.filetype = "remote"
             resource.format = udata_format
             resource.mime = mime
             resource.modified = modified_at
-            resource.extras['ods:type'] = 'api'
+            resource.extras["ods:type"] = "api"
             if created:
                 dataset.resources.append(resource)
 
     def description_from_fields(self, fields):
-        '''Build a resource description/schema from ODS API fields'''
+        """Build a resource description/schema from ODS API fields"""
         if not fields:
             return
 
-        out = ''
+        out = ""
         for field in fields:
-            out += '- *{label}*: {name}[{type}]'.format(**field)
-            if field.get('description'):
-                out += ' {description}'.format(**field)
-            out += '\n'
+            out += "- *{label}*: {name}[{type}]".format(**field)
+            if field.get("description"):
+                out += " {description}".format(**field)
+            out += "\n"
         return out
 
     def parse_date(self, date_str):

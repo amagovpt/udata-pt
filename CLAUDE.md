@@ -22,7 +22,7 @@ inv beat
 udata init
 
 # Run migrations
-udata db upgrade
+udata db migrate
 
 # Run tests (needs MongoDB on port 27018)
 docker compose -f docker-compose.test.yml up -d
@@ -62,10 +62,74 @@ uv run ruff format .
 ## Key Conventions
 
 - Pre-commit hooks: ruff check, ruff format, trailing whitespace, end-of-file fixer
-- Commit messages: readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
-- Update CHANGELOG.md when making notable changes
+- Commit messages: follow [Conventional Commits](#branch--commit-conventions), readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
+- Branches: follow [Conventional Branch](#branch--commit-conventions) (`<type>/<kebab-case-description>`).
+- **Update `CHANGELOG.md` after every notable change** (mandatory once the implementation is done). Add the entry at the top under `## Unreleased`, in the existing style: a **bold one-line summary**, optionally followed by indented sub-bullets explaining the *why/how* (not just a PR link), and a link to the PR — e.g. `[#143](https://github.com/amagovpt/udata-pt/pull/143)`. Describe the behaviour that changed and the reasoning. Reference the PR, not Jira ticket ids.
 - Tests use pytest with MongoDB (port 27018 via docker-compose.test.yml)
 - Coverage config in `coverage.rc` (branch coverage, excludes test dirs)
+
+## Branch & Commit Conventions
+
+All contributors must follow these conventions. References:
+[Conventional Branch](https://conventionalbranch.org/) and [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
+
+### Branches — Conventional Branch
+
+Format: `<type>/<description>`
+
+- **Description** in `kebab-case`, lowercase, alphanumerics and hyphens only (no spaces, `_`, uppercase, or special chars).
+- Optionally include the issue/ticket number: `feature/issue-123-public-search-ratelimit`.
+
+| Prefix     | Use                                                       |
+| ---------- | --------------------------------------------------------- |
+| `main`     | Main production branch (no prefix).                       |
+| `feature/` | New feature.                                              |
+| `bugfix/`  | Bug fix.                                                  |
+| `hotfix/`  | Urgent fix (typically against production).                |
+| `release/` | Release preparation.                                      |
+| `chore/`   | Tasks with no production-code impact (deps, config).      |
+
+Examples: `feature/aggregated-home-endpoint`, `bugfix/csrf-session-overwrite`, `chore/bump-backend-submodule`, `hotfix/download-ratelimit`.
+
+### Environment Promotion Flow
+
+This backend repo (`github.com/amagovpt/udata-pt`) has long-lived environment branches `develop`, `tst`, `ppr`, `main`. Promote changes upwards through PRs, one environment at a time:
+
+1. Branch **from `develop`** (using the Conventional Branch naming above).
+2. When ready, open a PR back **into `develop`**; integrate and test there.
+3. Then a PR **into `tst`**; test in tst.
+4. Then a PR **into `ppr`**; test in ppr.
+5. Then a PR **into `main`** (production).
+
+> The PR base is always the **next environment up**, not always `main`. Apply this flow only when the change touches this repo. GitHub CLI (`gh`) is not installed here — open PRs via the compare URL `https://github.com/amagovpt/udata-pt/compare/<base>...<head>?expand=1`. See the monorepo `CLAUDE.md` for the cross-repo rule.
+
+### Commits — Conventional Commits 1.0.0
+
+Format:
+
+```
+<type>[optional scope][!]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+- **type** (required): `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+- **scope** (optional): affected area, e.g. `feat(dataset):`, `fix(api):`.
+- **description**: imperative, lowercase, in English, no trailing period.
+- **`feat`** → _MINOR_ bump; **`fix`** → _PATCH_ bump.
+- **Breaking changes**: `!` after type/scope (e.g. `feat(api)!:`) and/or a `BREAKING CHANGE: <description>` footer.
+- Reference issues in the footer or description: `(fix #XXX)`.
+
+Examples:
+
+```
+feat(search): add user_or_ip rate-limit to public GET endpoints
+fix(auth): mint CSRF server-side on authenticated POSTs (fix #42)
+chore: bump backend submodule for public download rate-limit fix
+refactor(home): add aggregated /api/1/site/home/ endpoint
+```
 
 ## Important Paths
 

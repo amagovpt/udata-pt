@@ -3,9 +3,10 @@ from uuid import UUID
 
 from bson import ObjectId
 from flask import redirect, request, url_for
+from flask_login import current_user
 from mongoengine import Q
 from mongoengine.errors import InvalidQueryError, ValidationError
-from werkzeug.exceptions import NotFound
+from werkzeug.exceptions import NotFound, Unauthorized
 from werkzeug.routing import BaseConverter, PathConverter
 
 from udata import models
@@ -23,6 +24,17 @@ class LazyRedirect(object):
 
     def __init__(self, arg):
         self.arg = arg
+
+
+class SafeNotFound(NotFound):
+    """A 'not found' that must not disclose existence to anonymous callers.
+
+    Used by converters whose target requires authentication to read (e.g. the
+    user endpoints). When the resolved object does not exist, an anonymous
+    request is answered with 401 instead of 404 so the response is identical
+    whether or not the object exists — closing the user-enumeration vector
+    (CWE-203 / VULN-2090). Authenticated callers still get a normal 404.
+    """
 
 
 class ListConverter(BaseConverter):
@@ -156,6 +168,15 @@ class ReuseConverter(ModelConverter):
 class UserConverter(ModelConverter):
     model = models.User
 
+    def to_python(self, value):
+        result = super().to_python(value)
+        # User read endpoints require authentication (VULN-2092). Mark a missing
+        # user so an anonymous caller gets 401 (same as an existing user) instead
+        # of 404, preventing user enumeration (CWE-203 / VULN-2090).
+        if isinstance(result, NotFound) and not isinstance(result, SafeNotFound):
+            return SafeNotFound()
+        return result
+
 
 class TopicConverter(ModelConverter):
     model = models.Topic
@@ -233,7 +254,12 @@ def lazy_raise_or_redirect():
     if not request.view_args:
         return
     for name, value in request.view_args.items():
-        if isinstance(value, NotFound):
+        if isinstance(value, SafeNotFound):
+            # Don't leak existence to anonymous callers: answer 401 (identical to
+            # the response for an existing user) instead of 404 (VULN-2090).
+            request.routing_exception = Unauthorized() if current_user.is_anonymous else NotFound()
+            break
+        elif isinstance(value, NotFound):
             request.routing_exception = value
             break
         elif isinstance(value, LazyRedirect):

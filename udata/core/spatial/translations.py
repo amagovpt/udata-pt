@@ -20,4 +20,8 @@ TRANSLATIONS = (
     _("Overseas France"),
     _("French overseas collectivities"),
     _("French arrondissement"),
+    # Portuguese administrative levels (pt:distrito / pt:concelho / pt:freguesia)
+    _("District"),
+    _("County"),
+    _("Parish"),
 )

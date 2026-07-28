@@ -16,17 +16,13 @@ Usage:
     CSW endpoint, process their metadata, and create or update corresponding datasets and resources in udata.
 """
 
-from datetime import datetime
-import requests
-from urllib.parse import urlparse, urlencode
-
-from udata.harvest.backends.base import BaseBackend
-from udata.models import Resource, License
 from owslib.csw import CatalogueServiceWeb
 
+from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
+from udata.models import License, Resource
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import normalize_url_slashes, with_http_retry
 
 # backend = 'https://sniambgeoportal.apambiente.pt/geoportal/csw'
 
@@ -40,7 +36,7 @@ class PortalAmbienteBackend(BaseBackend):
     """
 
     name = "apambiente"
-    display_name = 'Harvester Portal do Ambiente'
+    display_name = "Harvester Portal do Ambiente"
 
     def inner_harvest(self):
         """
@@ -53,13 +49,18 @@ class PortalAmbienteBackend(BaseBackend):
             None. Calls self.process_dataset for each harvested record.
         """
         startposition = 0
-        csw = CatalogueServiceWeb(self.source.url)
-        csw.getrecords2(maxrecords=1)
+        # owslib issues its own HTTP requests, bypassing BaseBackend.get:
+        # re-check the URL against the SSRF guard first (LEDG-1729 / VULN-2084).
+        self._guard_url(self.source.url)
+        # Generous timeout: government servers can be slow.
+        # The constructor performs a GetCapabilities request, so retry it too.
+        csw = with_http_retry(self, CatalogueServiceWeb, self.source.url, timeout=60)
+        with_http_retry(self, csw.getrecords2, maxrecords=1)
         matches = csw.results.get("matches")
 
         while startposition <= matches:
-            csw.getrecords2(maxrecords=100, startposition=startposition)
-            startposition = csw.results.get('nextrecord')
+            with_http_retry(self, csw.getrecords2, maxrecords=100, startposition=startposition)
+            startposition = csw.results.get("nextrecord")
             for rec in csw.records:
                 item = {}
                 record = csw.records[rec]
@@ -67,7 +68,7 @@ class PortalAmbienteBackend(BaseBackend):
                 item["title"] = record.title
                 item["description"] = record.abstract
                 # Normalize URL slashes to ensure compatibility
-                item["url"] = normalize_url_slashes(record.references[0].get('url'))
+                item["url"] = normalize_url_slashes(record.references[0].get("url"))
                 item["type"] = record.type
                 # Process the dataset (create or update in udata)
                 self.process_dataset(record.identifier, title=record.title, date=None, items=item)
@@ -92,39 +93,34 @@ class PortalAmbienteBackend(BaseBackend):
         - store extra significant data in the `extra` attribute
         - map resources data
         """
-        item = kwargs.get('items')
+        item = kwargs.get("items")
 
         # Set basic dataset fields
-        dataset.title = item['title']
-        dataset.license = License.guess('cc-by')
+        dataset.title = item["title"]
+        dataset.license = License.guess("cc-by")
         dataset.tags = ["apambiente.pt"]
-        dataset.description = item['description']
+        dataset.description = item["description"]
 
-        if item.get('date'):
-            dataset.created_at = item['date']
+        if item.get("date"):
+            dataset.created_at = item["date"]
 
-        dataset.description = item.get('description')
+        dataset.description = item.get("description")
 
         # Force recreation of all resources
         dataset.resources = []
 
-        url = item.get('url')
+        url = item.get("url")
 
         # Determine resource format/type
-        if item.get('type') == "liveData":
+        if item.get("type") == "liveData":
             type = "wms"
         else:
-            type = url.split('.')[-1].lower()
+            type = url.split(".")[-1].lower()
             if len(type) > 3:
                 type = "wms"
 
         # Create and append the resource
-        new_resource = Resource(
-            title=dataset.title,
-            url=url,
-            filetype='remote',
-            format=type
-        )
+        new_resource = Resource(title=dataset.title, url=url, filetype="remote", format=type)
         dataset.resources.append(new_resource)
 
         return dataset

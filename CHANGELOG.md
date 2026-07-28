@@ -33,6 +33,331 @@
     pending code on re-point. Regression: `SAMLMigrationSecurityTest` in
     `udata/tests/frontend/test_saml.py`.
 
+- **chore(uwsgi): enable honour-range for static-map downloads** [#176](https://github.com/amagovpt/udata-pt/pull/176)
+  - Files under `/s/` are served by the uWSGI static-map, which ignores the
+    HTTP `Range` header unless `honour-range` is set — every response was a
+    full `200`, so interrupted downloads of large resources (e.g. the 634 MB
+    RGG gpkg, cut off by the upstream WAF's ~15s response timeout) could
+    never be resumed and always restarted from zero.
+  - With `honour-range = true`, uWSGI answers `206 Partial Content`, letting
+    browsers, `wget -c` and download managers resume where they left off.
+    The root fix (raising the WAF response timeout for `/s/`) is tracked
+    separately with the infrastructure team.
+
+- **feat(dataservices)!: restrict API creation to public-service organizations** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+  - `POST /api/1/dataservices/` now returns 403 unless the API is published in
+    the name of an organization carrying the `public-service` badge and the
+    caller belongs to it (portal admins may publish for any eligible
+    organization). Personal (owner) publishing is no longer allowed — the old
+    `owner = current_user` fallback was removed and any owner sent alongside an
+    organization is dropped. The rule applies to everyone, including admins
+    (LEDG-2190). Enforced at the endpoint so it also covers direct API calls,
+    not just the back office.
+
+- **fix(urls): drop the legacy `/pages` segment from every frontend URL the backend generates** [#171](https://github.com/amagovpt/udata-pt/pull/171)
+  - The frontend moved its public routes from `src/app/pages/...` to the
+    `[locale]/(pages)` route group, so URLs no longer carry a `/pages`
+    segment — but the backend kept generating `/pages/...` links, which now
+    land on a 404.
+  - Updated: `self_web_url` on Dataset/Reuse/Organization/User/Post models
+    (Post keeps the canonical English `/posts/<slug>` path, consistent with
+    the other entities),
+    membership/invitation mail CTAs (`/admin/org/...`, `/register`),
+    password-reset mail links (`/reset-password/<token>`), SAML login &
+    account-migration redirects (`/login`, `/migrate-account`), and the
+    Flask-Security SPA redirect targets in `udata.cfg`
+    (`SECURITY_RESET_VIEW`, `SECURITY_RESET_ERROR_VIEW`,
+    `SECURITY_POST_RESET_VIEW`).
+  - The frontend adds permanent redirects for old `/pages/*` URLs (links in
+    already-sent emails, bookmarks, indexed pages), so stale links keep
+    working.
+
+- **fix(storages): harden chunked uploads against intermittent file corruption** [#167](https://github.com/amagovpt/udata-pt/pull/167)
+  - Resource files uploaded/replaced via the admin were sometimes corrupted in
+    production. Root causes: the destination prefix had a 1-second resolution,
+    so a retried combine racing the original request (dropped connection behind
+    the F5/WAF) wrote interleaved into the same path; `combine_chunks` wrote
+    straight to the final target with no atomicity, no verification that every
+    part existed nor that the reassembled size matched; and a client retry of
+    an already-persisted part failed with `FileExists` → 500.
+  - `save_chunk` now overwrites by `uuid`+`partindex` (idempotent retries) and
+    records the optional `totalfilesize` field (historical fineuploader name;
+    legacy clients that omit it keep working).
+  - `combine_chunks` now: rejects replayed/unknown combines cleanly
+    (`upload-not-found`, `combine-in-progress` via an in-progress marker file),
+    verifies all parts exist before writing (`chunks-missing`), verifies the
+    reassembled size against `totalfilesize` (`size-mismatch`, chunks purged),
+    and on local storage writes to a temp name then renames atomically so
+    readers never observe a half-written file. Upload error responses gain an
+    additive machine-readable `code` field.
+  - The per-upload destination prefix gains a random fragment
+    (`slug/YYYYMMDD-HHMMSS-<hex8>`) so two same-second uploads of the same
+    filename can never collide.
+  - Regression tests in `test_storages.py` (part-retry idempotency, size
+    mismatch, missing part, double combine, in-progress/stale marker, legacy
+    protocol) and `test_datasets_api.py` (unique paths for same filename).
+
+- **fix: rate-limit the public contact form against submission floods (VULN-2089)**
+  - `POST /api/1/site/contact/` had no per-endpoint throttle, so it could be
+    flooded (the pentest sent bursts of submissions, spamming the support
+    inbox). reCAPTCHA v3 is already validated on the form but is a no-op unless
+    the keys are configured per environment.
+  - Added `CONTACT_SUBMIT_LIMIT` ("20 per minute; 200 per hour", keyed by
+    `user_or_ip`) as a structural backstop on `SiteContactAPI` that throttles
+    floods even when reCAPTCHA is not configured. No per-day cap (would become a
+    site-wide daily block under F5/WAF IP-collapse). reCAPTCHA remains the
+    primary anti-automation control; configuring `GOOGLE_RECAPTCHA_SECRET_KEY`
+    (backend) and `NEXT_PUBLIC_RECAPTCHA_SITE_KEY` (frontend) per environment is
+    the primary fix.
+  - Regression test in `test_site_api.py`
+    (`test_post_contact_is_rate_limited_against_flooding`).
+
+- **fix(docker): drop `./:/app` source bind mount, restore explicit config mounts** [#162](https://github.com/amagovpt/udata-pt/pull/162)
+  - PR #161 had replaced the specific read-only mounts (`udata.cfg`, `uwsgi`,
+    SAML credentials) and `logs` with a single `./:/app` bind mount. That
+    overlays the whole repo on `/app` and, critically, drops the
+    environment-specific config mounts, so the container loses its
+    `udata.cfg`/`uwsgi` configuration. Restored the explicit mounts and kept
+    `${FS_ROOT}:/dadosgov/fs`.
+
+- **fix: keep API error responses generic — no route hints (VULN-2091 hardening)**
+  - The pentest flagged "stack trace disclosure" on `/api/1/users/<value>`, but
+    the app already returns generic errors with `DEBUG=False` (a real traceback
+    would only appear if an environment set `DEBUG=true`). As defense-in-depth,
+    set `RESTX_ERROR_404_HELP = False` so Flask-RestX never appends
+    "did you mean <route> ?" hints (which disclose valid route prefixes) to 404s.
+  - Added regression tests (`test_error_disclosure.py`) asserting that 404 and
+    500 responses contain no traceback, no internal exception detail and no
+    route-prefix hints.
+
+- **fix: invalidate the server-side session on logout (VULN-2088)**
+  - Sessions are stateless signed cookies, so `logout()` only cleared the client
+    cookie: a session cookie captured before logout kept authenticating
+    server-side (the PoC replayed it on `POST /api/1/discussions/` after logout).
+  - The logout endpoint (`logout_with_proconnect_url`) now rotates the user's
+    `fs_uniquifier` (`_datastore.set_uniquifier`) before `logout()`, which
+    immediately invalidates every outstanding session and "remember me" cookie
+    for that user. Scoped to the logout endpoint only. udata API tokens are a
+    separate model and are unaffected.
+  - Side effect (intended): logging out ends the user's sessions on all devices.
+  - Regression coverage in `test_auth_api.py`
+    (`test_logout_invalidates_server_side_session`).
+
+- **perf(harvest): lightweight jobs list endpoint (counts + failed items only)**
+  - `GET /api/1/harvest/source/<id>/jobs/` used to serialize the full `items`
+    array of every job. For large harvesters (e.g. INE, ~13k items per job)
+    that was ~8.4 MB and ~29 s per page, so the admin harvester page timed out
+    and showed no jobs.
+  - The list now returns a lightweight shape: job metadata, per-status
+    `item_counts` computed in MongoDB via aggregation (the items array is never
+    loaded or transferred), and only `error_items` (the items that actually
+    have errors). Measured on the same INE job: 477 bytes / 0.03 s.
+  - The full items array remains available on the detail endpoint
+    `GET /api/1/harvest/source/.../job/<id>/` (unchanged). Companion
+    `dadosgov-fe` change consumes `item_counts`/`error_items`.
+    [#153](https://github.com/amagovpt/udata-pt/pull/153)
+
+- **fix: close user enumeration on `/api/1/users/<id>` (VULN-2090 / CWE-203)**
+  - After the VULN-2092 fix required authentication on the user read endpoints,
+    an anonymous caller could still enumerate accounts (by id or, more usefully,
+    by slug): an existing user returned `401` while a missing one returned `404`,
+    because the `ModelConverter` resolves the user in the routing layer (and
+    404s) *before* the view's `@api.secure` runs.
+  - Added a `SafeNotFound` marker returned by `UserConverter` for a missing user;
+    `lazy_raise_or_redirect` now answers an anonymous request with `401` (identical
+    to the response for an existing user) instead of `404`, so existence is no
+    longer observable. Authenticated (session) callers still get a normal `404`.
+    Fixes the whole user route family (`/<id>/`, `/contacts/`, `/following/`).
+  - Regression coverage in `test_user_api.py`
+    (`test_user_detail_no_enumeration_for_anonymous`).
+
+- **fix: route all harvest backend HTTP through a guarded session with retries (VULN-2084 follow-up)**
+  - The SSRF guard from LEDG-1729 / VULN-2084 only protected requests issued
+    through `BaseBackend.get/head/post`, but several PT-custom backends fetched
+    with bare `requests.get` (`dgt`, `ogc`, `inehvd`, `cswudata`), unguarded
+    `owslib` CSW clients (`apambiente`, `cswudata`) or a `subprocess curl` to
+    `/tmp` (`dgtIne`) — all bypassing `_guard_url`. They now go through the
+    guarded helpers; the CSW backends also re-check the resolved endpoint and
+    every server-advertised operation URL before `owslib` issues requests.
+  - `BaseBackend.get/head/post` were promoted to a pooled `requests.Session`
+    with a default `(connect, read)` timeout and retry of connection-level
+    failures with exponential backoff and jitter (SSL errors and HTTP status
+    codes are never retried) — the pattern proven in the INE FAST harvester.
+    Tunable via `HARVEST_HTTP_MAX_RETRIES`, `HARVEST_HTTP_RETRY_INITIAL_DELAY`,
+    `HARVEST_HTTP_RETRY_MAX_DELAY` and `HARVEST_HTTP_TIMEOUT`; disabled in the
+    Testing profile so simulated-error tests keep failing fast.
+  - Converted backends previously followed redirects silently; they now inherit
+    the secure `allow_redirects=False` default, so a 3xx from a source raises
+    instead of silently leaving the checked host.
+  - The INE backend now consumes the same `HARVEST_HTTP_*` settings instead of
+    its own hardcoded `MAX_RETRIES`/`TIMEOUT_*` constants: its private session
+    and duplicated retry helper were removed in favour of the guarded
+    `BaseBackend` helpers (also closing its own SSRF guard bypass). Only
+    `DOWNLOAD_MAX_RETRIES = 5` remains INE-specific, for the flaky full-file
+    catalog download where each retry re-transfers the whole body.
+  - owslib CSW calls (`CatalogueServiceWeb` constructor and `getrecords2` in
+    `cswudata` and `apambiente`) now retry connection-level failures too, via a
+    new `with_http_retry` helper in `harvester_utils` driven by the same
+    `HARVEST_HTTP_*` settings — owslib issues its own HTTP requests, so it did
+    not benefit from the `BaseBackend` retry.
+  - Re-enabled TLS certificate verification on the `odspt` and `dgt` backends
+    (`verify_ssl = False` removed): their configured sources
+    (transparencia.sns.gov.pt, snig.dgterritorio.gov.pt) present valid
+    Let's Encrypt certificates, verified against the requests/certifi bundle.
+  - Removed the dead `missing_datasets_warning` helper (broken since its
+    `theme` import was dropped) together with its only caller, the never-invoked
+    `CkanPTBackend.finalize()` (the `finalize` hook no longer exists in the
+    harvest lifecycle); assorted lint cleanup in the touched legacy backends.
+  - Removed the defunct `dadosGov` harvester (`dadosgov.py`,
+    `dadosgovBackend.py` and its entry point): a one-shot migration backend for
+    the legacy servico.dados.gov.pt portal that can no longer run — Python 2
+    era code (`reload(sys)`/`setdefaultencoding`), pre-refactor
+    `initialize/process` API, and a base-class constructor incompatible with
+    the current `BaseBackend` signature (raises `TypeError` on instantiation).
+    No harvest source uses the `dadosGov` backend.
+    [#147](https://github.com/amagovpt/udata-pt/pull/147)
+
+- **fix: require authentication on all `/api/1/users/*` read endpoints (LEDG-2113 / VULN-2092)**
+  - A security assessment (VULN-2092, Broken Access Control / CWE-284) found the
+    user read endpoints reachable by unauthenticated clients:
+    `GET /users/<id>/`, `/users/<id>/contacts/`, `/users/<id>/following/`,
+    `/users/<id>/followers/`, `/users/suggest/` and `/users/roles/`. The
+    `contacts` endpoint additionally exposed contact-point emails (unmasked PII),
+    and the consistent 200-vs-404 responses enabled user enumeration
+    (VULN-2090 / CWE-203).
+  - Added `@api.secure` to each of these GETs in `udata/core/user/api.py` so
+    anonymous requests get `401`; authenticated users are unaffected. The
+    followers GET is inherited from `FollowAPI` (shared with dataset/reuse/org
+    followers, which stay public), so it is overridden only on `FollowUserAPI`.
+  - **Breaking (frontend):** the public user profile, followers and following
+    pages must now call these endpoints through the authenticated proxy and
+    gate anonymous visitors to login. Tracked in the companion `dadosgov-fe`
+    change.
+  - Regression coverage in `test_user_api.py`
+    (`test_users_read_endpoints_require_authentication`).
+
+- **perf: index harvest.remote_id and batch the INE harvester's Mongo access**
+  - Phase 2 of the INE harvester (change detection + writes) was dominated by
+    unindexed lookups: `get_dataset()` ran one `harvest.remote_id` query per
+    item (~8500 COLLSCANs over the whole dataset collection), the bulk upsert
+    filters ran one more COLLSCAN per created dataset, and the post-create id
+    lookup another one. Downloading vs. streaming was **not** the issue —
+    parsing the full 21 MB XML takes 0.6s; the time went to MongoDB.
+  - Added an index on `dataset.harvest.remote_id` (migration
+    `2026-07-10-add-harvest-remote-id-index.py`) — this also benefits every
+    other harvester, since `BaseBackend.get_dataset()` runs the same query.
+  - INE backend now prefetches each chunk's datasets with a single `$in`
+    query (`_prefetch_datasets`), resolves created dataset ids with a single
+    `$in` query per chunk, and appends job items with a `$push` delta instead
+    of rewriting the ever-growing `job.items` array on every save. Benchmark
+    (local DB, 23k datasets, chunk of 500): 5362 ms → 77 ms per chunk (~70×).
+  - Also fixes a latent bug: the bulk flush now always happens before the
+    created-ids lookup, so HarvestItems no longer end up without a dataset
+    reference when a chunk had fewer than BULK_SIZE writes.
+
+- **fix: make the INE harvester resilient to truncated XML downloads**
+  - The INE endpoint (`xml_indic.jsp`) streams a large (~21 MB) catalog very
+    slowly (~6 min) and frequently drops the connection mid-stream (SSL EOF /
+    `ConnectionReset` / `ChunkedEncodingError`). The previous download loop only
+    retried the initial GET, not the streamed body, and did no integrity check,
+    so a mid-stream drop left a truncated `/tmp/ine.xml` that broke
+    `ET.iterparse` with `ParseError: unclosed CDATA section` and failed the whole
+    job.
+  - Added `INEBackend._download_to_file()` which retries the full transfer
+    (request + body), writes to a `.part` file, and only accepts a download that
+    matches `Content-Length` (when advertised) and ends with the closing
+    `</catalog>` root tag. When all attempts fail it reuses the last cached valid
+    file instead of aborting the job. The in-memory download path now validates
+    completeness too. Regression suite in `test_ine_backend.py`.
+
+- **fix: stop the Hydra crawler from 429'ing on metadata writeback under IP-collapse**
+  - The `hydra-pt` crawler writes check/analysis results back to udata after
+    every resource check via authenticated callbacks
+    (`PUT/DELETE /api/2/datasets/<d>/resources/<rid>/extras/` and the
+    dataset-level `.../extras/`). These endpoints carried no explicit
+    per-endpoint limit, so they fell under the IP-keyed `RATELIMIT_DEFAULT`
+    ("200 per hour"). The crawler runs from a single origin IP (and behind the
+    F5/WAF everything collapses to one IP anyway), so a full-catalog crawl
+    exhausted the shared hourly ceiling almost immediately and every subsequent
+    callback returned `429 TOO MANY REQUESTS` — the bot then dropped its analysis
+    results on the floor.
+  - Added `CRAWLER_WRITE_LIMIT` ("1200 per minute; 60000 per hour") in
+    `udata/api/limits.py`, sized for absurd resource volume and keyed by
+    `user_or_ip`. Because both extras endpoints are `@apiv2.secure`, the key is
+    always `user:{id}` (the Hydra bot's API-token identity), so the crawler gets
+    its own per-bot bucket that neither collapses with nor starves other traffic.
+    Applied to the `PUT`/`DELETE` methods of `ResourceExtrasAPI` and
+    `DatasetExtrasAPI`. No per-day cap (a daily cap would become a bot-wide daily
+    block mid-crawl). Regression suite in
+    `test_extras_writeback_ratelimit_ip_collapse.py`.
+
+- **fix: stop rejecting valid data files that contain HTML-looking substrings**
+  - `validate_upload()` scanned every non-image, non-XML upload for HTML/script
+    tokens (`<script`, `javascript:`, `<iframe`, `<object`, `<embed`). This is a
+    substring scan with no awareness of the file format, so a legitimate data
+    file — most visibly a large `.csv` — was rejected with HTTP 415 ("conteúdo
+    perigoso embutido") whenever a cell happened to hold one of those tokens
+    (e.g. an embedded HTML fragment or a `javascript:` URL). The larger the file,
+    the likelier the false positive.
+  - Resource files are always served with `Content-Disposition: attachment`
+    (see `udata/core/dataset/download_proxy.py` and the resource download
+    endpoint) — they are downloaded, never rendered inline — so the XSS vector
+    the scan defends against does not apply to inert data formats. The HTML/script
+    scan is now restricted to browser-renderable documents
+    (`HTML_RENDERABLE_EXTENSIONS`). Images keep magic-byte + Pillow + embedded
+    script checks, XML/SVG keep the XSS+XXE scan, and HTML MIME types are still
+    blocked outright — only inert data formats stop being scanned.
+
+- **fix: stream upload content validation to avoid `MemoryError` on large files**
+  - `validate_upload()` scans every uploaded resource for dangerous content
+    (`<script`, `javascript:`, XXE, …). `_scan_for_dangerous_content()` did
+    `f.read().lower()`, loading the whole file (plus a lowercased copy) into
+    memory. On large resource uploads (up to `RESOURCES_FILE_MAX_SIZE`, 800 MB)
+    this raised `MemoryError` in the uWSGI worker and returned HTTP 500 — this is
+    distinct from, and not fixed by, the chunked-upload transport work (PR #102)
+    or the server-side max-size enforcement (PR #115), both of which run before
+    this content scan.
+  - The scanner now reads the file in fixed 1 MiB chunks with a 1 KiB overlap
+    between chunks, so patterns straddling a chunk boundary are still detected
+    while peak memory stays bounded regardless of file size. Detection behaviour
+    is unchanged.
+
+- **fix: never expose deleted/archived datasets on the public organization tab**
+  - `GET /api/1/organizations/<org>/datasets/` did `Dataset.objects.owned_by(org)`
+    and only stripped `private` for non-members, so a public (non-private) but
+    **deleted** dataset of an organization showed on the org's datasets tab to
+    everyone (anonymous included), and inflated the tab count.
+  - The endpoint now hides `deleted`/`archived` datasets by default, while still
+    letting the admin org-management listing request them explicitly via the
+    `?deleted=true` / `?archived=true` status filters (which require auth).
+    Members still see the org's private drafts.
+
+- **fix: translate `EU_HVD_CATEGORIES` labels to Portuguese**
+  - The HVD category labels in `udata/rdf.py` were inherited from upstream in
+    French (`Météorologiques`, `Mobilité`, …). `TAG_TO_EU_HVD_CATEGORIES`
+    reverse-maps the *slugified* labels back to the EU BNA category URIs, so the
+    keys were French slugs (`mobilite`, `statistiques`, …) while the datasets are
+    tagged with Portuguese slugs (`mobilidade`, `estatisticas`,
+    `observacao-da-terra-e-do-ambiente`, …). The keys never matched, so
+    `dcatap:hvdCategory` was never emitted in the DCAT-AP HVD catalog harvested by
+    data.europa.eu.
+  - Translates the six category labels to Portuguese so the reverse map matches
+    the tags actually stored on datasets (both export in
+    `core/dataset/rdf.py` / `core/dataservices/rdf.py` and import in
+    `theme_labels_from_rdf`). The category URIs are unchanged.
+
+- **feat: add server-side `status` filter to `GET /api/1/reuses/`**
+  - The admin/backoffice reuses listing previously filtered by lifecycle status
+    (public/draft/archived/deleted) client-side, over the current page only, so
+    "show deleted" missed every match outside the visible page.
+  - Adds a `status` standalone filter (enum `public`, `draft`, `archived`,
+    `deleted`) wired through the existing `api_fields` parser, so it is enforced
+    in MongoDB and auto-documented in Swagger. It only narrows the base query
+    (which already enforces ownership/visibility via `visible_by_user`), so a
+    non-admin can never widen what they see; an unknown value returns `400`.
+  - Regression tests in `udata/tests/api/test_reuses_api.py`
+    (`test_reuse_api_list_filter_status*`).
+
 - **fix: lift public READ endpoints (suggest/detail/reference) out of the IP-keyed rate-limit**
   - Fourth IP-collapse fix after public-search (#89), download/export/feed (#90)
     and uploads (#91). Many anonymous GET endpoints the SSR/public pages hit

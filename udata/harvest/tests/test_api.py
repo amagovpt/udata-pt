@@ -20,6 +20,7 @@ from ..models import (
     VALIDATION_ACCEPTED,
     VALIDATION_PENDING,
     VALIDATION_REFUSED,
+    HarvestError,
     HarvestItem,
     HarvestSource,
     HarvestSourceValidation,
@@ -688,6 +689,43 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         # Make sure remote_url is exposed if exists
         assert response.json["items"][1]["remote_url"] is None
         assert response.json["items"][2]["remote_url"] == "https://my.remote.example.com"
+
+    def test_list_jobs_lightweight(self):
+        """The jobs list returns per-status counts and only failed items, never the full array"""
+        source = HarvestSourceFactory()
+        failed_ds = DatasetFactory()
+        HarvestJobFactory(
+            source=source,
+            items=[
+                HarvestItem(remote_id="1", status="done", dataset=DatasetFactory()),
+                HarvestItem(remote_id="2", status="skipped"),
+                HarvestItem(remote_id="3", status="done"),
+                HarvestItem(
+                    remote_id="4",
+                    status="failed",
+                    dataset=failed_ds,
+                    errors=[HarvestError(message="boom")],
+                ),
+            ],
+        )
+
+        response = self.get(url_for("api.harvest_jobs", source=source))
+        assert200(response)
+        assert response.json["total"] == 1
+
+        job = response.json["data"][0]
+        # The heavy full items array must not be serialized in the list
+        assert "items" not in job
+        assert job["item_counts"]["done"] == 2
+        assert job["item_counts"]["skipped"] == 1
+        assert job["item_counts"]["failed"] == 1
+        assert job["item_counts"]["total"] == 4
+        # Only the item that actually has errors is returned
+        assert len(job["error_items"]) == 1
+        error_item = job["error_items"][0]
+        assert error_item["remote_id"] == "4"
+        assert error_item["errors"][0]["message"] == "boom"
+        assert error_item["dataset"]["id"] == str(failed_ds.id)
 
     def test_get_source_permissions_as_anonymous(self):
         """It should return all permissions as False for anonymous users"""
