@@ -7,6 +7,7 @@ from udata.app import limiter
 from udata.core.dataservices.factories import (
     DataserviceFactory,  # noqa: F401 - registers Dataservice model
 )
+from udata.core.dataset.constants import INSPIRE
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.pages.factories import PageFactory
@@ -478,6 +479,10 @@ class SiteDatasetsListingAPITest(APITestCase):
         license = LicenseFactory()
         DatasetFactory.create_batch(3, organization=org, license=license)
         DatasetFactory(tags=["hvd"], organization=org)
+        DatasetFactory(organization=org).add_badge(INSPIRE)
+        # Carries the `inspire` tag but never got the badge: `rotulo_inspire`
+        # follows the badge, so this one must not be counted.
+        DatasetFactory(tags=["inspire"], organization=org)
 
         response = self.get(url_for("api.site_datasets_listing"))
         self.assert200(response)
@@ -511,11 +516,14 @@ class SiteDatasetsListingAPITest(APITestCase):
             "atualizacao_3_years",
             "rotulo_all",
             "rotulo_high_value",
+            "rotulo_inspire",
         ):
             assert key in counts, f"missing filter count: {key}"
         assert counts["formato_all"] == counts["atualizacao_all"] == counts["rotulo_all"]
         assert counts["rotulo_high_value"] >= 1
-        assert counts["atualizacao_all"] >= 4
+        # Only the badged dataset counts; the merely tagged one is excluded.
+        assert counts["rotulo_inspire"] == 1
+        assert counts["atualizacao_all"] >= 6
 
         assert any(o["id"] == str(org.id) for o in payload["organizations"])
         assert any(lic["id"] == license.id for lic in payload["licenses"])

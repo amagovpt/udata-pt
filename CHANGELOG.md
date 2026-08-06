@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **feat(site): add the INSPIRE count to the datasets listing filter counts** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+  - New `rotulo_inspire` (`badges__kind=INSPIRE`) in the aggregated
+    `/site/datasets-listing/` payload, so the "Inspire" option added to the
+    frontend sidebar shows a count like the other options do. The INSPIRE badge
+    is granted from the `inspire` tag, which the DCAT harvester sets when the
+    dataset carries a GEMET INSPIRE theme.
+  - Each `rotulo_*` count is keyed on whatever the listing actually filters on
+    for that option, so the number next to an option matches the number of
+    results it returns: the new one on the badge (`?badge=inspire`),
+    `rotulo_high_value` still on the raw tag (`?tag=hvd`). Moving HVD to its
+    badge is deliberately left out — the badge job only grants it to datasets
+    of certified public-service organizations, so it currently covers a subset
+    of the tagged datasets.
+
 - **chore(uwsgi): enable honour-range for static-map downloads** [#176](https://github.com/amagovpt/udata-pt/pull/176)
   - Files under `/s/` are served by the uWSGI static-map, which ignores the
     HTTP `Range` header unless `honour-range` is set — every response was a
