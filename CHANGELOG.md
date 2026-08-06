@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **feat(site): add the INSPIRE count to the datasets listing filter counts** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+- **feat(site): add the INSPIRE count to the datasets listing filter counts**
   - New `rotulo_inspire` (`badges__kind=INSPIRE`) in the aggregated
     `/site/datasets-listing/` payload, so the "Inspire" option added to the
     frontend sidebar shows a count like the other options do. The INSPIRE badge
@@ -27,7 +27,7 @@
     The root fix (raising the WAF response timeout for `/s/`) is tracked
     separately with the infrastructure team.
 
-- **feat(dataservices)!: restrict API creation to public-service organizations** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+- **feat(dataservices)!: restrict API creation to public-service organizations**
   - `POST /api/1/dataservices/` now returns 403 unless the API is published in
     the name of an organization carrying the `public-service` badge and the
     caller belongs to it (portal admins may publish for any eligible
