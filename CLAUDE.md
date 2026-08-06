@@ -64,7 +64,10 @@ uv run ruff format .
 - Pre-commit hooks: ruff check, ruff format, trailing whitespace, end-of-file fixer
 - Commit messages: follow [Conventional Commits](#branch--commit-conventions), readable, detailed, include `(fix #XXX)` to auto-close issues. **Never add `Co-Authored-By` or any AI attribution to commit messages.**
 - Branches: follow [Conventional Branch](#branch--commit-conventions) (`<type>/<kebab-case-description>`).
-- **Update `CHANGELOG.md` after every notable change** (mandatory once the implementation is done). Add the entry at the top under `## Unreleased`, in the existing style: a **bold one-line summary**, optionally followed by indented sub-bullets explaining the *why/how* (not just a PR link), and a link to the PR — e.g. `[#143](https://github.com/amagovpt/udata-pt/pull/143)`. Describe the behaviour that changed and the reasoning. Reference the PR, not Jira ticket ids.
+- **Update `CHANGELOG.md` after every notable change** (mandatory once the implementation is done). Add the entry at the top under `## Unreleased`, in the existing style: a **bold one-line summary**, followed by indented sub-bullets explaining the *why/how*. Describe the behaviour that changed and the reasoning — that is the whole value of the entry.
+  - **Do not reference the PR, and never write a `[#XXX]`/`[#NNN]` placeholder.** The PR number does not exist when the entry is written, and the merge commit already records it (`Merge pull request #180 from …`), so `git log --grep` finds it. Placeholders were the single largest source of promotion conflicts: the number got filled in on one branch only, so the same entry ended up with different text on `tst` and `ppr` and a line that should auto-merge conflicted instead. **Reference neither PRs nor Jira ticket ids.**
+  - **Never edit an entry that has already been promoted** to another environment branch, for the same reason.
+  - Conflicts in `## Unreleased` from two branches both inserting at the top are expected and safe: **keep both entries**, newest first. Never resolve one by deleting the other side's entry.
 - Tests use pytest with MongoDB (port 27018 via docker-compose.test.yml)
 - Coverage config in `coverage.rc` (branch coverage, excludes test dirs)
 
