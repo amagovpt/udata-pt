@@ -19,6 +19,7 @@ from udata.core.dataservices.csv import DataserviceCsvAdapter
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api import DEFAULT_SORTING, DatasetApiParser, catalog_parser, dataset_parser
 from udata.core.dataset.api_fields import dataset_page_fields, license_fields
+from udata.core.dataset.constants import INSPIRE
 from udata.core.dataset.csv import ResourcesCsvAdapter
 from udata.core.dataset.models import License, UpdateFrequency
 from udata.core.dataset.search import DatasetSearch
@@ -301,6 +302,14 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
     These counts do not vary with the user's current query: they reflect the
     full visible dataset corpus and feed the "Todos / Tabular / Estruturado /
     ..." labels in the sidebar.
+
+    Each "Tipo de dados" count (`rotulo_*`) is keyed on whatever the listing
+    filters on for that option, so that the number shown next to an option
+    always matches the number of results it returns: `rotulo_inspire` on the
+    INSPIRE badge (`?badge=inspire`) and `rotulo_high_value` on the raw `hvd`
+    tag (`?tag=hvd`). Moving HVD to its badge is tracked separately: the badge
+    job only grants it to datasets of certified public-service organizations,
+    so the badge currently covers a subset of the tagged datasets.
     """
     now = datetime.now(timezone.utc)
     d30 = now - timedelta(days=30)
@@ -316,6 +325,7 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
         "atualizacao_12_months": base_qs.filter(last_modified_internal__gte=d12m).count(),
         "atualizacao_3_years": base_qs.filter(last_modified_internal__gte=d3y).count(),
         "rotulo_high_value": base_qs.filter(tags="hvd").count(),
+        "rotulo_inspire": base_qs.filter(badges__kind=INSPIRE).count(),
     }
     for group_id, formats in _DATASET_FORMAT_GROUPS.items():
         counts[f"formato_{group_id}"] = base_qs.filter(resources__format__in=formats).count()
