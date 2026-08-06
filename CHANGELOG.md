@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **feat(site)!: key the datasets listing "Elevado Valor" count on the HVD badge**
+  - `rotulo_high_value` counted `tags="hvd"`, a free-form field any harvested
+    source can set. It now counts `badges__kind=HVD`, matching the frontend
+    option that moved to `?badge=hvd`, so the number shown next to the option is
+    the number of results it returns — and both now rest on the curated signal
+    granted by the `update-badges` job.
+  - **The count drops** (measured in dev: 251 tagged → 144 badged). The badge job
+    only grants HVD to datasets owned by certified public-service organizations,
+    so 107 datasets carrying the tag — all harvested, mostly from SNIG/DGT, with
+    the tag derived from the EU HVD categories declared at the source — fall
+    outside it. Widening that is a policy decision on the badge job itself.
+  - Environments need `udata job run update-badges` once plus a schedule
+    (`udata job schedule "30 6 * * *" update-badges`); without the job the
+    option shows 0, since no dataset carries the badge.
+
 - **feat(site): add the INSPIRE count to the datasets listing filter counts**
   - New `rotulo_inspire` (`badges__kind=INSPIRE`) in the aggregated
     `/site/datasets-listing/` payload, so the "Inspire" option added to the

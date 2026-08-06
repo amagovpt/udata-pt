@@ -15,6 +15,7 @@ from udata.api_fields import patch
 from udata.app import cache, limiter
 from udata.auth import admin_permission
 from udata.core import csv
+from udata.core.constants import HVD
 from udata.core.dataservices.csv import DataserviceCsvAdapter
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api import DEFAULT_SORTING, DatasetApiParser, catalog_parser, dataset_parser
@@ -303,13 +304,15 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
     full visible dataset corpus and feed the "Todos / Tabular / Estruturado /
     ..." labels in the sidebar.
 
-    Each "Tipo de dados" count (`rotulo_*`) is keyed on whatever the listing
-    filters on for that option, so that the number shown next to an option
-    always matches the number of results it returns: `rotulo_inspire` on the
-    INSPIRE badge (`?badge=inspire`) and `rotulo_high_value` on the raw `hvd`
-    tag (`?tag=hvd`). Moving HVD to its badge is tracked separately: the badge
-    job only grants it to datasets of certified public-service organizations,
-    so the badge currently covers a subset of the tagged datasets.
+    The "Tipo de dados" counts (`rotulo_*`) are keyed on the badge, matching
+    what the listing returns for `?badge=<kind>`, so the number shown next to an
+    option is always the number of results it returns. The badge is the curated
+    signal — it is granted by the `update-badges` job, while the raw `hvd` /
+    `inspire` tags can be set by any harvested source.
+
+    Note the HVD badge is only granted to datasets owned by certified
+    public-service organizations, so it covers a subset of the `hvd`-tagged
+    datasets. Widening that is a policy decision on the badge job, not here.
     """
     now = datetime.now(timezone.utc)
     d30 = now - timedelta(days=30)
@@ -324,7 +327,7 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
         "atualizacao_30_days": base_qs.filter(last_modified_internal__gte=d30).count(),
         "atualizacao_12_months": base_qs.filter(last_modified_internal__gte=d12m).count(),
         "atualizacao_3_years": base_qs.filter(last_modified_internal__gte=d3y).count(),
-        "rotulo_high_value": base_qs.filter(tags="hvd").count(),
+        "rotulo_high_value": base_qs.filter(badges__kind=HVD).count(),
         "rotulo_inspire": base_qs.filter(badges__kind=INSPIRE).count(),
     }
     for group_id, formats in _DATASET_FORMAT_GROUPS.items():

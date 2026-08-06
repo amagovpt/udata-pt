@@ -4,6 +4,7 @@ import pytest
 from flask import url_for
 
 from udata.app import limiter
+from udata.core.constants import HVD
 from udata.core.dataservices.factories import (
     DataserviceFactory,  # noqa: F401 - registers Dataservice model
 )
@@ -478,11 +479,11 @@ class SiteDatasetsListingAPITest(APITestCase):
         org = OrganizationFactory()
         license = LicenseFactory()
         DatasetFactory.create_batch(3, organization=org, license=license)
-        DatasetFactory(tags=["hvd"], organization=org)
+        DatasetFactory(organization=org).add_badge(HVD)
         DatasetFactory(organization=org).add_badge(INSPIRE)
-        # Carries the `inspire` tag but never got the badge: `rotulo_inspire`
-        # follows the badge, so this one must not be counted.
-        DatasetFactory(tags=["inspire"], organization=org)
+        # Carries both tags but never got the badges: the `rotulo_*` counts
+        # follow the badge, so this one must not be counted on either option.
+        DatasetFactory(tags=["hvd", "inspire"], organization=org)
 
         response = self.get(url_for("api.site_datasets_listing"))
         self.assert200(response)
@@ -520,8 +521,9 @@ class SiteDatasetsListingAPITest(APITestCase):
         ):
             assert key in counts, f"missing filter count: {key}"
         assert counts["formato_all"] == counts["atualizacao_all"] == counts["rotulo_all"]
-        assert counts["rotulo_high_value"] >= 1
-        # Only the badged dataset counts; the merely tagged one is excluded.
+        # One badged dataset each; the tagged-but-unbadged one is excluded from
+        # both counts.
+        assert counts["rotulo_high_value"] == 1
         assert counts["rotulo_inspire"] == 1
         assert counts["atualizacao_all"] >= 6
 
