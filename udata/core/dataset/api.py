@@ -109,7 +109,7 @@ from .models import (
     ResourceSchema,
     get_resource,
 )
-from .rdf import dataset_to_rdf
+from .rdf import dataset_to_rdf, detect_ogc_service
 
 DEFAULT_SORTING = "-created_at_internal"
 # Deduplication window for community resource submissions: a user re-posting the
@@ -638,8 +638,10 @@ class ResourceRedirectAPI(API):
 
         - Hosted resources (`fs_filename` set) are streamed from the
           storage backend via `send_file(as_attachment=True)`.
-        - Remote resources are pulled through the SSRF-guarded download
-          proxy (LEDG-1214), reusing `stream_as_attachment`.
+        - OGC services (WMS/WFS) keep the pre-LEDG-1765 302 redirect —
+          see `_is_ogc_service`.
+        - Other remote resources are pulled through the SSRF-guarded
+          download proxy (LEDG-1214), reusing `stream_as_attachment`.
 
         The endpoint URL is unchanged, so the permanent `latest` link of
         a resource keeps working for harvesters and external integrations.
@@ -649,6 +651,8 @@ class ResourceRedirectAPI(API):
             abort(404, "Resource not found")
         if resource.fs_filename:
             return _serve_hosted_resource(resource)
+        if _is_ogc_service(resource):
+            return redirect(resource.url.strip())
         return _proxy_remote_resource(resource)
 
 
@@ -670,6 +674,25 @@ def _ensure_extension(name: str, format_hint: str | None) -> str:
     if name.lower().endswith("." + ext):
         return name
     return f"{name}.{ext}"
+
+
+def _is_ogc_service(resource) -> bool:
+    """Whether `resource` points at an OGC service rather than a file.
+
+    A WMS/WFS "download" is a `GetCapabilities` XML handshake, not a file:
+    forcing `Content-Disposition: attachment` on it is meaningless, and
+    fetching it server-side puts a slow third-party endpoint on the
+    critical path of a user click (LEDG-2248). Several catalogued services
+    need more than `DOWNLOAD_PROXY_READ_TIMEOUT_S` just to answer, so the
+    proxy turned working services into 502s.
+
+    Delegates to `detect_ogc_service`, the same helper the RDF catalog uses
+    to decide what is a dataservice, so both agree on what "is a service"
+    means: `format` in `OGC_SERVICE_FORMATS`, or a `GetCapabilities` URL
+    carrying a `service=` parameter. Resources whose `format` is wrong but
+    whose URL is a plain `GetCapabilities` are therefore covered too.
+    """
+    return detect_ogc_service(resource) is not None
 
 
 def _serve_hosted_resource(resource):
