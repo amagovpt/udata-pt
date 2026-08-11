@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix(dataset): hold the download proxy read timeout at 300s and make the value drift-proof**
+  - The tracked deployment config pinned the proxy's read timeout to 10s while
+    the documented default is 300s, so what actually reached an environment was
+    whatever an unversioned host edit happened to say. That is how production
+    ended up cutting every upstream slower than 10s, and the blast radius is
+    wider than slow handshakes: the read timeout is an inter-chunk budget, not
+    a total, so too low a value also truncates downloads that are already
+    streaming.
+  - The value now sits in the versioned config at 300s and is overridable per
+    environment through `.env`. Tuning one environment no longer requires
+    hand-editing a tracked file on the host, which is the edit the repo cannot
+    see and nobody can review.
+  - `open_upstream` and `iter_capped` now read their budgets through in-code
+    fallbacks that mirror `Defaults`, instead of indexing `current_app.config`
+    directly. A host whose config predates the proxy section streams with the
+    documented budget rather than raising `KeyError` from inside a request —
+    the same pairing the harvest HTTP settings already use.
+  - A test pins the *effective* read timeout of the loaded config, not just the
+    default, so lowering it in either the config or the environment fails the
+    suite instead of surfacing later as a `502`.
+
 - **fix(dataset): redirect OGC services on `/datasets/r/<id>` instead of proxying them**
   - WMS/WFS distributions were being force-downloaded through the LEDG-1214
     proxy like any other remote resource, but their "download" is a
