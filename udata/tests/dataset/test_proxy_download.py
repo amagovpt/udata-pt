@@ -4,6 +4,7 @@ Covers:
 - `derive_filename` purity and sanitization.
 - SSRF guard reuse (canary denylist + private/loopback IPs).
 - `iter_capped` truncation at `DOWNLOAD_PROXY_MAX_BYTES`.
+- Timeout resolution and its in-code fallbacks (LEDG-2249).
 - Endpoint contract: status codes, Content-Disposition, Content-Type,
   Cache-Control, and `allow_redirects=False` on the outbound call.
 """
@@ -17,12 +18,17 @@ import requests
 from flask import url_for
 
 from udata.core.dataset.download_proxy import (
+    DEFAULT_CONNECT_TIMEOUT_S,
+    DEFAULT_MAX_BYTES,
+    DEFAULT_READ_TIMEOUT_S,
     ProxyDownloadForbidden,
     ProxyDownloadTooLarge,
     check_external_url,
     derive_filename,
     iter_capped,
+    open_upstream,
 )
+from udata.settings import Defaults
 from udata.tests.api import APITestCase
 
 
@@ -108,6 +114,78 @@ class ProxyDownloadHelpersTest(APITestCase):
         resp.close = MagicMock()
         list(iter_capped(resp))
         resp.close.assert_called_once()
+
+
+# ----------------------------------------------------------------------
+# Timeout resolution — regression guard for LEDG-2249
+# ----------------------------------------------------------------------
+
+
+class ProxyDownloadTimeoutConfigTest(APITestCase):
+    """The read timeout drifted to 10s in PRD and 502-ed every slow upstream.
+
+    These lock down the two halves of that failure: the shipped default must
+    stay generous, and a config that omits the keys must fall back to it
+    instead of raising `KeyError` from inside a request.
+    """
+
+    def _timeout_of_call(self, url="https://example.com/x.pdf"):
+        """Return the `timeout=` kwarg `open_upstream` passed to `requests.get`."""
+        with patch(
+            "udata.core.dataset.download_proxy.requests.get",
+            return_value=_build_mock_response(),
+        ) as g:
+            open_upstream(url)
+        _, kwargs = g.call_args
+        return kwargs.get("timeout")
+
+    @pytest.mark.options(
+        DOWNLOAD_PROXY_CONNECT_TIMEOUT_S=7,
+        DOWNLOAD_PROXY_READ_TIMEOUT_S=99,
+    )
+    def test_uses_configured_timeouts(self):
+        assert self._timeout_of_call() == (7, 99)
+
+    def test_falls_back_when_config_omits_keys(self):
+        """A `udata.cfg` predating the proxy section must not 500 the request."""
+        self.app.config.pop("DOWNLOAD_PROXY_CONNECT_TIMEOUT_S", None)
+        self.app.config.pop("DOWNLOAD_PROXY_READ_TIMEOUT_S", None)
+        assert self._timeout_of_call() == (DEFAULT_CONNECT_TIMEOUT_S, DEFAULT_READ_TIMEOUT_S)
+
+    def test_iter_capped_falls_back_when_config_omits_max_bytes(self):
+        self.app.config.pop("DOWNLOAD_PROXY_MAX_BYTES", None)
+        resp = MagicMock()
+        resp.iter_content = MagicMock(return_value=iter([b"hello"]))
+        resp.close = MagicMock()
+        assert b"".join(iter_capped(resp)) == b"hello"
+
+    def test_shipped_default_read_timeout_stays_generous(self):
+        """The in-code fallback and `Defaults` must not diverge.
+
+        The read timeout is an inter-chunk budget: lowering it truncates
+        downloads that are already streaming, so a change here is a
+        deliberate decision, not a tuning knob to nudge.
+        """
+        assert DEFAULT_READ_TIMEOUT_S == 300
+        assert Defaults.DOWNLOAD_PROXY_READ_TIMEOUT_S == DEFAULT_READ_TIMEOUT_S
+        assert Defaults.DOWNLOAD_PROXY_CONNECT_TIMEOUT_S == DEFAULT_CONNECT_TIMEOUT_S
+        assert Defaults.DOWNLOAD_PROXY_MAX_BYTES == DEFAULT_MAX_BYTES
+
+    def test_deployment_config_does_not_lower_read_timeout(self):
+        """Catch the drift where it actually happened: the loaded config.
+
+        `Defaults` was never wrong in PRD — `udata.cfg` (or a `.env` feeding
+        it) overrode the read timeout downwards. This asserts the *effective*
+        value of the app under test, so lowering it in either place fails here
+        rather than surfacing as a `502` in production. Raising it is fine.
+        """
+        effective = self.app.config["DOWNLOAD_PROXY_READ_TIMEOUT_S"]
+        assert effective >= DEFAULT_READ_TIMEOUT_S, (
+            f"DOWNLOAD_PROXY_READ_TIMEOUT_S is {effective}s, below the "
+            f"{DEFAULT_READ_TIMEOUT_S}s floor. The read timeout is an "
+            "inter-chunk budget: a short value truncates downloads already in "
+            "progress. Check udata.cfg and the environment before relaxing this."
+        )
 
 
 # ----------------------------------------------------------------------
