@@ -3,17 +3,18 @@
 ## Unreleased
 
 - **fix(dataset): hold the download proxy read timeout at 300s and make the value drift-proof**
-  - The tracked deployment config pinned the proxy's read timeout to 10s while
-    the documented default is 300s, so what actually reached an environment was
-    whatever an unversioned host edit happened to say. That is how production
-    ended up cutting every upstream slower than 10s, and the blast radius is
-    wider than slow handshakes: the read timeout is an inter-chunk budget, not
-    a total, so too low a value also truncates downloads that are already
-    streaming.
-  - The value now sits in the versioned config at 300s and is overridable per
-    environment through `.env`. Tuning one environment no longer requires
-    hand-editing a tracked file on the host, which is the edit the repo cannot
-    see and nobody can review.
+  - Production answered `502` to every upstream slower than 10s while the
+    documented default is 300s. No tracked file explained that: the
+    `DOWNLOAD_PROXY_*` keys were absent from the deployment config on every
+    environment branch, so the value in force was whatever an unreviewed host
+    edit happened to say, and the repo offered nothing to compare against. The
+    blast radius is wider than slow handshakes: the read timeout is an
+    inter-chunk budget, not a total, so too low a value also truncates
+    downloads that are already streaming.
+  - The three keys now sit in the versioned config — the read timeout
+    explicitly at 300s — each overridable through `.env`. An environment
+    needing different budgets no longer has a reason to hand-edit a tracked
+    file on the host, and the value in force is visible in the repo.
   - `open_upstream` and `iter_capped` now read their budgets through in-code
     fallbacks that mirror `Defaults`, instead of indexing `current_app.config`
     directly. A host whose config predates the proxy section streams with the
