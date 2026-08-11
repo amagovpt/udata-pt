@@ -4,8 +4,11 @@ Covers both code paths of `ResourceRedirectAPI`:
 
 - Hosted resources (`fs_filename` set) — served via `send_file(as_attachment=True)`
   with the stored mimetype and a sensible download name.
-- Remote resources (only `url`) — proxied through `stream_as_attachment`, so
-  they inherit the SSRF guard, byte cap and attachment headers from the
+- OGC services (WMS/WFS) — kept on the pre-LEDG-1765 302 redirect, since a
+  `GetCapabilities` handshake is not a file and slow third-party endpoints
+  were turning into 502s (LEDG-2248).
+- Other remote resources (only `url`) — proxied through `stream_as_attachment`,
+  so they inherit the SSRF guard, byte cap and attachment headers from the
   LEDG-1214 download proxy.
 
 The previous behavior (302 redirect to `resource.url`) was tested in
@@ -256,6 +259,141 @@ class ResourceRedirectForceDownloadTest(APITestCase):
             response = self._hit(resource.id)
 
         assert response.status_code == 502
+
+    # ------------------------------------------------------------------
+    # OGC service path — 302, no proxy (LEDG-2248)
+    # ------------------------------------------------------------------
+
+    def test_wms_resource_redirects_without_proxying(self):
+        """A WMS distribution is a service handshake, not a download.
+
+        The reported case: the DGT ortophoto service answers a
+        `GetCapabilities` in ~13s, which is longer than the proxy's read
+        timeout, so every click returned 502. A 302 hands the wait back to
+        the browser, as before LEDG-1765.
+        """
+        url = "https://cartografia.example.org/wms/ortos?service=wms&request=getcapabilities"
+        resource = ResourceFactory(
+            url=url,
+            filetype="remote",
+            fs_filename=None,
+            format="wms",
+        )
+        DatasetFactory(resources=[resource])
+
+        with patch("udata.core.dataset.download_proxy.requests.get") as upstream:
+            response = self._hit(resource.id)
+
+        assert response.status_code == 302
+        assert response.location == url
+        # The whole point: no server-side fetch on the critical path.
+        upstream.assert_not_called()
+
+    def test_wfs_resource_redirects_without_proxying(self):
+        url = "https://si.example.org/wfs/dados?service=wfs&version=2.0.0"
+        resource = ResourceFactory(
+            url=url,
+            filetype="remote",
+            fs_filename=None,
+            format="wfs",
+        )
+        DatasetFactory(resources=[resource])
+
+        with patch("udata.core.dataset.download_proxy.requests.get") as upstream:
+            response = self._hit(resource.id)
+
+        assert response.status_code == 302
+        assert response.location == url
+        upstream.assert_not_called()
+
+    def test_ogc_service_detected_from_url_when_format_is_wrong(self):
+        """Harvested services often carry a bogus `format`.
+
+        `detect_ogc_service` also matches a `GetCapabilities` URL with a
+        `service=` parameter, so those resources redirect too instead of
+        being force-downloaded.
+        """
+        url = "https://geo.example.org/geoserver/ows?service=WMS&request=GetCapabilities"
+        resource = ResourceFactory(
+            url=url,
+            filetype="remote",
+            fs_filename=None,
+            format="xml",
+        )
+        DatasetFactory(resources=[resource])
+
+        with patch("udata.core.dataset.download_proxy.requests.get") as upstream:
+            response = self._hit(resource.id)
+
+        assert response.status_code == 302
+        assert response.location == url
+        upstream.assert_not_called()
+
+    def test_ogc_prefixed_format_redirects(self):
+        """`ogc:wms` — the form emitted by the RDF/DCAT harvest path."""
+        url = "https://geo.example.org/wms?service=wms&request=getcapabilities"
+        resource = ResourceFactory(
+            url=url,
+            filetype="remote",
+            fs_filename=None,
+            format="ogc:wms",
+        )
+        DatasetFactory(resources=[resource])
+
+        with patch("udata.core.dataset.download_proxy.requests.get") as upstream:
+            response = self._hit(resource.id)
+
+        assert response.status_code == 302
+        upstream.assert_not_called()
+
+    def test_hosted_resource_with_wms_format_still_served_as_attachment(self):
+        """`fs_filename` wins: an uploaded file is a file, whatever its format.
+
+        Guards the branch order — the OGC check must not hijack hosted
+        resources, whose `url` points back at our own storage.
+        """
+        resource = ResourceFactory(
+            fs_filename="ds-slug/20260520-143015/capabilities.xml",
+            mime="application/xml",
+            title="capabilities.xml",
+            format="wms",
+        )
+        DatasetFactory(resources=[resource])
+
+        with patch(
+            "udata.core.dataset.api.storages.resources.open",
+            return_value=BytesIO(b"<WMS_Capabilities/>"),
+        ):
+            response = self._hit(resource.id)
+
+        assert response.status_code == 200
+        assert response.headers["Content-Disposition"].startswith("attachment;")
+        assert response.data == b"<WMS_Capabilities/>"
+
+    def test_non_ogc_remote_resource_is_not_redirected(self):
+        """Counter-case: a plain CSV keeps the forced-download contract.
+
+        Pins the narrow scope of LEDG-2248 — only services were carved out.
+        """
+        resource = ResourceFactory(
+            url="https://example.com/data/export.csv",
+            filetype="remote",
+            fs_filename=None,
+            title="export.csv",
+            format="csv",
+        )
+        DatasetFactory(resources=[resource])
+        mock_upstream = _build_mock_upstream(body=b"a,b\n1,2\n", content_type="text/csv")
+
+        with patch(
+            "udata.core.dataset.download_proxy.requests.get",
+            return_value=mock_upstream,
+        ) as upstream:
+            response = self._hit(resource.id)
+
+        assert response.status_code == 200
+        assert response.headers["Content-Disposition"].startswith("attachment;")
+        upstream.assert_called_once()
 
     # ------------------------------------------------------------------
     # 404 path — unchanged from the pre-LEDG-1765 behavior

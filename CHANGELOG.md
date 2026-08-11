@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **fix(dataset): redirect OGC services on `/datasets/r/<id>` instead of proxying them**
+  - WMS/WFS distributions were being force-downloaded through the LEDG-1214
+    proxy like any other remote resource, but their "download" is a
+    `GetCapabilities` handshake, not a file. Several catalogued services need
+    longer than the proxy's read timeout just to answer, so a working service
+    (e.g. DGT's ortophotos, ~13s to first byte) turned into a `502` on every
+    click, while the portal also charged itself the wait on the critical path
+    of a user action.
+  - Those resources now get the pre-LEDG-1765 `302` back, handing the wait to
+    the browser as before. Files are untouched: uploaded resources are still
+    streamed from storage and other remote resources still go through the
+    SSRF-guarded proxy with `Content-Disposition: attachment` — the branch is
+    checked after `fs_filename`, so an uploaded file whose format says `wms`
+    stays a download.
+  - Detection reuses `detect_ogc_service`, the helper the RDF catalog already
+    uses to decide what is a dataservice, so both agree on what a service is.
+    It also matches a `GetCapabilities` URL carrying a `service=` parameter,
+    which covers harvested resources whose `format` is wrong.
+
 - **feat(site): add the INSPIRE count to the datasets listing filter counts**
   - New `rotulo_inspire` (`badges__kind=INSPIRE`) in the aggregated
     `/site/datasets-listing/` payload, so the "Inspire" option added to the
