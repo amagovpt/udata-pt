@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **fix: restore the twelve tests that had been failing on `develop`**
+  - `.gitignore` carried a bare `data` entry, which git matches against any
+    file or directory of that name at any depth rather than the local data
+    directory at the repository root the comment describes. It swallowed two
+    upstream fixture directories, and the commit that introduced the pattern
+    deleted their contents in the same move, so
+    `udata/harvest/tests/ckan/data/dkan-french-w-license.json`,
+    `udata/tests/data/image.png` and `image.jpg` left the index unnoticed and
+    five tests have been raising `FileNotFoundError` ever since. The pattern is
+    now anchored to `/data` and the three blobs are back.
+  - `test_geo2france` asserted an `accessRights` value its own fixture no
+    longer contained. Upstream changed the fixture's `gmd:otherConstraints`
+    line and the assertions together when it added access rights harvesting;
+    merging that work here kept the test side and resolved the fixture side in
+    favour of our older copy. The single diverging line is realigned.
+  - Translating the `EU_HVD_CATEGORIES` labels to Portuguese changed the tag
+    slugs they produce, but the tests still spelled the French ones, so four
+    more failed — one on a tag comparison, three on `KeyError`. The six BNA
+    category URIs are now named constants and `EU_HVD_CATEGORY_TAGS` maps each
+    to its tag, with `TAG_TO_EU_HVD_CATEGORIES` as its reverse. Tests address
+    categories by URI, which is a stable vocabulary identifier, so they no
+    longer depend on the language the labels are written in.
+
 - **fix(harvest): repair self-concatenated URLs and the format guess in the APAmbiente harvester**
   - One catalogue record publishes a `dct:references` link whose path is glued
     to itself (`.../meta_2030_0.xlsx_Clima/.../meta_2030_0.xlsx`), so every
