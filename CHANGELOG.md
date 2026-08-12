@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **fix(harvest): repair self-concatenated URLs and the format guess in the APAmbiente harvester**
+  - One catalogue record publishes a `dct:references` link whose path is glued
+    to itself (`.../meta_2030_0.xlsx_Clima/.../meta_2030_0.xlsx`), so every
+    download of that resource answered `404`. The repetition comes from the
+    origin, not from us — the harvester never concatenated anything — so it is
+    now collapsed on the way in: a path tail that repeats verbatim and spans
+    more than one segment is dropped, leaving the link the origin actually
+    serves. A single repeated segment (`/reports/reports`) is left alone,
+    because that is a plausible real path rather than the defect.
+  - The resource format was derived from `url.split(".")[-1]`, which reads the
+    dots in the host name whenever the path carries no extension, and any
+    result longer than three characters was rewritten to `wms`. Spreadsheets,
+    presentations, metadata links and thumbnails were therefore all published
+    as map services. The extension is now read from the last path segment
+    only, an OGC `SERVICE=` query parameter takes precedence when there is no
+    extension to read, and anything unrecognised falls back to `remote` — the
+    same fallback the sibling CSW backend already uses. Replayed against the
+    live catalogue this corrects 46 of 3936 records and leaves the rest
+    untouched.
+  - The URL repair and the format guess live in `harvester_utils` as
+    standalone functions so they are covered directly, with the production
+    record that triggered the report used verbatim as the failing input.
+
 - **fix(dataset): hold the download proxy read timeout at 300s and make the value drift-proof**
   - Production answered `502` to every upstream slower than 10s while the
     documented default is 300s. No tracked file explained that: the
