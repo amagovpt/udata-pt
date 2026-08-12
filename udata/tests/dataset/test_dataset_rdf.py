@@ -46,14 +46,15 @@ from udata.rdf import (
     DCAT,
     DCATAP,
     DCT,
+    EU_HVD_CATEGORY_TAGS,
     EUFREQ,
     FREQ,
     GEODCAT,
+    HVD_CATEGORY_MOBILITY,
     HVD_LEGISLATION,
     SCHEMA,
     SKOS,
     SPDX,
-    TAG_TO_EU_HVD_CATEGORIES,
     VCARD,
     default_lang_value,
     primary_topic_identifier_from_rdf,
@@ -333,15 +334,14 @@ class DatasetToRdfTest(PytestOnlyAPITestCase):
     def test_hvd_dataset(self):
         """Test that a dataset tagged hvd has appropriate DCAT-AP HVD properties"""
         dataset = DatasetFactory(
-            resources=ResourceFactory.build_batch(3), tags=["hvd", "mobilite", "test"]
+            resources=ResourceFactory.build_batch(3),
+            tags=["hvd", EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_MOBILITY], "test"],
         )
         dataset.add_badge(HVD)
         d = dataset_to_rdf(dataset)
 
         assert d.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
-        assert d.value(DCATAP.hvdCategory).identifier == URIRef(
-            TAG_TO_EU_HVD_CATEGORIES["mobilite"]
-        )
+        assert d.value(DCATAP.hvdCategory).identifier == URIRef(HVD_CATEGORY_MOBILITY)
         for distrib in d.objects(DCAT.distribution):
             assert distrib.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
 
@@ -351,7 +351,8 @@ class DatasetToRdfTest(PytestOnlyAPITestCase):
         with a DCAT.accessService and appropriate DCAT-AP HVD properties
         """
         dataset = DatasetFactory(
-            resources=ResourceFactory.build_batch(3), tags=["hvd", "mobilite", "test"]
+            resources=ResourceFactory.build_batch(3),
+            tags=["hvd", EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_MOBILITY], "test"],
         )
         dataset.add_badge(HVD)
         dataservice = DataserviceFactory(datasets=[dataset], tags=["hvd"])
