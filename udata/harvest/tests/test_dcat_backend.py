@@ -20,7 +20,13 @@ from udata.harvest.backends import get_backend
 from udata.harvest.backends.dcat import CswDcatBackend
 from udata.harvest.models import HarvestJob
 from udata.models import Dataset
-from udata.rdf import DCAT, RDF, namespace_manager
+from udata.rdf import (
+    DCAT,
+    EU_HVD_CATEGORY_TAGS,
+    HVD_CATEGORY_EARTH_OBSERVATION,
+    RDF,
+    namespace_manager,
+)
 from udata.storage.s3 import get_from_json
 from udata.tests.api import PytestOnlyDBTestCase
 
@@ -585,7 +591,7 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         ]
         assert dataset.extras["dcat"]["provenance"] == ["Description de la provenance des données"]
 
-        assert "observation-de-la-terre-et-environnement" in dataset.tags
+        assert EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_EARTH_OBSERVATION] in dataset.tags
         assert "hvd" in dataset.tags
 
         dataset = Dataset.objects.get(harvest__dct_identifier="1")
