@@ -119,17 +119,29 @@ RDF_EXTENSIONS = {
 # Includes control characters, unicode surrogate characters and unicode end-of-plane non-characters
 ILLEGAL_XML_CHARS = "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
 
+# High Value Datasets category URIs. Unlike the labels below, these are stable
+# identifiers from the EU BNA vocabulary, so refer to a category by its URI.
+HVD_CATEGORY_METEOROLOGICAL = "http://data.europa.eu/bna/c_164e0bf5"
+HVD_CATEGORY_COMPANIES = "http://data.europa.eu/bna/c_a9135398"
+HVD_CATEGORY_GEOSPATIAL = "http://data.europa.eu/bna/c_ac64a52d"
+HVD_CATEGORY_MOBILITY = "http://data.europa.eu/bna/c_b79e35eb"
+HVD_CATEGORY_EARTH_OBSERVATION = "http://data.europa.eu/bna/c_dd313021"
+HVD_CATEGORY_STATISTICS = "http://data.europa.eu/bna/c_e1da4e07"
+
 # Map High Value Datasets URIs to keyword categories
 EU_HVD_CATEGORIES = {
-    "http://data.europa.eu/bna/c_164e0bf5": "Meteorológicas",
-    "http://data.europa.eu/bna/c_a9135398": "Empresas e propriedade de empresas",
-    "http://data.europa.eu/bna/c_ac64a52d": "Geoespaciais",
-    "http://data.europa.eu/bna/c_b79e35eb": "Mobilidade",
-    "http://data.europa.eu/bna/c_dd313021": "Observação da Terra e do ambiente",
-    "http://data.europa.eu/bna/c_e1da4e07": "Estatísticas",
+    HVD_CATEGORY_METEOROLOGICAL: "Meteorológicas",
+    HVD_CATEGORY_COMPANIES: "Empresas e propriedade de empresas",
+    HVD_CATEGORY_GEOSPATIAL: "Geoespaciais",
+    HVD_CATEGORY_MOBILITY: "Mobilidade",
+    HVD_CATEGORY_EARTH_OBSERVATION: "Observação da Terra e do ambiente",
+    HVD_CATEGORY_STATISTICS: "Estatísticas",
 }
 HVD_LEGISLATION = "http://data.europa.eu/eli/reg_impl/2023/138/oj"
-TAG_TO_EU_HVD_CATEGORIES = {slugify_tag(EU_HVD_CATEGORIES[uri]): uri for uri in EU_HVD_CATEGORIES}
+# The tag a dataset carries for each category, and its reverse. Both derive from
+# the labels, so they follow whatever language those are written in.
+EU_HVD_CATEGORY_TAGS = {uri: slugify_tag(label) for uri, label in EU_HVD_CATEGORIES.items()}
+TAG_TO_EU_HVD_CATEGORIES = {tag: uri for uri, tag in EU_HVD_CATEGORY_TAGS.items()}
 
 INSPIRE_GEMET_THEME_NAMESPACE = "http://inspire.ec.europa.eu/theme"
 INSPIRE_GEMET_SCHEME_URIS = [

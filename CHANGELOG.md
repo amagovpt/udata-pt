@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+- **fix: restore the twelve tests that had been failing on `develop`**
+  - `.gitignore` carried a bare `data` entry, which git matches against any
+    file or directory of that name at any depth rather than the local data
+    directory at the repository root the comment describes. It swallowed two
+    upstream fixture directories, and the commit that introduced the pattern
+    deleted their contents in the same move, so
+    `udata/harvest/tests/ckan/data/dkan-french-w-license.json`,
+    `udata/tests/data/image.png` and `image.jpg` left the index unnoticed and
+    five tests have been raising `FileNotFoundError` ever since. The pattern is
+    now anchored to `/data` and the three blobs are back.
+  - `test_geo2france` asserted an `accessRights` value its own fixture no
+    longer contained. Upstream changed the fixture's `gmd:otherConstraints`
+    line and the assertions together when it added access rights harvesting;
+    merging that work here kept the test side and resolved the fixture side in
+    favour of our older copy. The single diverging line is realigned.
+  - Translating the `EU_HVD_CATEGORIES` labels to Portuguese changed the tag
+    slugs they produce, but the tests still spelled the French ones, so four
+    more failed — one on a tag comparison, three on `KeyError`. The six BNA
+    category URIs are now named constants and `EU_HVD_CATEGORY_TAGS` maps each
+    to its tag, with `TAG_TO_EU_HVD_CATEGORIES` as its reverse. Tests address
+    categories by URI, which is a stable vocabulary identifier, so they no
+    longer depend on the language the labels are written in.
+
+- **fix(harvest): repair self-concatenated URLs and the format guess in the APAmbiente harvester**
+  - One catalogue record publishes a `dct:references` link whose path is glued
+    to itself (`.../meta_2030_0.xlsx_Clima/.../meta_2030_0.xlsx`), so every
+    download of that resource answered `404`. The repetition comes from the
+    origin, not from us — the harvester never concatenated anything — so it is
+    now collapsed on the way in: a path tail that repeats verbatim and spans
+    more than one segment is dropped, leaving the link the origin actually
+    serves. A single repeated segment (`/reports/reports`) is left alone,
+    because that is a plausible real path rather than the defect.
+  - The resource format was derived from `url.split(".")[-1]`, which reads the
+    dots in the host name whenever the path carries no extension, and any
+    result longer than three characters was rewritten to `wms`. Spreadsheets,
+    presentations, metadata links and thumbnails were therefore all published
+    as map services. The extension is now read from the last path segment
+    only, an OGC `SERVICE=` query parameter takes precedence when there is no
+    extension to read, and anything unrecognised falls back to `remote` — the
+    same fallback the sibling CSW backend already uses. Replayed against the
+    live catalogue this corrects 46 of 3936 records and leaves the rest
+    untouched.
+  - The URL repair and the format guess live in `harvester_utils` as
+    standalone functions so they are covered directly, with the production
+    record that triggered the report used verbatim as the failing input.
+
+- **fix(dataset): hold the download proxy read timeout at 300s and make the value drift-proof**
+  - Production answered `502` to every upstream slower than 10s while the
+    documented default is 300s. No tracked file explained that: the
+    `DOWNLOAD_PROXY_*` keys were absent from the deployment config on every
+    environment branch, so the value in force was whatever an unreviewed host
+    edit happened to say, and the repo offered nothing to compare against. The
+    blast radius is wider than slow handshakes: the read timeout is an
+    inter-chunk budget, not a total, so too low a value also truncates
+    downloads that are already streaming.
+  - The three keys now sit in the versioned config — the read timeout
+    explicitly at 300s — each overridable through `.env`. An environment
+    needing different budgets no longer has a reason to hand-edit a tracked
+    file on the host, and the value in force is visible in the repo.
+  - `open_upstream` and `iter_capped` now read their budgets through in-code
+    fallbacks that mirror `Defaults`, instead of indexing `current_app.config`
+    directly. A host whose config predates the proxy section streams with the
+    documented budget rather than raising `KeyError` from inside a request —
+    the same pairing the harvest HTTP settings already use.
+  - A test pins the *effective* read timeout of the loaded config, not just the
+    default, so lowering it in either the config or the environment fails the
+    suite instead of surfacing later as a `502`.
+
+- **fix(dataset): redirect OGC services on `/datasets/r/<id>` instead of proxying them**
+  - WMS/WFS distributions were being force-downloaded through the LEDG-1214
+    proxy like any other remote resource, but their "download" is a
+    `GetCapabilities` handshake, not a file. Several catalogued services need
+    longer than the proxy's read timeout just to answer, so a working service
+    (e.g. DGT's ortophotos, ~13s to first byte) turned into a `502` on every
+    click, while the portal also charged itself the wait on the critical path
+    of a user action.
+  - Those resources now get the pre-LEDG-1765 `302` back, handing the wait to
+    the browser as before. Files are untouched: uploaded resources are still
+    streamed from storage and other remote resources still go through the
+    SSRF-guarded proxy with `Content-Disposition: attachment` — the branch is
+    checked after `fs_filename`, so an uploaded file whose format says `wms`
+    stays a download.
+  - Detection reuses `detect_ogc_service`, the helper the RDF catalog already
+    uses to decide what is a dataservice, so both agree on what a service is.
+    It also matches a `GetCapabilities` URL carrying a `service=` parameter,
+    which covers harvested resources whose `format` is wrong.
+
 - **feat(site): add the INSPIRE count to the datasets listing filter counts**
   - New `rotulo_inspire` (`badges__kind=INSPIRE`) in the aggregated
     `/site/datasets-listing/` payload, so the "Inspire" option added to the

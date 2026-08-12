@@ -14,8 +14,12 @@ from udata.rdf import (
     DCAT,
     DCATAP,
     DCT,
+    EU_HVD_CATEGORY_TAGS,
+    HVD_CATEGORY_GEOSPATIAL,
+    HVD_CATEGORY_METEOROLOGICAL,
+    HVD_CATEGORY_MOBILITY,
+    HVD_CATEGORY_STATISTICS,
     HVD_LEGISLATION,
-    TAG_TO_EU_HVD_CATEGORIES,
 )
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.tests.helpers import assert200, assert_redirects
@@ -49,28 +53,33 @@ class DataserviceToRdfTest(PytestOnlyAPITestCase):
 
     def test_hvd_dataservice(self):
         """Test that a dataservice tagged hvd has appropriate DCAT-AP HVD properties"""
-        dataservice = DataserviceFactory(tags=["hvd", "mobilite", "test"])
+        dataservice = DataserviceFactory(
+            tags=["hvd", EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_MOBILITY], "test"]
+        )
         dataservice.add_badge(HVD)
         d = dataservice_to_rdf(dataservice)
 
         assert d.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
-        assert d.value(DCATAP.hvdCategory).identifier == URIRef(
-            TAG_TO_EU_HVD_CATEGORIES["mobilite"]
-        )
+        assert d.value(DCATAP.hvdCategory).identifier == URIRef(HVD_CATEGORY_MOBILITY)
         for distrib in d.objects(DCAT.distribution):
             assert distrib.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
 
     def test_hvd_dataservice_with_hvd_datasets(self):
         """Test that a dataservice tagged hvd has its datasets' HVD categories"""
-        dataset = DatasetFactory(tags=["meteorologiques"])
-        dataset_hvd_1 = DatasetFactory(tags=["hvd", "statistiques", "not-a-hvd-category"])
+        meteorological = EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_METEOROLOGICAL]
+        statistics = EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_STATISTICS]
+        mobility = EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_MOBILITY]
+        geospatial = EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_GEOSPATIAL]
+
+        dataset = DatasetFactory(tags=[meteorological])
+        dataset_hvd_1 = DatasetFactory(tags=["hvd", statistics, "not-a-hvd-category"])
         dataset_hvd_2 = DatasetFactory(
-            tags=["hvd", "statistiques", "mobilite", "geospatiales", "not-a-hvd-category"]
+            tags=["hvd", statistics, mobility, geospatial, "not-a-hvd-category"]
         )
         dataset_hvd_1.add_badge(HVD)
         dataset_hvd_2.add_badge(HVD)
         dataservice = DataserviceFactory(
-            datasets=[dataset, dataset_hvd_1, dataset_hvd_2], tags=["hvd", "mobilite", "test"]
+            datasets=[dataset, dataset_hvd_1, dataset_hvd_2], tags=["hvd", mobility, "test"]
         )
         dataservice.add_badge(HVD)
         d = dataservice_to_rdf(dataservice)
@@ -78,10 +87,10 @@ class DataserviceToRdfTest(PytestOnlyAPITestCase):
         assert d.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
         hvd_categories = [cat.identifier for cat in d.objects(DCATAP.hvdCategory)]
         assert len(hvd_categories) == 3
-        assert URIRef(TAG_TO_EU_HVD_CATEGORIES["mobilite"]) in hvd_categories
-        assert URIRef(TAG_TO_EU_HVD_CATEGORIES["geospatiales"]) in hvd_categories
-        assert URIRef(TAG_TO_EU_HVD_CATEGORIES["statistiques"]) in hvd_categories
-        assert URIRef(TAG_TO_EU_HVD_CATEGORIES["meteorologiques"]) not in hvd_categories
+        assert URIRef(HVD_CATEGORY_MOBILITY) in hvd_categories
+        assert URIRef(HVD_CATEGORY_GEOSPATIAL) in hvd_categories
+        assert URIRef(HVD_CATEGORY_STATISTICS) in hvd_categories
+        assert URIRef(HVD_CATEGORY_METEOROLOGICAL) not in hvd_categories
         for distrib in d.objects(DCAT.distribution):
             assert distrib.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
 

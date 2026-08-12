@@ -24,6 +24,16 @@ from flask import Response, current_app, stream_with_context
 import udata.uris as uris
 from udata.harvest.url_filter import HarvestURLForbidden, check_harvest_url
 
+# Fallbacks for when the deployment config omits the `DOWNLOAD_PROXY_*` keys.
+# They mirror `Defaults` in `udata/settings.py`, so a host whose `udata.cfg`
+# predates that section streams with the documented budget instead of raising
+# `KeyError` mid-request. Read the values through the accessors below rather
+# than `config[...]`, mirroring the `HARVEST_HTTP_*` properties in
+# `udata/harvest/backends/base.py`.
+DEFAULT_MAX_BYTES = 500 * 1024 * 1024
+DEFAULT_CONNECT_TIMEOUT_S = 10
+DEFAULT_READ_TIMEOUT_S = 300
+
 
 class ProxyDownloadForbidden(ValueError):
     """Raised when an external URL is rejected by the proxy SSRF guard."""
@@ -81,8 +91,10 @@ def open_upstream(url: str) -> requests.Response:
     denylisted or private host bypassing `check_external_url`. The caller is
     responsible for closing the returned response.
     """
-    connect = current_app.config["DOWNLOAD_PROXY_CONNECT_TIMEOUT_S"]
-    read = current_app.config["DOWNLOAD_PROXY_READ_TIMEOUT_S"]
+    connect = current_app.config.get("DOWNLOAD_PROXY_CONNECT_TIMEOUT_S") or (
+        DEFAULT_CONNECT_TIMEOUT_S
+    )
+    read = current_app.config.get("DOWNLOAD_PROXY_READ_TIMEOUT_S") or DEFAULT_READ_TIMEOUT_S
     response = requests.get(
         url,
         stream=True,
@@ -101,7 +113,7 @@ def iter_capped(response: requests.Response):
     propagate the exception and abort the response, so the browser sees a
     truncated download rather than a successful one with bad data.
     """
-    max_bytes = current_app.config["DOWNLOAD_PROXY_MAX_BYTES"]
+    max_bytes = current_app.config.get("DOWNLOAD_PROXY_MAX_BYTES") or DEFAULT_MAX_BYTES
     total = 0
     try:
         for chunk in response.iter_content(chunk_size=8192):
