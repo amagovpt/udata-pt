@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **fix: harvested resources keep their id, and their download link, across harvests**
+  - Eight backends — `dgt`, `dgtIne`, `ogc`, `apambiente`, `cswudata`, `ine`,
+    `inehvd` and `maaf` — emptied `dataset.resources` and rebuilt every resource
+    from scratch on each run. `Resource.id` is auto-generated, so each nightly
+    harvest minted a brand new UUID for every resource of every dataset it
+    touched, and the `/api/1/datasets/r/<id>` permalink — the link users copy
+    and share, and the one external integrations consume — died with it. This is
+    what users were reporting as "the URLs keep changing"; files uploaded on the
+    portal kept working because harvesters never touch them.
+  - Resources are now reconciled instead of recreated, through a single
+    `sync_resources` helper: an entry matches an existing resource when their
+    URLs agree once normalized, and that resource object is kept and refreshed
+    in place, so the id survives. Matching by URL reuses the approach the
+    `odspt` backend already had in `get_resource`, and pruning what upstream
+    stopped publishing follows `ckanpt`. As a side effect the per-resource
+    `extras` — the availability check results — and `created_at` survive too,
+    and a URL that the source lists twice no longer yields two resources.
+  - Resources uploaded through the portal onto a harvested dataset are no longer
+    deleted by the next harvest. They never belonged to the harvester, and
+    dropping them both lost the file and left it orphaned in storage.
+  - The already broken links are not recoverable: the old UUIDs are gone. This
+    only stops them from breaking again from the next harvest onwards.
+  - Deploying this requires restarting the Celery worker and beat. A
+    long-running worker keeps the previous backend code in memory, so scheduled
+    harvests would go on recreating the resources.
 - **fix: restore the twelve tests that had been failing on `develop`**
   - `.gitignore` carried a bare `data` entry, which git matches against any
     file or directory of that name at any depth rather than the local data
