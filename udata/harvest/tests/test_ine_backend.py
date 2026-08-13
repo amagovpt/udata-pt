@@ -129,11 +129,11 @@ class INEPrefetchDatasetsTest(PytestOnlyDBTestCase):
         assert dataset.organization == org
 
 
-def _catalog_xml(ids):
+def _catalog_xml(ids, revision=""):
     indicators = "\n".join(
         f"""<indicator id='{i}'>
         <title><![CDATA[Indicador {i}]]></title>
-        <description><![CDATA[Descrição {i}]]></description>
+        <description><![CDATA[Descrição {i}{revision}]]></description>
         <html><bdd_url><![CDATA[https://www.ine.pt/xurl/indx/{i}/PT]]></bdd_url></html>
         <json>
         <json_dataset><![CDATA[https://www.ine.pt/js/{i}.json]]></json_dataset>
@@ -188,3 +188,41 @@ class INEInnerHarvestTest(PytestOnlyDBTestCase):
         assert job.status == "done"
         assert [item.status for item in job.items] == ["skipped"] * 3
         assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 3
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEResourceIdentityTest(PytestOnlyDBTestCase):
+    """Applying changed metadata must not cost the resources their ids.
+
+    `_has_changed` lets any edited field through to the apply step, which used to
+    wipe and rebuild every resource of the dataset — a new id, and therefore a
+    dead `/api/1/datasets/r/<id>` permalink, for each of them (LEDG-2251).
+    """
+
+    def _harvest(self, rmock, tmp_path, source, revision=""):
+        rmock.get(INE_URL, text=_catalog_xml(["0001"], revision=revision))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def _dataset(self, source):
+        return Dataset.objects(
+            __raw__={"harvest.source_id": str(source.id), "harvest.remote_id": "0001"}
+        ).first()
+
+    def test_changed_description_keeps_the_resource_ids(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        self._harvest(rmock, tmp_path, source)
+        before = [r.id for r in self._dataset(source).resources]
+        assert len(before) == 1
+
+        job = self._harvest(rmock, tmp_path, source, revision=" (revista)")
+
+        # The dataset really was reprocessed, not skipped as unchanged.
+        assert [item.status for item in job.items] == ["done"]
+        dataset = self._dataset(source)
+        assert "(revista)" in dataset.description
+        assert [r.id for r in dataset.resources] == before
