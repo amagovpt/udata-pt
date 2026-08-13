@@ -13,9 +13,9 @@ from slugify import slugify
 
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem, HarvestJob
-from udata.models import Dataset, License, Resource
+from udata.models import Dataset, License
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import normalize_url_slashes, sync_resources
 
 
 class INEDownloadIncomplete(Exception):
@@ -435,10 +435,10 @@ class INEBackend(BaseBackend):
         if "description" in md:
             dataset.description = md["description"]
 
-        dataset.resources = []
-        for res_data in md.get("resources") or []:
-            r = Resource(**res_data)
-            dataset.resources.append(r)
+        # Reconciled, not rebuilt: `_has_changed` lets any single metadata edit
+        # reach this point, and recreating the resources there would hand every
+        # one of them a new id — a new, broken download permalink (LEDG-2251).
+        sync_resources(dataset, md.get("resources") or [])
 
         if not dataset.harvest:
             dataset.harvest = Dataset.harvest.document_type_obj()
