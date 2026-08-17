@@ -14,12 +14,18 @@
     different ceiling set it in `.env` (documented in `.env.example`) rather than
     editing the tracked config on the host — the failure mode that left PRD
     running an undocumented download-proxy timeout.
-  - Two consequences worth checking before raising it further: each upload needs
+  - The upload endpoints get their own harakiri budget of 600 s in
+    `uwsgi/front.ini` (`route = /upload/ harakiri:600`), up from the 120 s every
+    route inherited from `route-run`. The combine request reads every part,
+    writes the reassembled file and hashes it in one request — ~1074 parts at the
+    new ceiling — so on the old budget the worker was killed mid-combine and the
+    upload was lost after the user had already sent the whole file. The nginx
+    `proxy_read_timeout` in front must cover the same value, or the combine
+    response is abandoned with a 502 even when the backend finishes cleanly.
+  - Still worth checking before raising the ceiling further: each upload needs
     roughly twice the file size in transient space under `FS_ROOT` (chunk parts
     plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
-    combine request — which reads every part, writes the whole file and hashes it
-    — must finish inside the uWSGI harakiri budget in `uwsgi/front.ini`, still
-    120 s for this route.
+    frontend sends up to three files in parallel.
 
 - **fix: restore the twelve tests that had been failing on `develop`**
   - `.gitignore` carried a bare `data` entry, which git matches against any
