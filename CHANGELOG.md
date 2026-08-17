@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **feat(storages): raise the resource upload ceiling to 1 GiB and make it environment-tunable**
+  - `RESOURCES_FILE_MAX_SIZE` goes from 800 MB to 1 GiB (1073741824 bytes). The
+    limit is enforced in `storages.api`: `combine_chunks` aborts mid-write as
+    soon as the reassembled size would cross it (so an oversized file is never
+    fully written to disk) and `handle_upload` re-checks the finished file, which
+    also covers single-shot uploads. Nothing else in the upload path changes —
+    parts are still ~1 MB, so the perimeter WAF still sees only small requests.
+  - The value is now read from `udata.cfg` as `_env_int("RESOURCES_FILE_MAX_SIZE",
+    …)` instead of being fixed in `settings.py`. Environments that need a
+    different ceiling set it in `.env` (documented in `.env.example`) rather than
+    editing the tracked config on the host — the failure mode that left PRD
+    running an undocumented download-proxy timeout.
+  - Two consequences worth checking before raising it further: each upload needs
+    roughly twice the file size in transient space under `FS_ROOT` (chunk parts
+    plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
+    combine request — which reads every part, writes the whole file and hashes it
+    — must finish inside the uWSGI harakiri budget in `uwsgi/front.ini`, still
+    120 s for this route.
+
 - **fix: restore the twelve tests that had been failing on `develop`**
   - `.gitignore` carried a bare `data` entry, which git matches against any
     file or directory of that name at any depth rather than the local data
