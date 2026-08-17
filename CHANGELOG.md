@@ -22,6 +22,19 @@
     upload was lost after the user had already sent the whole file. The nginx
     `proxy_read_timeout` in front must cover the same value, or the combine
     response is abandoned with a 502 even when the backend finishes cleanly.
+  - The resource download endpoints get the same 600 s budget
+    (`route = ^/api/1/datasets/(r/|proxy/download/) harakiri:600`): the permanent
+    `/r/<id>` link that serves hosted files as attachments, and the proxy that
+    pulls remote resources (already allowed 300 s per chunk). On local storage
+    uWSGI hands the transfer to its offload threads and harakiri never applies,
+    but when the transfer runs inside the worker — an S3 backend, whose handle is
+    not a real file descriptor, or the remote proxy — a 1 GiB file does not fit in
+    120 s. Capacity note: with nginx `proxy_buffering` on (the default) the
+    backend writes at LAN speed and nginx feeds the slow client, so this budget
+    is not exposed to the user's connection; with buffering off, or a response
+    larger than `proxy_max_temp_file_size` (default exactly 1024m), nginx paces
+    the backend at the client's speed and a slow download can hold a worker for
+    the full 600 s.
   - Still worth checking before raising the ceiling further: each upload needs
     roughly twice the file size in transient space under `FS_ROOT` (chunk parts
     plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
