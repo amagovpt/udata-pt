@@ -10,7 +10,7 @@ from werkzeug.wrappers import Request
 
 from udata.core import storages
 from udata.core.storages import utils
-from udata.core.storages.api import COMBINE_MARKER, META, chunk_filename
+from udata.core.storages.api import COMBINE_MARKER, META, _max_size_error, chunk_filename
 from udata.core.storages.tasks import purge_chunks
 from udata.core.storages.validation import (
     _SCAN_CHUNK_SIZE,
@@ -19,6 +19,7 @@ from udata.core.storages.validation import (
     _scan_for_dangerous_content,
     validate_upload,
 )
+from udata.settings import Defaults
 from udata.tests import PytestOnlyTestCase
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.utils import faker
@@ -112,6 +113,27 @@ class ConfigurableAllowedExtensionsTest(PytestOnlyTestCase):
         assert "xml" not in storages.CONFIGURABLE_AUTHORIZED_TYPES
         assert "exe" not in storages.CONFIGURABLE_AUTHORIZED_TYPES
         assert "bat" not in storages.CONFIGURABLE_AUTHORIZED_TYPES
+
+
+class ResourcesFileMaxSizeTest(PytestOnlyTestCase):
+    """The shipped ceiling for an uploaded resource file.
+
+    Pinned in a test because it is a published limit: the frontend guard, the
+    operator documentation and the disk sizing of `FS_ROOT` are all derived from
+    it, so lowering it is a product decision and must not happen by accident.
+    """
+
+    def test_default_is_one_gibibyte(self):
+        assert Defaults.RESOURCES_FILE_MAX_SIZE == 1024 * 1024 * 1024
+
+    def test_error_message_reports_the_configured_limit(self):
+        """The message is derived from the config, never from a fixed string.
+
+        An environment running its own ceiling (env `RESOURCES_FILE_MAX_SIZE`)
+        must tell the publisher that number, not the shipped default.
+        """
+        assert "1024 MB" in _max_size_error(1024 * 1024 * 1024)
+        assert "800 MB" in _max_size_error(800 * 1024 * 1024)
 
 
 @pytest.mark.usefixtures("instance_path")
@@ -387,6 +409,27 @@ class StorageUploadViewTest(PytestOnlyAPITestCase):
         assert response.status_code == 413
         # The oversized file must not be left behind.
         assert list(storages.resources.list_files()) == []
+
+    @pytest.mark.options(RESOURCES_FILE_MAX_SIZE=4)
+    def test_chunked_upload_at_exactly_the_limit(self):
+        """A file whose size equals the ceiling is accepted, not rejected.
+
+        The guard is `written > max_size`, so the boundary belongs to the
+        publisher; an off-by-one here would silently shave the advertised limit.
+        """
+        self.login()
+        url = url_for("storage.upload", name="tmp")
+        uuid = str(uuid4())
+        parts = 4  # 4 * 1 byte == the 4-byte ceiling
+
+        for i in range(parts):
+            assert200(self.send_part(url, uuid, i, parts))
+
+        response = self.send_combine(url, uuid, parts)
+
+        assert200(response)
+        assert storages.tmp.read(response.json["filename"]) == b"aaaa"
+        assert list(storages.chunks.list_files()) == []
 
     @pytest.mark.options(RESOURCES_FILE_MAX_SIZE=2)
     def test_chunked_upload_too_large(self):
