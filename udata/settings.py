@@ -524,7 +524,9 @@ class Defaults(object):
     # Maximum size (bytes) for an uploaded resource file. Enforced server-side
     # in storages.api.handle_upload (the client-side guard in the frontend is
     # bypassable). Applies to the reassembled file for chunked uploads.
-    RESOURCES_FILE_MAX_SIZE = 800 * 1024 * 1024
+    # Deployments override it through `udata.cfg` (env `RESOURCES_FILE_MAX_SIZE`)
+    # rather than by editing this default.
+    RESOURCES_FILE_MAX_SIZE = 1024 * 1024 * 1024
 
     # Avatar providers parameters
     # Overrides themes and default parameters
