@@ -27,6 +27,44 @@
   - Deploying this requires restarting the Celery worker and beat. A
     long-running worker keeps the previous backend code in memory, so scheduled
     harvests would go on recreating the resources.
+- **feat(storages): raise the resource upload ceiling to 1 GiB and make it environment-tunable**
+  - `RESOURCES_FILE_MAX_SIZE` goes from 800 MB to 1 GiB (1073741824 bytes). The
+    limit is enforced in `storages.api`: `combine_chunks` aborts mid-write as
+    soon as the reassembled size would cross it (so an oversized file is never
+    fully written to disk) and `handle_upload` re-checks the finished file, which
+    also covers single-shot uploads. Nothing else in the upload path changes —
+    parts are still ~1 MB, so the perimeter WAF still sees only small requests.
+  - The value is now read from `udata.cfg` as `_env_int("RESOURCES_FILE_MAX_SIZE",
+    …)` instead of being fixed in `settings.py`. Environments that need a
+    different ceiling set it in `.env` (documented in `.env.example`) rather than
+    editing the tracked config on the host — the failure mode that left PRD
+    running an undocumented download-proxy timeout.
+  - The upload endpoints get their own harakiri budget of 600 s in
+    `uwsgi/front.ini` (`route = /upload/ harakiri:600`), up from the 120 s every
+    route inherited from `route-run`. The combine request reads every part,
+    writes the reassembled file and hashes it in one request — ~1074 parts at the
+    new ceiling — so on the old budget the worker was killed mid-combine and the
+    upload was lost after the user had already sent the whole file. The nginx
+    `proxy_read_timeout` in front must cover the same value, or the combine
+    response is abandoned with a 502 even when the backend finishes cleanly.
+  - The resource download endpoints get the same 600 s budget
+    (`route = ^/api/1/datasets/(r/|proxy/download/) harakiri:600`): the permanent
+    `/r/<id>` link that serves hosted files as attachments, and the proxy that
+    pulls remote resources (already allowed 300 s per chunk). On local storage
+    uWSGI hands the transfer to its offload threads and harakiri never applies,
+    but when the transfer runs inside the worker — an S3 backend, whose handle is
+    not a real file descriptor, or the remote proxy — a 1 GiB file does not fit in
+    120 s. Capacity note: with nginx `proxy_buffering` on (the default) the
+    backend writes at LAN speed and nginx feeds the slow client, so this budget
+    is not exposed to the user's connection; with buffering off, or a response
+    larger than `proxy_max_temp_file_size` (default exactly 1024m), nginx paces
+    the backend at the client's speed and a slow download can hold a worker for
+    the full 600 s.
+  - Still worth checking before raising the ceiling further: each upload needs
+    roughly twice the file size in transient space under `FS_ROOT` (chunk parts
+    plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
+    frontend sends up to three files in parallel.
+
 - **fix: restore the twelve tests that had been failing on `develop`**
   - `.gitignore` carried a bare `data` entry, which git matches against any
     file or directory of that name at any depth rather than the local data
