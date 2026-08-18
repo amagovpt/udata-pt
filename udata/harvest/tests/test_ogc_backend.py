@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.ogc import OGCBackend
@@ -136,3 +137,67 @@ class OGCBackendHarvestTest(PytestOnlyDBTestCase):
 
         remote_ids = {item.remote_id for item in job.items}
         assert remote_ids == {"a", "b"}
+
+
+GEOJSON_URL = "https://geoportal.example.pt/collections/a/items?f=json"
+CSV_URL = "https://geoportal.example.pt/collections/a/items.csv"
+
+
+def _distribution(url, encoding_format, name="Distribution"):
+    return {"contentURL": url, "encodingFormat": encoding_format, "name": name}
+
+
+def _item_with_distributions(distributions, name="Dataset A"):
+    item = _item("a", name, ["geo"])
+    item["distribution"] = distributions
+    return item
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCResourceIdentityTest(PytestOnlyDBTestCase):
+    """Resources must keep their id — hence their permalink — across harvests.
+
+    They used to be wiped and rebuilt on every run (LEDG-2251).
+    """
+
+    def _harvest(self, rmock, source, distributions, name="Dataset A"):
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_distributions(distributions, name)]))
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_reharvest_keeps_the_resource_ids(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(GEOJSON_URL, "application/geo+json"),
+            _distribution(CSV_URL, "text/csv"),
+        ]
+        before = [r.id for r in self._harvest(rmock, source, distributions).resources]
+        assert len(before) == 2
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        assert [r.id for r in dataset.resources] == before
+
+    def test_renamed_dataset_keeps_the_resource_ids(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [_distribution(CSV_URL, "text/csv")]
+        before = [r.id for r in self._harvest(rmock, source, distributions).resources]
+
+        dataset = self._harvest(rmock, source, distributions, name="Dataset A revisto")
+
+        assert dataset.title == "Dataset A revisto"
+        assert [r.id for r in dataset.resources] == before
+
+    def test_distribution_dropped_upstream_disappears(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(GEOJSON_URL, "application/geo+json"),
+            _distribution(CSV_URL, "text/csv"),
+        ]
+        kept_id = self._harvest(rmock, source, distributions).resources[0].id
+
+        dataset = self._harvest(rmock, source, distributions[:1])
+
+        assert [r.url for r in dataset.resources] == [GEOJSON_URL]
+        assert [r.id for r in dataset.resources] == [kept_id]

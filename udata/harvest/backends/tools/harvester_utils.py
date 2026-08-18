@@ -3,8 +3,11 @@ import logging
 import random
 import re
 import time
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import requests
+
+from udata.models import Resource
 
 log = logging.getLogger(__name__)
 
@@ -66,3 +69,121 @@ def normalize_url_slashes(url: str) -> str:
         return "://".join(parts)
     else:
         return re.sub(r"/+", "/", url)
+
+
+def _url_key(url: str) -> str:
+    """Comparison key for resource URLs: normalized slashes, no outer spaces."""
+    return normalize_url_slashes((url or "").strip()).strip()
+
+
+def sync_resources(dataset, entries: list[dict]) -> None:
+    """Reconcile `dataset.resources` with the harvested `entries`, in place.
+
+    Each entry is a dict of `Resource` field values and must carry a `url`. An
+    entry matches an existing resource when the two URLs agree once normalized;
+    that resource object is then kept — and with it its `id`, hence the
+    `/api/1/datasets/r/<id>` permalink users copy and external integrations
+    consume — and only its fields are refreshed.
+
+    Harvesters used to do `dataset.resources = []` and rebuild every resource
+    from scratch, and since `Resource.id` is an `AutoUUIDField` that mints a new
+    UUID on every creation, each nightly run silently broke every permalink of
+    the dataset (LEDG-2251). Matching by URL follows the `odspt` backend, which
+    already reuses resources through `get_resource()`; dropping the entries that
+    vanished upstream follows `ckanpt`.
+
+    Resources absent from `entries` are removed, **except hosted ones**: those
+    were uploaded through the portal, never belonged to the harvester, and
+    deleting them would both lose the file and orphan it in storage.
+    """
+    available = list(dataset.resources)
+    synced = []
+    seen = set()
+
+    for entry in entries:
+        fields = dict(entry)
+        url = _url_key(fields.pop("url", None))
+        # A resource without a URL cannot be stored, and a URL harvested twice
+        # describes the same resource: keeping both would leave the duplicate
+        # matchless — and therefore with a brand new id — on the next run.
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        fields["url"] = url
+
+        resource = next((r for r in available if _url_key(r.url) == url), None)
+        if resource is None:
+            resource = Resource(**fields)
+        else:
+            available.remove(resource)
+            for name, value in fields.items():
+                setattr(resource, name, value)
+        synced.append(resource)
+
+    # Files uploaded on the portal are not part of the harvested payload.
+    synced.extend(resource for resource in available if resource.filetype == "file")
+
+    # Rebinding the list is not a wipe: these are the very same `Resource`
+    # objects, so their ids survive. It also reorders them after the source and
+    # drops whatever upstream no longer publishes.
+    dataset.resources = synced
+
+
+def collapse_duplicated_path(url: str) -> str:
+    """Drop a path tail that upstream metadata emitted twice in a row.
+
+    Some catalogues publish links whose path was concatenated with itself,
+    e.g. `.../geoportaldocs/_Clima/Portal/meta.xlsx_Clima/Portal/meta.xlsx`
+    (LEDG-2250). The doubled link 404s while the single one resolves, so the
+    repetition is stripped before the URL reaches a resource.
+
+    Only a tail spanning **more than one path segment** is collapsed: a single
+    repeated segment (`/reports/reports`) is a plausible real path, whereas a
+    multi-segment path repeating itself verbatim at the very end is not. The
+    longest such repetition wins. Scheme, host, query and fragment are left
+    untouched — the defect only ever affects the path.
+    """
+    if not url:
+        return url
+    parts = urlsplit(url)
+    path = parts.path
+    length = len(path)
+    for half in range(length // 2, 0, -1):
+        tail = path[length - half :]
+        if path[length - 2 * half : length - half] != tail:
+            continue
+        # Require the repeated tail to cross a segment boundary.
+        if "/" not in tail.strip("/"):
+            continue
+        return urlunsplit(parts._replace(path=path[: length - half]))
+    return url
+
+
+# Query-string service values that identify an OGC endpoint, e.g.
+# `...?SERVICE=WMS&REQUEST=GetCapabilities`.
+OGC_SERVICE_FORMATS = frozenset({"wms", "wfs", "wcs", "wmts", "csw"})
+
+
+def guess_url_format(url: str, fallback: str = "remote") -> str:
+    """Derive a resource format from `url`, or `fallback` when unknown.
+
+    An OGC `SERVICE=` query parameter wins over the file extension, since
+    those endpoints carry no extension at all. Otherwise the extension is read
+    from the **last path segment only** — reading it off the whole URL picks up
+    dots from the host name and from query strings, which is how `.xlsx`
+    documents ended up published as WMS services (LEDG-2250).
+    """
+    if not url:
+        return fallback
+    parts = urlsplit(url)
+    query = {key.lower(): value for key, value in parse_qs(parts.query).items()}
+    service = (query.get("service") or [""])[0].strip().lower()
+    if service in OGC_SERVICE_FORMATS:
+        return service
+    name = unquote(parts.path).rsplit("/", 1)[-1]
+    if "." in name:
+        extension = name.rsplit(".", 1)[-1].strip().lower()
+        # Anything else is upstream noise (`.pdf_Relatorio_2`, truncated paths).
+        if extension.isalnum() and len(extension) <= 5:
+            return extension
+    return fallback

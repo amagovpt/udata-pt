@@ -26,9 +26,9 @@ from udata.harvest.filters import (
     to_date,
 )
 from udata.harvest.models import HarvestItem
-from udata.models import License, Resource, SpatialCoverage
+from udata.models import License, SpatialCoverage
 
-from .tools.harvester_utils import with_http_retry
+from .tools.harvester_utils import sync_resources, with_http_retry
 
 log = logging.getLogger(__name__)
 
@@ -206,8 +206,10 @@ class CSWUdataBackend(BaseBackend):
         # Process spatial coverage
         self._process_spatial(dataset, data)
 
-        # Force recreation of all resources
-        dataset.resources = []
+        # Reconcile the resources with the record instead of recreating them:
+        # a fresh `Resource` gets a fresh id, and with it a fresh — therefore
+        # broken — download permalink (LEDG-2251).
+        resources = []
 
         for res_data in data.get("resources", []):
             url = res_data.get("url")
@@ -237,11 +239,16 @@ class CSWUdataBackend(BaseBackend):
             # Use resource name if available, otherwise use dataset title
             resource_title = name if name else dataset.title
 
-            # Create and append the resource
-            new_resource = Resource(
-                title=resource_title, url=url, filetype="remote", format=res_type
+            resources.append(
+                {
+                    "title": resource_title,
+                    "url": url,
+                    "filetype": "remote",
+                    "format": res_type,
+                }
             )
-            dataset.resources.append(new_resource)
+
+        sync_resources(dataset, resources)
 
         log.debug(
             f"Processed dataset {item.remote_id}: {dataset.title} with {len(dataset.resources)} resources"

@@ -32,6 +32,169 @@
     rejects a code whose target no longer matches, and `search` clears any
     pending code on re-point. Regression: `SAMLMigrationSecurityTest` in
     `udata/tests/frontend/test_saml.py`.
+- **fix: harvested resources keep their id, and their download link, across harvests**
+  - Eight backends — `dgt`, `dgtIne`, `ogc`, `apambiente`, `cswudata`, `ine`,
+    `inehvd` and `maaf` — emptied `dataset.resources` and rebuilt every resource
+    from scratch on each run. `Resource.id` is auto-generated, so each nightly
+    harvest minted a brand new UUID for every resource of every dataset it
+    touched, and the `/api/1/datasets/r/<id>` permalink — the link users copy
+    and share, and the one external integrations consume — died with it. This is
+    what users were reporting as "the URLs keep changing"; files uploaded on the
+    portal kept working because harvesters never touch them.
+  - Resources are now reconciled instead of recreated, through a single
+    `sync_resources` helper: an entry matches an existing resource when their
+    URLs agree once normalized, and that resource object is kept and refreshed
+    in place, so the id survives. Matching by URL reuses the approach the
+    `odspt` backend already had in `get_resource`, and pruning what upstream
+    stopped publishing follows `ckanpt`. As a side effect the per-resource
+    `extras` — the availability check results — and `created_at` survive too,
+    and a URL that the source lists twice no longer yields two resources.
+  - Resources uploaded through the portal onto a harvested dataset are no longer
+    deleted by the next harvest. They never belonged to the harvester, and
+    dropping them both lost the file and left it orphaned in storage.
+  - The already broken links are not recoverable: the old UUIDs are gone. This
+    only stops them from breaking again from the next harvest onwards.
+  - Deploying this requires restarting the Celery worker and beat. A
+    long-running worker keeps the previous backend code in memory, so scheduled
+    harvests would go on recreating the resources.
+- **feat(storages): raise the resource upload ceiling to 1 GiB and make it environment-tunable**
+  - `RESOURCES_FILE_MAX_SIZE` goes from 800 MB to 1 GiB (1073741824 bytes). The
+    limit is enforced in `storages.api`: `combine_chunks` aborts mid-write as
+    soon as the reassembled size would cross it (so an oversized file is never
+    fully written to disk) and `handle_upload` re-checks the finished file, which
+    also covers single-shot uploads. Nothing else in the upload path changes —
+    parts are still ~1 MB, so the perimeter WAF still sees only small requests.
+  - The value is now read from `udata.cfg` as `_env_int("RESOURCES_FILE_MAX_SIZE",
+    …)` instead of being fixed in `settings.py`. Environments that need a
+    different ceiling set it in `.env` (documented in `.env.example`) rather than
+    editing the tracked config on the host — the failure mode that left PRD
+    running an undocumented download-proxy timeout.
+  - The upload endpoints get their own harakiri budget of 600 s in
+    `uwsgi/front.ini` (`route = /upload/ harakiri:600`), up from the 120 s every
+    route inherited from `route-run`. The combine request reads every part,
+    writes the reassembled file and hashes it in one request — ~1074 parts at the
+    new ceiling — so on the old budget the worker was killed mid-combine and the
+    upload was lost after the user had already sent the whole file. The nginx
+    `proxy_read_timeout` in front must cover the same value, or the combine
+    response is abandoned with a 502 even when the backend finishes cleanly.
+  - The resource download endpoints get the same 600 s budget
+    (`route = ^/api/1/datasets/(r/|proxy/download/) harakiri:600`): the permanent
+    `/r/<id>` link that serves hosted files as attachments, and the proxy that
+    pulls remote resources (already allowed 300 s per chunk). On local storage
+    uWSGI hands the transfer to its offload threads and harakiri never applies,
+    but when the transfer runs inside the worker — an S3 backend, whose handle is
+    not a real file descriptor, or the remote proxy — a 1 GiB file does not fit in
+    120 s. Capacity note: with nginx `proxy_buffering` on (the default) the
+    backend writes at LAN speed and nginx feeds the slow client, so this budget
+    is not exposed to the user's connection; with buffering off, or a response
+    larger than `proxy_max_temp_file_size` (default exactly 1024m), nginx paces
+    the backend at the client's speed and a slow download can hold a worker for
+    the full 600 s.
+  - Still worth checking before raising the ceiling further: each upload needs
+    roughly twice the file size in transient space under `FS_ROOT` (chunk parts
+    plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
+    frontend sends up to three files in parallel.
+
+- **fix: restore the twelve tests that had been failing on `develop`**
+  - `.gitignore` carried a bare `data` entry, which git matches against any
+    file or directory of that name at any depth rather than the local data
+    directory at the repository root the comment describes. It swallowed two
+    upstream fixture directories, and the commit that introduced the pattern
+    deleted their contents in the same move, so
+    `udata/harvest/tests/ckan/data/dkan-french-w-license.json`,
+    `udata/tests/data/image.png` and `image.jpg` left the index unnoticed and
+    five tests have been raising `FileNotFoundError` ever since. The pattern is
+    now anchored to `/data` and the three blobs are back.
+  - `test_geo2france` asserted an `accessRights` value its own fixture no
+    longer contained. Upstream changed the fixture's `gmd:otherConstraints`
+    line and the assertions together when it added access rights harvesting;
+    merging that work here kept the test side and resolved the fixture side in
+    favour of our older copy. The single diverging line is realigned.
+  - Translating the `EU_HVD_CATEGORIES` labels to Portuguese changed the tag
+    slugs they produce, but the tests still spelled the French ones, so four
+    more failed — one on a tag comparison, three on `KeyError`. The six BNA
+    category URIs are now named constants and `EU_HVD_CATEGORY_TAGS` maps each
+    to its tag, with `TAG_TO_EU_HVD_CATEGORIES` as its reverse. Tests address
+    categories by URI, which is a stable vocabulary identifier, so they no
+    longer depend on the language the labels are written in.
+
+- **fix(harvest): repair self-concatenated URLs and the format guess in the APAmbiente harvester**
+  - One catalogue record publishes a `dct:references` link whose path is glued
+    to itself (`.../meta_2030_0.xlsx_Clima/.../meta_2030_0.xlsx`), so every
+    download of that resource answered `404`. The repetition comes from the
+    origin, not from us — the harvester never concatenated anything — so it is
+    now collapsed on the way in: a path tail that repeats verbatim and spans
+    more than one segment is dropped, leaving the link the origin actually
+    serves. A single repeated segment (`/reports/reports`) is left alone,
+    because that is a plausible real path rather than the defect.
+  - The resource format was derived from `url.split(".")[-1]`, which reads the
+    dots in the host name whenever the path carries no extension, and any
+    result longer than three characters was rewritten to `wms`. Spreadsheets,
+    presentations, metadata links and thumbnails were therefore all published
+    as map services. The extension is now read from the last path segment
+    only, an OGC `SERVICE=` query parameter takes precedence when there is no
+    extension to read, and anything unrecognised falls back to `remote` — the
+    same fallback the sibling CSW backend already uses. Replayed against the
+    live catalogue this corrects 46 of 3936 records and leaves the rest
+    untouched.
+  - The URL repair and the format guess live in `harvester_utils` as
+    standalone functions so they are covered directly, with the production
+    record that triggered the report used verbatim as the failing input.
+
+- **fix(dataset): hold the download proxy read timeout at 300s and make the value drift-proof**
+  - Production answered `502` to every upstream slower than 10s while the
+    documented default is 300s. No tracked file explained that: the
+    `DOWNLOAD_PROXY_*` keys were absent from the deployment config on every
+    environment branch, so the value in force was whatever an unreviewed host
+    edit happened to say, and the repo offered nothing to compare against. The
+    blast radius is wider than slow handshakes: the read timeout is an
+    inter-chunk budget, not a total, so too low a value also truncates
+    downloads that are already streaming.
+  - The three keys now sit in the versioned config — the read timeout
+    explicitly at 300s — each overridable through `.env`. An environment
+    needing different budgets no longer has a reason to hand-edit a tracked
+    file on the host, and the value in force is visible in the repo.
+  - `open_upstream` and `iter_capped` now read their budgets through in-code
+    fallbacks that mirror `Defaults`, instead of indexing `current_app.config`
+    directly. A host whose config predates the proxy section streams with the
+    documented budget rather than raising `KeyError` from inside a request —
+    the same pairing the harvest HTTP settings already use.
+  - A test pins the *effective* read timeout of the loaded config, not just the
+    default, so lowering it in either the config or the environment fails the
+    suite instead of surfacing later as a `502`.
+
+- **fix(dataset): redirect OGC services on `/datasets/r/<id>` instead of proxying them**
+  - WMS/WFS distributions were being force-downloaded through the LEDG-1214
+    proxy like any other remote resource, but their "download" is a
+    `GetCapabilities` handshake, not a file. Several catalogued services need
+    longer than the proxy's read timeout just to answer, so a working service
+    (e.g. DGT's ortophotos, ~13s to first byte) turned into a `502` on every
+    click, while the portal also charged itself the wait on the critical path
+    of a user action.
+  - Those resources now get the pre-LEDG-1765 `302` back, handing the wait to
+    the browser as before. Files are untouched: uploaded resources are still
+    streamed from storage and other remote resources still go through the
+    SSRF-guarded proxy with `Content-Disposition: attachment` — the branch is
+    checked after `fs_filename`, so an uploaded file whose format says `wms`
+    stays a download.
+  - Detection reuses `detect_ogc_service`, the helper the RDF catalog already
+    uses to decide what is a dataservice, so both agree on what a service is.
+    It also matches a `GetCapabilities` URL carrying a `service=` parameter,
+    which covers harvested resources whose `format` is wrong.
+
+- **feat(site): add the INSPIRE count to the datasets listing filter counts**
+  - New `rotulo_inspire` (`badges__kind=INSPIRE`) in the aggregated
+    `/site/datasets-listing/` payload, so the "Inspire" option added to the
+    frontend sidebar shows a count like the other options do. The INSPIRE badge
+    is granted from the `inspire` tag, which the DCAT harvester sets when the
+    dataset carries a GEMET INSPIRE theme.
+  - Each `rotulo_*` count is keyed on whatever the listing actually filters on
+    for that option, so the number next to an option matches the number of
+    results it returns: the new one on the badge (`?badge=inspire`),
+    `rotulo_high_value` still on the raw tag (`?tag=hvd`). Moving HVD to its
+    badge is deliberately left out — the badge job only grants it to datasets
+    of certified public-service organizations, so it currently covers a subset
+    of the tagged datasets.
 
 - **chore(uwsgi): enable honour-range for static-map downloads** [#176](https://github.com/amagovpt/udata-pt/pull/176)
   - Files under `/s/` are served by the uWSGI static-map, which ignores the
@@ -44,7 +207,7 @@
     The root fix (raising the WAF response timeout for `/s/`) is tracked
     separately with the infrastructure team.
 
-- **feat(dataservices)!: restrict API creation to public-service organizations** [#XXX](https://github.com/amagovpt/udata-pt/pull/XXX)
+- **feat(dataservices)!: restrict API creation to public-service organizations**
   - `POST /api/1/dataservices/` now returns 403 unless the API is published in
     the name of an organization carrying the `public-service` badge and the
     caller belongs to it (portal admins may publish for any eligible

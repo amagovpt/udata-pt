@@ -7,6 +7,7 @@ from udata.app import limiter
 from udata.core.dataservices.factories import (
     DataserviceFactory,  # noqa: F401 - registers Dataservice model
 )
+from udata.core.dataset.constants import INSPIRE
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.pages.factories import PageFactory
@@ -116,6 +117,77 @@ class SiteContactAPITest(APITestCase):
         assert 429 in statuses, f"contact form was not rate-limited: {sorted(set(statuses))}"
         # Legitimate submissions still go through below the cap.
         assert statuses.count(204) >= 1
+
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org",
+        DEFAULT_LANGUAGE="en",
+        GOOGLE_RECAPTCHA_SECRET_KEY=None,
+    )
+    def test_post_contact_preserves_message_line_breaks_in_html(self):
+        """The frontend composes the structured header (category, URL, datetime)
+        and the body into a single ``message`` joined by newlines. The HTML mail
+        must render those newlines as ``<br>`` so the fields don't collapse onto
+        a single line. Regression for the "tudo na mesma linha" report."""
+        message = (
+            "Categoria: Conteúdo incorreto ou indisponível\n"
+            "Página/URL: https://ppr-dadosgov.arte.gov.pt/pages/support\n"
+            "Data/hora aproximada: 05/06/2026 16:30\n"
+            "\n"
+            "TESTE este email é recebido em que situação?"
+        )
+        with capture_mails() as mails:
+            response = self.post(
+                url_for("api.site_contact"),
+                {
+                    "topic": "bug",
+                    "email": "user@example.org",
+                    "subject": "Conteúdo incorreto",
+                    "message": message,
+                },
+            )
+
+        self.assertStatus(response, 204)
+        assert len(mails) == 1
+        html = mails[0].html
+        # Each structured field is separated from the next by a <br>, and the
+        # blank line between header and body becomes a double break.
+        assert "Categoria: Conteúdo incorreto ou indisponível<br>" in html
+        assert "Página/URL: https://ppr-dadosgov.arte.gov.pt/pages/support<br>" in html
+        assert "Data/hora aproximada: 05/06/2026 16:30<br><br>" in html
+        # The bug was the whole message rendered as a single run with no breaks.
+        assert "<br>" in html
+        # The plain-text part keeps the original newlines verbatim.
+        assert message in mails[0].body
+
+    @pytest.mark.options(
+        MAIL_DEFAULT_RECEIVER="support@example.org",
+        DEFAULT_LANGUAGE="en",
+        GOOGLE_RECAPTCHA_SECRET_KEY=None,
+    )
+    def test_post_contact_does_not_truncate_long_message(self):
+        """Support messages can reach 5000 chars (frontend cap). The mail must
+        carry the full message instead of cutting it at the generic 200-char
+        ``LabelledContent`` truncation. Regression for truncated support bodies."""
+        tail = "END_OF_A_VERY_LONG_SUPPORT_MESSAGE"
+        message = "x" * 300 + tail
+        with capture_mails() as mails:
+            response = self.post(
+                url_for("api.site_contact"),
+                {
+                    "topic": "feedback",
+                    "email": "user@example.org",
+                    "subject": "Long feedback",
+                    "message": message,
+                },
+            )
+
+        self.assertStatus(response, 204)
+        assert len(mails) == 1
+        # The tail (well beyond the 200-char default) must survive in both parts.
+        assert tail in mails[0].html
+        assert tail in mails[0].body
+        # And nothing was elided.
+        assert "…" not in mails[0].body
 
     @pytest.mark.options(
         MAIL_DEFAULT_RECEIVER="support@example.org",
@@ -407,6 +479,10 @@ class SiteDatasetsListingAPITest(APITestCase):
         license = LicenseFactory()
         DatasetFactory.create_batch(3, organization=org, license=license)
         DatasetFactory(tags=["hvd"], organization=org)
+        DatasetFactory(organization=org).add_badge(INSPIRE)
+        # Carries the `inspire` tag but never got the badge: `rotulo_inspire`
+        # follows the badge, so this one must not be counted.
+        DatasetFactory(tags=["inspire"], organization=org)
 
         response = self.get(url_for("api.site_datasets_listing"))
         self.assert200(response)
@@ -440,11 +516,14 @@ class SiteDatasetsListingAPITest(APITestCase):
             "atualizacao_3_years",
             "rotulo_all",
             "rotulo_high_value",
+            "rotulo_inspire",
         ):
             assert key in counts, f"missing filter count: {key}"
         assert counts["formato_all"] == counts["atualizacao_all"] == counts["rotulo_all"]
         assert counts["rotulo_high_value"] >= 1
-        assert counts["atualizacao_all"] >= 4
+        # Only the badged dataset counts; the merely tagged one is excluded.
+        assert counts["rotulo_inspire"] == 1
+        assert counts["atualizacao_all"] >= 6
 
         assert any(o["id"] == str(org.id) for o in payload["organizations"])
         assert any(lic["id"] == license.id for lic in payload["licenses"])

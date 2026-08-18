@@ -9,7 +9,7 @@ Classes:
     PortalAmbienteBackend: Custom udata harvester backend for the Environment Portal.
 
 Functions:
-    normalize_url_slashes(url: str) -> str: Utility to normalize slashes in URLs (imported).
+    build_resource_url(raw_url: str) -> str: Turn a `dct:references` link into a resource URL.
 
 Usage:
     This backend is intended to be used as a plugin in a udata instance. It will fetch datasets from the configured
@@ -20,11 +20,28 @@ from owslib.csw import CatalogueServiceWeb
 
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
-from udata.models import License, Resource
+from udata.models import License
 
-from .tools.harvester_utils import normalize_url_slashes, with_http_retry
+from .tools.harvester_utils import (
+    collapse_duplicated_path,
+    guess_url_format,
+    normalize_url_slashes,
+    sync_resources,
+    with_http_retry,
+)
 
 # backend = 'https://sniambgeoportal.apambiente.pt/geoportal/csw'
+
+
+def build_resource_url(raw_url: str) -> str:
+    """Turn a raw `dct:references` link into the URL published on the resource.
+
+    The catalogue hands out Windows-style separators and, on at least one
+    record, a path concatenated with itself — that doubled link 404s while the
+    single one downloads (LEDG-2250). Both defects are repaired here so the
+    resource URL matches what the origin actually serves.
+    """
+    return collapse_duplicated_path(normalize_url_slashes(raw_url))
 
 
 class PortalAmbienteBackend(BaseBackend):
@@ -67,8 +84,8 @@ class PortalAmbienteBackend(BaseBackend):
                 item["id"] = record.identifier
                 item["title"] = record.title
                 item["description"] = record.abstract
-                # Normalize URL slashes to ensure compatibility
-                item["url"] = normalize_url_slashes(record.references[0].get("url"))
+                # Repair the separators and self-concatenated paths the catalogue emits
+                item["url"] = build_resource_url(record.references[0].get("url"))
                 item["type"] = record.type
                 # Process the dataset (create or update in udata)
                 self.process_dataset(record.identifier, title=record.title, date=None, items=item)
@@ -106,21 +123,29 @@ class PortalAmbienteBackend(BaseBackend):
 
         dataset.description = item.get("description")
 
-        # Force recreation of all resources
-        dataset.resources = []
-
         url = item.get("url")
 
-        # Determine resource format/type
+        # Determine resource format/type. `liveData` records describe a map
+        # service; everything else is a file, so the format comes from the URL
+        # itself instead of being guessed from its length.
         if item.get("type") == "liveData":
-            type = "wms"
+            resource_format = "wms"
         else:
-            type = url.split(".")[-1].lower()
-            if len(type) > 3:
-                type = "wms"
+            resource_format = guess_url_format(url)
 
-        # Create and append the resource
-        new_resource = Resource(title=dataset.title, url=url, filetype="remote", format=type)
-        dataset.resources.append(new_resource)
+        # Refresh the resource in place rather than recreating it: a new
+        # `Resource` would mean a new id, i.e. a dead download permalink for
+        # everyone who had copied the previous one (LEDG-2251).
+        sync_resources(
+            dataset,
+            [
+                {
+                    "title": dataset.title,
+                    "url": url,
+                    "filetype": "remote",
+                    "format": resource_format,
+                }
+            ],
+        )
 
         return dataset

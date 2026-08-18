@@ -88,8 +88,9 @@ docker-compose.override.yml
 # Local configuration file of udata
 # udata.cfg
 
-# Local data directory
-data
+# Local data directory (root only: an unanchored `data` also matches the
+# test fixture directories udata/tests/data and udata/harvest/tests/ckan/data)
+/data
 
 node_modules/
 udata/auth/saml/credentials/

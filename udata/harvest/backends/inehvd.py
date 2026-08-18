@@ -4,7 +4,9 @@ from xml.dom import minidom
 
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
-from udata.models import License, Resource
+from udata.models import License
+
+from .tools.harvester_utils import sync_resources
 
 
 class INEHvdBackend(BaseBackend):
@@ -174,34 +176,37 @@ class INEHvdBackend(BaseBackend):
         if html_node:
             dataset.extras["bdd_url"] = get_text(html_node[0].getElementsByTagName("bdd_url"))
 
-        # Resources
-        dataset.resources = []
+        # Resources: matched against the ones already stored, so that the
+        # download permalinks stay valid across harvests (LEDG-2251).
+        resources = []
 
         json_node = target.getElementsByTagName("json")
         if json_node:
             # JSON Dataset Resource
             json_ds_url = get_text(json_node[0].getElementsByTagName("json_dataset"))
             if json_ds_url:
-                dataset.resources.append(
-                    Resource(
-                        title="Dados (JSON)",
-                        url=json_ds_url,
-                        filetype="remote",
-                        mime="application/json",
-                    )
+                resources.append(
+                    {
+                        "title": "Dados (JSON)",
+                        "url": json_ds_url,
+                        "filetype": "remote",
+                        "mime": "application/json",
+                    }
                 )
 
             # JSON Metainfo Resource
             json_meta_url = get_text(json_node[0].getElementsByTagName("json_metainfo"))
             if json_meta_url:
-                dataset.resources.append(
-                    Resource(
-                        title="Metainfo (JSON)",
-                        url=json_meta_url,
-                        filetype="remote",
-                        mime="application/json",
-                    )
+                resources.append(
+                    {
+                        "title": "Metainfo (JSON)",
+                        "url": json_meta_url,
+                        "filetype": "remote",
+                        "mime": "application/json",
+                    }
                 )
+
+        sync_resources(dataset, resources)
 
         return dataset
 
