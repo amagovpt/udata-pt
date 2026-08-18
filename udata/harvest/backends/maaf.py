@@ -19,9 +19,11 @@ from udata.harvest.filters import (
     to_date,
 )
 from udata.harvest.models import HarvestItem
-from udata.models import Checksum, License, Resource, SpatialCoverage
+from udata.models import Checksum, License, SpatialCoverage
 from udata.mongo.datetime_fields import DateRange
 from udata.utils import get_by
+
+from .tools.harvester_utils import sync_resources
 
 log = logging.getLogger(__name__)
 
@@ -190,24 +192,29 @@ class MaafBackend(BaseBackend):
             if metadata.get("territorial_coverage_code"):
                 dataset.spatial.zones = [ZONES[metadata["territorial_coverage_code"]]]
 
-        dataset.resources = []
+        # Resources are reconciled with the remote listing rather than rebuilt,
+        # so an unchanged file keeps its id and its download permalink
+        # (LEDG-2251).
+        resources = []
         cle = get_by(metadata["resources"], "format", "cle")
         for row in metadata["resources"]:
             if row["format"] == "cle":
                 continue
             else:
-                resource = Resource(
-                    title=row["name"],
-                    description=(row["description"] + "\n\n" + SSL_COMMENT).strip(),
-                    filetype="remote",
-                    url=row["url"],
-                    format=row["format"],
-                )
-                if resource.format == "csv" and cle:
-                    resource.checksum = Checksum(type="sha256", value=self.get(cle["url"]).text)
+                fields = {
+                    "title": row["name"],
+                    "description": (row["description"] + "\n\n" + SSL_COMMENT).strip(),
+                    "filetype": "remote",
+                    "url": row["url"],
+                    "format": row["format"],
+                }
+                if fields["format"] == "csv" and cle:
+                    fields["checksum"] = Checksum(type="sha256", value=self.get(cle["url"]).text)
                 if row.get("last_modified"):
-                    resource.last_modified_internal = row["last_modified"]
-                dataset.resources.append(resource)
+                    fields["last_modified_internal"] = row["last_modified"]
+                resources.append(fields)
+
+        sync_resources(dataset, resources)
 
         if metadata.get("author"):
             dataset.extras["author"] = metadata["author"]
