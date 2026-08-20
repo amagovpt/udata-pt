@@ -1,6 +1,7 @@
 from flask import session
 
 from udata.api import api, base_reference, fields
+from udata.auth import current_user
 from udata.auth.helpers import current_user_is_admin_or_self
 
 from .constants import BIGGEST_AVATAR_SIZE
@@ -9,6 +10,16 @@ from .constants import BIGGEST_AVATAR_SIZE
 def _get_saml_login():
     """Return True if the current session was authenticated via SAML."""
     return session.get("saml_login", False)
+
+
+def _is_current_user(user) -> bool:
+    """True when the serialized user is the authenticated caller.
+
+    Session-derived flags (like saml_login) only make sense for the caller's
+    own account: on any other user they would leak the *viewer's* session
+    state, which is meaningless and misleading.
+    """
+    return current_user.is_authenticated and current_user.id == user.id
 
 
 def _count_user_datasets(user) -> int:
@@ -31,9 +42,7 @@ def _count_user_reuses(user) -> int:
     """
     from udata.models import Reuse  # avoid circular imports
 
-    return Reuse.objects(
-        owner=user, private__ne=True, archived=None, deleted=None
-    ).count()
+    return Reuse.objects(owner=user, private__ne=True, archived=None, deleted=None).count()
 
 
 user_ref_fields = api.inherit(
@@ -75,6 +84,27 @@ user_fields = api.model(
         "email": fields.Raw(
             attribute=lambda o: o.email if current_user_is_admin_or_self() else None,
             description="The user email",
+            readonly=True,
+        ),
+        # In user_fields (not the unused me_fields) because GET /api/1/me/
+        # marshals user_fields; only meaningful for the caller's own session,
+        # so it is null on any other user.
+        "saml_login": fields.Raw(
+            attribute=lambda o: _get_saml_login() if _is_current_user(o) else None,
+            description="Whether the current session was authenticated via SAML "
+            "(only present on the caller's own user, e.g. /me)",
+            readonly=True,
+        ),
+        # In user_fields (not the unused me_fields) because GET /api/1/me/
+        # marshals user_fields; guarded like email so public user listings
+        # never disclose which accounts still hold a placeholder email.
+        "pending_registration": fields.Raw(
+            attribute=lambda o: (
+                o.has_placeholder_email if current_user_is_admin_or_self() else None
+            ),
+            description="True while the account still has a minted saml-* placeholder "
+            "email; the user must provide a real email to complete registration "
+            "(only present for global admins and on /me)",
             readonly=True,
         ),
         "avatar": fields.ImageField(original=True, description="The user avatar URL"),
@@ -133,16 +163,14 @@ user_fields = api.model(
     },
 )
 
+# NOTE: currently unused — GET /api/1/me/ marshals user_fields, so anything
+# meant to appear on /me must live there (guarded). Kept only for the swagger
+# model; marshalling this on GET would also expose apikey on every /me poll.
 me_fields = api.inherit(
     "Me",
     user_fields,
     {
         "apikey": fields.String(description="The user API Key", readonly=True),
-        "saml_login": fields.Boolean(
-            attribute=lambda o: _get_saml_login(),
-            description="Whether the current session was authenticated via SAML",
-            readonly=True,
-        ),
     },
 )
 

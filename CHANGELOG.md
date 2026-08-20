@@ -9,6 +9,60 @@
     so the whole `test_saml.py` suite never ran green. Assertions and the
     wizard docstring now match the real `/migrate-account` path; no
     behaviour change.
+- **fix: eIDAS login never extracted the eIDAS attributes it requests**
+  - The eIDAS AuthnRequest asks for the eidas.europa.eu natural-person
+    attributes (`PersonIdentifier` required, `CurrentGivenName`,
+    `CurrentFamilyName`, …), but the `/saml/eidas/sso` postback only read
+    the CMD MDC/Cidadao URIs — and eIDAS carries neither a NIC nor an email,
+    so a foreign citizen's login always dead-ended in "error" and a redirect
+    to /login: no account, no stored identifier, no email flow.
+  - The postback now reads both namespaces (MDC first, in case the PT node
+    translates), mapping `CurrentGivenName` → `first_name` (NomeProprio),
+    `CurrentFamilyName` → `last_name` (NomeApelido), and `PersonIdentifier`
+    into the same `extras.auth_nic` slot as the CMD NIC (HMAC-hashed; the
+    formats cannot collide), so repeat logins resolve the same account and
+    the migration wizard, Subject↔identifier binding (kept strict,
+    fail-closed) and admin commands work identically to CMD. eIDAS has no
+    email attribute, so eIDAS accounts get a placeholder email and go
+    through the complete-registration page like any CMD account without a
+    usable email. Attribute URIs are now shared constants between the
+    AuthnRequests and the extraction so they cannot drift again.
+  - Tests: new `SAMLEidasSSOTest` success-path suite (account shape, repeat
+    login, wizard candidate, NameID binding, MDC-translated responses) —
+    the existing eIDAS tests were rejection-only and mocked CMD attributes,
+    which is why this was never caught. Real-IdP validation in TST is
+    required before promoting (confirm which URIs the PT node returns and
+    that NameID == PersonIdentifier).
+- **fix: actually return `saml_login` on `GET /api/1/me/`**
+  - The field was defined on the `me_fields` model, but the endpoint marshals
+    `user_fields`, so it was never present in the response — the frontend's
+    `samlLogin` state was always false (e.g. the profile page never hid the
+    change-email control for SAML sessions as intended). The field now lives
+    in `user_fields`, returned only when the serialized user is the
+    authenticated caller: the flag comes from the caller's session, so on any
+    other user it would leak the viewer's own session state — it is `null`
+    there instead. The stale duplicate was removed from `me_fields`, which is
+    documented as currently unused.
+- **feat: force CMD/SAML accounts with a placeholder email to complete registration with a real one**
+  - Accounts created from a CMD identity without a usable email get a minted
+    `saml-*@autenticacao.gov.pt` placeholder and could previously browse
+    indefinitely with it. Now any CMD/eIDAS login that lands on a placeholder
+    email — a freshly created account, or an older one from before this
+    check — is redirected to the frontend `/complete-registration` page
+    instead of its destination, where the user must provide a valid email
+    (verified through the existing change-email confirmation link) to
+    conclude registration. `/saml/migration/skip` also reports
+    `pending_registration` in its JSON response so the wizard can route the
+    user there.
+  - `GET /api/1/me/` now exposes a `pending_registration` boolean (guarded
+    like `email`: only for admins and on `/me`) so the frontend can gate
+    navigation. Placeholder mint and detection share constants in
+    `udata/core/user/constants.py` (`User.has_placeholder_email`).
+  - `/change-email` is now rate-limited (5/min keyed per authenticated user,
+    not per IP, because the PRD proxy chain collapses visitors onto shared
+    egress IPs) so the confirmation-mail sender cannot be used as an open
+    relay, and `ChangeEmailForm` rejects an already-registered email at
+    submit time instead of only after the confirmation link is clicked.
 - **feat: CMD (Chave Móvel Digital) account linking with mandatory ownership confirmation**
   - Direct login on a CMD/SAML callback now happens ONLY when the NIC is
     already linked to an account. Any other match — by email or by

@@ -403,6 +403,22 @@ _OUTSTANDING_RELAY_KEY = "saml_outstanding_relay:{token}"
 _OUTSTANDING_RELAY_TTL = 600  # 10 minutes — enough for the user to complete CMD
 _OUTSTANDING_RELAY_TOKEN_BYTES = 32
 
+# CMD (autenticacao.gov MDC) attribute URIs — used both in the AuthnRequest
+# RequestedAttributes and in the SSO postback extraction.
+MDC_ATTR_EMAIL = "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+MDC_ATTR_NIC = "http://interop.gov.pt/MDC/Cidadao/NIC"
+MDC_ATTR_FIRST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
+MDC_ATTR_LAST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+
+# eIDAS natural-person attribute URIs. Field mapping to the CMD equivalents:
+# PersonIdentifier → NIC slot (extras.auth_nic, HMAC-hashed),
+# CurrentGivenName → first_name (NomeProprio), CurrentFamilyName → last_name
+# (NomeApelido). eIDAS has no email attribute, so eIDAS accounts always get
+# a placeholder email and must complete registration on the frontend.
+EIDAS_ATTR_PERSON_IDENTIFIER = "http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"
+EIDAS_ATTR_GIVEN_NAME = "http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"
+EIDAS_ATTR_FAMILY_NAME = "http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"
+
 
 def _remember_outstanding(reqid, kind):
     """Record an AuthnRequest id in the user's session.
@@ -628,7 +644,14 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
     if not user_email or datastore.find_user(email=user_email):
         import uuid
 
-        user_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
+        from udata.core.user.constants import (
+            SAML_PLACEHOLDER_EMAIL_DOMAIN,
+            SAML_PLACEHOLDER_EMAIL_PREFIX,
+        )
+
+        user_email = (
+            f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
+        )
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -649,6 +672,12 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
 
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
+
+    ``user_nic`` carries the unique identifier of the authenticated identity:
+    the NIC for CMD logins, or the eIDAS PersonIdentifier (e.g. "ES/PT/...")
+    for eIDAS logins. Both are HMAC-hashed into ``extras.auth_nic`` — the
+    formats cannot collide, and every lookup/linking rule below applies to
+    either provider identically.
 
     Decision order:
     1. NIC already linked → direct login (entry rule). This is the ONLY
@@ -745,6 +774,16 @@ def _handle_saml_user_login(user, new_account=False):
 
     login_user(user)
     session["saml_login"] = True
+
+    # Accounts still holding a minted saml-* placeholder email (new accounts
+    # created without a usable CMD email, or older ones from before this
+    # check) must provide a real email before using the portal. The original
+    # destination is dropped on purpose: completing registration is a hard
+    # precondition, and the page explains the situation itself (no
+    # cmd_new_account banner needed).
+    if user.has_placeholder_email:
+        return redirect(f"{frontend_url}/complete-registration")
+
     destination = f"{frontend_url}{next_path}" if next_path else (frontend_url or "/")
     if new_account:
         separator = "&" if "?" in destination else "?"
@@ -964,22 +1003,22 @@ def sp_initiated():
     spcertenc = RequestedAttributes(
         [
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/CorreioElectronico",
+                name=MDC_ATTR_EMAIL,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/NIC",
+                name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/NomeProprio",
+                name=MDC_ATTR_FIRST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/NomeApelido",
+                name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
@@ -1239,12 +1278,10 @@ def idp_initiated():
                 pass
 
         if identity:
-            user_email = _first_value(
-                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-            )
-            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            user_email = _first_value(identity, MDC_ATTR_EMAIL)
+            user_nic = _first_value(identity, MDC_ATTR_NIC)
+            first_name = _first_value(identity, MDC_ATTR_FIRST_NAME)
+            last_name = _first_value(identity, MDC_ATTR_LAST_NAME)
             current_app.logger.warning(
                 f"[DEBUG] SAML atributos extraídos: email={user_email!r}, "
                 f"nic_present={bool(user_nic)}, nome={first_name!r} {last_name!r}, "
@@ -1425,17 +1462,17 @@ def sp_eidas_initiated():
     spcertenc = RequestedAttributes(
         [
             RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier",
+                name=EIDAS_ATTR_PERSON_IDENTIFIER,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
             RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName",
+                name=EIDAS_ATTR_FAMILY_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
             RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName",
+                name=EIDAS_ATTR_GIVEN_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
@@ -1604,14 +1641,29 @@ def idp_eidas_initiated():
     try:
         identity = authn_response.get_identity()
         if identity:
-            user_email = _first_value(
-                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+            # MDC (CMD) URIs first — the PT node may translate eIDAS
+            # attributes into them — then the eIDAS natural-person URIs the
+            # AuthnRequest actually asks for. Mapping: PersonIdentifier →
+            # NIC slot, CurrentGivenName → first_name, CurrentFamilyName →
+            # last_name. eIDAS carries no email attribute: the account is
+            # created with a placeholder email and the user completes
+            # registration on the frontend.
+            user_email = _first_value(identity, MDC_ATTR_EMAIL)
+            user_nic = _first_value(identity, MDC_ATTR_NIC) or _first_value(
+                identity, EIDAS_ATTR_PERSON_IDENTIFIER
             )
-            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            first_name = _first_value(identity, MDC_ATTR_FIRST_NAME) or _first_value(
+                identity, EIDAS_ATTR_GIVEN_NAME
+            )
+            last_name = _first_value(identity, MDC_ATTR_LAST_NAME) or _first_value(
+                identity, EIDAS_ATTR_FAMILY_NAME
+            )
+            id_source = (
+                "mdc" if _first_value(identity, MDC_ATTR_NIC) else ("eidas" if user_nic else None)
+            )
             current_app.logger.info(
-                f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
+                f"eIDAS atributos via pysaml2: email={user_email}, "
+                f"id={'***' if user_nic else None} (source={id_source}), "
                 f"nome={first_name} {last_name}"
             )
     except Exception as e:
@@ -1619,7 +1671,7 @@ def idp_eidas_initiated():
 
     if not user_email and not user_nic:
         current_app.logger.error(
-            "eIDAS SSO: nenhum atributo extraído (email/NIC). "
+            "eIDAS SSO: nenhum atributo extraído (email/NIC/PersonIdentifier). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
             "tem acesso à chave privada para desencriptar."
         )
@@ -2012,4 +2064,7 @@ def migration_skip():
     session.pop("migration_send_count", None)
     session.pop("migration_password_attempts", None)
 
-    return jsonify({"success": True})
+    # A placeholder email means registration is not complete yet: the
+    # frontend must send the user to /complete-registration instead of
+    # the homepage.
+    return jsonify({"success": True, "pending_registration": user.has_placeholder_email})
