@@ -1466,6 +1466,60 @@ class SAMLEidasSSOTest(APITestCase):
             assert user.email == "citizen@example.pt"
             assert user.extras.get("auth_nic") == _hash_nic("12345678")
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_falls_back_to_ava_when_identity_is_empty(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Parity with CMD: some responses expose attributes only through
+        ``ava`` while ``get_identity()`` returns empty — the extraction
+        must fall back to ``ava`` instead of rejecting the login."""
+        mock_response = _make_authn_response_mock(
+            person_identifier=self.PERSON_ID,
+            given_name="Carmen",
+            family_name="García",
+        )
+        # get_identity() empty, attributes only reachable through .ava.
+        mock_response.get_identity.return_value = {}
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = mock_response
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(
+            person_identifier=self.PERSON_ID, given_name="Carmen", family_name="García"
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(xml)
+
+            assert mock_login.call_count == 1
+            user = mock_login.call_args[0][0]
+            assert user.extras.get("auth_nic") == _hash_nic(self.PERSON_ID)
+            assert user.first_name == "Carmen"
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_without_identifier_reports_received_attribute_uris(self, mock_client_for):
+        """When the response carries neither email nor NIC/PersonIdentifier,
+        the rejection redirect exposes the attribute URIs that DID arrive
+        (schema names only) so a browser trace suffices to diagnose."""
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                given_name="Carmen",
+                family_name="García",
+            )
+            mock_login.assert_not_called()
+
+        assert response.status_code == 302
+        location = response.headers["Location"]
+        assert "saml_error=missing_attributes" in location
+        # URL-encoded CurrentGivenName URI must be present in saml_detail.
+        assert "saml_detail=" in location
+        assert "CurrentGivenName" in location
+
 
 class SAMLLogoutFlowTest(APITestCase):
     """Test the SAML logout callback clears the session."""

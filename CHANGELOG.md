@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **fix: eIDAS attribute extraction falls back to `ava` and reports received attribute URIs**
+  - DEV validation showed `saml_error=missing_attributes`: the eIDAS
+    response passes every security check but `get_identity()` yields no
+    usable attribute. The CMD postback already falls back to the pysaml2
+    `ava` mapping when `get_identity()` comes back empty — the eIDAS
+    postback now does the same (plus the same empty-identity diagnostic
+    log).
+  - When a response still carries neither email nor NIC/PersonIdentifier,
+    the rejection redirect now includes `saml_detail=<attribute URIs>`
+    (schema names only, never values) so a browser network trace alone
+    shows exactly what the IdP returned and the next fix can be targeted.
 - **feat: expose the SAML rejection code in the login redirect (`?saml_error=`)**
   - Every fail-closed exit of the CMD/eIDAS SSO callbacks redirects to the
     frontend login page; without backend-log access the failure modes are

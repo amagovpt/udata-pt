@@ -601,6 +601,7 @@ def _reject_saml_login(
     issuer=None,
     name_id=None,
     reason=None,
+    detail=None,
 ):
     """Reject a SAML SSO request: log + audit + flash + redirect.
 
@@ -617,8 +618,13 @@ def _reject_saml_login(
     # Surface the rejection code in the redirect so the failure is visible
     # in a browser network trace (environments where operators cannot reach
     # the backend logs). Short internal codes only — never log text.
+    # ``detail`` may carry non-sensitive schema information (e.g. the
+    # attribute URIs the IdP returned) — never identity values.
     error_code = quote(reason or "rejected", safe="")
-    return redirect(f"{frontend_url}/login?saml_error={error_code}")
+    destination = f"{frontend_url}/login?saml_error={error_code}"
+    if detail:
+        destination += f"&saml_detail={quote(detail, safe='')}"
+    return redirect(destination)
 
 
 def _hash_nic(nic):
@@ -1645,11 +1651,26 @@ def idp_eidas_initiated():
         )
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
-    # Não existe fallback: atributos só são lidos depois da assinatura
-    # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
+    # Atributos só são lidos depois da assinatura ter sido verificada
+    # por pysaml2 (VULN-2077 / TICKET-58).
+    identity_keys_csv = ""
     try:
         identity = authn_response.get_identity()
+
+        # Também tentar ava (attribute value assertions) como alternativa —
+        # mesmo fallback do postback CMD: nalgumas respostas o get_identity()
+        # vem vazio mas os atributos estão em ``ava``.
+        if not identity:
+            try:
+                ava = authn_response.ava
+                current_app.logger.info(f"eIDAS pysaml2 ava: {list(ava.keys()) if ava else None}")
+                if ava:
+                    identity = ava
+            except AttributeError:
+                pass
+
         if identity:
+            identity_keys_csv = ",".join(sorted(identity.keys())[:12])
             # MDC (CMD) URIs first — the PT node may translate eIDAS
             # attributes into them — then the eIDAS natural-person URIs the
             # AuthnRequest actually asks for. Mapping: PersonIdentifier →
@@ -1677,6 +1698,15 @@ def idp_eidas_initiated():
                 f"identity_keys={list(identity.keys())}, "
                 f"name_id_format={name_id_format!r}"
             )
+        else:
+            # Mesmo log de diagnóstico do postback CMD.
+            current_app.logger.warning(
+                f"eIDAS pysaml2: identity vazio. "
+                f"response type={type(authn_response).__name__}, "
+                f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
+                f"encrypted_assertions="
+                f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
+            )
     except Exception as e:
         current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
 
@@ -1684,7 +1714,8 @@ def idp_eidas_initiated():
         current_app.logger.error(
             "eIDAS SSO: nenhum atributo extraído (email/NIC/PersonIdentifier). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
-            "tem acesso à chave privada para desencriptar."
+            "tem acesso à chave privada para desencriptar. "
+            f"identity_keys={identity_keys_csv!r}"
         )
 
     # 2b. NameID ↔ identifier binding (VULN-2077 / TICKET-58).
@@ -1728,8 +1759,23 @@ def idp_eidas_initiated():
         user = _create_saml_user(user_email, user_nic, first_name, last_name)
         status = "new"
 
+    if user is None:
+        # Neither email nor NIC/PersonIdentifier came through: nothing to
+        # authenticate against. Surface the attribute URIs that DID arrive
+        # (schema names only, never values) so a browser network trace is
+        # enough to diagnose what the IdP actually returned.
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: sem atributos utilizáveis (identity_keys={identity_keys_csv!r})",
+            _("Autenticação rejeitada: resposta sem atributos de identidade."),
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="missing_attributes",
+            detail=identity_keys_csv,
+        )
+
     _audit_saml(
-        "success" if user else "user_not_found",
+        "success",
         "eidas",
         issuer=issuer,
         name_id=name_id_value,
