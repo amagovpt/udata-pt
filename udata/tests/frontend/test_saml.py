@@ -590,6 +590,9 @@ class SAMLLoginFlowTest(APITestCase):
 
             assert response.status_code == 302
             assert "login" in response.location.lower()
+            # The redirect carries a diagnosis code readable from a browser
+            # network trace (no backend-log access needed).
+            assert "saml_error=missing_attributes" in response.location
 
     def test_login_sets_saml_session_flag(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
@@ -1140,6 +1143,9 @@ class SAMLVuln2077RegressionTest(APITestCase):
             response = self._post_saml_response(xml)
             mock_login.assert_not_called()
         assert response.status_code == 302
+        # The rejection code is exposed in the redirect for browser-trace
+        # diagnosis (environments without backend-log access).
+        assert "saml_error=issuer_untrusted" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_rejects_subject_attribute_mismatch(self, mock_client_for):
@@ -1411,6 +1417,7 @@ class SAMLEidasSSOTest(APITestCase):
 
         assert response.status_code == 302
         assert "/login" in response.headers["Location"]
+        assert "saml_error=subject_nic_mismatch" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
