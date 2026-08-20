@@ -13,6 +13,7 @@ import secrets
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
@@ -613,7 +614,11 @@ def _reject_saml_login(
     _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason=reason or log_message)
     do_flash(flash_message, "error")
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-    return redirect(f"{frontend_url}/login")
+    # Surface the rejection code in the redirect so the failure is visible
+    # in a browser network trace (environments where operators cannot reach
+    # the backend logs). Short internal codes only — never log text.
+    error_code = quote(reason or "rejected", safe="")
+    return redirect(f"{frontend_url}/login?saml_error={error_code}")
 
 
 def _hash_nic(nic):
@@ -758,7 +763,10 @@ def _handle_saml_user_login(user, new_account=False):
             f"(frontend_url={frontend_url!r})"
         )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
-        return redirect(f"{frontend_url}/login")
+        # user is None only when the IdP response carried neither an email
+        # nor a NIC/PersonIdentifier — expose it in the redirect for
+        # browser-trace diagnosis (see _reject_saml_login).
+        return redirect(f"{frontend_url}/login?saml_error=missing_attributes")
 
     if requires_confirmation(user):
         # Auto-confirm on SAML login — autenticação.gov already verified the user.
@@ -1125,7 +1133,7 @@ def idp_initiated():
                     )
                     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
                     do_flash(f"Autenticação rejeitada: {display_msg}", "error")
-                    return redirect(f"{frontend_url}/login")
+                    return redirect(f"{frontend_url}/login?saml_error=idp_denied")
     except Exception as e:
         current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
 

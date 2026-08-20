@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **feat: expose the SAML rejection code in the login redirect (`?saml_error=`)**
+  - Every fail-closed exit of the CMD/eIDAS SSO callbacks redirects to the
+    frontend login page; without backend-log access the failure modes are
+    indistinguishable from a browser trace. The redirect now carries a short
+    internal code (`signature_invalid`, `issuer_untrusted`,
+    `subject_nic_mismatch`, `replay`, `idp_denied`,
+    `missing_attributes`, …) so the reason is readable straight from the
+    browser network log. Codes only — no log text or identity data leaks
+    into the URL.
 - **fix: eIDAS logins were rejected by the NameID binding once PersonIdentifier extraction landed**
   - Observed in TST: after completing the eIDAS flow the user was bounced
     back to the login page. autenticacao.gov emits the Subject NameID as an
