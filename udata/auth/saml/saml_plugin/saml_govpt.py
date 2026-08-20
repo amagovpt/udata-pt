@@ -1626,6 +1626,7 @@ def idp_eidas_initiated():
             reason="subject_unreadable",
         )
     name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    name_id_format = (getattr(subject, "format", None) or "").strip() if subject else ""
     if not name_id_value:
         return _reject_saml_login(
             "eIDAS SSO rejeitado: Subject/NameID em falta",
@@ -1664,7 +1665,9 @@ def idp_eidas_initiated():
             current_app.logger.info(
                 f"eIDAS atributos via pysaml2: email={user_email}, "
                 f"id={'***' if user_nic else None} (source={id_source}), "
-                f"nome={first_name} {last_name}"
+                f"nome={first_name} {last_name}, "
+                f"identity_keys={list(identity.keys())}, "
+                f"name_id_format={name_id_format!r}"
             )
     except Exception as e:
         current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
@@ -1676,8 +1679,21 @@ def idp_eidas_initiated():
             "tem acesso à chave privada para desencriptar."
         )
 
-    # 2b. NameID ↔ NIC binding (VULN-2077 / TICKET-58).
-    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+    # 2b. NameID ↔ identifier binding (VULN-2077 / TICKET-58).
+    # Same rule as the CMD postback: autenticacao.gov emits NameID as an
+    # opaque pseudonym with Format=unspecified — it is unrelated to the
+    # NIC/PersonIdentifier attribute, so the equality check would always
+    # fail (observed in TST: every eIDAS login was rejected with
+    # subject_nic_mismatch once PersonIdentifier extraction landed). XSW
+    # protection still comes from the Response signature (xmlsec1), the
+    # Issuer whitelist, the replay cache and allow_unsolicited=False; the
+    # binding only adds value for IdPs that emit the identifier as Subject.
+    # Skip it when the format is unspecified (or absent).
+    nameid_is_pseudonym = name_id_format in (
+        "",
+        "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+    )
+    if user_nic and not nameid_is_pseudonym and not _name_id_binds_nic(name_id_value, user_nic):
         return _reject_saml_login(
             "eIDAS SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
             _("Autenticação rejeitada: identidade SAML inconsistente."),
