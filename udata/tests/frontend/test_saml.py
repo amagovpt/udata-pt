@@ -643,7 +643,7 @@ class SAMLSSOCallbackTest(APITestCase):
             assert mock_login.call_count == 0
 
         assert response.status_code == 302
-        assert "/pages/migrate-account" in response.headers["Location"]
+        assert "/migrate-account" in response.headers["Location"]
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
 
@@ -1416,7 +1416,7 @@ class SAMLAccountLinkingTest(APITestCase):
 
 class SAMLMigrationWizardTest(APITestCase):
     """End-to-end coverage of the account-linking wizard: an email or
-    name match redirects to /pages/migrate-account, where the user
+    name match redirects to /migrate-account, where the user
     either proves ownership of the default account (email + password
     login, or emailed code) to link it, or explicitly creates a new
     account. Only a NIC match logs in directly.
@@ -1469,7 +1469,7 @@ class SAMLMigrationWizardTest(APITestCase):
             assert mock_login.call_count == 0
 
         assert response.status_code == 302
-        assert "/pages/migrate-account" in response.headers["Location"]
+        assert "/migrate-account" in response.headers["Location"]
         assert User.objects.count() == users_before
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
@@ -1512,7 +1512,7 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Maria",
             last_name="Santos",
         )
-        assert "/pages/migrate-account" in response.headers["Location"]
+        assert "/migrate-account" in response.headers["Location"]
 
         # The user chooses "Já possuo uma conta" and logs in.
         response = self.client.post(
@@ -1721,7 +1721,7 @@ class SAMLMigrationWizardTest(APITestCase):
             assert mock_login.call_count == 0
 
         assert response.status_code == 302
-        assert "/pages/migrate-account" in response.headers["Location"]
+        assert "/migrate-account" in response.headers["Location"]
 
         with self.client.session_transaction() as sess:
             pending = sess.get("saml_migration_pending")
@@ -1864,7 +1864,7 @@ class SAMLMigrationSecurityTest(APITestCase):
         resp = self._sso_with(
             mock_client_for, nic="66667777", first_name="Mallory", last_name="Evil"
         )
-        assert "/pages/migrate-account" in resp.headers["Location"]
+        assert "/migrate-account" in resp.headers["Location"]
 
         # 2. Attacker requests a code — emailed to their OWN address. We
         #    capture it as the attacker would read it from their inbox.

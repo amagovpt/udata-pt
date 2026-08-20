@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **test: update SAML wizard assertions to the prefix-free /migrate-account path**
+  - Five tests still asserted the legacy `/pages/migrate-account` redirect
+    target, but generated frontend URLs dropped the `/pages` segment when
+    the frontend moved its routes to the `[locale]/(pages)` route group —
+    so the whole `test_saml.py` suite never ran green. Assertions and the
+    wizard docstring now match the real `/migrate-account` path; no
+    behaviour change.
 - **feat: CMD (Chave Móvel Digital) account linking with mandatory ownership confirmation**
   - Direct login on a CMD/SAML callback now happens ONLY when the NIC is
     already linked to an account. Any other match — by email or by
