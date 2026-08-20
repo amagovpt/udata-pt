@@ -151,6 +151,16 @@ class ChangeEmailForm(Form):
                 "Your new email must be different than your previous email"
             )
             return False
+
+        # Reject already-registered emails at submit time; otherwise the
+        # collision only surfaces after the user clicks the confirmation
+        # link (confirm_change_email redirects with change_email_already_taken).
+        from udata.models import datastore
+
+        existing = datastore.find_user(email=self.new_email.data.strip())
+        if existing and existing.id != self.user.id:
+            self.new_email.errors.append(_("This email is already registered"))
+            return False
         return True
 
 

@@ -556,6 +556,53 @@ class SAMLLoginFlowTest(APITestCase):
                 mock_login.assert_called_once_with(user)
                 assert session.get("saml_login") is True
 
+    def test_placeholder_email_user_redirects_to_complete_registration(self):
+        """A user still holding a minted saml-* placeholder email must be
+        sent to the complete-registration page — new accounts and older
+        placeholder accounts logging in again alike."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
+
+        with self.app.test_request_context():
+            self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+            user = UserFactory(email="saml-abcdef01@autenticacao.gov.pt", confirmed_at="2024-01-01")
+
+            response = _handle_saml_user_login(user)
+
+            assert response.status_code == 302
+            assert response.location == "http://localhost:3000/complete-registration"
+            # The user is logged in: completing registration happens in-session.
+            assert session.get("saml_login") is True
+
+    def test_placeholder_email_redirect_drops_next_url_and_new_account_flag(self):
+        """Completing registration is a hard precondition: the original
+        destination and the cmd_new_account banner are dropped on purpose."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
+
+        with self.app.test_request_context():
+            self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+            session["saml_next_url"] = "/datasets"
+            user = UserFactory(email="saml-deadbeef@autenticacao.gov.pt", confirmed_at="2024-01-01")
+
+            response = _handle_saml_user_login(user, new_account=True)
+
+            assert response.status_code == 302
+            assert response.location == "http://localhost:3000/complete-registration"
+            assert "saml_next_url" not in session
+
+    def test_regular_user_keeps_next_url(self):
+        """Guard: the placeholder redirect must not affect normal accounts."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
+
+        with self.app.test_request_context():
+            self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+            session["saml_next_url"] = "/datasets"
+            user = UserFactory(confirmed_at="2024-01-01")
+
+            response = _handle_saml_user_login(user)
+
+            assert response.status_code == 302
+            assert response.location == "http://localhost:3000/datasets"
+
 
 class SAMLSSOCallbackTest(APITestCase):
     """Test the full /saml/sso endpoint (idp_initiated).
@@ -851,7 +898,7 @@ class SAMLSSOCallbackTest(APITestCase):
         xml = _build_saml_response_xml(nic="88888888", first_name="Pedro", last_name="Nunes")
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
-            self._post_saml_response(xml)
+            response = self._post_saml_response(xml)
 
             assert mock_login.call_count == 1
             logged_in_user = mock_login.call_args[0][0]
@@ -859,6 +906,41 @@ class SAMLSSOCallbackTest(APITestCase):
             assert _SAML_PLACEHOLDER_EMAIL_RE.match(logged_in_user.email), logged_in_user.email
             assert "88888888" not in logged_in_user.email  # NIC must not leak
             assert logged_in_user.extras.get("auth_nic") == _hash_nic("88888888")
+
+        # Registration is not complete without a real email: the user is
+        # sent to the complete-registration page, not the homepage.
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_sso_callback_existing_placeholder_account_redirects_to_complete_registration(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """An older account created with a placeholder email (before the
+        complete-registration flow) is forced to the page on its next login."""
+        existing = UserFactory(
+            email="saml-cafe0123@autenticacao.gov.pt",
+            extras={"auth_nic": _hash_nic("33334444")},
+            confirmed_at="2024-01-01",
+        )
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            nic="33334444", first_name="Pedro", last_name="Nunes"
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        xml = _build_saml_response_xml(nic="33334444", first_name="Pedro", last_name="Nunes")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_saml_response(xml)
+
+            assert mock_login.call_count == 1
+            assert mock_login.call_args[0][0].id == existing.id
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
 
     def test_sso_rejects_missing_saml_response(self):
         """POST to /saml/sso without SAMLResponse should fail."""
@@ -1648,6 +1730,8 @@ class SAMLMigrationWizardTest(APITestCase):
 
         response = self.client.post("/saml/migration/skip")
         assert response.status_code == 200
+        # The CMD email was usable — registration is complete.
+        assert response.json["pending_registration"] is False
 
         new_user = User.objects(email="rita.cmd@example.pt").first()
         assert new_user is not None
@@ -1766,6 +1850,9 @@ class SAMLMigrationWizardTest(APITestCase):
 
         response = self.client.post("/saml/migration/skip")
         assert response.status_code == 200
+        # A placeholder was minted — the frontend must route the user to
+        # /complete-registration to provide a real email.
+        assert response.json["pending_registration"] is True
 
         new_user = User.objects(extras__auth_nic=_hash_nic("12121212")).first()
         assert new_user is not None
@@ -1805,7 +1892,10 @@ class SAMLMigrationWizardTest(APITestCase):
                 assert logged_in_user.id != existing.id
 
             assert response.status_code == 302
-            assert "cmd_new_account=1" in response.headers["Location"]
+            # The CMD brought no email, so the new account got a placeholder:
+            # the user is sent to complete registration instead of the
+            # cmd_new_account homepage banner.
+            assert response.headers["Location"].endswith("/complete-registration")
             assert User.objects.count() == users_before + 1
             existing.reload()
             assert not (existing.extras or {}).get("auth_nic")

@@ -628,7 +628,14 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
     if not user_email or datastore.find_user(email=user_email):
         import uuid
 
-        user_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
+        from udata.core.user.constants import (
+            SAML_PLACEHOLDER_EMAIL_DOMAIN,
+            SAML_PLACEHOLDER_EMAIL_PREFIX,
+        )
+
+        user_email = (
+            f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
+        )
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -745,6 +752,16 @@ def _handle_saml_user_login(user, new_account=False):
 
     login_user(user)
     session["saml_login"] = True
+
+    # Accounts still holding a minted saml-* placeholder email (new accounts
+    # created without a usable CMD email, or older ones from before this
+    # check) must provide a real email before using the portal. The original
+    # destination is dropped on purpose: completing registration is a hard
+    # precondition, and the page explains the situation itself (no
+    # cmd_new_account banner needed).
+    if user.has_placeholder_email:
+        return redirect(f"{frontend_url}/complete-registration")
+
     destination = f"{frontend_url}{next_path}" if next_path else (frontend_url or "/")
     if new_account:
         separator = "&" if "?" in destination else "?"
@@ -2012,4 +2029,7 @@ def migration_skip():
     session.pop("migration_send_count", None)
     session.pop("migration_password_attempts", None)
 
-    return jsonify({"success": True})
+    # A placeholder email means registration is not complete yet: the
+    # frontend must send the user to /complete-registration instead of
+    # the homepage.
+    return jsonify({"success": True, "pending_registration": user.has_placeholder_email})
