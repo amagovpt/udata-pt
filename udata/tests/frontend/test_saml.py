@@ -124,6 +124,7 @@ def _make_authn_response_mock(
     last_name=None,
     issuer=TEST_SAML_ISSUER,
     name_id=None,
+    name_id_format=None,
     person_identifier=None,
     given_name=None,
     family_name=None,
@@ -140,7 +141,10 @@ def _make_authn_response_mock(
 
     ``name_id`` defaults to ``nic`` so the binding check passes for the
     common case; pass an explicit value (e.g. ``""``) to simulate a
-    Subject mismatch in dedicated tests.
+    Subject mismatch in dedicated tests. ``name_id_format`` sets the
+    Subject's NameID Format (e.g. the ``unspecified`` pseudonym format the
+    real IdP emits, which makes the handlers skip the binding check); when
+    omitted the mock behaves as a specified format and the binding applies.
     """
     identity = {}
     if email:
@@ -176,6 +180,8 @@ def _make_authn_response_mock(
         # back to a stable placeholder for tests that do not exercise it
         # at all (e.g. email-only logins).
         subject_mock.text = nic or person_identifier or "test-name-id"
+    if name_id_format is not None:
+        subject_mock.format = name_id_format
     response.get_subject.return_value = subject_mock
     return response
 
@@ -1294,8 +1300,11 @@ class SAMLEidasSSOTest(APITestCase):
             **attrs
         )
         mock_client_for.return_value = mock_saml_client
-        # name_id/issuer only shape the validated mock, not the raw XML.
-        xml_attrs = {k: v for k, v in attrs.items() if k not in ("name_id", "issuer")}
+        # name_id/name_id_format/issuer only shape the validated mock, not
+        # the raw XML.
+        xml_attrs = {
+            k: v for k, v in attrs.items() if k not in ("name_id", "name_id_format", "issuer")
+        }
         return self._post_eidas_response(_build_saml_response_xml(**xml_attrs))
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
@@ -1387,7 +1396,8 @@ class SAMLEidasSSOTest(APITestCase):
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_eidas_rejects_name_id_person_identifier_mismatch(self, mock_client_for):
         """Strict Subject↔identifier binding (anti-XSW) applies to the
-        eIDAS PersonIdentifier exactly as it does to the CMD NIC."""
+        eIDAS PersonIdentifier exactly as it does to the CMD NIC — for a
+        NameID with a specific (non-pseudonym) format."""
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
                 mock_client_for,
@@ -1395,11 +1405,40 @@ class SAMLEidasSSOTest(APITestCase):
                 given_name="Carmen",
                 family_name="García",
                 name_id="ES/PT/9999999999",
+                name_id_format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
             )
             mock_login.assert_not_called()
 
         assert response.status_code == 302
         assert "/login" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_pseudonym_name_id_skips_binding(self, mock_client_for, mock_requires_conf):
+        """The real IdP emits NameID as an opaque pseudonym with
+        Format=unspecified, unrelated to the PersonIdentifier (observed in
+        TST: every eIDAS login was rejected with subject_nic_mismatch).
+        Same rule as CMD: the binding check is skipped for pseudonym
+        NameIDs and the login proceeds."""
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier="CZ/PT/83e5a4b9-5524-4ed6-a30e-bf9ee71c8fc6",
+                given_name="Pavel",
+                family_name="Novák",
+                name_id="opaque-pseudonym-value",
+                name_id_format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+            )
+
+            assert mock_login.call_count == 1
+            user = mock_login.call_args[0][0]
+            assert user.extras.get("auth_nic") == _hash_nic(
+                "CZ/PT/83e5a4b9-5524-4ed6-a30e-bf9ee71c8fc6"
+            )
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")

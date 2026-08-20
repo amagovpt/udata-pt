@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix: eIDAS logins were rejected by the NameID binding once PersonIdentifier extraction landed**
+  - Observed in TST: after completing the eIDAS flow the user was bounced
+    back to the login page. autenticacao.gov emits the Subject NameID as an
+    opaque pseudonym with Format=unspecified — unrelated to the
+    PersonIdentifier attribute — so the strict Subject↔identifier equality
+    check rejected every eIDAS login (`subject_nic_mismatch`). The CMD
+    postback already skips the binding for pseudonym NameIDs for exactly
+    this reason; the eIDAS postback now applies the same rule, keeping XSW
+    protection via the Response signature, Issuer whitelist, replay cache
+    and `allow_unsolicited=False`, and still rejecting a mismatched NameID
+    that carries a specific format.
+  - Diagnostics: the eIDAS attribute-extraction log now includes
+    `identity_keys` and `name_id_format`, so a failing TST login pinpoints
+    whether the IdP returned unexpected attribute URIs or NameID formats.
 - **test: update SAML wizard assertions to the prefix-free /migrate-account path**
   - Five tests still asserted the legacy `/pages/migrate-account` redirect
     target, but generated frontend URLs dropped the `/pages` segment when
