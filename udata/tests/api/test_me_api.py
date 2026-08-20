@@ -58,6 +58,32 @@ class MeAPITest(APITestCase):
         self.assert200(response)
         self.assertFalse(response.json["pending_registration"])
 
+    def test_saml_login_flag(self):
+        """It should expose the session's saml_login flag on /me"""
+        self.login()
+        with self.client.session_transaction() as sess:
+            sess["saml_login"] = True
+        response = self.get(url_for("api.me"))
+        self.assert200(response)
+        self.assertTrue(response.json["saml_login"])
+
+    def test_saml_login_flag_regular_session(self):
+        """It should report saml_login False for a non-SAML session"""
+        self.login()
+        response = self.get(url_for("api.me"))
+        self.assert200(response)
+        self.assertFalse(response.json["saml_login"])
+
+    def test_saml_login_flag_not_leaked_on_other_users(self):
+        """The session flag is meaningless on other users: it must be null"""
+        self.login()
+        with self.client.session_transaction() as sess:
+            sess["saml_login"] = True
+        other = UserFactory()
+        response = self.get(url_for("api.user", user=other))
+        self.assert200(response)
+        self.assertIsNone(response.json["saml_login"])
+
     def test_update_profile(self):
         """It should update my profile from the API"""
         self.login()

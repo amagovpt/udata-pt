@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **fix: actually return `saml_login` on `GET /api/1/me/`**
+  - The field was defined on the `me_fields` model, but the endpoint marshals
+    `user_fields`, so it was never present in the response — the frontend's
+    `samlLogin` state was always false (e.g. the profile page never hid the
+    change-email control for SAML sessions as intended). The field now lives
+    in `user_fields`, returned only when the serialized user is the
+    authenticated caller: the flag comes from the caller's session, so on any
+    other user it would leak the viewer's own session state — it is `null`
+    there instead. The stale duplicate was removed from `me_fields`, which is
+    documented as currently unused.
 - **feat: force CMD/SAML accounts with a placeholder email to complete registration with a real one**
   - Accounts created from a CMD identity without a usable email get a minted
     `saml-*@autenticacao.gov.pt` placeholder and could previously browse
