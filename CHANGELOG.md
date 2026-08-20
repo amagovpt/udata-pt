@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **fix: eIDAS login never extracted the eIDAS attributes it requests**
+  - The eIDAS AuthnRequest asks for the eidas.europa.eu natural-person
+    attributes (`PersonIdentifier` required, `CurrentGivenName`,
+    `CurrentFamilyName`, …), but the `/saml/eidas/sso` postback only read
+    the CMD MDC/Cidadao URIs — and eIDAS carries neither a NIC nor an email,
+    so a foreign citizen's login always dead-ended in "error" and a redirect
+    to /login: no account, no stored identifier, no email flow.
+  - The postback now reads both namespaces (MDC first, in case the PT node
+    translates), mapping `CurrentGivenName` → `first_name` (NomeProprio),
+    `CurrentFamilyName` → `last_name` (NomeApelido), and `PersonIdentifier`
+    into the same `extras.auth_nic` slot as the CMD NIC (HMAC-hashed; the
+    formats cannot collide), so repeat logins resolve the same account and
+    the migration wizard, Subject↔identifier binding (kept strict,
+    fail-closed) and admin commands work identically to CMD. eIDAS has no
+    email attribute, so eIDAS accounts get a placeholder email and go
+    through the complete-registration page like any CMD account without a
+    usable email. Attribute URIs are now shared constants between the
+    AuthnRequests and the extraction so they cannot drift again.
+  - Tests: new `SAMLEidasSSOTest` success-path suite (account shape, repeat
+    login, wizard candidate, NameID binding, MDC-translated responses) —
+    the existing eIDAS tests were rejection-only and mocked CMD attributes,
+    which is why this was never caught. Real-IdP validation in TST is
+    required before promoting (confirm which URIs the PT node returns and
+    that NameID == PersonIdentifier).
 - **fix: actually return `saml_login` on `GET /api/1/me/`**
   - The field was defined on the `me_fields` model, but the endpoint marshals
     `user_fields`, so it was never present in the response — the frontend's

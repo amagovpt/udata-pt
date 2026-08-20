@@ -41,10 +41,20 @@ from udata.tests.api import APITestCase
 _SAML_PLACEHOLDER_EMAIL_RE = re.compile(r"^saml-[a-f0-9]{8}@autenticacao\.gov\.pt$")
 
 
-def _build_saml_response_xml(email=None, nic=None, first_name=None, last_name=None):
+def _build_saml_response_xml(
+    email=None,
+    nic=None,
+    first_name=None,
+    last_name=None,
+    person_identifier=None,
+    given_name=None,
+    family_name=None,
+):
     """Build a minimal SAML Response XML with the given attributes.
 
-    This simulates what autenticacao.gov returns after successful authentication.
+    This simulates what autenticacao.gov returns after successful
+    authentication — MDC/Cidadao attributes for CMD, and the
+    eidas.europa.eu natural-person attributes for eIDAS logins.
     """
     attributes = ""
     if email:
@@ -71,6 +81,24 @@ def _build_saml_response_xml(email=None, nic=None, first_name=None, last_name=No
                         NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
             <saml:AttributeValue>{last_name}</saml:AttributeValue>
         </saml:Attribute>"""
+    if person_identifier:
+        attributes += f"""
+        <saml:Attribute Name="http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"
+                        NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
+            <saml:AttributeValue>{person_identifier}</saml:AttributeValue>
+        </saml:Attribute>"""
+    if given_name:
+        attributes += f"""
+        <saml:Attribute Name="http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"
+                        NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
+            <saml:AttributeValue>{given_name}</saml:AttributeValue>
+        </saml:Attribute>"""
+    if family_name:
+        attributes += f"""
+        <saml:Attribute Name="http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"
+                        NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
+            <saml:AttributeValue>{family_name}</saml:AttributeValue>
+        </saml:Attribute>"""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
@@ -96,6 +124,9 @@ def _make_authn_response_mock(
     last_name=None,
     issuer=TEST_SAML_ISSUER,
     name_id=None,
+    person_identifier=None,
+    given_name=None,
+    family_name=None,
 ):
     """Build a MagicMock that mimics a validated pysaml2 AuthnResponse.
 
@@ -120,6 +151,16 @@ def _make_authn_response_mock(
         identity["http://interop.gov.pt/MDC/Cidadao/NomeProprio"] = [first_name]
     if last_name:
         identity["http://interop.gov.pt/MDC/Cidadao/NomeApelido"] = [last_name]
+    if person_identifier:
+        identity["http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"] = [
+            person_identifier
+        ]
+    if given_name:
+        identity["http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"] = [given_name]
+    if family_name:
+        identity["http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"] = [
+            family_name
+        ]
 
     response = MagicMock()
     response.get_identity.return_value = identity
@@ -130,10 +171,11 @@ def _make_authn_response_mock(
     if name_id is not None:
         subject_mock.text = name_id
     else:
-        # Default to the NIC so the Subject↔NIC binding check passes when a
-        # NIC is present; fall back to a stable placeholder for tests that
-        # do not exercise NIC at all (e.g. email-only logins).
-        subject_mock.text = nic or "test-name-id"
+        # Default to the unique identifier (NIC for CMD, PersonIdentifier
+        # for eIDAS) so the Subject↔identifier binding check passes; fall
+        # back to a stable placeholder for tests that do not exercise it
+        # at all (e.g. email-only logins).
+        subject_mock.text = nic or person_identifier or "test-name-id"
     response.get_subject.return_value = subject_mock
     return response
 
@@ -1218,6 +1260,165 @@ class SAMLVuln2077RegressionTest(APITestCase):
             response = self._post_eidas_response(xml)
             mock_login.assert_not_called()
         assert response.status_code == 302
+
+
+class SAMLEidasSSOTest(APITestCase):
+    """Success-path coverage for /saml/eidas/sso — parity with CMD.
+
+    eIDAS responses carry the eidas.europa.eu natural-person attributes
+    (PersonIdentifier, CurrentGivenName, CurrentFamilyName) instead of the
+    MDC/Cidadao ones, and never carry an email. Field mapping:
+    PersonIdentifier → extras.auth_nic (HMAC), CurrentGivenName →
+    first_name, CurrentFamilyName → last_name; the account gets a
+    placeholder email and must complete registration on the frontend.
+    """
+
+    PERSON_ID = "ES/PT/1234567890"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+        app.config["MIGRATION_MODE_ENABLED"] = True
+
+    def _post_eidas_response(self, saml_xml):
+        encoded = base64.b64encode(saml_xml.encode("utf-8")).decode("utf-8")
+        return self.client.post(
+            "/saml/eidas/sso",
+            data={"SAMLResponse": encoded},
+            follow_redirects=False,
+        )
+
+    def _sso_with(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        # name_id/issuer only shape the validated mock, not the raw XML.
+        xml_attrs = {k: v for k, v in attrs.items() if k not in ("name_id", "issuer")}
+        return self._post_eidas_response(_build_saml_response_xml(**xml_attrs))
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_creates_account_from_eidas_attributes(self, mock_client_for, mock_requires_conf):
+        """eIDAS-only attributes create an account with the same shape as
+        CMD: names mapped, PersonIdentifier hashed into auth_nic, and a
+        placeholder email that forces the complete-registration page."""
+        from udata.core.user.models import User
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+
+            assert mock_login.call_count == 1
+            user = mock_login.call_args[0][0]
+            # CurrentGivenName → first_name, CurrentFamilyName → last_name
+            assert user.first_name == "Carmen"
+            assert user.last_name == "García"
+            # PersonIdentifier → auth_nic (HMAC), never stored raw
+            assert user.extras.get("auth_nic") == _hash_nic(self.PERSON_ID)
+            assert self.PERSON_ID not in (user.extras.get("auth_nic") or "")
+            # eIDAS has no email attribute → placeholder, not NIC-derived
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+        assert User.objects(extras__auth_nic=_hash_nic(self.PERSON_ID)).count() == 1
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_repeat_login_resolves_same_account(self, mock_client_for, mock_requires_conf):
+        """A second login with the same PersonIdentifier must resolve the
+        existing account instead of creating a duplicate."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="saml-feedc0de@autenticacao.gov.pt",
+            extras={"auth_nic": _hash_nic(self.PERSON_ID)},
+            confirmed_at="2024-01-01",
+        )
+        users_before = User.objects.count()
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+
+            assert mock_login.call_count == 1
+            assert mock_login.call_args[0][0].id == existing.id
+
+        assert User.objects.count() == users_before
+        # Still holding the placeholder → forced back to the page.
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_name_match_redirects_to_migration_wizard(self, mock_client_for):
+        """A homonym account without a linked identity becomes a wizard
+        candidate — same ownership-confirmation rule as CMD."""
+        existing = UserFactory(
+            email="carmen@example.pt",
+            password="S3cretPass!",
+            first_name="Carmen",
+            last_name="García",
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+            assert mock_login.call_count == 0
+
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_rejects_name_id_person_identifier_mismatch(self, mock_client_for):
+        """Strict Subject↔identifier binding (anti-XSW) applies to the
+        eIDAS PersonIdentifier exactly as it does to the CMD NIC."""
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+                name_id="ES/PT/9999999999",
+            )
+            mock_login.assert_not_called()
+
+        assert response.status_code == 302
+        assert "/login" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_still_accepts_mdc_attributes(self, mock_client_for, mock_requires_conf):
+        """If the PT node translates eIDAS attributes into the MDC/Cidadao
+        namespace, the postback keeps working (MDC is read first)."""
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._sso_with(
+                mock_client_for,
+                email="citizen@example.pt",
+                nic="12345678",
+                first_name="Ana",
+                last_name="Bento",
+            )
+
+            assert mock_login.call_count == 1
+            user = mock_login.call_args[0][0]
+            assert user.email == "citizen@example.pt"
+            assert user.extras.get("auth_nic") == _hash_nic("12345678")
 
 
 class SAMLLogoutFlowTest(APITestCase):
