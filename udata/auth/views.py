@@ -30,6 +30,7 @@ from flask_security.views import (
 from flask_wtf.csrf import generate_csrf
 from werkzeug.local import LocalProxy
 
+from udata.api.limits import user_or_ip
 from udata.app import limiter
 from udata.auth.proconnect import get_logout_url
 from udata.uris import homepage_url
@@ -264,9 +265,14 @@ def create_security_blueprint(app, state, import_name):
         "/confirm-change-email/<token>", methods=["GET", "POST"], endpoint="confirm_change_email"
     )(confirm_change_email)
 
+    # Rate-limited so the confirmation-mail sender cannot be used as an open
+    # relay. Keyed per authenticated user (not per IP): the endpoint is
+    # @login_required and the PRD proxy chain collapses visitors onto shared
+    # egress IPs (see _credential_key docstring), so an IP key would let
+    # legitimate users block each other.
     bp.route(
         app.config["SECURITY_CHANGE_EMAIL_URL"], methods=["GET", "POST"], endpoint="change_email"
-    )(change_email)
+    )(limiter.limit("5 per minute", key_func=user_or_ip)(change_email))
     bp.route(app.config["SECURITY_GET_CSRF"], methods=["GET"], endpoint="get_csrf")(get_csrf)
 
     if state.two_factor:
