@@ -31,9 +31,7 @@ def _count_user_reuses(user) -> int:
     """
     from udata.models import Reuse  # avoid circular imports
 
-    return Reuse.objects(
-        owner=user, private__ne=True, archived=None, deleted=None
-    ).count()
+    return Reuse.objects(owner=user, private__ne=True, archived=None, deleted=None).count()
 
 
 user_ref_fields = api.inherit(
@@ -75,6 +73,18 @@ user_fields = api.model(
         "email": fields.Raw(
             attribute=lambda o: o.email if current_user_is_admin_or_self() else None,
             description="The user email",
+            readonly=True,
+        ),
+        # In user_fields (not the unused me_fields) because GET /api/1/me/
+        # marshals user_fields; guarded like email so public user listings
+        # never disclose which accounts still hold a placeholder email.
+        "pending_registration": fields.Raw(
+            attribute=lambda o: (
+                o.has_placeholder_email if current_user_is_admin_or_self() else None
+            ),
+            description="True while the account still has a minted saml-* placeholder "
+            "email; the user must provide a real email to complete registration "
+            "(only present for global admins and on /me)",
             readonly=True,
         ),
         "avatar": fields.ImageField(original=True, description="The user avatar URL"),

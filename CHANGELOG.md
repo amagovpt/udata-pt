@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **feat: force CMD/SAML accounts with a placeholder email to complete registration with a real one**
+  - Accounts created from a CMD identity without a usable email get a minted
+    `saml-*@autenticacao.gov.pt` placeholder and could previously browse
+    indefinitely with it. Now any CMD/eIDAS login that lands on a placeholder
+    email — a freshly created account, or an older one from before this
+    check — is redirected to the frontend `/complete-registration` page
+    instead of its destination, where the user must provide a valid email
+    (verified through the existing change-email confirmation link) to
+    conclude registration. `/saml/migration/skip` also reports
+    `pending_registration` in its JSON response so the wizard can route the
+    user there.
+  - `GET /api/1/me/` now exposes a `pending_registration` boolean (guarded
+    like `email`: only for admins and on `/me`) so the frontend can gate
+    navigation. Placeholder mint and detection share constants in
+    `udata/core/user/constants.py` (`User.has_placeholder_email`).
+  - `/change-email` is now rate-limited (5/min keyed per authenticated user,
+    not per IP, because the PRD proxy chain collapses visitors onto shared
+    egress IPs) so the confirmation-mail sender cannot be used as an open
+    relay, and `ChangeEmailForm` rejects an already-registered email at
+    submit time instead of only after the confirmation link is clicked.
 - **feat: CMD (Chave Móvel Digital) account linking with mandatory ownership confirmation**
   - Direct login on a CMD/SAML callback now happens ONLY when the NIC is
     already linked to an account. Any other match — by email or by

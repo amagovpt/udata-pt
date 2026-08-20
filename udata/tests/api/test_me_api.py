@@ -44,6 +44,20 @@ class MeAPITest(APITestCase):
         response = self.get(url_for("api.me"))
         self.assert401(response)
 
+    def test_pending_registration_flag(self):
+        """It should flag accounts still holding a saml-* placeholder email"""
+        self.login(UserFactory(email="saml-abcdef01@autenticacao.gov.pt"))
+        response = self.get(url_for("api.me"))
+        self.assert200(response)
+        self.assertTrue(response.json["pending_registration"])
+
+    def test_pending_registration_flag_regular_user(self):
+        """It should not flag accounts with a real email"""
+        self.login()
+        response = self.get(url_for("api.me"))
+        self.assert200(response)
+        self.assertFalse(response.json["pending_registration"])
+
     def test_update_profile(self):
         """It should update my profile from the API"""
         self.login()

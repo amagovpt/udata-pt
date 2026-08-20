@@ -10,6 +10,7 @@ from flask_security.utils import hash_password
 from werkzeug.datastructures import MultiDict
 
 from udata.commands import cli, exit_with_error, success
+from udata.core.user.constants import SAML_PLACEHOLDER_EMAIL_PREFIX
 from udata.models import User, datastore
 
 log = logging.getLogger(__name__)
@@ -140,7 +141,7 @@ def fix_cmd_duplicates(dry_run):
     """
     import re
 
-    duplicates = list(User.objects(email__startswith="saml-"))
+    duplicates = list(User.objects(email__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX))
     if not duplicates:
         success("No duplicate SAML accounts found")
         return
@@ -164,7 +165,7 @@ def fix_cmd_duplicates(dry_run):
             User.objects(
                 first_name=re.compile(f"^{re.escape(fname)}$", re.IGNORECASE),
                 last_name=re.compile(f"^{re.escape(lname)}$", re.IGNORECASE),
-                email__not__startswith="saml-",
+                email__not__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX,
             )
         )
 
