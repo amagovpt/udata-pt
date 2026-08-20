@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **test: update SAML wizard assertions to the prefix-free /migrate-account path**
+  - Five tests still asserted the legacy `/pages/migrate-account` redirect
+    target, but generated frontend URLs dropped the `/pages` segment when
+    the frontend moved its routes to the `[locale]/(pages)` route group —
+    so the whole `test_saml.py` suite never ran green. Assertions and the
+    wizard docstring now match the real `/migrate-account` path; no
+    behaviour change.
 - **fix: eIDAS login never extracted the eIDAS attributes it requests**
   - The eIDAS AuthnRequest asks for the eidas.europa.eu natural-person
     attributes (`PersonIdentifier` required, `CurrentGivenName`,
