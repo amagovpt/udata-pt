@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **fix: align the eIDAS AuthnRequest with the Minimum Data Set and stop over-requesting attributes**
+  - The four eIDAS natural-person MDS attributes (PersonIdentifier,
+    CurrentFamilyName, CurrentGivenName, DateOfBirth) are now requested
+    as required, per the eIDAS specification — only PersonIdentifier was;
+    the PT node was silently upgrading the rest downstream, and relying
+    on that normalisation was fragile.
+  - CurrentAddress, Gender and PlaceOfBirth are no longer requested:
+    they were never read nor stored, and they appeared on the citizen's
+    consent screen as data dados.gov.pt collects without any use (data
+    minimisation). DateOfBirth still arrives (MDS) but is intentionally
+    not stored — the User model has no birth-date field.
 - **fix: read eIDAS attributes by the friendly names pysaml2 actually delivers**
   - Root cause of the DEV `missing_attributes` failures: pysaml2 ships
     built-in attribute maps that translate the known eIDAS natural-person
