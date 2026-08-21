@@ -128,6 +128,7 @@ def _make_authn_response_mock(
     person_identifier=None,
     given_name=None,
     family_name=None,
+    eidas_friendly_names=False,
 ):
     """Build a MagicMock that mimics a validated pysaml2 AuthnResponse.
 
@@ -155,16 +156,32 @@ def _make_authn_response_mock(
         identity["http://interop.gov.pt/MDC/Cidadao/NomeProprio"] = [first_name]
     if last_name:
         identity["http://interop.gov.pt/MDC/Cidadao/NomeApelido"] = [last_name]
+    # pysaml2's built-in attribute maps translate the eIDAS natural-person
+    # URIs into friendly names in get_identity() (PersonIdentifier,
+    # FirstName, FamilyName) — that is what the real IdP responses yield.
+    # eidas_friendly_names=True models that; False keeps the raw URIs
+    # (defensive path kept in the extraction).
     if person_identifier:
-        identity["http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"] = [
-            person_identifier
-        ]
+        key = (
+            "PersonIdentifier"
+            if eidas_friendly_names
+            else "http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"
+        )
+        identity[key] = [person_identifier]
     if given_name:
-        identity["http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"] = [given_name]
+        key = (
+            "FirstName"
+            if eidas_friendly_names
+            else "http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"
+        )
+        identity[key] = [given_name]
     if family_name:
-        identity["http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"] = [
-            family_name
-        ]
+        key = (
+            "FamilyName"
+            if eidas_friendly_names
+            else "http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"
+        )
+        identity[key] = [family_name]
 
     response = MagicMock()
     response.get_identity.return_value = identity
@@ -1306,10 +1323,12 @@ class SAMLEidasSSOTest(APITestCase):
             **attrs
         )
         mock_client_for.return_value = mock_saml_client
-        # name_id/name_id_format/issuer only shape the validated mock, not
-        # the raw XML.
+        # name_id/name_id_format/issuer/eidas_friendly_names only shape the
+        # validated mock, not the raw XML.
         xml_attrs = {
-            k: v for k, v in attrs.items() if k not in ("name_id", "name_id_format", "issuer")
+            k: v
+            for k, v in attrs.items()
+            if k not in ("name_id", "name_id_format", "issuer", "eidas_friendly_names")
         }
         return self._post_eidas_response(_build_saml_response_xml(**xml_attrs))
 
@@ -1468,37 +1487,56 @@ class SAMLEidasSSOTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
-    def test_eidas_falls_back_to_ava_when_identity_is_empty(
+    def test_eidas_friendly_name_attributes_from_pysaml2_maps(
         self, mock_client_for, mock_requires_conf
     ):
-        """Parity with CMD: some responses expose attributes only through
-        ``ava`` while ``get_identity()`` returns empty — the extraction
-        must fall back to ``ava`` instead of rejecting the login."""
-        mock_response = _make_authn_response_mock(
-            person_identifier=self.PERSON_ID,
-            given_name="Carmen",
-            family_name="García",
-        )
-        # get_identity() empty, attributes only reachable through .ava.
-        mock_response.get_identity.return_value = {}
-        mock_saml_client = MagicMock()
-        mock_saml_client.parse_authn_request_response.return_value = mock_response
-        mock_client_for.return_value = mock_saml_client
-
-        xml = _build_saml_response_xml(
-            person_identifier=self.PERSON_ID, given_name="Carmen", family_name="García"
-        )
-
+        """The real-world shape: pysaml2's built-in attribute maps translate
+        the eIDAS URIs into friendly names (PersonIdentifier, FirstName,
+        FamilyName), so get_identity() keys them that way — the extraction
+        must find them (this was the DEV `missing_attributes` failure)."""
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
-            response = self._post_eidas_response(xml)
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+                eidas_friendly_names=True,
+                name_id="opaque-pseudonym-value",
+                name_id_format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+            )
 
             assert mock_login.call_count == 1
             user = mock_login.call_args[0][0]
             assert user.extras.get("auth_nic") == _hash_nic(self.PERSON_ID)
             assert user.first_name == "Carmen"
+            assert user.last_name == "García"
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
 
         assert response.status_code == 302
         assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+    def test_eidas_idp_denied_status_redirects_cleanly(self):
+        """A non-Success StatusCode from the IdP must produce a clean
+        redirect with saml_error=idp_denied instead of a pysaml2
+        StatusError 500 (parity with the CMD pre-check)."""
+        denied_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                ID="_denied123" Version="2.0"
+                IssueInstant="2024-01-01T00:00:00Z">
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder">
+            <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:RequestDenied"/>
+        </samlp:StatusCode>
+        <samlp:StatusMessage>User cancelled the authentication</samlp:StatusMessage>
+    </samlp:Status>
+</samlp:Response>"""
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(denied_xml)
+            mock_login.assert_not_called()
+
+        assert response.status_code == 302
+        assert "saml_error=idp_denied" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_eidas_without_identifier_reports_received_attribute_uris(self, mock_client_for):

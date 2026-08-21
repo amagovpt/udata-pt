@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **fix: read eIDAS attributes by the friendly names pysaml2 actually delivers**
+  - Root cause of the DEV `missing_attributes` failures: pysaml2 ships
+    built-in attribute maps that translate the known eIDAS natural-person
+    URIs into friendly names — `get_identity()` keys them as
+    `PersonIdentifier`, `FirstName` and `FamilyName`, never as the full
+    URIs. The CMD MDC/Cidadao URIs are in no map, so they stay raw — which
+    is why the CMD URI lookups always matched while the eIDAS ones never
+    could. Extraction now tries MDC URI → eIDAS URI → pysaml2 friendly
+    name for each field; the `ava` fallback added the day before is
+    removed (in pysaml2 7.x `ava` is the same dict as `get_identity()`,
+    so it was a no-op).
+  - The eIDAS postback also gains the CMD "step 0" StatusCode pre-check
+    (shared `_idp_status_rejection` helper): an IdP-side rejection now
+    produces a clean `saml_error=idp_denied` redirect instead of a
+    pysaml2 `StatusError` 500.
 - **fix: eIDAS attribute extraction falls back to `ava` and reports received attribute URIs**
   - DEV validation showed `saml_error=missing_attributes`: the eIDAS
     response passes every security check but `get_identity()` yields no
