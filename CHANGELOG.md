@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+- **fix: CMD login no longer locks out accounts holding stale `auth_nic` values**
+  - Any value in `extras.auth_nic` used to be treated as "already linked to
+    another CMD identity", which excluded the account from the migration
+    wizard. Accounts carrying stale non-hashed values left by older portal
+    versions (plain digit NICs, legacy-encrypted ciphertexts, junk) could
+    therefore never log in via CMD: the hash lookup missed, the wizard
+    refused them, and every attempt minted a duplicate account without the
+    user's organizations or roles.
+  - Two changes, both gated on `is_nic_hashed`: a plain stored NIC identical
+    to the one in the signed autenticacao.gov assertion now logs the user in
+    directly and is upgraded to the hashed format in place (lazy migration,
+    covers environments where `migrate-nics` has not run yet); and accounts
+    whose `auth_nic` is not a valid hash are again eligible for the wizard
+    (email/name match + ownership confirmation), which overwrites the stale
+    value with a fresh hash on completion — this re-links the
+    legacy-encrypted accounts without needing the old portal's decryption
+    key. Accounts with a properly hashed link keep the exact same
+    protections as before.
+- **fix: guard the NIC migration against legacy-encrypted values and consolidate it into `udata user migrate-nics`**
+  - `hash-nics` hashed *any* value in `extras.auth_nic` that was not already a
+    64-hex HMAC digest. Production data still holds three other formats —
+    plain digit NICs from the old SAML plugin, long hex ciphertexts (512
+    chars) encrypted by the previous portal, and stray non-NIC junk — so a run
+    would have irreversibly destroyed the ciphertexts (the only recoverable
+    form of those NICs) and hashed garbage. Values are now classified first
+    and only plain digit NICs are hashed; everything else is reported and
+    left untouched. Users whose NIC is stored plain cannot log in via CMD at
+    all (the login only matches the HMAC form) and ended up with duplicate
+    accounts lacking their organization memberships.
+  - `fix-cmd-duplicates` re-hashed NICs that duplicates created by the
+    current plugin already store hashed (corrupting the link), could merge
+    into soft-deleted accounts (no `deleted=None` filter), and silently
+    overwrote a target's existing link to a *different* CMD identity. All
+    three are fixed; conflicts are now skipped and reported for a manual
+    `merge-saml` decision.
+  - Both commands were replaced by a single idempotent
+    `udata user migrate-nics [--dry-run]` that runs hash → dedupe in order
+    (hashing first repairs logins immediately and makes the merge comparisons
+    canonical) and ends with a report of what was migrated and what still
+    needs manual or decryption-based follow-up. `merge-saml` stays for the
+    manual cases and now refuses unexpected NIC formats.
+  - Duplicates are matched to their traditional account by the hashed NIC
+    first — the NIC identifies the person, so a name spelled differently
+    (e.g. CMD returns the full civil name) no longer leaves a redundant
+    duplicate behind sharing the same NIC hash, which made the CMD login
+    ambiguous. Name matching remains as fallback.
+  - A failure while merging one duplicate (the first production run tripped
+    over an unrelated broken unique index it had to build on first access to
+    another collection) no longer aborts the whole run: the duplicate is
+    reported as unresolved and the migration carries on to the final report,
+    which now also lists NIC hashes shared by multiple accounts (one person
+    with a personal and an institutional account — ambiguous CMD login that
+    needs a manual decision on which account keeps the link).
+  - The `_hash_nic`/`_is_nic_hashed` helpers, duplicated verbatim between the
+    user commands and the SAML plugin, moved to a shared `udata.core.user.nic`
+    module.
 - **fix: SP-initiated SAML logout terminates the local session before the IdP dance**
   - "Sair" for CMD/eIDAS sessions navigates to `/saml/logout`, which only
     ended the dados.gov.pt session at the IdP's single-logout postback — if
