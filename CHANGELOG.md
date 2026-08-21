@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+- **fix: SP-initiated SAML logout terminates the local session before the IdP dance**
+  - "Sair" for CMD/eIDAS sessions navigates to `/saml/logout`, which only
+    ended the dados.gov.pt session at the IdP's single-logout postback — if
+    any step of that round-trip failed, the user stayed logged in and the
+    button appeared to do nothing. This path had never been exercised:
+    until `saml_login` was actually returned by `/api/1/me/`, every user
+    took the plain logout path. The local session (flask-login +
+    `saml_login` flag) is now terminated immediately when `/saml/logout`
+    or `/saml/eidas/logout` is hit; the IdP hand-off form is still
+    returned as best effort.
+  - The LogoutRequest also stops sending a dummy NameID (the literal
+    format string): the SSO postbacks now record the authenticated
+    Subject NameID (+format) in the session and the logout uses it, so
+    the IdP can resolve the right session; the historical dummy remains
+    the fallback for sessions created before this change.
+- **fix: align the eIDAS AuthnRequest with the Minimum Data Set and stop over-requesting attributes**
+  - The four eIDAS natural-person MDS attributes (PersonIdentifier,
+    CurrentFamilyName, CurrentGivenName, DateOfBirth) are now requested
+    as required, per the eIDAS specification — only PersonIdentifier was;
+    the PT node was silently upgrading the rest downstream, and relying
+    on that normalisation was fragile.
+  - CurrentAddress, Gender and PlaceOfBirth are no longer requested:
+    they were never read nor stored, and they appeared on the citizen's
+    consent screen as data dados.gov.pt collects without any use (data
+    minimisation). DateOfBirth still arrives (MDS) but is intentionally
+    not stored — the User model has no birth-date field.
+- **fix: read eIDAS attributes by the friendly names pysaml2 actually delivers**
+  - Root cause of the DEV `missing_attributes` failures: pysaml2 ships
+    built-in attribute maps that translate the known eIDAS natural-person
+    URIs into friendly names — `get_identity()` keys them as
+    `PersonIdentifier`, `FirstName` and `FamilyName`, never as the full
+    URIs. The CMD MDC/Cidadao URIs are in no map, so they stay raw — which
+    is why the CMD URI lookups always matched while the eIDAS ones never
+    could. Extraction now tries MDC URI → eIDAS URI → pysaml2 friendly
+    name for each field; the `ava` fallback added the day before is
+    removed (in pysaml2 7.x `ava` is the same dict as `get_identity()`,
+    so it was a no-op).
+  - The eIDAS postback also gains the CMD "step 0" StatusCode pre-check
+    (shared `_idp_status_rejection` helper): an IdP-side rejection now
+    produces a clean `saml_error=idp_denied` redirect instead of a
+    pysaml2 `StatusError` 500.
+- **fix: eIDAS attribute extraction falls back to `ava` and reports received attribute URIs**
+  - DEV validation showed `saml_error=missing_attributes`: the eIDAS
+    response passes every security check but `get_identity()` yields no
+    usable attribute. The CMD postback already falls back to the pysaml2
+    `ava` mapping when `get_identity()` comes back empty — the eIDAS
+    postback now does the same (plus the same empty-identity diagnostic
+    log).
+  - When a response still carries neither email nor NIC/PersonIdentifier,
+    the rejection redirect now includes `saml_detail=<attribute URIs>`
+    (schema names only, never values) so a browser network trace alone
+    shows exactly what the IdP returned and the next fix can be targeted.
+- **feat: expose the SAML rejection code in the login redirect (`?saml_error=`)**
+  - Every fail-closed exit of the CMD/eIDAS SSO callbacks redirects to the
+    frontend login page; without backend-log access the failure modes are
+    indistinguishable from a browser trace. The redirect now carries a short
+    internal code (`signature_invalid`, `issuer_untrusted`,
+    `subject_nic_mismatch`, `replay`, `idp_denied`,
+    `missing_attributes`, …) so the reason is readable straight from the
+    browser network log. Codes only — no log text or identity data leaks
+    into the URL.
 - **fix: eIDAS logins were rejected by the NameID binding once PersonIdentifier extraction landed**
   - Observed in TST: after completing the eIDAS flow the user was bounced
     back to the login page. autenticacao.gov emits the Subject NameID as an

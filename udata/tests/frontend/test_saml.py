@@ -128,6 +128,7 @@ def _make_authn_response_mock(
     person_identifier=None,
     given_name=None,
     family_name=None,
+    eidas_friendly_names=False,
 ):
     """Build a MagicMock that mimics a validated pysaml2 AuthnResponse.
 
@@ -155,16 +156,32 @@ def _make_authn_response_mock(
         identity["http://interop.gov.pt/MDC/Cidadao/NomeProprio"] = [first_name]
     if last_name:
         identity["http://interop.gov.pt/MDC/Cidadao/NomeApelido"] = [last_name]
+    # pysaml2's built-in attribute maps translate the eIDAS natural-person
+    # URIs into friendly names in get_identity() (PersonIdentifier,
+    # FirstName, FamilyName) — that is what the real IdP responses yield.
+    # eidas_friendly_names=True models that; False keeps the raw URIs
+    # (defensive path kept in the extraction).
     if person_identifier:
-        identity["http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"] = [
-            person_identifier
-        ]
+        key = (
+            "PersonIdentifier"
+            if eidas_friendly_names
+            else "http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"
+        )
+        identity[key] = [person_identifier]
     if given_name:
-        identity["http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"] = [given_name]
+        key = (
+            "FirstName"
+            if eidas_friendly_names
+            else "http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"
+        )
+        identity[key] = [given_name]
     if family_name:
-        identity["http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"] = [
-            family_name
-        ]
+        key = (
+            "FamilyName"
+            if eidas_friendly_names
+            else "http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"
+        )
+        identity[key] = [family_name]
 
     response = MagicMock()
     response.get_identity.return_value = identity
@@ -590,6 +607,9 @@ class SAMLLoginFlowTest(APITestCase):
 
             assert response.status_code == 302
             assert "login" in response.location.lower()
+            # The redirect carries a diagnosis code readable from a browser
+            # network trace (no backend-log access needed).
+            assert "saml_error=missing_attributes" in response.location
 
     def test_login_sets_saml_session_flag(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
@@ -1140,6 +1160,9 @@ class SAMLVuln2077RegressionTest(APITestCase):
             response = self._post_saml_response(xml)
             mock_login.assert_not_called()
         assert response.status_code == 302
+        # The rejection code is exposed in the redirect for browser-trace
+        # diagnosis (environments without backend-log access).
+        assert "saml_error=issuer_untrusted" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_rejects_subject_attribute_mismatch(self, mock_client_for):
@@ -1300,10 +1323,12 @@ class SAMLEidasSSOTest(APITestCase):
             **attrs
         )
         mock_client_for.return_value = mock_saml_client
-        # name_id/name_id_format/issuer only shape the validated mock, not
-        # the raw XML.
+        # name_id/name_id_format/issuer/eidas_friendly_names only shape the
+        # validated mock, not the raw XML.
         xml_attrs = {
-            k: v for k, v in attrs.items() if k not in ("name_id", "name_id_format", "issuer")
+            k: v
+            for k, v in attrs.items()
+            if k not in ("name_id", "name_id_format", "issuer", "eidas_friendly_names")
         }
         return self._post_eidas_response(_build_saml_response_xml(**xml_attrs))
 
@@ -1411,6 +1436,7 @@ class SAMLEidasSSOTest(APITestCase):
 
         assert response.status_code == 302
         assert "/login" in response.headers["Location"]
+        assert "saml_error=subject_nic_mismatch" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
@@ -1458,6 +1484,157 @@ class SAMLEidasSSOTest(APITestCase):
             user = mock_login.call_args[0][0]
             assert user.email == "citizen@example.pt"
             assert user.extras.get("auth_nic") == _hash_nic("12345678")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_friendly_name_attributes_from_pysaml2_maps(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The real-world shape: pysaml2's built-in attribute maps translate
+        the eIDAS URIs into friendly names (PersonIdentifier, FirstName,
+        FamilyName), so get_identity() keys them that way — the extraction
+        must find them (this was the DEV `missing_attributes` failure)."""
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+                eidas_friendly_names=True,
+                name_id="opaque-pseudonym-value",
+                name_id_format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+            )
+
+            assert mock_login.call_count == 1
+            user = mock_login.call_args[0][0]
+            assert user.extras.get("auth_nic") == _hash_nic(self.PERSON_ID)
+            assert user.first_name == "Carmen"
+            assert user.last_name == "García"
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+    def test_eidas_idp_denied_status_redirects_cleanly(self):
+        """A non-Success StatusCode from the IdP must produce a clean
+        redirect with saml_error=idp_denied instead of a pysaml2
+        StatusError 500 (parity with the CMD pre-check)."""
+        denied_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                ID="_denied123" Version="2.0"
+                IssueInstant="2024-01-01T00:00:00Z">
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder">
+            <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:RequestDenied"/>
+        </samlp:StatusCode>
+        <samlp:StatusMessage>User cancelled the authentication</samlp:StatusMessage>
+    </samlp:Status>
+</samlp:Response>"""
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._post_eidas_response(denied_xml)
+            mock_login.assert_not_called()
+
+        assert response.status_code == 302
+        assert "saml_error=idp_denied" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_without_identifier_reports_received_attribute_uris(self, mock_client_for):
+        """When the response carries neither email nor NIC/PersonIdentifier,
+        the rejection redirect exposes the attribute URIs that DID arrive
+        (schema names only) so a browser trace suffices to diagnose."""
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                given_name="Carmen",
+                family_name="García",
+            )
+            mock_login.assert_not_called()
+
+        assert response.status_code == 302
+        location = response.headers["Location"]
+        assert "saml_error=missing_attributes" in location
+        # URL-encoded CurrentGivenName URI must be present in saml_detail.
+        assert "saml_detail=" in location
+        assert "CurrentGivenName" in location
+
+
+class SAMLLogoutInitiationTest(APITestCase):
+    """SP-initiated logout (/saml/logout, /saml/eidas/logout).
+
+    The local session must be terminated BEFORE the user is handed to the
+    IdP single-logout dance: if any step of that round-trip fails, clicking
+    "Sair" must still have logged the user out of the portal. The
+    LogoutRequest must carry the Subject NameID recorded at SSO time so the
+    IdP can resolve the right session.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _saml_config(self, app):
+        app.config["SECURITY_SAML_ENTITY_ID"] = "www.dados.gov.pt"
+        app.config["SECURITY_SAML_ENTITY_NAME"] = "dados.gov.pt"
+        app.config["SECURITY_SAML_KEY_FILE"] = "udata/auth/saml/credentials/private.pem"
+        app.config["SECURITY_SAML_CERT_FILE"] = "udata/auth/saml/credentials/AMA.pem"
+        app.config["SECURITY_SAML_IDP_METADATA"] = "udata/auth/saml/credentials/metadata.xml"
+        app.config["SECURITY_SAML_FA_URL"] = "https://preprod.autenticacao.gov.pt/fa/"
+        app.config["SECURITY_SAML_FAAALEVEL"] = 3
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def test_saml_logout_terminates_local_session_first(self):
+        with self.client.session_transaction() as sess:
+            sess["saml_login"] = True
+            sess["saml_name_id"] = "pseudonym-abc123"
+            sess["saml_name_id_format"] = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.logout_user") as mock_logout:
+            response = self.client.get("/saml/logout")
+
+            mock_logout.assert_called_once()
+
+        # The IdP hand-off form is still returned (best-effort SLO)...
+        assert response.status_code == 200
+        body = response.get_data(as_text=True)
+        assert 'name="SAMLRequest"' in body
+        assert "https://preprod.autenticacao.gov.pt/fa/" in body
+        # ...carrying the NameID recorded at SSO time.
+        saml_request = re.search(r'name="SAMLRequest"\s+value="([^"]+)"', body).group(1)
+        decoded = base64.b64decode(saml_request).decode("utf-8", "replace")
+        assert "pseudonym-abc123" in decoded
+
+        # ...but the local session is already dead.
+        with self.client.session_transaction() as sess:
+            assert sess.get("saml_login") is None
+            assert sess.get("saml_name_id") is None
+            assert sess.get("saml_name_id_format") is None
+
+    def test_eidas_logout_terminates_local_session_first(self):
+        with self.client.session_transaction() as sess:
+            sess["saml_login"] = True
+            sess["saml_name_id"] = "CZ/PT/83e5a4b9-5524-4ed6-a30e-bf9ee71c8fc6"
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.logout_user") as mock_logout:
+            response = self.client.get("/saml/eidas/logout")
+
+            mock_logout.assert_called_once()
+
+        assert response.status_code == 200
+        assert 'name="SAMLRequest"' in response.get_data(as_text=True)
+        with self.client.session_transaction() as sess:
+            assert sess.get("saml_login") is None
+            assert sess.get("saml_name_id") is None
+
+    def test_saml_logout_without_stored_name_id_uses_fallback(self):
+        """Sessions from before the NameID was recorded still log out."""
+        with self.client.session_transaction() as sess:
+            sess["saml_login"] = True
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.logout_user") as mock_logout:
+            response = self.client.get("/saml/logout")
+            mock_logout.assert_called_once()
+
+        assert response.status_code == 200
+        with self.client.session_transaction() as sess:
+            assert sess.get("saml_login") is None
 
 
 class SAMLLogoutFlowTest(APITestCase):
