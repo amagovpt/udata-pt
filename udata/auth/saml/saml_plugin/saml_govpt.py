@@ -4,7 +4,6 @@ from __future__ import unicode_literals
 import base64
 import binascii
 import hashlib
-import hmac
 import logging
 import os
 import random
@@ -84,6 +83,7 @@ ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
 from udata.app import csrf
+from udata.core.user.nic import hash_nic as _hash_nic
 from udata.i18n import lazy_gettext as _
 from udata.mail import MailMessage, send_mail
 from udata.models import datastore
@@ -682,26 +682,6 @@ def _idp_status_rejection(raw_saml_response, kind):
     except Exception as e:
         current_app.logger.warning(f"SAML ({kind}): Falha ao verificar status da resposta: {e}")
     return None
-
-
-def _hash_nic(nic):
-    """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY.
-
-    Returns a hex digest that is deterministic (same NIC → same hash)
-    but not reversible. Used for storing and matching NIC values
-    without exposing the raw personal identifier in the database.
-    """
-    secret = current_app.config["SECRET_KEY"]
-    if isinstance(secret, str):
-        secret = secret.encode("utf-8")
-    return hmac.new(secret, nic.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _is_nic_hashed(nic_value):
-    """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
-    return bool(
-        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
-    )
 
 
 def _create_saml_user(user_email, user_nic, first_name, last_name):

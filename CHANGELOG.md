@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **fix: guard the NIC migration against legacy-encrypted values and consolidate it into `udata user migrate-nics`**
+  - `hash-nics` hashed *any* value in `extras.auth_nic` that was not already a
+    64-hex HMAC digest. Production data still holds three other formats —
+    plain digit NICs from the old SAML plugin, long hex ciphertexts (512
+    chars) encrypted by the previous portal, and stray non-NIC junk — so a run
+    would have irreversibly destroyed the ciphertexts (the only recoverable
+    form of those NICs) and hashed garbage. Values are now classified first
+    and only plain digit NICs are hashed; everything else is reported and
+    left untouched. Users whose NIC is stored plain cannot log in via CMD at
+    all (the login only matches the HMAC form) and ended up with duplicate
+    accounts lacking their organization memberships.
+  - `fix-cmd-duplicates` re-hashed NICs that duplicates created by the
+    current plugin already store hashed (corrupting the link), could merge
+    into soft-deleted accounts (no `deleted=None` filter), and silently
+    overwrote a target's existing link to a *different* CMD identity. All
+    three are fixed; conflicts are now skipped and reported for a manual
+    `merge-saml` decision.
+  - Both commands were replaced by a single idempotent
+    `udata user migrate-nics [--dry-run]` that runs hash → dedupe in order
+    (hashing first repairs logins immediately and makes the merge comparisons
+    canonical) and ends with a report of what was migrated and what still
+    needs manual or decryption-based follow-up. `merge-saml` stays for the
+    manual cases and now refuses unexpected NIC formats.
+  - The `_hash_nic`/`_is_nic_hashed` helpers, duplicated verbatim between the
+    user commands and the SAML plugin, moved to a shared `udata.core.user.nic`
+    module.
 - **fix: SP-initiated SAML logout terminates the local session before the IdP dance**
   - "Sair" for CMD/eIDAS sessions navigates to `/saml/logout`, which only
     ended the dados.gov.pt session at the IdP's single-logout postback — if
