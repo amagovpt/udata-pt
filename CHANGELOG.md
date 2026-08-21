@@ -17,6 +17,32 @@
     Subject NameID (+format) in the session and the logout uses it, so
     the IdP can resolve the right session; the historical dummy remains
     the fallback for sessions created before this change.
+- **fix: align the eIDAS AuthnRequest with the Minimum Data Set and stop over-requesting attributes**
+  - The four eIDAS natural-person MDS attributes (PersonIdentifier,
+    CurrentFamilyName, CurrentGivenName, DateOfBirth) are now requested
+    as required, per the eIDAS specification — only PersonIdentifier was;
+    the PT node was silently upgrading the rest downstream, and relying
+    on that normalisation was fragile.
+  - CurrentAddress, Gender and PlaceOfBirth are no longer requested:
+    they were never read nor stored, and they appeared on the citizen's
+    consent screen as data dados.gov.pt collects without any use (data
+    minimisation). DateOfBirth still arrives (MDS) but is intentionally
+    not stored — the User model has no birth-date field.
+- **fix: read eIDAS attributes by the friendly names pysaml2 actually delivers**
+  - Root cause of the DEV `missing_attributes` failures: pysaml2 ships
+    built-in attribute maps that translate the known eIDAS natural-person
+    URIs into friendly names — `get_identity()` keys them as
+    `PersonIdentifier`, `FirstName` and `FamilyName`, never as the full
+    URIs. The CMD MDC/Cidadao URIs are in no map, so they stay raw — which
+    is why the CMD URI lookups always matched while the eIDAS ones never
+    could. Extraction now tries MDC URI → eIDAS URI → pysaml2 friendly
+    name for each field; the `ava` fallback added the day before is
+    removed (in pysaml2 7.x `ava` is the same dict as `get_identity()`,
+    so it was a no-op).
+  - The eIDAS postback also gains the CMD "step 0" StatusCode pre-check
+    (shared `_idp_status_rejection` helper): an IdP-side rejection now
+    produces a clean `saml_error=idp_denied` redirect instead of a
+    pysaml2 `StatusError` 500.
 - **fix: eIDAS attribute extraction falls back to `ava` and reports received attribute URIs**
   - DEV validation showed `saml_error=missing_attributes`: the eIDAS
     response passes every security check but `get_identity()` yields no

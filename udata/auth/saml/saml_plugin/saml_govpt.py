@@ -420,6 +420,17 @@ EIDAS_ATTR_PERSON_IDENTIFIER = "http://eidas.europa.eu/attributes/naturalperson/
 EIDAS_ATTR_GIVEN_NAME = "http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"
 EIDAS_ATTR_FAMILY_NAME = "http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"
 
+# pysaml2 ships built-in attribute maps (saml2/attributemaps/saml_uri.py) that
+# translate the KNOWN eIDAS natural-person URIs above into friendly names when
+# NameFormat is urn:oasis:names:tc:SAML:2.0:attrname-format:uri — so
+# get_identity() keys eIDAS attributes by these names, NOT by the full URIs.
+# The MDC/Cidadao URIs are in no map, which is why they stay as raw URIs
+# (allow_unknown_attributes) and the CMD lookups match while URI-based eIDAS
+# lookups do not. Extraction must therefore try both forms.
+EIDAS_FRIENDLY_PERSON_IDENTIFIER = "PersonIdentifier"
+EIDAS_FRIENDLY_GIVEN_NAME = "FirstName"
+EIDAS_FRIENDLY_FAMILY_NAME = "FamilyName"
+
 
 def _remember_outstanding(reqid, kind):
     """Record an AuthnRequest id in the user's session.
@@ -625,6 +636,52 @@ def _reject_saml_login(
     if detail:
         destination += f"&saml_detail={quote(detail, safe='')}"
     return redirect(destination)
+
+
+def _idp_status_rejection(raw_saml_response, kind):
+    """Pre-check the raw SAMLResponse for an IdP-side rejection.
+
+    When the IdP returns a non-Success ``samlp:StatusCode`` (e.g. the user
+    cancelled, or the request was denied upstream), pysaml2 raises
+    ``StatusError`` during parsing — which would surface as a 500. Detect it
+    first and return a clean redirect with the human-readable reason; return
+    ``None`` when the status is Success (or unreadable, in which case the
+    normal fail-closed parsing decides).
+    """
+    try:
+        decoded_xml = base64.b64decode(raw_saml_response)
+        xml_str = None
+        for codec in ["utf-8", "ISO-8859-1"]:
+            try:
+                xml_str = decoded_xml.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+        if xml_str:
+            status_root = ET.fromstring(xml_str)
+            ns = {"samlp": "urn:oasis:names:tc:SAML:2.0:protocol"}
+            status_code = status_root.find(".//samlp:StatusCode", ns)
+            status_msg = status_root.find(".//samlp:StatusMessage", ns)
+            if status_code is not None:
+                status_value = status_code.attrib.get("Value", "")
+                if "Success" not in status_value:
+                    # Extract human-readable message; fall back to status URI
+                    msg_text = status_msg.text if status_msg is not None else None
+                    # Also check for a nested sub-status code (e.g. RequestDenied)
+                    sub_code = status_code.find("samlp:StatusCode", ns)
+                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
+                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
+                    current_app.logger.error(
+                        f"SAML ({kind}): IdP rejeitou o pedido: "
+                        f"status={status_value}, sub={sub_value}, msg={msg_text}"
+                    )
+                    _audit_saml("rejected", kind, reason="idp_denied")
+                    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+                    do_flash(f"Autenticação rejeitada: {display_msg}", "error")
+                    return redirect(f"{frontend_url}/login?saml_error=idp_denied")
+    except Exception as e:
+        current_app.logger.warning(f"SAML ({kind}): Falha ao verificar status da resposta: {e}")
+    return None
 
 
 def _hash_nic(nic):
@@ -1110,38 +1167,9 @@ def idp_initiated():
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
 
     # 0. Verificar se o IdP rejeitou o pedido (antes de tentar pysaml2)
-    try:
-        decoded_xml = base64.b64decode(raw_saml_response)
-        xml_str = None
-        for codec in ["utf-8", "ISO-8859-1"]:
-            try:
-                xml_str = decoded_xml.decode(codec)
-                break
-            except UnicodeDecodeError:
-                continue
-        if xml_str:
-            status_root = ET.fromstring(xml_str)
-            ns = {"samlp": "urn:oasis:names:tc:SAML:2.0:protocol"}
-            status_code = status_root.find(".//samlp:StatusCode", ns)
-            status_msg = status_root.find(".//samlp:StatusMessage", ns)
-            if status_code is not None:
-                status_value = status_code.attrib.get("Value", "")
-                if "Success" not in status_value:
-                    # Extract human-readable message; fall back to status URI
-                    msg_text = status_msg.text if status_msg is not None else None
-                    # Also check for a nested sub-status code (e.g. RequestDenied)
-                    sub_code = status_code.find("samlp:StatusCode", ns)
-                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
-                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
-                    current_app.logger.error(
-                        f"SAML: IdP rejeitou o pedido: "
-                        f"status={status_value}, sub={sub_value}, msg={msg_text}"
-                    )
-                    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-                    do_flash(f"Autenticação rejeitada: {display_msg}", "error")
-                    return redirect(f"{frontend_url}/login?saml_error=idp_denied")
-    except Exception as e:
-        current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
+    denied = _idp_status_rejection(raw_saml_response, kind="cmd")
+    if denied is not None:
+        return denied
 
     # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta).
     # Política fail-closed (VULN-2077 / TICKET-58):
@@ -1168,7 +1196,8 @@ def idp_initiated():
         _diag_form_keys = []
     _diag_inresponse_to = None
     try:
-        _m = re.search(r'\bInResponseTo="([^"]+)"', decoded_xml.decode("utf-8", "replace"))
+        _decoded_diag = base64.b64decode(raw_saml_response)
+        _m = re.search(r'\bInResponseTo="([^"]+)"', _decoded_diag.decode("utf-8", "replace"))
         if _m:
             _diag_inresponse_to = _m.group(1)
     except Exception:
@@ -1509,6 +1538,16 @@ def sp_eidas_initiated():
 
     faa = FAAALevel(text=str(current_app.config.get("SECURITY_SAML_FAAALEVEL")))
 
+    # eIDAS natural-person Minimum Data Set (MDS): PersonIdentifier,
+    # CurrentFamilyName, CurrentGivenName and DateOfBirth are guaranteed by
+    # every member state and must be requested as required per the eIDAS
+    # spec (the PT node was already forwarding them as Optional="false"
+    # downstream). The optional attributes (CurrentAddress, Gender,
+    # PlaceOfBirth) are no longer requested: they were never read nor
+    # stored, and requesting them showed up on the citizen's consent
+    # screen without any use (data minimisation). DateOfBirth still
+    # arrives (MDS) but is intentionally not stored — the User model has
+    # no birth-date field.
     spcertenc = RequestedAttributes(
         [
             RequestedAttribute(
@@ -1519,32 +1558,17 @@ def sp_eidas_initiated():
             RequestedAttribute(
                 name=EIDAS_ATTR_FAMILY_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=EIDAS_ATTR_GIVEN_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name="http://eidas.europa.eu/attributes/naturalperson/DateOfBirth",
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentAddress",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/Gender",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/PlaceOfBirth",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
         ]
     )
@@ -1593,6 +1617,13 @@ def idp_eidas_initiated():
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
+
+    # 0. Verificar se o IdP rejeitou o pedido (antes de tentar pysaml2) —
+    # sem este pre-check um StatusCode non-Success faria o pysaml2 levantar
+    # StatusError e o pedido terminaria em 500 em vez de redirect limpo.
+    denied = _idp_status_rejection(raw_saml_response, kind="eidas")
+    if denied is not None:
+        return denied
 
     # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta).
     # Política fail-closed (VULN-2077 / TICKET-58): MissingKey/SignatureError
@@ -1693,40 +1724,42 @@ def idp_eidas_initiated():
     try:
         identity = authn_response.get_identity()
 
-        # Também tentar ava (attribute value assertions) como alternativa —
-        # mesmo fallback do postback CMD: nalgumas respostas o get_identity()
-        # vem vazio mas os atributos estão em ``ava``.
-        if not identity:
-            try:
-                ava = authn_response.ava
-                current_app.logger.info(f"eIDAS pysaml2 ava: {list(ava.keys()) if ava else None}")
-                if ava:
-                    identity = ava
-            except AttributeError:
-                pass
-
         if identity:
             identity_keys_csv = ",".join(sorted(identity.keys())[:12])
             # MDC (CMD) URIs first — the PT node may translate eIDAS
             # attributes into them — then the eIDAS natural-person URIs the
-            # AuthnRequest actually asks for. Mapping: PersonIdentifier →
+            # AuthnRequest asks for, and finally the FRIENDLY NAMES pysaml2's
+            # built-in attribute maps translate those URIs into (this is how
+            # they actually arrive from get_identity(); see the
+            # EIDAS_FRIENDLY_* constants). Mapping: PersonIdentifier →
             # NIC slot, CurrentGivenName → first_name, CurrentFamilyName →
             # last_name. eIDAS carries no email attribute: the account is
             # created with a placeholder email and the user completes
             # registration on the frontend.
             user_email = _first_value(identity, MDC_ATTR_EMAIL)
-            user_nic = _first_value(identity, MDC_ATTR_NIC) or _first_value(
-                identity, EIDAS_ATTR_PERSON_IDENTIFIER
+            user_nic = (
+                _first_value(identity, MDC_ATTR_NIC)
+                or _first_value(identity, EIDAS_ATTR_PERSON_IDENTIFIER)
+                or _first_value(identity, EIDAS_FRIENDLY_PERSON_IDENTIFIER)
             )
-            first_name = _first_value(identity, MDC_ATTR_FIRST_NAME) or _first_value(
-                identity, EIDAS_ATTR_GIVEN_NAME
+            first_name = (
+                _first_value(identity, MDC_ATTR_FIRST_NAME)
+                or _first_value(identity, EIDAS_ATTR_GIVEN_NAME)
+                or _first_value(identity, EIDAS_FRIENDLY_GIVEN_NAME)
             )
-            last_name = _first_value(identity, MDC_ATTR_LAST_NAME) or _first_value(
-                identity, EIDAS_ATTR_FAMILY_NAME
+            last_name = (
+                _first_value(identity, MDC_ATTR_LAST_NAME)
+                or _first_value(identity, EIDAS_ATTR_FAMILY_NAME)
+                or _first_value(identity, EIDAS_FRIENDLY_FAMILY_NAME)
             )
-            id_source = (
-                "mdc" if _first_value(identity, MDC_ATTR_NIC) else ("eidas" if user_nic else None)
-            )
+            if _first_value(identity, MDC_ATTR_NIC):
+                id_source = "mdc"
+            elif _first_value(identity, EIDAS_ATTR_PERSON_IDENTIFIER):
+                id_source = "eidas-uri"
+            elif user_nic:
+                id_source = "eidas-friendly"
+            else:
+                id_source = None
             current_app.logger.info(
                 f"eIDAS atributos via pysaml2: email={user_email}, "
                 f"id={'***' if user_nic else None} (source={id_source}), "
