@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **fix: CMD login no longer locks out accounts holding stale `auth_nic` values**
+  - Any value in `extras.auth_nic` used to be treated as "already linked to
+    another CMD identity", which excluded the account from the migration
+    wizard. Accounts carrying stale non-hashed values left by older portal
+    versions (plain digit NICs, legacy-encrypted ciphertexts, junk) could
+    therefore never log in via CMD: the hash lookup missed, the wizard
+    refused them, and every attempt minted a duplicate account without the
+    user's organizations or roles.
+  - Two changes, both gated on `is_nic_hashed`: a plain stored NIC identical
+    to the one in the signed autenticacao.gov assertion now logs the user in
+    directly and is upgraded to the hashed format in place (lazy migration,
+    covers environments where `migrate-nics` has not run yet); and accounts
+    whose `auth_nic` is not a valid hash are again eligible for the wizard
+    (email/name match + ownership confirmation), which overwrites the stale
+    value with a fresh hash on completion — this re-links the
+    legacy-encrypted accounts without needing the old portal's decryption
+    key. Accounts with a properly hashed link keep the exact same
+    protections as before.
 - **fix: guard the NIC migration against legacy-encrypted values and consolidate it into `udata user migrate-nics`**
   - `hash-nics` hashed *any* value in `extras.auth_nic` that was not already a
     64-hex HMAC digest. Production data still holds three other formats —

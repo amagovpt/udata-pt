@@ -211,33 +211,33 @@ class SAMLCodeIntegrityTest(APITestCase):
         from udata.auth.saml.saml_plugin import register_user
 
         source = inspect.getsource(register_user)
-        assert (
-            "render_template" not in source
-        ), "register_user.py still calls render_template — this causes TemplateNotFound"
-        assert (
-            "register_saml.html" not in source
-        ), "register_user.py still references register_saml.html template"
+        assert "render_template" not in source, (
+            "register_user.py still calls render_template — this causes TemplateNotFound"
+        )
+        assert "register_saml.html" not in source, (
+            "register_user.py still references register_saml.html template"
+        )
 
     def test_saml_govpt_has_no_template_rendering(self):
         """saml_govpt.py must NOT call render_template or reference register_saml.html."""
         from udata.auth.saml.saml_plugin import saml_govpt
 
         source = inspect.getsource(saml_govpt)
-        assert (
-            "register_saml.html" not in source
-        ), "saml_govpt.py still references register_saml.html template"
+        assert "register_saml.html" not in source, (
+            "saml_govpt.py still references register_saml.html template"
+        )
 
     def test_no_redirect_to_saml_register(self):
         """saml_govpt.py must NOT redirect to saml.register (no intermediate form)."""
         from udata.auth.saml.saml_plugin import saml_govpt
 
         source = inspect.getsource(saml_govpt)
-        assert (
-            "url_for('saml.register')" not in source
-        ), "saml_govpt.py still redirects to saml.register instead of auto-creating users"
-        assert (
-            'url_for("saml.register")' not in source
-        ), "saml_govpt.py still redirects to saml.register instead of auto-creating users"
+        assert "url_for('saml.register')" not in source, (
+            "saml_govpt.py still redirects to saml.register instead of auto-creating users"
+        )
+        assert 'url_for("saml.register")' not in source, (
+            "saml_govpt.py still redirects to saml.register instead of auto-creating users"
+        )
 
 
 def _make_test_cert_and_key():
@@ -384,9 +384,9 @@ class SAMLOutstandingRelayTest(APITestCase):
         b = _new_relay_state_token()
 
         assert a and b and a != b, "tokens must be unique per call"
-        assert re.fullmatch(
-            r"[A-Za-z0-9_\-]+", a
-        ), "token must be URL-safe so it round-trips through HTTP-POST RelayState"
+        assert re.fullmatch(r"[A-Za-z0-9_\-]+", a), (
+            "token must be URL-safe so it round-trips through HTTP-POST RelayState"
+        )
 
     def test_store_then_consume_returns_bucket(self):
         cache = _InMemoryCache()
@@ -406,9 +406,9 @@ class SAMLOutstandingRelayTest(APITestCase):
             second = _consume_outstanding_relay(token)
 
             assert first == {"id-abc": "cmd"}
-            assert (
-                second == {}
-            ), "second consume must return empty so the response cannot be replayed"
+            assert second == {}, (
+                "second consume must return empty so the response cannot be replayed"
+            )
 
     def test_consume_unknown_token_returns_empty(self):
         with patch("udata.app.cache", _InMemoryCache()):
@@ -1911,6 +1911,161 @@ class SAMLAccountLinkingTest(APITestCase):
             assert status == "existing_saml"
             assert user.id == existing.id
             assert User.objects.count() == 1
+
+
+class SAMLStaleNicRelinkTest(APITestCase):
+    """Accounts holding stale (non-hashed) auth_nic values left by older
+    portal versions: plain digit NICs, legacy-encrypted ciphertexts (512
+    hex chars) and junk. Those values can never match the login lookup, so
+    they must not lock the account out of CMD login: a plain NIC identical
+    to the authenticated one upgrades in place, and any other stale value
+    keeps the account eligible for the migration wizard. Only a properly
+    hashed auth_nic counts as \"already linked to another identity\"."""
+
+    LEGACY_ENCRYPTED = "ab12" * 128  # 512 hex chars
+
+    def test_plain_stored_nic_logs_in_and_upgrades_to_hash(self):
+        """Old plugin versions stored the NIC in plain form. The incoming
+        NIC comes from a signed assertion, so an exact match proves the
+        link: direct login, and the stored value is upgraded to the hash."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+
+        with self.app.app_context():
+            existing = UserFactory(
+                email="cristina@example.pt",
+                password="S3cretPass!",
+                extras={"auth_nic": "08133404"},
+            )
+
+            user, status = _find_or_create_saml_user(
+                user_email="cristina.cmd@example.pt",
+                user_nic="08133404",
+                first_name="Cristina",
+                last_name="Isidro",
+            )
+
+            assert status == "existing_saml"
+            assert user.id == existing.id
+            existing.reload()
+            assert existing.extras["auth_nic"] == _hash_nic("08133404")
+
+    def test_plain_stored_nic_of_someone_else_does_not_match(self):
+        """A different plain NIC on another account is neither matched nor
+        modified — the login proceeds to the normal wizard/new-account path."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+
+        with self.app.app_context():
+            other = UserFactory(
+                first_name="Alguém",
+                last_name="Diferente",
+                extras={"auth_nic": "99990000"},
+            )
+
+            user, status = _find_or_create_saml_user(
+                user_email=None,
+                user_nic="08133404",
+                first_name="Cristina",
+                last_name="Isidro",
+            )
+
+            assert status == "new"
+            assert user.id != other.id
+            other.reload()
+            assert other.extras["auth_nic"] == "99990000"
+
+    def test_email_match_with_legacy_encrypted_nic_is_wizard_candidate(self):
+        """A legacy ciphertext does not count as a linked identity: the
+        email-matched account is offered in the wizard for re-linking."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+
+        with self.app.app_context():
+            existing = UserFactory(
+                email="legacy@example.pt",
+                password="S3cretPass!",
+                extras={"auth_nic": self.LEGACY_ENCRYPTED},
+            )
+
+            user, status = _find_or_create_saml_user(
+                user_email="legacy@example.pt",
+                user_nic="12345678",
+                first_name="Rui",
+                last_name="Martinho",
+            )
+
+            assert status == "migration_candidate"
+            assert user.id == existing.id
+            # Nothing linked yet — ownership not proven.
+            existing.reload()
+            assert existing.extras["auth_nic"] == self.LEGACY_ENCRYPTED
+
+    def test_email_match_with_hashed_nic_stays_excluded(self):
+        """Security invariant: an account properly linked to ANOTHER CMD
+        identity is never offered in the wizard on email match."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+
+        with self.app.app_context():
+            linked = UserFactory(
+                email="linked@example.pt",
+                extras={"auth_nic": _hash_nic("00001111")},
+            )
+
+            user, status = _find_or_create_saml_user(
+                user_email="linked@example.pt",
+                user_nic="22223333",
+                first_name="Nuno",
+                last_name="Matos",
+            )
+
+            assert status == "new"
+            assert user.id != linked.id
+            linked.reload()
+            assert linked.extras["auth_nic"] == _hash_nic("00001111")
+
+    def test_name_match_with_junk_nic_is_wizard_candidate(self):
+        """Junk auth_nic values (old usernames) do not count as a linked
+        identity either: the name-matched account goes to the wizard."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+
+        with self.app.app_context():
+            existing = UserFactory(
+                first_name="Pedro",
+                last_name="Almeida",
+                password="S3cretPass!",
+                extras={"auth_nic": "johndoe"},
+            )
+
+            user, status = _find_or_create_saml_user(
+                user_email=None,
+                user_nic="55667788",
+                first_name="Pedro",
+                last_name="Almeida",
+            )
+
+            assert status == "migration_candidate"
+            assert user.id == existing.id
+            existing.reload()
+            assert existing.extras["auth_nic"] == "johndoe"
+
+    def test_find_legacy_user_allows_stale_nic(self):
+        """The wizard search/password path must also accept accounts with
+        stale values, so they can prove ownership and be re-linked."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _find_legacy_user
+
+        with self.app.app_context():
+            stale = UserFactory(
+                email="stale@example.pt",
+                password="S3cretPass!",
+                extras={"auth_nic": self.LEGACY_ENCRYPTED},
+            )
+            UserFactory(
+                email="linked2@example.pt",
+                password="S3cretPass!",
+                extras={"auth_nic": _hash_nic("13579246")},
+            )
+
+            found = _find_legacy_user(email="stale@example.pt")
+            assert found is not None and found.id == stale.id
+            assert _find_legacy_user(email="linked2@example.pt") is None
 
 
 class SAMLMigrationWizardTest(APITestCase):

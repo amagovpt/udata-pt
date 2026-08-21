@@ -84,6 +84,7 @@ ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
 from udata.app import csrf
 from udata.core.user.nic import hash_nic as _hash_nic
+from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
 from udata.mail import MailMessage, send_mail
 from udata.models import datastore
@@ -718,6 +719,17 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
     return user
 
 
+def _has_linked_nic(user):
+    """True when the account holds a properly linked (hashed) CMD identity.
+
+    Plain, legacy-encrypted or junk ``auth_nic`` values left behind by older
+    portal versions do not count as a link: they can never match a login
+    lookup, so the account must stay eligible for the migration wizard to
+    re-link it (the wizard overwrites the stale value with a fresh hash).
+    """
+    return _is_nic_hashed((user.extras or {}).get("auth_nic"))
+
+
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
 
@@ -728,12 +740,18 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     either provider identically.
 
     Decision order:
-    1. NIC already linked → direct login (entry rule). This is the ONLY
-       path that logs the user in without ownership confirmation.
+    1. NIC already linked (hashed, or stored in plain form by an old plugin
+       version — upgraded to the hash on the spot) → direct login (entry
+       rule). This is the ONLY path that logs the user in without ownership
+       confirmation.
     2. Email match → suspected existing account; the user must confirm
        ownership through the migration wizard before linking
     3. Name-only match → same, suspected existing account
     4. No match → create a new account
+
+    Accounts whose ``auth_nic`` holds a stale non-hashed value (plain NIC of
+    a different identity, legacy ciphertext, junk) are NOT treated as linked:
+    they remain wizard candidates in rules 2 and 3.
 
     Returns a tuple (user, status) where status is one of:
     - "existing_saml" — NIC already linked, normal login
@@ -752,12 +770,23 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         if user:
             return user, "existing_saml"
 
+        # 1b. Same identity stored in plain form by an old plugin version:
+        #     the incoming NIC comes from a signed autenticacao.gov
+        #     assertion, so an exact match proves the link — upgrade the
+        #     stored value to the hashed format and log the user in.
+        user = User.objects(extras__auth_nic=user_nic).first()
+        if user:
+            user.extras["auth_nic"] = _hash_nic(user_nic)
+            user.save()
+            current_app.logger.info(f"SAML: upgraded plain stored NIC to hash for user {user.id}")
+            return user, "existing_saml"
+
     # 2. Match by email: never auto-link — ownership must be proven
     #    (password or email code) via the migration wizard. Accounts
     #    already linked to another CMD identity are not candidates.
     if user_email:
         user = datastore.find_user(email=user_email)
-        if user and not (user.extras and user.extras.get("auth_nic")):
+        if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
                 f"(id={user.id}) — ownership confirmation required"
@@ -766,17 +795,21 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
 
     # 3. Name-only match against accounts without a linked CMD identity:
     #    never auto-merge — ownership must be proven (password or email
-    #    code) via the migration wizard before linking.
+    #    code) via the migration wizard before linking. The non-hashed
+    #    filter cannot be expressed in the query, so filter in Python.
     if first_name and last_name:
-        candidates = User.objects(
-            first_name__iexact=first_name,
-            last_name__iexact=last_name,
-            deleted=None,
-            extras__auth_nic__exists=False,
-        )
-        count = candidates.count()
+        candidates = [
+            candidate
+            for candidate in User.objects(
+                first_name__iexact=first_name,
+                last_name__iexact=last_name,
+                deleted=None,
+            )
+            if not _has_linked_nic(candidate)
+        ]
+        count = len(candidates)
         if count:
-            candidate = candidates.first() if count == 1 else None
+            candidate = candidates[0] if count == 1 else None
             current_app.logger.info(
                 f"SAML: name-only match for {first_name} {last_name} "
                 f"({count} candidate(s)) — ownership confirmation required"
@@ -911,7 +944,7 @@ def _find_legacy_user(email=None, first_name=None, last_name=None):
             deleted=None,
         ).first()
 
-    if user and user.password and not (user.extras and user.extras.get("auth_nic")):
+    if user and user.password and not _has_linked_nic(user):
         if not user.deleted:
             return user
     return None
@@ -1922,7 +1955,7 @@ def migration_check():
     if not current_user.is_authenticated:
         return jsonify({"needs_migration": False})
 
-    has_nic = current_user.extras and current_user.extras.get("auth_nic")
+    has_nic = _has_linked_nic(current_user)
     needs = bool(not has_nic and current_user.password)
     return jsonify({"needs_migration": needs})
 
@@ -2119,7 +2152,7 @@ def migration_confirm():
             not user
             or user.deleted
             or not user.password
-            or (user.extras and user.extras.get("auth_nic"))
+            or _has_linked_nic(user)
             or not verify_and_update_password(password, user)
         ):
             return jsonify({"error": "Invalid credentials"}), 400
