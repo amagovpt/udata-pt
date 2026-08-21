@@ -1404,6 +1404,12 @@ def idp_initiated():
         name_id=name_id_value,
         reason=status,
     )
+    # Remember the authenticated Subject so SP-initiated logout can send the
+    # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    session["saml_name_id"] = name_id_value
+    # Only ever store plain strings in the session (the format may be a
+    # non-string sentinel in edge cases; production values are str or None).
+    session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
     return _handle_saml_user_login(user, new_account=(status == "new"))
 
 
@@ -1432,9 +1438,38 @@ def saml_logout_postback():
             else:
                 break
 
-    session.pop("saml_login", None)
-    logout_user()
+    _terminate_local_session()
     return redirect(frontend_url or "/")
+
+
+def _saml_session_name_id():
+    """Build the NameID for a LogoutRequest from the session, if stored.
+
+    The SSO postbacks record the Subject NameID the IdP authenticated
+    (``saml_name_id``/``saml_name_id_format``); using it lets the IdP tie
+    the LogoutRequest to the right session. Falls back to the historical
+    dummy value when nothing was recorded (e.g. sessions from before this
+    was stored, or wizard-created logins).
+    """
+    text = session.get("saml_name_id") or "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"
+    fmt = session.get("saml_name_id_format") or NAMEID_FORMAT_UNSPECIFIED
+    return NameID(format=fmt, text=text)
+
+
+def _terminate_local_session():
+    """End the dados.gov.pt session immediately.
+
+    Called by the SP-initiated logout routes BEFORE handing the user to the
+    IdP single-logout dance: if any step of that round-trip fails (IdP
+    error, unreachable postback, dummy NameID the IdP cannot resolve), the
+    local session must already be dead — clicking "Sair" always logs the
+    user out of the portal. The SLO postback clears the same keys again,
+    which is harmless.
+    """
+    session.pop("saml_login", None)
+    session.pop("saml_name_id", None)
+    session.pop("saml_name_id_format", None)
+    logout_user()
 
 
 #################################################################
@@ -1445,10 +1480,7 @@ def saml_logout():
     saml_client = saml_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
     )
-    nid = NameID(
-        format=NAMEID_FORMAT_UNSPECIFIED,
-        text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
-    )
+    nid = _saml_session_name_id()
 
     logout_url = LogoutUrl(text=_saml_endpoint_url("saml.saml_logout_postback"))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
@@ -1463,6 +1495,10 @@ def saml_logout():
         consent="urn:oasis:names:tc:SAML:2.0:logout:user",
         extensions=extensions,
     )
+
+    # Local session first, IdP dance second (best effort) — see
+    # _terminate_local_session.
+    _terminate_local_session()
 
     post_message = http_form_post_message(message=logout_request, location=destination)
     return _saml_form_response(post_message["data"])
@@ -1814,6 +1850,12 @@ def idp_eidas_initiated():
         name_id=name_id_value,
         reason=status,
     )
+    # Remember the authenticated Subject so SP-initiated logout can send the
+    # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    session["saml_name_id"] = name_id_value
+    # Only ever store plain strings in the session (the format may be a
+    # non-string sentinel in edge cases; production values are str or None).
+    session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
     return _handle_saml_user_login(user, new_account=(status == "new"))
 
 
@@ -1841,8 +1883,7 @@ def eidas_logout_postback():
             else:
                 break
 
-    session.pop("saml_login", None)
-    logout_user()
+    _terminate_local_session()
     frontend_url = current_app.config.get("CDATA_BASE_URL") or "/"
     return redirect(frontend_url)
 
@@ -1855,10 +1896,7 @@ def eidas_logout():
     saml_client = eidas_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
     )
-    nid = NameID(
-        format=NAMEID_FORMAT_UNSPECIFIED,
-        text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
-    )
+    nid = _saml_session_name_id()
 
     logout_url = LogoutUrl(text=_saml_endpoint_url("saml.eidas_logout_postback"))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
@@ -1873,6 +1911,10 @@ def eidas_logout():
         consent="urn:oasis:names:tc:SAML:2.0:logout:user",
         extensions=extensions,
     )
+
+    # Local session first, IdP dance second (best effort) — see
+    # _terminate_local_session.
+    _terminate_local_session()
 
     post_message = http_form_post_message(message=logout_request, location=destination)
     return _saml_form_response(post_message["data"])

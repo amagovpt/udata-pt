@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **fix: SP-initiated SAML logout terminates the local session before the IdP dance**
+  - "Sair" for CMD/eIDAS sessions navigates to `/saml/logout`, which only
+    ended the dados.gov.pt session at the IdP's single-logout postback — if
+    any step of that round-trip failed, the user stayed logged in and the
+    button appeared to do nothing. This path had never been exercised:
+    until `saml_login` was actually returned by `/api/1/me/`, every user
+    took the plain logout path. The local session (flask-login +
+    `saml_login` flag) is now terminated immediately when `/saml/logout`
+    or `/saml/eidas/logout` is hit; the IdP hand-off form is still
+    returned as best effort.
+  - The LogoutRequest also stops sending a dummy NameID (the literal
+    format string): the SSO postbacks now record the authenticated
+    Subject NameID (+format) in the session and the logout uses it, so
+    the IdP can resolve the right session; the historical dummy remains
+    the fallback for sessions created before this change.
 - **fix: align the eIDAS AuthnRequest with the Minimum Data Set and stop over-requesting attributes**
   - The four eIDAS natural-person MDS attributes (PersonIdentifier,
     CurrentFamilyName, CurrentGivenName, DateOfBirth) are now requested
