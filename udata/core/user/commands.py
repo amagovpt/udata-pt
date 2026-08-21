@@ -159,10 +159,13 @@ def _hash_plain_nics(dry_run):
 def _merge_cmd_duplicates(dry_run):
     """Merge duplicate SAML accounts into their traditional counterparts.
 
-    Identifies users with placeholder SAML emails (saml-*@autenticacao.gov.pt),
-    finds the matching traditional account by first_name + last_name, merges the
-    NIC into the traditional account, and deletes the duplicate. Duplicates it
-    cannot safely resolve are returned for a manual ``merge-saml`` decision.
+    Identifies users with placeholder SAML emails (saml-*@autenticacao.gov.pt)
+    and finds the matching traditional account: first by the hashed NIC (the
+    NIC identifies the person, regardless of name spelling), then by
+    first_name + last_name as fallback. Merges the NIC into the traditional
+    account and deletes the duplicate. Duplicates it cannot safely resolve
+    are returned for a manual ``merge-saml`` decision, and a failure on one
+    duplicate never aborts the rest of the run.
     """
     stats = {"merged": 0, "unresolved": []}
 
@@ -189,15 +192,27 @@ def _merge_cmd_duplicates(dry_run):
             unresolved(dup, "unexpected NIC format on the duplicate")
             continue
 
-        # Find the traditional account by name (case-insensitive, exact match)
+        # A traditional account already holding this exact hash IS the same
+        # person — the duplicate is redundant no matter how the names are
+        # spelled. Name matching is only the fallback.
         candidates = list(
             User.objects(
-                first_name=re.compile(f"^{re.escape(dup.first_name or '')}$", re.IGNORECASE),
-                last_name=re.compile(f"^{re.escape(dup.last_name or '')}$", re.IGNORECASE),
+                extras__auth_nic=hashed_nic,
+                id__ne=dup.id,
                 email__not__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX,
                 deleted=None,
             )
         )
+        if not candidates:
+            # Fallback: traditional account by name (case-insensitive, exact)
+            candidates = list(
+                User.objects(
+                    first_name=re.compile(f"^{re.escape(dup.first_name or '')}$", re.IGNORECASE),
+                    last_name=re.compile(f"^{re.escape(dup.last_name or '')}$", re.IGNORECASE),
+                    email__not__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX,
+                    deleted=None,
+                )
+            )
 
         if len(candidates) == 0:
             unresolved(dup, "no traditional account found")
@@ -228,11 +243,17 @@ def _merge_cmd_duplicates(dry_run):
                     dup.email,
                 )
         else:
-            if not target.extras:
-                target.extras = {}
-            target.extras["auth_nic"] = hashed_nic
-            target.save()
-            dup._delete()
+            # One bad document (e.g. a cascade-delete tripping over broken
+            # data elsewhere) must not abort the whole migration run.
+            try:
+                if not target.extras:
+                    target.extras = {}
+                target.extras["auth_nic"] = hashed_nic
+                target.save()
+                dup._delete()
+            except Exception as e:
+                unresolved(dup, f"merge failed: {e}")
+                continue
             log.info(
                 "MERGED hashed NIC into %s | deleted %s",
                 target.email,
@@ -241,6 +262,22 @@ def _merge_cmd_duplicates(dry_run):
         stats["merged"] += 1
 
     return stats
+
+
+def _find_shared_nics():
+    """Return hashed NIC values held by more than one account.
+
+    Two accounts sharing the same hash (typically one person who registered
+    both a personal and an institutional account with the same NIC) make the
+    CMD login ambiguous — the lookup returns an arbitrary one. These need a
+    manual decision on which account keeps the link.
+    """
+    pipeline = [
+        {"$match": {"extras.auth_nic": {"$exists": True}}},
+        {"$group": {"_id": "$extras.auth_nic", "n": {"$sum": 1}, "emails": {"$push": "$email"}}},
+        {"$match": {"n": {"$gt": 1}}},
+    ]
+    return [group for group in User.objects.aggregate(pipeline) if is_nic_hashed(str(group["_id"]))]
 
 
 @grp.command()
@@ -285,6 +322,16 @@ def migrate_nics(dry_run):
         )
         for email, reason in merge_stats["unresolved"]:
             log.info("    - %s — %s", email, reason)
+
+    shared = _find_shared_nics()
+    if shared:
+        log.warning(
+            "  NIC hashes shared by multiple accounts (ambiguous CMD login, "
+            "needs a manual decision on which account keeps the link): %d",
+            len(shared),
+        )
+        for group in shared:
+            log.warning("    - %s", " | ".join(group["emails"]))
 
     success(
         f"{'Would migrate' if dry_run else 'Migrated'}: "

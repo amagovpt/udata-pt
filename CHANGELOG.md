@@ -43,6 +43,18 @@
     canonical) and ends with a report of what was migrated and what still
     needs manual or decryption-based follow-up. `merge-saml` stays for the
     manual cases and now refuses unexpected NIC formats.
+  - Duplicates are matched to their traditional account by the hashed NIC
+    first — the NIC identifies the person, so a name spelled differently
+    (e.g. CMD returns the full civil name) no longer leaves a redundant
+    duplicate behind sharing the same NIC hash, which made the CMD login
+    ambiguous. Name matching remains as fallback.
+  - A failure while merging one duplicate (the first production run tripped
+    over an unrelated broken unique index it had to build on first access to
+    another collection) no longer aborts the whole run: the duplicate is
+    reported as unresolved and the migration carries on to the final report,
+    which now also lists NIC hashes shared by multiple accounts (one person
+    with a personal and an institutional account — ambiguous CMD login that
+    needs a manual decision on which account keeps the link).
   - The `_hash_nic`/`_is_nic_hashed` helpers, duplicated verbatim between the
     user commands and the SAML plugin, moved to a shared `udata.core.user.nic`
     module.

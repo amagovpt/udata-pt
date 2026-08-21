@@ -1,4 +1,5 @@
 from datetime import datetime
+from unittest.mock import patch
 
 from udata.core.user.constants import (
     SAML_PLACEHOLDER_EMAIL_DOMAIN,
@@ -147,6 +148,83 @@ class MigrateNicsMergePhaseTest(PytestOnlyDBTestCase):
         dup.reload()
         with self.app.app_context():
             assert dup.extras["auth_nic"] == hash_nic(PLAIN_NIC)
+
+    def test_nic_match_wins_over_name_mismatch(self):
+        """A traditional account already holding the duplicate's hashed NIC
+        is the same person even when the names are spelled differently —
+        the redundant duplicate is deleted."""
+        with self.app.app_context():
+            hashed = hash_nic(PLAIN_NIC)
+        target = UserFactory(first_name="Leonor", last_name="Pinto", extras={"auth_nic": hashed})
+        dup = UserFactory(
+            email=placeholder_email("11112222"),
+            first_name="Leonor",
+            last_name="Cabral Diogo Pinto",
+            extras={"auth_nic": hashed},
+        )
+
+        self.cli("user", "migrate-nics")
+
+        target.reload()
+        assert target.extras["auth_nic"] == hashed
+        assert User.objects(id=dup.id).first() is None
+
+    def test_failure_on_one_duplicate_does_not_abort_the_run(self):
+        """A cascade-delete blowing up on one duplicate must not prevent the
+        remaining duplicates from being merged."""
+        with self.app.app_context():
+            hashed_a = hash_nic(PLAIN_NIC)
+            hashed_b = hash_nic(OTHER_NIC)
+        target_a = UserFactory(first_name="Ana", last_name="Amaral", extras={"auth_nic": hashed_a})
+        dup_a = UserFactory(
+            email=placeholder_email("aaaa0000"),
+            first_name="Ana",
+            last_name="Amaral",
+            extras={"auth_nic": hashed_a},
+        )
+        target_b = UserFactory(first_name="Bruno", last_name="Barros")
+        dup_b = UserFactory(
+            email=placeholder_email("bbbb0000"),
+            first_name="Bruno",
+            last_name="Barros",
+            extras={"auth_nic": hashed_b},
+        )
+
+        real_delete = User._delete
+
+        def flaky_delete(self, *args, **kwargs):
+            if self.id == dup_a.id:
+                raise RuntimeError("boom")
+            return real_delete(self, *args, **kwargs)
+
+        with patch.object(User, "_delete", flaky_delete):
+            result = self.cli("user", "migrate-nics")
+
+        # dup_a failed and is reported; dup_b was still merged.
+        assert User.objects(id=dup_a.id).first() is not None
+        assert User.objects(id=dup_b.id).first() is None
+        target_b.reload()
+        assert target_b.extras["auth_nic"] == hashed_b
+        assert "1 unresolved" in result.output
+        target_a.reload()
+        assert target_a.extras["auth_nic"] == hashed_a
+
+    def test_find_shared_nics_reports_ambiguous_hashes(self):
+        from udata.core.user.commands import _find_shared_nics
+
+        with self.app.app_context():
+            hashed = hash_nic(PLAIN_NIC)
+        UserFactory(email="pessoal@example.pt", extras={"auth_nic": hashed})
+        UserFactory(email="institucional@example.pt", extras={"auth_nic": hashed})
+        UserFactory(extras={"auth_nic": LEGACY_ENCRYPTED_NIC})
+        UserFactory(extras={"auth_nic": LEGACY_ENCRYPTED_NIC})
+
+        with self.app.app_context():
+            shared = _find_shared_nics()
+
+        # Only the hashed group is reported (legacy pairs are not login-ambiguous).
+        assert len(shared) == 1
+        assert sorted(shared[0]["emails"]) == ["institucional@example.pt", "pessoal@example.pt"]
 
     def test_skips_on_multiple_name_matches(self):
         homonyms = [UserFactory(first_name="Cristina", last_name="Isidro") for _ in range(2)]
