@@ -1502,6 +1502,16 @@ def sp_eidas_initiated():
 
     faa = FAAALevel(text=str(current_app.config.get("SECURITY_SAML_FAAALEVEL")))
 
+    # eIDAS natural-person Minimum Data Set (MDS): PersonIdentifier,
+    # CurrentFamilyName, CurrentGivenName and DateOfBirth are guaranteed by
+    # every member state and must be requested as required per the eIDAS
+    # spec (the PT node was already forwarding them as Optional="false"
+    # downstream). The optional attributes (CurrentAddress, Gender,
+    # PlaceOfBirth) are no longer requested: they were never read nor
+    # stored, and requesting them showed up on the citizen's consent
+    # screen without any use (data minimisation). DateOfBirth still
+    # arrives (MDS) but is intentionally not stored — the User model has
+    # no birth-date field.
     spcertenc = RequestedAttributes(
         [
             RequestedAttribute(
@@ -1512,32 +1522,17 @@ def sp_eidas_initiated():
             RequestedAttribute(
                 name=EIDAS_ATTR_FAMILY_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=EIDAS_ATTR_GIVEN_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name="http://eidas.europa.eu/attributes/naturalperson/DateOfBirth",
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentAddress",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/Gender",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/PlaceOfBirth",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
         ]
     )
