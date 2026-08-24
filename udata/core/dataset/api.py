@@ -37,7 +37,7 @@ from flask import (
 )
 from flask_restx.inputs import boolean
 from flask_security import current_user
-from mongoengine.queryset.visitor import Q
+from mongoengine.queryset.visitor import Q, QCombination
 
 from udata.api import API, api, errors
 from udata.api.limits import (
@@ -125,7 +125,7 @@ COMMUNITY_RESOURCE_DEDUPE_WINDOW = timedelta(minutes=5)
 SUGGEST_SORTING = "-metrics.followers"
 
 
-def format_family_query(family: FormatFamily) -> Q:
+def format_family_query(family: FormatFamily) -> Q | QCombination:
     """Build the Mongo query matching datasets belonging to a format family.
 
     Mirrors how `DatasetSearch.format_family` indexes the same notion, so the
@@ -133,6 +133,10 @@ def format_family_query(family: FormatFamily) -> Q:
     when at least one of its resources does, and to OTHER when it has a resource
     outside every family (an absent or unrecognised format included) or when it
     has no resources at all.
+
+    Families therefore overlap — a dataset with a CSV and an unrecognised format
+    is both TABULAR and OTHER — so the per-family counts are not a partition of
+    the corpus. That is the same shape the sidebar has always had.
 
     OTHER needs `$elemMatch`: on an array field, `resources__format__nin` means
     "no resource matches", which is the complement of the wrong set.
