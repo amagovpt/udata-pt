@@ -35,14 +35,29 @@ class CkanPTBackend(BaseBackend):
     )
     schema = ckan_schema
 
-    harvest_config = {}
-
     def __init__(self, source_or_job, dryrun=False, max_items=None):
         super(CkanPTBackend, self).__init__(source_or_job, dryrun=dryrun, max_items=max_items)
+        self.harvest_config = self._parse_harvest_config()
+
+    def _parse_harvest_config(self) -> dict:
+        """Read the optional JSON config blob carried by the source description.
+
+        Legacy contract of this backend only: the description field doubles as a
+        config blob holding `license` and `geozones`. It is free text in the UI, so
+        anything that is not a JSON object simply means "no config" - never an error,
+        in a dry run just as in a real harvest.
+        """
         try:
-            self.harvest_config = json.loads(safe_unicode(self.source.description))
+            config = json.loads(safe_unicode(self.source.description))
         except (ValueError, TypeError):
-            pass
+            return {}
+
+        # A description that is a bare JSON scalar ("2026", "null", "true") parses
+        # fine but is not a config: keeping it would break every `.get()` below.
+        if not isinstance(config, dict):
+            return {}
+
+        return config
 
     def get_headers(self):
         headers = super(CkanPTBackend, self).get_headers()
@@ -101,14 +116,6 @@ class CkanPTBackend(BaseBackend):
         return response.json()
 
     def inner_harvest(self):
-        try:
-            self.harvest_config = json.loads(safe_unicode(self.source.description))
-        except (ValueError, TypeError) as e:
-            if self.dryrun:
-                raise e
-            else:
-                pass
-
         """List all datasets for a given ..."""
         fix = False  # Fix should be True for CKAN < '1.8'
 
