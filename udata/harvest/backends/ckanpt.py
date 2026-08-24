@@ -47,9 +47,19 @@ class CkanPTBackend(BaseBackend):
         anything that is not a JSON object simply means "no config" - never an error,
         in a dry run just as in a real harvest.
         """
+        description = self.source.description or ""
         try:
-            config = json.loads(safe_unicode(self.source.description))
+            config = json.loads(safe_unicode(description))
         except (ValueError, TypeError):
+            # Prose is the normal case and must stay silent, otherwise every run of
+            # every CKAN PT harvester logs a warning. Only complain when someone
+            # clearly meant to write config and got the syntax wrong.
+            if description.strip()[:1] in ("{", "["):
+                log.warning(
+                    "Description of harvest source %s looks like a JSON config but "
+                    "could not be parsed; ignoring it (license/geozones)",
+                    self.source.id,
+                )
             return {}
 
         # A description that is a bare JSON scalar ("2026", "null", "true") parses

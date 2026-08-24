@@ -7,6 +7,7 @@ harvest.
 """
 
 import json
+import logging
 
 import pytest
 
@@ -19,6 +20,7 @@ from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import faker
 
 DATASET_NAME = "ckanpt-dataset"
+BACKEND_LOGGER = "udata.harvest.backends.ckanpt"
 
 
 def ckanpt_organization(acronym):
@@ -171,3 +173,30 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         job = source.get_last_job()
         assert job.status == "done", [error.message for error in job.errors]
         assert len(Dataset.objects) == 1
+
+    def backend_warnings(self, caplog):
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == BACKEND_LOGGER and record.levelno == logging.WARNING
+        ]
+
+    def test_malformed_json_description_is_logged(self, caplog):
+        """Someone who meant to write config and got it wrong gets a warning."""
+        source = self.source('{"license": ')
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            self.assert_previewed_one_item(actions.preview(source))
+
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert str(source.id) in warnings[0]
+
+    def test_prose_description_is_not_logged(self, caplog):
+        """Prose is the normal case: it must not log on every single run."""
+        source = self.source("Harvester dos dados abertos do municipio.")
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            self.assert_previewed_one_item(actions.preview(source))
+
+        assert self.backend_warnings(caplog) == []
