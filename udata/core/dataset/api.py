@@ -85,7 +85,13 @@ from .api_fields import (
     upload_community_fields,
     upload_fields,
 )
-from .constants import RESOURCE_TYPES, UpdateFrequency
+from .constants import (
+    RESOURCE_TYPES,
+    FormatFamily,
+    UpdateFrequency,
+    get_family_formats,
+    get_known_formats,
+)
 from .download_proxy import (
     ProxyDownloadForbidden,
     stream_as_attachment,
@@ -117,6 +123,24 @@ DEFAULT_SORTING = "-created_at_internal"
 # Defense in depth on top of the rate-limit (TICKET-59 / VULN-2078).
 COMMUNITY_RESOURCE_DEDUPE_WINDOW = timedelta(minutes=5)
 SUGGEST_SORTING = "-metrics.followers"
+
+
+def format_family_query(family: FormatFamily) -> Q:
+    """Build the Mongo query matching datasets belonging to a format family.
+
+    Mirrors how `DatasetSearch.format_family` indexes the same notion, so the
+    Mongo listing and the search service agree: a dataset belongs to a family
+    when at least one of its resources does, and to OTHER when it has a resource
+    outside every family (an absent or unrecognised format included) or when it
+    has no resources at all.
+
+    OTHER needs `$elemMatch`: on an array field, `resources__format__nin` means
+    "no resource matches", which is the complement of the wrong set.
+    """
+    if family is FormatFamily.OTHER:
+        known = sorted(get_known_formats())
+        return Q(resources__match={"format": {"$nin": known}}) | Q(resources__size=0)
+    return Q(resources__format__in=sorted(get_family_formats(family)))
 
 
 class DatasetApiParser(ModelApiParser):
@@ -166,6 +190,17 @@ class DatasetApiParser(ModelApiParser):
             help="(beta, subject to change/be removed)",
         )
         self.parser.add_argument("format", type=str, location="args", action="append")
+        # Coarse-grained companion to `format`: filters on the family a resource
+        # format belongs to (see FormatFamily / the *_FORMATS settings) instead of
+        # naming every extension. Repeatable, and repeats are an OR.
+        self.parser.add_argument(
+            "format_family",
+            type=str,
+            choices=[family.value for family in FormatFamily],
+            location="args",
+            action="append",
+            help="Filter on a resource format family. Repeatable; repeats are OR'ed.",
+        )
         self.parser.add_argument("schema", type=str, location="args")
         self.parser.add_argument("schema_version", type=str, location="args")
         self.parser.add_argument(
@@ -260,6 +295,14 @@ class DatasetApiParser(ModelApiParser):
             datasets = datasets.filter(id__in=ids)
         if args.get("format"):
             datasets = datasets.filter(resources__format__in=args["format"])
+        if args.get("format_family"):
+            # OR across the requested families, AND against the other filters,
+            # like every other multi-value filter here.
+            family_query = None
+            for value in args["format_family"]:
+                query = format_family_query(FormatFamily(value))
+                family_query = query if family_query is None else family_query | query
+            datasets = datasets.filter(family_query)
         if args.get("schema"):
             datasets = datasets.filter(resources__schema__name=args["schema"])
         if args.get("schema_version"):

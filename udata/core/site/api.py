@@ -15,11 +15,18 @@ from udata.api_fields import patch
 from udata.app import cache, limiter
 from udata.auth import admin_permission
 from udata.core import csv
+from udata.core.constants import HVD
 from udata.core.dataservices.csv import DataserviceCsvAdapter
 from udata.core.dataservices.models import Dataservice
-from udata.core.dataset.api import DEFAULT_SORTING, DatasetApiParser, catalog_parser, dataset_parser
+from udata.core.dataset.api import (
+    DEFAULT_SORTING,
+    DatasetApiParser,
+    catalog_parser,
+    dataset_parser,
+    format_family_query,
+)
 from udata.core.dataset.api_fields import dataset_page_fields, license_fields
-from udata.core.dataset.constants import INSPIRE
+from udata.core.dataset.constants import INSPIRE, FormatFamily
 from udata.core.dataset.csv import ResourcesCsvAdapter
 from udata.core.dataset.models import License, UpdateFrequency
 from udata.core.dataset.search import DatasetSearch
@@ -286,16 +293,6 @@ class SiteHomeReusesAPI(API):
         return [_serialize_reuse(r) for r in reuses]
 
 
-# Format groups for the /datasets sidebar filters. Kept in sync with
-# FORMAT_GROUP_MAP in frontend/src/components/datasets/DatasetsFilters.tsx.
-_DATASET_FORMAT_GROUPS: dict[str, list[str]] = {
-    "tabular": ["csv", "xls", "xlsx", "ods", "parquet", "tsv"],
-    "structured": ["json", "rdf", "xml", "sql", "ndjson", "jsonl"],
-    "geographic": ["geojson", "shp", "kml", "kmz", "gpx", "wfs", "wms"],
-    "documents": ["pdf", "doc", "docx", "md", "txt", "odt", "rtf"],
-}
-
-
 def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
     """Return the unfiltered global counts used by the dataset sidebar filters.
 
@@ -303,13 +300,17 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
     full visible dataset corpus and feed the "Todos / Tabular / Estruturado /
     ..." labels in the sidebar.
 
-    Each "Tipo de dados" count (`rotulo_*`) is keyed on whatever the listing
-    filters on for that option, so that the number shown next to an option
-    always matches the number of results it returns: `rotulo_inspire` on the
-    INSPIRE badge (`?badge=inspire`) and `rotulo_high_value` on the raw `hvd`
-    tag (`?tag=hvd`). Moving HVD to its badge is tracked separately: the badge
-    job only grants it to datasets of certified public-service organizations,
-    so the badge currently covers a subset of the tagged datasets.
+    Every count is keyed on exactly what the listing filters on for that option,
+    so the number shown next to an option always matches the number of results
+    it returns:
+
+    - `formato_<family>` reuses `format_family_query`, the same expression the
+      `?format_family=` filter applies. This used to be a local copy of the
+      format lists that the frontend copied in turn, and `formato_other` was
+      simply missing, which is why the "Outros" option showed no count and
+      returned everything.
+    - `rotulo_high_value` / `rotulo_inspire` on the HVD and INSPIRE badges,
+      matching `?badge=hvd` / `?badge=inspire`.
     """
     now = datetime.now(timezone.utc)
     d30 = now - timedelta(days=30)
@@ -324,11 +325,11 @@ def _compute_dataset_filter_counts(base_qs) -> dict[str, int]:
         "atualizacao_30_days": base_qs.filter(last_modified_internal__gte=d30).count(),
         "atualizacao_12_months": base_qs.filter(last_modified_internal__gte=d12m).count(),
         "atualizacao_3_years": base_qs.filter(last_modified_internal__gte=d3y).count(),
-        "rotulo_high_value": base_qs.filter(tags="hvd").count(),
+        "rotulo_high_value": base_qs.filter(badges__kind=HVD).count(),
         "rotulo_inspire": base_qs.filter(badges__kind=INSPIRE).count(),
     }
-    for group_id, formats in _DATASET_FORMAT_GROUPS.items():
-        counts[f"formato_{group_id}"] = base_qs.filter(resources__format__in=formats).count()
+    for family in FormatFamily:
+        counts[f"formato_{family.value}"] = base_qs.filter(format_family_query(family)).count()
     return counts
 
 

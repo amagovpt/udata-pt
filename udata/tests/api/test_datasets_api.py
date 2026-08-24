@@ -376,6 +376,57 @@ class DatasetAPITest(APITestCase):
             {d["id"] for d in response.json["data"]},
         )
 
+    def test_dataset_api_list_with_format_family_filter(self):
+        """`?format_family=` filters on the family a resource format belongs to.
+
+        Coarse-grained companion to `?format=`, so the listing sidebar can offer
+        "Tabular / Estruturado / ... / Outros" without every client copying the
+        format lists. OTHER is the complement of the other families, which is why
+        it needs its own query rather than a list of extensions.
+        """
+        tabular = DatasetFactory(resources=[ResourceFactory(format="csv")])
+        machine_readable = DatasetFactory(resources=[ResourceFactory(format="json")])
+        geographical = DatasetFactory(resources=[ResourceFactory(format="shp")])
+        documents = DatasetFactory(resources=[ResourceFactory(format="pdf")])
+        unclassified = DatasetFactory(resources=[ResourceFactory(format="some-unknown-format")])
+        # DatasetFactory defaults to no resources, so there is nothing to derive a
+        # family from: OTHER, matching how DatasetSearch indexes format_family.
+        no_resources = DatasetFactory()
+
+        for family, expected in (
+            ("tabular", tabular),
+            ("machine_readable", machine_readable),
+            ("geographical", geographical),
+            ("documents", documents),
+        ):
+            response = self.get(url_for("api.datasets", format_family=family))
+            self.assert200(response)
+            self.assertEqual(len(response.json["data"]), 1, f"family {family}")
+            self.assertEqual(response.json["data"][0]["id"], str(expected.id))
+
+        response = self.get(url_for("api.datasets", format_family="other"))
+        self.assert200(response)
+        self.assertEqual(
+            {str(unclassified.id), str(no_resources.id)},
+            {d["id"] for d in response.json["data"]},
+        )
+
+        # Several families are an OR, like every other repeatable filter.
+        response = self.get(url_for("api.datasets", format_family=["tabular", "documents"]))
+        self.assert200(response)
+        self.assertEqual(
+            {str(tabular.id), str(documents.id)},
+            {d["id"] for d in response.json["data"]},
+        )
+
+        # AND against a different filter: this dataset is tabular, not a document.
+        response = self.get(url_for("api.datasets", format_family="documents", format="csv"))
+        self.assert200(response)
+        self.assertEqual(len(response.json["data"]), 0)
+
+        response = self.get(url_for("api.datasets", format_family="not-a-family"))
+        self.assert400(response)
+
     def test_dataset_api_list_with_restricted_filters(self):
         owner = UserFactory()
         org = OrganizationFactory(members=[Member(user=owner)])
