@@ -213,7 +213,14 @@ class DatasetApiParser(ModelApiParser):
             )
             datasets = datasets.search_text(phrase_query)
         if args.get("tag"):
-            datasets = datasets.filter(tags__all=args["tag"])
+            # OR within the filter: `?tag=a&tag=b` returns datasets carrying either tag.
+            # Upstream udata uses `tags__all` (AND) here; dados.gov.pt diverges on purpose
+            # (LEDG-2255). The portal's sidebar filters are multi-select, and every other
+            # one of them is already an OR — `license`, `format`, `frequency`, `badge`,
+            # `organization`, `geozone`, `granularity` are all `__in`. Keeping tags as the
+            # single AND made picking two keywords return an almost empty intersection,
+            # which reads as a broken filter.
+            datasets = datasets.filter(tags__in=args["tag"])
         if args.get("license"):
             datasets = datasets.filter(license__in=License.objects.filter(id__in=args["license"]))
         if args.get("geozone"):

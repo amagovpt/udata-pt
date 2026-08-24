@@ -238,11 +238,17 @@ class DatasetAPITest(APITestCase):
             set([d["id"] for d in response.json["data"]]),
         )
 
-        # filter on multiple tags
-        response = self.get(url_for("api.datasets", tag=["my-tag-shared", "my-tag-1"]))
+        # filter on multiple tags: OR, i.e. either tag matches (LEDG-2255).
+        # Upstream udata answers AND here; dados.gov.pt diverges so the multi-select
+        # sidebar filter behaves like every other one. Picking two tags that no single
+        # dataset shares would return nothing under AND, so this pins the OR.
+        response = self.get(url_for("api.datasets", tag=["my-tag-1", "my-tag-2"]))
         self.assert200(response)
-        self.assertEqual(len(response.json["data"]), 1)
-        self.assertEqual(response.json["data"][0]["id"], str(tag_dataset_1.id))
+        self.assertEqual(len(response.json["data"]), 2)
+        self.assertEqual(
+            set([str(tag_dataset_1.id), str(tag_dataset_2.id)]),
+            set([d["id"] for d in response.json["data"]]),
+        )
 
         # filter on format
         response = self.get(url_for("api.datasets", format="my-format"))
