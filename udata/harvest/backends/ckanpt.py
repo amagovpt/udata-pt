@@ -69,6 +69,26 @@ class CkanPTBackend(BaseBackend):
 
         return config
 
+    def default_license(self) -> License:
+        """The license to fall back on when the remote one cannot be guessed.
+
+        `harvest_config` stores the configured license as its identifier, but
+        `Dataset.license` is a reference: handing the raw string to `License.guess`
+        as its default made every item fail validation whenever the remote license
+        was not resolvable.
+        """
+        configured = self.harvest_config.get("license")
+        if configured:
+            license = License.objects(id=configured).first()
+            if license:
+                return license
+            log.warning(
+                "Unknown license %s configured on harvest source %s; using the default one",
+                configured,
+                self.source.id,
+            )
+        return License.default()
+
     def get_headers(self):
         headers = super(CkanPTBackend, self).get_headers()
         headers["content-type"] = "application/json"
@@ -192,9 +212,8 @@ class CkanPTBackend(BaseBackend):
             dataset.organization = orgObj
 
         # Detect license
-        default_license = self.harvest_config.get("license", License.default())
         dataset.license = License.guess(
-            data["license_id"], data["license_title"], default=default_license
+            data["license_id"], data["license_title"], default=self.default_license()
         )
 
         dataset.tags = [t["name"] for t in data["tags"] if t["name"]]

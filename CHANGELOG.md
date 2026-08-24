@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **fix: previewing a CKAN PT harvester no longer fails when the description is not JSON**
+  - This backend carries its optional config (`license`, `geozones`) as a JSON
+    blob in the harvest source description, which is a free-text field in the
+    UI. `inner_harvest` re-parsed that description and re-raised the decoding
+    error whenever `dryrun` was set — and previewing is exactly what runs with
+    `dryrun` — so every preview of a CKAN PT harvester ended in the raw
+    `Expecting value: line 1 column 1 (char 0)` with zero items unless someone
+    had typed valid JSON into the description. The real harvest swallowed the
+    same error, making the preview stricter than the run it previews.
+  - The redundant re-parse is gone: the constructor already parses the same
+    source instance, and nothing can change the description in between. A
+    description that is not a JSON object now simply means "no config", in a
+    preview as in a real harvest, and bare JSON scalars (`2026`, `null`) are
+    rejected too — they parse fine but are not a config and used to break
+    every lookup downstream. A malformed blob is no longer silent: it logs a
+    warning, but only when the text starts with `{` or `[`, so prose in a
+    free-text field does not warn on every run.
+  - Fixes the configured `license` along the way. It is stored as an
+    identifier and was handed straight to `License.guess` as its default,
+    while `Dataset.license` is a reference — so every item whose remote
+    license could not be guessed failed validation. The identifier is now
+    resolved to a license, and an unknown one warns and falls back to the
+    default instead of failing the harvest.
+
 - **fix: CMD login no longer locks out accounts holding stale `auth_nic` values**
   - Any value in `extras.auth_nic` used to be treated as "already linked to
     another CMD identity", which excluded the account from the migration

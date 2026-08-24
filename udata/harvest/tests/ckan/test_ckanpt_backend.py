@@ -11,6 +11,7 @@ import logging
 
 import pytest
 
+from udata.core.dataset.factories import LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.spatial.factories import GeoZoneFactory
 from udata.harvest import actions
@@ -144,17 +145,20 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
 
     def test_preview_with_json_description(self):
         """A valid JSON description still feeds `harvest_config`."""
+        license = LicenseFactory()
         zone = GeoZoneFactory()
-        source = self.source(json.dumps({"geozones": [zone.id]}))
+        source = self.source(json.dumps({"license": license.id, "geozones": [zone.id]}))
 
         dataset = self.assert_previewed_one_item(actions.preview(source))
 
+        assert dataset.license == license
         assert [z.id for z in dataset.spatial.zones] == [zone.id]
 
     def test_run_with_json_description(self):
         """The real harvest keeps honouring a valid JSON config."""
+        license = LicenseFactory()
         zone = GeoZoneFactory()
-        source = self.source(json.dumps({"geozones": [zone.id]}))
+        source = self.source(json.dumps({"license": license.id, "geozones": [zone.id]}))
 
         actions.run(source)
 
@@ -162,7 +166,32 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         job = source.get_last_job()
         assert job.status == "done", [error.message for error in job.errors]
         dataset = Dataset.objects.get(id=job.items[0].dataset.id)
+        assert dataset.license == license
         assert [z.id for z in dataset.spatial.zones] == [zone.id]
+
+    def test_unknown_configured_license_falls_back(self, caplog):
+        """An id that matches no license must not fail the whole harvest."""
+        default = LicenseFactory(id="notspecified")
+        source = self.source(json.dumps({"license": "no-such-license"}))
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert dataset.license == default
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert "no-such-license" in warnings[0]
+
+    def test_remote_license_wins_over_configured_one(self):
+        """The config is a fallback, not an override."""
+        configured = LicenseFactory()
+        remote = LicenseFactory()
+        self.package["result"]["license_id"] = remote.id
+        source = self.source(json.dumps({"license": configured.id}))
+
+        dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert dataset.license == remote
 
     def test_run_with_prose_description(self):
         source = self.source("Harvester dos dados abertos do municipio.")
