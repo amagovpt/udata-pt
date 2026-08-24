@@ -8,6 +8,7 @@ harvest.
 
 import json
 import logging
+from urllib.parse import urljoin
 
 import pytest
 
@@ -15,8 +16,9 @@ from udata.core.dataset.factories import LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.spatial.factories import GeoZoneFactory
 from udata.harvest import actions
+from udata.harvest.backends.ckanpt import CkanPTBackend
 from udata.harvest.tests.factories import HarvestSourceFactory
-from udata.models import Dataset
+from udata.models import Dataset, Organization
 from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import faker
 
@@ -103,6 +105,8 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
             headers={"Content-Type": "application/json"},
         )
         self.ckan_url = ckan.BASE_URL
+        self.ckan = ckan
+        self.rmock = rmock
 
     def source(self, description):
         return HarvestSourceFactory(
@@ -119,7 +123,6 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         item = job.items[0]
         assert item.status == "done", [error.message for error in item.errors]
         assert item.dataset is not None
-        # A preview must not persist anything.
         assert len(Dataset.objects) == 0
         return item.dataset
 
@@ -139,6 +142,9 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
     def test_preview_with_scalar_json_description(self):
         """`json.loads` accepts bare scalars; they are not a config either."""
         self.assert_previewed_one_item(actions.preview(self.source("2026")))
+
+    def test_preview_with_array_json_description(self):
+        self.assert_previewed_one_item(actions.preview(self.source("[1, 2]")))
 
     def test_preview_with_malformed_json_description(self):
         self.assert_previewed_one_item(actions.preview(self.source('{"license": ')))
@@ -182,6 +188,65 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         assert len(warnings) == 1
         assert "no-such-license" in warnings[0]
 
+    def test_configured_license_is_matched_case_insensitively(self):
+        """Identifiers are stored lower case but typed by hand."""
+        license = LicenseFactory(id="cc-by-4.0")
+        source = self.source(json.dumps({"license": "  CC-BY-4.0  "}))
+
+        dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert dataset.license == license
+
+    def test_configured_license_cannot_inject_mongo_operators(self, caplog):
+        """The identifier comes from user input and must never reach the query."""
+        LicenseFactory(id="notspecified")
+        target = LicenseFactory(id="cc-by")
+        source = self.source(json.dumps({"license": {"$regex": "^cc"}}))
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert dataset.license != target
+        assert dataset.license.id == "notspecified"
+        assert len(self.backend_warnings(caplog)) == 1
+
+    def test_configured_license_cannot_forge_log_lines(self, caplog):
+        """A crafted identifier must not be able to fake a log entry."""
+        LicenseFactory(id="notspecified")
+        forged = "x\nWARNING [udata] Harvest source approved by sysadmin"
+        source = self.source(json.dumps({"license": forged}))
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            self.assert_previewed_one_item(actions.preview(source))
+
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert "\n" not in warnings[0]
+
+    def test_unknown_license_is_only_logged_once_per_job(self, caplog):
+        """`default_license` runs per dataset; the job must not collect one line each."""
+        LicenseFactory(id="notspecified")
+        second = dict(self.package["result"], id=faker.uuid4(), name="ckanpt-dataset-2")
+        self.rmock.get(
+            self.ckan.PACKAGE_LIST_URL,
+            json={"success": True, "result": [DATASET_NAME, "ckanpt-dataset-2"]},
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+        self.rmock.get(
+            urljoin(self.ckan.PACKAGE_SHOW_URL, "?id=ckanpt-dataset-2"),
+            json={"success": True, "result": second},
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+        source = self.source(json.dumps({"license": "no-such-license"}))
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            job = actions.preview(source)
+
+        assert len(job.items) == 2
+        assert len(self.backend_warnings(caplog)) == 1
+
     def test_remote_license_wins_over_configured_one(self):
         """The config is a fallback, not an override."""
         configured = LicenseFactory()
@@ -210,9 +275,17 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
             if record.name == BACKEND_LOGGER and record.levelno == logging.WARNING
         ]
 
-    def test_malformed_json_description_is_logged(self, caplog):
-        """Someone who meant to write config and got it wrong gets a warning."""
-        source = self.source('{"license": ')
+    @pytest.mark.parametrize(
+        "description",
+        [
+            '{"license": ',  # a typo in a config someone meant to write
+            "[1, 2]",  # deliberate JSON, but not an object
+            "2026",  # a bare scalar
+        ],
+    )
+    def test_unusable_json_description_is_logged(self, caplog, description):
+        """Deliberate JSON we cannot use must not be discarded in silence."""
+        source = self.source(description)
 
         with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
             self.assert_previewed_one_item(actions.preview(source))
@@ -220,6 +293,58 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         warnings = self.backend_warnings(caplog)
         assert len(warnings) == 1
         assert str(source.id) in warnings[0]
+
+    def test_warning_names_an_unsaved_source(self, caplog):
+        """`preview_from_config` has no source id yet - the very path of this fix."""
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            actions.preview_from_config(
+                name="A new harvester",
+                url=self.ckan_url,
+                backend="ckanpt",
+                description='{"license": ',
+                organization=self.org,
+            )
+
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert "A new harvester" in warnings[0]
+        assert "None" not in warnings[0]
+
+    @pytest.mark.parametrize(
+        ("description", "warns"),
+        [
+            # Decoded before the "looks like config" test, or bytes never warn.
+            (b'{"license": ', True),
+            ({"license": 1}, True),
+            # Renders as "True": no more config-looking than any other prose.
+            (True, False),
+        ],
+    )
+    def test_non_string_description_is_handled(self, caplog, description, warns):
+        """A StringField, but a CLI or a migration can still put anything in it."""
+        source = self.source("placeholder")
+        source.description = description
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            backend = CkanPTBackend(source, dryrun=True)
+
+        assert backend.harvest_config == {}
+        assert len(self.backend_warnings(caplog)) == (1 if warns else 0)
+
+    def test_preview_persists_an_unknown_organization(self):
+        """Characterisation, not an endorsement: a preview should persist nothing.
+
+        `inner_process_dataset` saves the organization with no `dryrun` guard, so
+        previewing a source whose remote organization is unknown creates it for
+        real. Pre-existing and out of scope here (it is not about the description
+        being JSON), but the assertion above only holds because the fixture
+        pre-creates the organization - so it is documented rather than implied.
+        """
+        self.package["result"]["organization"]["name"] = "brand-new-org"
+
+        actions.preview(self.source(""))
+
+        assert Organization.objects(acronym="brand-new-org").count() == 1
 
     def test_prose_description_is_not_logged(self, caplog):
         """Prose is the normal case: it must not log on every single run."""

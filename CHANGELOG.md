@@ -23,7 +23,8 @@
     identifier and was handed straight to `License.guess` as its default,
     while `Dataset.license` is a reference — so every item whose remote
     license could not be guessed failed validation. The identifier is now
-    resolved to a license, and an unknown one warns and falls back to the
+    resolved to a license, matched case-insensitively the way `License.guess`
+    matches, and an unknown one warns once per job and falls back to the
     default instead of failing the harvest.
 
 - **fix: CMD login no longer locks out accounts holding stale `auth_nic` values**
