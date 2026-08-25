@@ -35,6 +35,20 @@
   - The description field also stops being marked as required in the harvester
     form, which it never was: nothing validated it, and the backend has always
     described it as optional details about the harvester.
+  - What inheriting must not cost: the remote `metadata_created` /
+    `metadata_modified` dates keep being recorded, because the public listing sorts
+    on them and upstream only keeps the first, on the harvest metadata. A remote
+    geometry upstream cannot map — anything that is not a polygon — no longer fails
+    the whole dataset, which it would have, since this backend used to parse that
+    value and discard it. And a dataset keeps the geographic zones it already has
+    when its source configures none, so the window between deploying and running
+    the migration cannot wipe them.
+  - A remote can no longer take over a file uploaded on the portal by publishing a
+    resource with its identifier, which would have repointed the shared
+    `/api/1/datasets/r/<id>` link at remote content and left the file prunable.
+    And the zone list is bounded: it is deduplicated, capped and resolved in one
+    query, so a large value cannot tie up a request or grow a harvest job past the
+    size it can still be saved at.
 
 - **fix: previewing a CKAN PT harvester no longer fails when the description is not JSON**
   - This backend carries its optional config (`license`, `geozones`) as a JSON
