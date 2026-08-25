@@ -16,15 +16,30 @@
   - The unscoped URI lookup is deliberate — it deduplicates the same DCAT record
     harvested under two different domains when `dct:identifier` is a stable URI —
     so the fix keeps it and refuses the *match* instead: a lookup that lands on a
-    record owned by a different organization or user now raises, the harvest item
-    is reported as failed, and the record is left untouched. The guard lives on
-    the base class, so it covers every backend and dataservices as well as
-    datasets, rather than being worked around in one harvester.
+    record harvested by a different source and owned by a different organization
+    or user now raises, the harvest item is reported as failed, and the record is
+    left untouched. The guard lives on the base class, so it covers every backend
+    and dataservices as well as datasets, rather than being worked around in one
+    harvester.
+  - Scoping it to *other* sources is a deliberate departure from the upstream
+    guard this is based on, and it is what makes it safe here. Upstream compares
+    owners outright, which it can afford because none of its backends writes
+    `dataset.organization`; `ckanpt` and `odspt` do, mapping each remote
+    publisher onto a local organization, so their records routinely belong to
+    someone other than the source harvesting them. Compared against production
+    first: the owner-only form would have failed 229 datasets across five sources
+    on every subsequent run — 131 of the 144 on the health transparency portal,
+    84 of the 400 on Lisbon's, and the rest on Porto, Oeiras and ICNF. A record
+    the current source already harvested is never the takeover being guarded
+    against.
   - Two sources under the *same* owner can still hand a record over to each
     other; that is the legitimate source-migration case, and it is what keeps
     re-harvesting from duplicating. A record with neither an organization nor an
     owner is likewise still claimable — no such record was observed in
-    production.
+    production, though purging an organization would create them in bulk. The
+    INE harvester also builds its own lookup instead of going through the shared
+    one, so it stays outside this guard; reaching its records would require a
+    source declaring the INE's own domain, which would then harvest the real INE.
   - Production was audited before the change: of 19 144 harvested datasets
     across 38 sources, 61 carry a URI-shaped remote id — the only ones that ever
     reached the unscoped lookup — and all 61 sit on the two sources that
