@@ -202,6 +202,42 @@ class FormatFamily(StrEnum):
     OTHER = auto()
 
 
+# The setting holding each family's format list. OTHER is deliberately absent:
+# it is defined by exclusion, so it has no list of its own and adding one would
+# create a second place to keep in sync.
+FORMAT_FAMILY_SETTINGS: dict[FormatFamily, str] = {
+    FormatFamily.TABULAR: "TABULAR_FORMATS",
+    FormatFamily.MACHINE_READABLE: "MACHINE_READABLE_FORMATS",
+    FormatFamily.GEOGRAPHICAL: "GEOGRAPHICAL_FORMATS",
+    FormatFamily.DOCUMENTS: "DOCUMENTS_FORMATS",
+}
+
+
+def get_family_formats(family: FormatFamily) -> frozenset[str]:
+    """
+    Return the formats belonging to a family.
+
+    Empty for OTHER, which is the complement of every other family rather than
+    a list — use `get_known_formats()` to build that complement.
+    """
+    from flask import current_app
+
+    setting = FORMAT_FAMILY_SETTINGS.get(family)
+    if setting is None:
+        return frozenset()
+    return frozenset(current_app.config[setting])
+
+
+def get_known_formats() -> frozenset[str]:
+    """
+    Return every format classified into a family.
+
+    A resource whose format falls outside this set (or has no format at all)
+    belongs to OTHER.
+    """
+    return frozenset().union(*(get_family_formats(family) for family in FORMAT_FAMILY_SETTINGS))
+
+
 def get_format_family(format_str: str | None) -> FormatFamily:
     """
     Determine the format family for a given format string.
@@ -215,20 +251,12 @@ def get_format_family(format_str: str | None) -> FormatFamily:
     Returns:
         The corresponding FormatFamily enum value
     """
-    from flask import current_app
-
     if not format_str:
         return FormatFamily.OTHER
 
     fmt = format_str.lower().strip()
 
-    if fmt in current_app.config["TABULAR_FORMATS"]:
-        return FormatFamily.TABULAR
-    elif fmt in current_app.config["MACHINE_READABLE_FORMATS"]:
-        return FormatFamily.MACHINE_READABLE
-    elif fmt in current_app.config["GEOGRAPHICAL_FORMATS"]:
-        return FormatFamily.GEOGRAPHICAL
-    elif fmt in current_app.config["DOCUMENTS_FORMATS"]:
-        return FormatFamily.DOCUMENTS
-    else:
-        return FormatFamily.OTHER
+    for family in FORMAT_FAMILY_SETTINGS:
+        if fmt in get_family_formats(family):
+            return family
+    return FormatFamily.OTHER

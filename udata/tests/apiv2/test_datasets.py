@@ -107,18 +107,20 @@ class DatasetAPIV2Test(APITestCase):
 
     def test_search_dataset_tags(self):
         tag_dataset_1 = DatasetFactory(tags=["my-tag-shared", "my-tag-1"])
-        DatasetFactory(tags=["my-tag-shared", "my-tag-2"])
+        tag_dataset_2 = DatasetFactory(tags=["my-tag-shared", "my-tag-2"])
 
         response = self.get(url_for("apiv2.dataset_search", tag="my-tag-shared"))
         self.assert200(response)
         data = response.json["data"]
         assert len(data) == 2
 
-        response = self.get(url_for("apiv2.dataset_search", tag=["my-tag-shared", "my-tag-1"]))
+        # Multiple tags are an OR: either tag matches (LEDG-2255). Upstream udata
+        # answers AND; these two tags share no dataset, so AND would return nothing.
+        response = self.get(url_for("apiv2.dataset_search", tag=["my-tag-1", "my-tag-2"]))
         self.assert200(response)
         data = response.json["data"]
-        assert len(data) == 1
-        assert data[0]["id"] == str(tag_dataset_1.id)
+        assert len(data) == 2
+        assert {d["id"] for d in data} == {str(tag_dataset_1.id), str(tag_dataset_2.id)}
 
     def test_search_dataset_badges(self):
         test_dataset = DatasetFactory(badges=[{"kind": "spd"}, {"kind": "hvd"}])
