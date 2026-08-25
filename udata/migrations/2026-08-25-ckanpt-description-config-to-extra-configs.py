@@ -14,6 +14,8 @@ parses as JSON, and a key already present in `extra_configs` is never added agai
 import json
 import logging
 
+from mongoengine.errors import ValidationError
+
 from udata.harvest.models import HarvestSource
 from udata.models import GeoZone
 from udata.utils import safe_unicode
@@ -36,16 +38,30 @@ def legacy_config(source) -> dict | None:
     return config
 
 
+def as_text(value) -> str:
+    """A config scalar as text, or "" for anything that is not one.
+
+    `str()` on its own turns JSON `null` and `false` into the literal strings
+    "None" and "False", which would settle in the form as a permanent junk value
+    and warn on every job forever.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
 def as_extra_config_value(key: str, value) -> str | None:
     """The value as an extra config holds it: a string, or `None` to skip it."""
     if key == "geozones":
         # `HarvestExtraConfig` only admits the scalar types of `HarvestFilter.TYPES`,
         # so the list travels comma-separated; a zone identifier has no comma in it.
         zones = value if isinstance(value, list) else [value]
-        identifiers = [str(zone).strip() for zone in zones if str(zone).strip()]
+        identifiers = [text for text in (as_text(zone) for zone in zones) if text]
         return ",".join(identifiers) or None
 
-    return str(value).strip() or None
+    return as_text(value) or None
 
 
 def migrate(db):
@@ -75,14 +91,35 @@ def migrate(db):
                         # Migrated anyway: the backend warns and skips it at harvest
                         # time, and dropping it here would lose the admin's intent.
                         log.warning(
-                            "Source %s configures unknown geozone %s", source.id, identifier
+                            "Source %s configures unknown geozone %s",
+                            source.id,
+                            # `repr` so a crafted identifier cannot forge log lines.
+                            repr(identifier)[:200],
                         )
 
         source.config["extra_configs"] = extra_configs
-        # The blobs nest the real description under a `description` key; whatever is
-        # not there was never prose to begin with.
-        source.description = config.get("description") or ""
-        source.save()
+
+        # The blobs nest the real description under a `description` key. There is no
+        # down migration, so a blob that holds prose anywhere else is logged in full
+        # before being replaced: better a recoverable log line than a silent loss.
+        description = as_text(config.get("description"))
+        if not description and len(config) > len([k for k in CONFIG_KEYS if k in config]):
+            log.warning(
+                "Source %s has a config blob with no usable description; "
+                "replacing it with an empty one. Previous value: %s",
+                source.id,
+                repr(source.description)[:1000],
+            )
+        source.description = description
+
+        try:
+            source.save()
+        except ValidationError as e:
+            # One unsaveable source must not stop the ones after it in cursor order:
+            # those are exactly the ones left exposed to the un-migrated behaviour.
+            log.error(f"Failed to save source {source.id}: {e}")
+            continue
+
         migrated += 1
         log.info("Migrated source %s: %s", source.id, extra_configs)
 

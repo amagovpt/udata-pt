@@ -6,15 +6,19 @@ reading the same values it read before, and running twice changes nothing.
 """
 
 import importlib.util
+import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from mongoengine.connection import get_db
+from mongoengine.errors import ValidationError
 
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.spatial.factories import GeoZoneFactory
 from udata.harvest.backends.ckanpt import CkanPTBackend
+from udata.harvest.models import HarvestSource
 from udata.harvest.tests.factories import HarvestSourceFactory
 from udata.tests.api import PytestOnlyDBTestCase
 
@@ -157,6 +161,98 @@ class DescriptionConfigMigrationTest(PytestOnlyDBTestCase):
 
         assert extra_configs(source) == {"geozones": "pt:concelho:0000"}
         assert any("pt:concelho:0000" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        "blob",
+        [
+            '{"license": null, "geozones": null}',
+            '{"license": false, "geozones": false}',
+            '{"license": "", "geozones": []}',
+            '{"license": "   ", "geozones": ["  "]}',
+        ],
+    )
+    def test_a_config_key_with_no_usable_value_is_skipped(self, blob):
+        """`str(None)` is "None", which would settle in the form as a junk value."""
+        source = self.source(blob)
+
+        self.migrate(get_db())
+
+        assert extra_configs(source) == {}
+
+    def test_prose_outside_the_description_key_is_logged_before_it_is_replaced(self, caplog):
+        """There is no down migration, so the only recovery is the log."""
+        source = self.source('{"license": "cc-by", "notes": "Harvester do municipio de Braga"}')
+
+        self.migrate(get_db())
+
+        source.reload()
+        assert source.description == ""
+        assert extra_configs(source) == {"license": "cc-by"}
+        assert any("Harvester do municipio de Braga" in r.getMessage() for r in caplog.records)
+
+    def test_a_config_only_blob_is_replaced_without_a_warning(self):
+        """Nothing to lose: the blob held config and nothing else."""
+        zone = GeoZoneFactory()
+        source = self.source('{"geozones": ["%s"]}' % zone.id)
+
+        self.migrate(get_db())
+
+        source.reload()
+        assert source.description == ""
+
+    def test_a_non_string_description_value_is_not_written_back(self, caplog):
+        """`HarvestSource.description` is a `StringField`: a nested object raises."""
+        source = self.source('{"geozones": ["pt:distrito:11"], "description": {"pt": "Porto"}}')
+
+        self.migrate(get_db())
+
+        source.reload()
+        assert source.description == ""
+        assert extra_configs(source) == {"geozones": "pt:distrito:11"}
+        assert any('{"pt": "Porto"}' in record.getMessage() for record in caplog.records)
+
+    def test_a_source_that_fails_to_save_does_not_stop_the_run(self, caplog):
+        """The sources after it in cursor order are the ones left un-migrated.
+
+        And those are exactly the ones exposed to the pre-migration behaviour, so
+        the loop has to survive one bad document.
+        """
+        zone = GeoZoneFactory()
+        self.source('{"description": "Falha", "geozones": ["%s"]}' % zone.id)
+        self.source('{"description": "Porto", "geozones": ["%s"]}' % zone.id)
+
+        real_save = HarvestSource.save
+        calls = []
+
+        def save(self, *args, **kwargs):
+            calls.append(self.id)
+            if len(calls) == 1:
+                raise ValidationError("forced")
+            return real_save(self, *args, **kwargs)
+
+        with mock.patch.object(HarvestSource, "save", save):
+            self.migrate(get_db())
+
+        assert len(calls) == 2, "the run stopped at the first failure"
+        assert any("Failed to save source" in record.getMessage() for record in caplog.records)
+        # Whichever the cursor reached second is migrated; the other is untouched.
+        migrated = [
+            source
+            for source in HarvestSource.objects(backend="ckanpt")
+            if source.config.get("extra_configs")
+        ]
+        assert len(migrated) == 1
+
+    def test_an_unknown_geozone_cannot_forge_a_log_line(self, caplog):
+        forged = "x\nWARNING [udata] Harvest source approved by sysadmin"
+        source = self.source(json.dumps({"geozones": [forged]}))
+
+        self.migrate(get_db())
+
+        assert extra_configs(source) == {"geozones": forged}
+        forged_lines = [r for r in caplog.records if "approved by sysadmin" in r.getMessage()]
+        assert len(forged_lines) == 1
+        assert "\n" not in forged_lines[0].getMessage()
 
     def test_other_backends_are_left_alone(self):
         source = self.source('{"geozones": ["pt:concelho:1106"]}', backend="dcat")
