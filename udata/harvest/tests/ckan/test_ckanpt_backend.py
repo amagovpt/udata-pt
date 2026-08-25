@@ -19,7 +19,7 @@ from udata.core.spatial.factories import GeoZoneFactory
 from udata.harvest import actions
 from udata.harvest.backends.ckanpt import CkanPTBackend
 from udata.harvest.tests.factories import HarvestSourceFactory
-from udata.models import Dataset, Organization
+from udata.models import Dataset, Organization, Resource
 from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import faker
 
@@ -88,7 +88,7 @@ def ckanpt_package(acronym):
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ckanpt"])
-class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
+class CkanPTBackendTest(PytestOnlyDBTestCase):
     @pytest.fixture(autouse=True)
     def setup_remote(self, ckan, rmock):
         self.org = OrganizationFactory(acronym="ckanpt-org")
@@ -108,6 +108,15 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         self.ckan_url = ckan.BASE_URL
         self.ckan = ckan
         self.rmock = rmock
+
+    def remote_returns_the_package(self):
+        """Re-register the mock after mutating the payload; the last one registered wins."""
+        self.rmock.get(
+            self.ckan.PACKAGE_SHOW_URL,
+            json=self.package,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
 
     def source(self, description):
         return HarvestSourceFactory(
@@ -377,6 +386,123 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         backend = CkanPTBackend(source, dryrun=True)
 
         assert backend.configured_geozones == []
+
+    # --- Behaviour now inherited from CkanBackend instead of duplicated (LEDG-2319)
+
+    def test_remote_frequency_is_mapped(self):
+        """The fork hardcoded `frequency = "unknown"` for every dataset it harvested."""
+        self.package["result"]["extras"] = [{"key": "frequency", "value": "monthly"}]
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.frequency == "monthly"
+
+    def test_remote_url_lands_on_harvest_metadata(self):
+        """The fork wrote back the extras the 2022-10-10 migration had removed."""
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.harvest.remote_url == f"{self.ckan_url}/dataset/{DATASET_NAME}"
+        assert dataset.harvest.ckan_name == DATASET_NAME
+        assert "remote_url" not in dataset.extras
+        assert "ckan:name" not in dataset.extras
+        assert "harvest:name" not in dataset.extras
+
+    def test_reharvest_preserves_a_license_set_on_the_portal(self):
+        """Upstream keeps a stored license; the configured one is only a default."""
+        configured = LicenseFactory()
+        chosen = LicenseFactory()
+        source = self.configured(license=configured.id)
+
+        actions.run(source)
+        dataset = Dataset.objects.first()
+        assert dataset.license == configured
+        dataset.license = chosen
+        dataset.save()
+
+        actions.run(source)
+
+        dataset.reload()
+        assert dataset.license == chosen
+
+    # --- Behaviour that is genuinely PT and survives as an override
+
+    def test_source_hostname_is_tagged(self):
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert "localhost" in dataset.tags
+
+    def test_run_creates_an_unknown_organization(self):
+        """Upstream never touches `dataset.organization`; this portal maps it."""
+        self.package["result"]["organization"]["name"] = "brand-new-org"
+
+        actions.run(self.source(""))
+
+        assert Organization.objects(acronym="brand-new-org").count() == 1
+        assert Dataset.objects.first().organization.acronym == "brand-new-org"
+
+    def test_configured_geozones_win_over_the_remote_spatial_text(self):
+        remote = GeoZoneFactory()
+        configured = GeoZoneFactory()
+        self.package["result"]["extras"] = [{"key": "spatial-text", "value": remote.name}]
+        source = self.configured(geozones=configured.id)
+
+        dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert [z.id for z in dataset.spatial.zones] == [configured.id]
+
+    def test_resource_urls_are_slash_normalized(self):
+        self.package["result"]["resources"][0]["url"] = "http://dados.example.pt//a//b.csv"
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.resources[0].url == "http://dados.example.pt/a/b.csv"
+
+    def test_resources_dropped_at_source_are_pruned(self):
+        """Upstream keeps every resource it ever harvested; this portal prunes."""
+        source = self.source("")
+        dropped = dict(
+            self.package["result"]["resources"][0],
+            id=faker.uuid4(),
+            url=faker.unique_url(),
+        )
+        self.package["result"]["resources"].append(dropped)
+
+        actions.run(source)
+        dataset = Dataset.objects.first()
+        assert len(dataset.resources) == 2
+        kept_id = dataset.resources[0].id
+        dataset.resources.append(
+            Resource(title="Uploaded on the portal", url=faker.unique_url(), filetype="file")
+        )
+        dataset.save()
+
+        self.package["result"]["resources"].remove(dropped)
+        self.remote_returns_the_package()
+        actions.run(source)
+
+        dataset.reload()
+        assert [r.id for r in dataset.resources if r.filetype == "remote"] == [kept_id]
+        assert [r.title for r in dataset.resources if r.filetype == "file"] == [
+            "Uploaded on the portal"
+        ]
+
+    def test_preview_does_not_prune_resources(self):
+        """A preview reports what the source has; it does not act on it."""
+        source = self.source("")
+        actions.run(source)
+        dataset = Dataset.objects.first()
+        harvested_id = dataset.resources[0].id
+
+        self.package["result"]["resources"] = [
+            dict(self.package["result"]["resources"][0], id=faker.uuid4(), url=faker.unique_url())
+        ]
+        self.remote_returns_the_package()
+        job = actions.preview(source)
+
+        assert job.items[0].status == "done", [e.message for e in job.items[0].errors]
+        assert harvested_id in [r.id for r in job.items[0].dataset.resources]
+        dataset.reload()
+        assert [r.id for r in dataset.resources] == [harvested_id]
 
     def test_http_error_fails_the_item(self):
         """Inherited from upstream: `get_action` calls `raise_for_status`.

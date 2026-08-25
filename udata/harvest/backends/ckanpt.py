@@ -12,14 +12,11 @@ from functools import cached_property
 from urllib.parse import urlparse
 from uuid import UUID
 
-from udata import uris
-from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import HarvestExtraConfig
-from udata.harvest.exceptions import HarvestSkipException
 from udata.harvest.models import HarvestItem
 from udata.i18n import lazy_gettext as _
-from udata.models import GeoZone, License, Organization, Resource, SpatialCoverage, db
-from udata.utils import daterange_end, daterange_start, get_by, safe_unicode
+from udata.models import GeoZone, License, Organization, SpatialCoverage
+from udata.utils import safe_unicode
 
 from .ckan.harvesters import ALLOWED_RESOURCE_TYPES, CkanBackend
 from .tools.harvester_utils import normalize_url_slashes
@@ -161,167 +158,98 @@ class CkanPTBackend(CkanBackend):
                 )
         return zones
 
+    def validate(self, data, schema):
+        """Keep the validated payload around: the PT deltas below need it.
+
+        `CkanBackend.inner_process_dataset` reads the remote payload into a local
+        variable and returns only the dataset, so an override running after it has
+        no way to see the organization or the resource list the source published.
+        Stashing it here is the one seam that keeps the upstream file untouched.
+        """
+        self._remote_data = super().validate(data, schema)
+        return self._remote_data
+
+    def get_dataset(self, remote_id):
+        """Seed a new dataset with the configured license.
+
+        Upstream computes its fallback as `dataset.license or License.default()`, so
+        putting the configured license on the dataset before it gets there turns the
+        config into a default without touching the upstream file - and keeps
+        upstream's rule that a license already stored wins on a re-harvest.
+        """
+        dataset = super().get_dataset(remote_id)
+        if not dataset.license:
+            dataset.license = self.default_license
+        return dataset
+
     def inner_process_dataset(self, item: HarvestItem):
-        response = self.get_action("package_show", id=item.remote_id)
-        data = self.validate(response["result"], self.schema)
+        """The upstream CKAN mapping, plus what is specific to this portal.
 
-        if isinstance(data, list):
-            data = data[0]
+        Everything the two backends agree on - core attributes, license guessing,
+        update frequency, spatial and temporal extras, remote URL, harvest metadata,
+        resource fields - comes from `super()`. What is left below is the PT delta.
+        """
+        dataset = super().inner_process_dataset(item)
+        data = self._remote_data
 
-        # Fix the remote_id: use real ID instead of not stable name
-        item.remote_id = data["id"]
+        # Upstream never touches `dataset.organization`. This portal maps the remote
+        # CKAN organization onto a local one by acronym, creating it when it is new.
+        acronym = data["organization"]["name"]
+        organization = Organization.objects(acronym=acronym).first()
+        if not organization:
+            organization = Organization(
+                acronym=acronym,
+                name=data["organization"]["title"],
+                description=data["organization"]["description"],
+            )
+            # LEDG-2320: this runs on a preview too, where nothing should be saved.
+            organization.save()
+        dataset.organization = organization
 
-        # Skip if no resource
-        if not len(data.get("resources", [])):
-            msg = "Dataset {0} has no record".format(item.remote_id)
-            raise HarvestSkipException(msg)
-
-        dataset = self.get_dataset(item.remote_id)
-
-        # Core attributes
-        if not dataset.slug:
-            dataset.slug = data["name"]
-        dataset.title = data["title"]
-        dataset.description = parse_html(data["notes"])
-
-        # Detect Org
-        organization_acronym = data["organization"]["name"]
-        orgObj = Organization.objects(acronym=organization_acronym).first()
-        if orgObj:
-            # print 'Found %s' % orgObj.acronym
-            dataset.organization = orgObj
-        else:
-            orgObj = Organization()
-            orgObj.acronym = organization_acronym
-            orgObj.name = data["organization"]["title"]
-            orgObj.description = data["organization"]["description"]
-            orgObj.save()
-            # print 'Created %s' % orgObj.acronym
-
-            dataset.organization = orgObj
-
-        # Detect license
-        dataset.license = License.guess(
-            data["license_id"], data["license_title"], default=self.default_license
-        )
-
-        dataset.tags = [t["name"] for t in data["tags"] if t["name"]]
-
+        # Which source a dataset came from, as a tag. `super()` rebuilds the tag list
+        # from the remote ones, so this has to come after it.
         dataset.tags.append(urlparse(self.source.url).hostname)
-
-        dataset.created_at_internal = data["metadata_created"]
-        dataset.last_modified_internal = data["metadata_modified"]
-
-        dataset.frequency = "unknown"
-        dataset.extras["ckan:name"] = data["name"]
-
-        temporal_start, temporal_end = None, None
-
-        for extra in data["extras"]:
-            # GeoJSON representation (Polygon or Point)
-            if extra["key"] == "spatial":
-                # Parsed for validation only; the spatial mapping below is disabled
-                json.loads(extra["value"])
-            #  Textual representation of the extent / location
-            elif extra["key"] == "spatial-text":
-                log.debug("spatial-text value not handled")
-            # Linked Data URI representing the place name
-            elif extra["key"] == "spatial-uri":
-                log.debug("spatial-uri value not handled")
-            # Update frequency
-            elif extra["key"] == "frequency":
-                log.debug("frequency %s", extra["value"])
-            # Temporal coverage start
-            elif extra["key"] == "temporal_start":
-                temporal_start = daterange_start(extra["value"])
-                continue
-            # Temporal coverage end
-            elif extra["key"] == "temporal_end":
-                temporal_end = daterange_end(extra["value"])
-                continue
-            dataset.extras[extra["key"]] = extra["value"]
 
         # Zones configured on the source win over whatever the remote declares.
         if self.configured_geozones:
             dataset.spatial = SpatialCoverage(zones=self.configured_geozones)
-        #
-        # if spatial_geom:
-        #     dataset.spatial = SpatialCoverage()
-        #     if spatial_geom['type'] == 'Polygon':
-        #         coordinates = [spatial_geom['coordinates']]
-        #     elif spatial_geom['type'] == 'MultiPolygon':
-        #         coordinates = spatial_geom['coordinates']
-        #     else:
-        #         HarvestException('Unsupported spatial geometry')
-        #     dataset.spatial.geom = {
-        #         'type': 'MultiPolygon',
-        #         'coordinates': coordinates
-        #     }
 
-        if temporal_start and temporal_end:
-            dataset.temporal_coverage = db.DateRange(
-                start=temporal_start,
-                end=temporal_end,
-            )
-
-        # Remote URL
-        if data.get("url"):
-            try:
-                url = uris.validate(data["url"])
-            except uris.ValidationError:
-                dataset.extras["remote_url"] = self.dataset_url(data["name"])
-                dataset.extras["ckan:source"] = data["url"]
-            else:
-                dataset.extras["remote_url"] = url
-
-        dataset.extras["harvest:name"] = self.source.name
-
-        current_resources = [str(resource.id) for resource in dataset.resources]
-        fetched_resources = []
-
-        # Resources
-        for res in data["resources"]:
-            if res["resource_type"] not in ALLOWED_RESOURCE_TYPES:
-                continue
-
-            # Ignore invalid Resources
-            try:
-                url = uris.validate(res["url"])
-            except uris.ValidationError:
-                continue
-
-            try:
-                resource = get_by(dataset.resources, "id", UUID(res["id"]))
-            except Exception:
-                log.error("Unable to parse resource ID %s", res["id"])
-                continue
-
-            fetched_resources.append(str(res["id"]))
-            if not resource:
-                resource = Resource(id=res["id"])
-                dataset.resources.append(resource)
-            resource.title = res.get("name", "") or ""
-            resource.description = parse_html(res.get("description"))
-            resource.url = normalize_url_slashes(res["url"])
-            resource.filetype = "remote"
-            resource.format = res.get("format")
-            resource.mime = res.get("mimetype")
-            resource.hash = res.get("hash")
-            resource.created = res["created"]
-            resource.modified = res["last_modified"]
-            # resource.published = resource.published or resource.created
-            resource.published = resource.created
-
-        # Clean up old resources removed from source
-        for resource_id in current_resources:
-            if resource_id not in fetched_resources:
-                try:
-                    resource = get_by(dataset.resources, "id", UUID(resource_id))
-                except Exception:
-                    log.error("Unable to parse resource ID %s", resource_id)
-                    continue
-                else:
-                    if resource and not self.dryrun:
-                        dataset.resources.remove(resource)
+        self.reconcile_resources(dataset, data["resources"])
 
         return dataset
+
+    def reconcile_resources(self, dataset, entries: list[dict]) -> None:
+        """The two resource rules upstream does not have.
+
+        Upstream stores whatever path the source publishes and keeps every resource
+        it has ever harvested. Here the URL goes through `normalize_url_slashes`
+        first, and a resource the source stopped publishing is removed - except an
+        uploaded one, which never belonged to the harvester (the exception
+        `sync_resources` documents).
+
+        A preview shows what the source has, it does not act on what it no longer
+        has, so pruning is skipped on a dry run.
+        """
+        published = set()
+        for entry in entries:
+            if entry["resource_type"] not in ALLOWED_RESOURCE_TYPES:
+                continue
+            try:
+                published.add(UUID(entry["id"]))
+            except (TypeError, ValueError):
+                # Already logged by `super()`, which could not store it either.
+                continue
+
+        kept = []
+        for resource in dataset.resources:
+            if resource.filetype == "file":
+                # Uploaded on the portal: not the harvester's to remove.
+                kept.append(resource)
+                continue
+            if resource.id in published:
+                resource.url = normalize_url_slashes(resource.url)
+            elif not self.dryrun:
+                continue
+            kept.append(resource)
+
+        dataset.resources = kept
