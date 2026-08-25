@@ -5,6 +5,7 @@
 
 import json
 import logging
+from functools import cached_property
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
 
@@ -35,14 +36,93 @@ class CkanPTBackend(BaseBackend):
     )
     schema = ckan_schema
 
-    harvest_config = {}
-
     def __init__(self, source_or_job, dryrun=False, max_items=None):
         super(CkanPTBackend, self).__init__(source_or_job, dryrun=dryrun, max_items=max_items)
+        self.harvest_config = self._parse_harvest_config()
+
+    def source_label(self) -> str:
+        """How to name the source in logs.
+
+        `preview_from_config` previews an unsaved source, so there is no id yet -
+        and that is exactly the path this backend's previews come from.
+        """
+        return self.source.id or self.source.name or self.source.url
+
+    def _parse_harvest_config(self) -> dict:
+        """Read the optional JSON config blob carried by the source description.
+
+        Legacy contract of this backend only: the description field doubles as a
+        config blob holding `license` and `geozones`. It is free text in the UI, so
+        anything that is not a JSON object simply means "no config" - never an error,
+        in a dry run just as in a real harvest.
+        """
+        # Decode once: the description is a StringField, but nothing stops a CLI or a
+        # migration from putting bytes or another type in there.
+        text = safe_unicode(self.source.description) or ""
         try:
-            self.harvest_config = json.loads(safe_unicode(self.source.description))
-        except (ValueError, TypeError):
-            pass
+            config = json.loads(text)
+        except (ValueError, TypeError, RecursionError):
+            # Prose is the normal case and must stay silent, otherwise every run of
+            # every CKAN PT harvester logs a warning. Only complain when someone
+            # clearly meant to write config and got the syntax wrong.
+            if text.lstrip()[:1] in ("{", "["):
+                self._warn_unusable_config()
+            return {}
+
+        # A description that is a bare JSON scalar ("2026", "null", "true") or an
+        # array parses fine but is not a config: keeping it would break every
+        # `.get()` below. Deliberate JSON that we cannot use always warns.
+        if not isinstance(config, dict):
+            self._warn_unusable_config()
+            return {}
+
+        return config
+
+    def _warn_unusable_config(self) -> None:
+        log.warning(
+            "Description of harvest source %s is not a JSON object; ignoring it (license/geozones)",
+            self.source_label(),
+        )
+
+    @cached_property
+    def default_license(self) -> License | None:
+        """The license to fall back on when the remote one cannot be guessed.
+
+        `harvest_config` stores the configured license as its identifier, but
+        `Dataset.license` is a reference: handing the raw string to `License.guess`
+        as its default made every item fail validation whenever the remote license
+        was not resolvable.
+
+        Cached: the config cannot change during a run, and this is called once per
+        dataset - an unknown identifier would otherwise re-query and re-log for
+        every single item of the job.
+
+        Returns `None` when the license list has never been seeded, since
+        `License.default()` does; `Dataset.license` is not required.
+        """
+        configured = self.harvest_config.get("license")
+        if not configured:
+            return License.default()
+
+        # Identifiers are stored lower case and typed by hand, so match the way
+        # `License.guess_one` does. Anything that is not a string is not an
+        # identifier - and must never reach the query, where a dict would be read
+        # as Mongo operators.
+        license = (
+            License.objects(id__iexact=configured.strip()).first()
+            if isinstance(configured, str)
+            else None
+        )
+        if license:
+            return license
+
+        log.warning(
+            "Unknown license %s configured on harvest source %s; using the default one",
+            # `repr` so a crafted identifier cannot forge log lines with newlines.
+            repr(configured)[:200],
+            self.source_label(),
+        )
+        return License.default()
 
     def get_headers(self):
         headers = super(CkanPTBackend, self).get_headers()
@@ -101,14 +181,6 @@ class CkanPTBackend(BaseBackend):
         return response.json()
 
     def inner_harvest(self):
-        try:
-            self.harvest_config = json.loads(safe_unicode(self.source.description))
-        except (ValueError, TypeError) as e:
-            if self.dryrun:
-                raise e
-            else:
-                pass
-
         """List all datasets for a given ..."""
         fix = False  # Fix should be True for CKAN < '1.8'
 
@@ -175,9 +247,8 @@ class CkanPTBackend(BaseBackend):
             dataset.organization = orgObj
 
         # Detect license
-        default_license = self.harvest_config.get("license", License.default())
         dataset.license = License.guess(
-            data["license_id"], data["license_title"], default=default_license
+            data["license_id"], data["license_title"], default=self.default_license
         )
 
         dataset.tags = [t["name"] for t in data["tags"] if t["name"]]
