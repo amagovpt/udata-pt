@@ -329,10 +329,18 @@ class CkanPTBackend(CkanBackend):
             # a new one. That is exactly the question a preview is used to answer, so
             # it is said out loud: `process_dataset` collects these onto `item.logs`,
             # which the preview API returns.
-            log.info(
+            #
+            # `warning`, not `info`: `init_logging` puts the app logger at WARNING
+            # outside debug, and the collector hangs off that logger - an `info`
+            # would be dropped before it ever became a record. Warning is also the
+            # honest level here, and this branch only runs on a preview, so it
+            # cannot become noise on a scheduled harvest.
+            log.warning(
                 "Organization %s does not exist yet; a real harvest would create it, "
                 "the preview does not",
-                repr(acronym),
+                # `repr` and bounded, like the other warnings here: the value is
+                # remote and these records are returned in the preview response.
+                repr(acronym)[:200],
             )
 
         # Which source a dataset came from, as a tag. `super()` rebuilds the tag list

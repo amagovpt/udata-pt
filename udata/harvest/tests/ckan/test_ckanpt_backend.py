@@ -810,8 +810,12 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
 
         job = actions.preview(self.source(""))
 
-        messages = [entry.message for entry in job.items[0].logs]
-        assert any("brand-new-org" in message for message in messages), messages
+        # The level matters, not just the text: the collector hangs off the app
+        # logger, which `init_logging` pins at WARNING outside debug and testing -
+        # an `info` would never become a record in production.
+        entries = [entry for entry in job.items[0].logs if "brand-new-org" in entry.message]
+        assert entries, [entry.message for entry in job.items[0].logs]
+        assert [entry.level for entry in entries] == ["WARNING"]
 
     def test_preview_maps_a_known_organization(self):
         """The other half of the guard: an organization that exists is still mapped.

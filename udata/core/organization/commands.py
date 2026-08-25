@@ -4,6 +4,7 @@ import click
 
 from udata.commands import cli, exit_with_error, success, white
 from udata.models import (
+    CommunityResource,
     ContactPoint,
     Dataservice,
     Dataset,
@@ -13,6 +14,7 @@ from udata.models import (
     Reuse,
     Topic,
 )
+from udata.utils import safe_unicode
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +76,16 @@ def find_unowned_organizations():
     # through `udata.models`, which is still initialising when this module loads.
     from udata.harvest.models import HarvestSource
 
-    owning_documents = (Dataservice, Dataset, Page, Reuse, Topic, ContactPoint, HarvestSource)
+    owning_documents = (
+        CommunityResource,
+        ContactPoint,
+        Dataservice,
+        Dataset,
+        Page,
+        Reuse,
+        Topic,
+        HarvestSource,
+    )
     # One `distinct` per collection rather than a count per organization: the
     # question is answered in as many queries as there are collections, instead of
     # four per organization on a database that can hold thousands of them.
@@ -96,6 +107,23 @@ def find_unowned_organizations():
         and not organization.requests
         and organization.id not in used_ids
     ]
+
+
+def _printable(value):
+    """One line of printable text, safe to send to a terminal.
+
+    Everything printed on a candidate row came from a remote harvest payload.
+    `name` and `acronym` go through no sanitisation on any write path - only
+    `description` does, via `Organization.pre_save` - so escape sequences and
+    control characters have to be dropped here, and the row is tab-separated, so
+    tabs and newlines have to go too or a crafted name forges rows.
+    """
+    text = "".join(
+        character if character.isprintable() else " " for character in safe_unicode(value or "")
+    )
+    # Collapse what is left, so a run of stripped control characters does not leave
+    # a gap wide enough to look like the next column.
+    return " ".join(text.split())
 
 
 @grp.command()
@@ -121,13 +149,11 @@ def audit_unowned():
                 "\t".join(
                     (
                         str(organization.id),
-                        organization.acronym or "-",
+                        _printable(organization.acronym) or "-",
                         organization.slug,
-                        organization.name,
+                        _printable(organization.name),
                         "created {0:%Y-%m-%d}".format(organization.created_at),
-                        # Collapsed onto one line: the row is tab-separated, and a
-                        # remote-supplied description can be any number of lines.
-                        " ".join((organization.description or "").split())[:120],
+                        _printable(organization.description)[:120],
                     )
                 )
             )

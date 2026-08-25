@@ -190,10 +190,17 @@ class OdsBackendPT(BaseBackend):
                 # that has an organization means the item shows one a real run would
                 # not use. `process_dataset` collects this onto `item.logs`, which
                 # the preview API returns, so the difference is not silent.
-                log.info(
+                #
+                # `warning`, not `info`: `init_logging` puts the app logger at
+                # WARNING outside debug, and the collector hangs off that logger.
+                # This branch only runs on a preview, so it cannot become noise on
+                # a scheduled harvest.
+                log.warning(
                     "Organization %s does not exist yet; a real harvest would create "
                     "it, the preview does not",
-                    repr(organization_acronym),
+                    # `repr` and bounded: the value is remote and these records
+                    # are returned in the preview response.
+                    repr(organization_acronym)[:200],
                 )
 
         tags = set()

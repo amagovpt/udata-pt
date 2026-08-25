@@ -65,8 +65,11 @@ class OdsBackendPTOrganizationTest(PytestOnlyDBTestCase):
 
         job = OdsBackendPT(self._source(), dryrun=True).harvest()
 
-        messages = [entry.message for entry in job.items[0].logs]
-        assert any("brand-new-org" in message for message in messages), messages
+        # Asserted at WARNING on purpose: `init_logging` pins the app logger, which
+        # the collector hangs off, at WARNING outside debug and testing.
+        entries = [entry for entry in job.items[0].logs if "brand-new-org" in entry.message]
+        assert entries, [entry.message for entry in job.items[0].logs]
+        assert [entry.level for entry in entries] == ["WARNING"]
 
     def test_preview_maps_a_known_publisher(self, rmock):
         """Not writing must not degrade into not resolving at all."""
