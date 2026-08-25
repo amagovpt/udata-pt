@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- **refactor: the CKAN PT harvester is a specialisation of the upstream CKAN backend, not a copy of it**
+  - `ckanpt` was introduced as a copy-paste fork of the upstream CKAN harvester
+    and never reconciled, so 90 lines of it were literal duplication —
+    `get_headers`, `action_url`, `dataset_url`, `get_status`, `get_action`,
+    `inner_harvest` — and the rest was frozen at the state of the upstream file
+    the day it was copied. It now subclasses `CkanBackend` and overrides only
+    what is actually specific to this portal: mapping the remote CKAN
+    organization onto a local one by acronym, tagging the dataset with the source
+    hostname, letting the configured geozones win over the remote spatial
+    extras, and pruning resources the source stopped publishing. Upstream fixes
+    reach it on its own from now on instead of having to be reapplied by hand on
+    every sync.
+  - Four things the fork was getting wrong come back for free. Update frequency
+    was hardcoded to "unknown" for every dataset this backend harvested,
+    whatever the remote portal declared. `remote_url`, `ckan:name`, `ckan:source`
+    and `harvest:name` were written into extras — exactly what an earlier
+    migration had removed — instead of onto the harvest metadata that the API,
+    the dataset page and the harvest job items actually read, which is why the
+    "see at source" link was empty for every CKAN PT dataset. The remote
+    `spatial`, `spatial-text` and temporal extras were parsed and discarded. And
+    a license set by hand on the portal was reset on every re-harvest.
+  - The source description stops doubling as a config blob. `license` and
+    `geozones` are declared extra configs now, the way `remote_url_prefix` is on
+    the DCAT backend, so the harvester form shows and validates them; the zone
+    list travels comma-separated because an extra config only holds a scalar. A
+    zone identifier that matches no document is dropped with a warning instead of
+    failing every dataset of the source over a single typo. Two migrations carry
+    the existing data across: the config moves out of the description — which is
+    restored to the prose the blobs nested inside it — and the legacy extras move
+    onto the harvest metadata.
+  - The description field also stops being marked as required in the harvester
+    form, which it never was: nothing validated it, and the backend has always
+    described it as optional details about the harvester.
+  - What inheriting must not cost: the remote `metadata_created` /
+    `metadata_modified` dates keep being recorded, because the public listing sorts
+    on them and upstream only keeps the first, on the harvest metadata. A remote
+    geometry upstream cannot map — anything that is not a polygon — no longer fails
+    the whole dataset, which it would have, since this backend used to parse that
+    value and discard it. And a dataset keeps the geographic zones it already has
+    when its source configures none, so the window between deploying and running
+    the migration cannot wipe them.
+  - A remote can no longer take over a file uploaded on the portal by publishing a
+    resource with its identifier, which would have repointed the shared
+    `/api/1/datasets/r/<id>` link at remote content and left the file prunable.
+    And the zone list is bounded: it is deduplicated, capped and resolved in one
+    query, so a large value cannot tie up a request or grow a harvest job past the
+    size it can still be saved at.
+
 - **fix: previewing a CKAN PT harvester no longer fails when the description is not JSON**
   - This backend carries its optional config (`license`, `geozones`) as a JSON
     blob in the harvest source description, which is a free-text field in the
