@@ -208,15 +208,26 @@ class OGCBackend(BaseBackend):
                     org_or_owner = {"owner": dataset.owner}
 
                 if org_or_owner:
-                    contact, _ = ContactPoint.objects.get_or_create(
-                        name=name, email=email, role="publisher", **org_or_owner
-                    )
+                    if self.dryrun:
+                        # A preview creates nothing: only reuse an existing contact
+                        # point, never mint one. Mongoengine cannot reference an
+                        # unsaved document, so there is nothing to put on the item
+                        # when none matches. Same guard as upstream applies in
+                        # `contact_points_from_rdf` for the DCAT path.
+                        contact = ContactPoint.objects.filter(
+                            name=name, email=email, role="publisher", **org_or_owner
+                        ).first()
+                    else:
+                        contact, _ = ContactPoint.objects.get_or_create(
+                            name=name, email=email, role="publisher", **org_or_owner
+                        )
 
-                    if not dataset.contact_points:
-                        dataset.contact_points = []
+                    if contact:
+                        if not dataset.contact_points:
+                            dataset.contact_points = []
 
-                    if contact not in dataset.contact_points:
-                        dataset.contact_points.append(contact)
+                        if contact not in dataset.contact_points:
+                            dataset.contact_points.append(contact)
 
         return dataset
 
