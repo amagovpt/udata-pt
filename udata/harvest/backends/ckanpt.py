@@ -14,8 +14,10 @@ from uuid import UUID
 
 from udata import uris
 from udata.frontend.markdown import parse_html
+from udata.harvest.backends.base import HarvestExtraConfig
 from udata.harvest.exceptions import HarvestSkipException
 from udata.harvest.models import HarvestItem
+from udata.i18n import lazy_gettext as _
 from udata.models import GeoZone, License, Organization, Resource, SpatialCoverage, db
 from udata.utils import daterange_end, daterange_start, get_by, safe_unicode
 
@@ -28,10 +30,24 @@ log = logging.getLogger(__name__)
 class CkanPTBackend(CkanBackend):
     name = "ckanpt"
     display_name = "CKAN PT"
+    extra_configs = (
+        HarvestExtraConfig(
+            _("License"),
+            "license",
+            str,
+            _("Identifier of the license to fall back on, e.g. cc-by"),
+        ),
+        HarvestExtraConfig(
+            _("Geozones"),
+            "geozones",
+            str,
+            _("Comma-separated GeoZone identifiers, e.g. pt:concelho:1106"),
+        ),
+    )
 
     def __init__(self, source_or_job, dryrun=False, max_items=None):
-        super(CkanPTBackend, self).__init__(source_or_job, dryrun=dryrun, max_items=max_items)
-        self.harvest_config = self._parse_harvest_config()
+        super().__init__(source_or_job, dryrun=dryrun, max_items=max_items)
+        self._warn_if_description_holds_config()
 
     def source_label(self) -> str:
         """How to name the source in logs.
@@ -41,39 +57,34 @@ class CkanPTBackend(CkanBackend):
         """
         return self.source.id or self.source.name or self.source.url
 
-    def _parse_harvest_config(self) -> dict:
-        """Read the optional JSON config blob carried by the source description.
+    def _warn_if_description_holds_config(self) -> None:
+        """Transitional: the description used to double as a config blob.
 
-        Legacy contract of this backend only: the description field doubles as a
-        config blob holding `license` and `geozones`. It is free text in the UI, so
-        anything that is not a JSON object simply means "no config" - never an error,
-        in a dry run just as in a real harvest.
+        `license` and `geozones` are extra configs now, and the description is back
+        to being what the form has always called it - free text. A description that
+        is still a JSON object carrying those keys was written as config, and that
+        config no longer applies: say so once per job instead of letting it look
+        like it still works.
         """
         # Decode once: the description is a StringField, but nothing stops a CLI or a
         # migration from putting bytes or another type in there.
         text = safe_unicode(self.source.description) or ""
         try:
-            config = json.loads(text)
+            legacy = json.loads(text)
         except (ValueError, TypeError, RecursionError):
             # Prose is the normal case and must stay silent, otherwise every run of
-            # every CKAN PT harvester logs a warning. Only complain when someone
-            # clearly meant to write config and got the syntax wrong.
-            if text.lstrip()[:1] in ("{", "["):
-                self._warn_unusable_config()
-            return {}
+            # every CKAN PT harvester logs a warning. Config that never parsed never
+            # applied anything either, so nothing changed for it.
+            return
 
-        # A description that is a bare JSON scalar ("2026", "null", "true") or an
-        # array parses fine but is not a config: keeping it would break every
-        # `.get()` below. Deliberate JSON that we cannot use always warns.
-        if not isinstance(config, dict):
-            self._warn_unusable_config()
-            return {}
+        if not isinstance(legacy, dict) or not any(
+            key in legacy for key in ("license", "geozones")
+        ):
+            return
 
-        return config
-
-    def _warn_unusable_config(self) -> None:
         log.warning(
-            "Description of harvest source %s is not a JSON object; ignoring it (license/geozones)",
+            "Description of harvest source %s still holds JSON config; license and "
+            "geozones are extra configs now and the description is no longer read",
             self.source_label(),
         )
 
@@ -81,10 +92,9 @@ class CkanPTBackend(CkanBackend):
     def default_license(self) -> License | None:
         """The license to fall back on when the remote one cannot be guessed.
 
-        `harvest_config` stores the configured license as its identifier, but
-        `Dataset.license` is a reference: handing the raw string to `License.guess`
-        as its default made every item fail validation whenever the remote license
-        was not resolvable.
+        The extra config stores the license as its identifier, but `Dataset.license`
+        is a reference: handing the raw string to `License.guess` as its default made
+        every item fail validation whenever the remote license was not resolvable.
 
         Cached: the config cannot change during a run, and this is called once per
         dataset - an unknown identifier would otherwise re-query and re-log for
@@ -93,7 +103,7 @@ class CkanPTBackend(CkanBackend):
         Returns `None` when the license list has never been seeded, since
         `License.default()` does; `Dataset.license` is not required.
         """
-        configured = self.harvest_config.get("license")
+        configured = self.get_extra_config_value("license")
         if not configured:
             return License.default()
 
@@ -116,6 +126,40 @@ class CkanPTBackend(CkanBackend):
             self.source_label(),
         )
         return License.default()
+
+    @cached_property
+    def configured_geozones(self) -> list[GeoZone]:
+        """The geozones configured on the source, resolved to documents.
+
+        Stored comma-separated because `HarvestExtraConfig` only admits the scalar
+        types of `HarvestFilter.TYPES`, and a zone identifier (`pt:concelho:1106`)
+        never contains a comma.
+
+        An identifier matching no zone is dropped with a warning rather than failing
+        the item: this used to go through `GeoZone.objects.get()`, so a single typo
+        in the config failed every dataset of the source.
+
+        Cached for the same reason as `default_license`: once per dataset otherwise.
+        """
+        configured = self.get_extra_config_value("geozones")
+        if not isinstance(configured, str):
+            return []
+
+        zones = []
+        for identifier in (part.strip() for part in configured.split(",")):
+            if not identifier:
+                continue
+            zone = GeoZone.objects(id=identifier).first()
+            if zone:
+                zones.append(zone)
+            else:
+                log.warning(
+                    "Unknown geozone %s configured on harvest source %s; ignoring it",
+                    # `repr` so a crafted identifier cannot forge log lines.
+                    repr(identifier)[:200],
+                    self.source_label(),
+                )
+        return zones
 
     def inner_process_dataset(self, item: HarvestItem):
         response = self.get_action("package_show", id=item.remote_id)
@@ -197,13 +241,9 @@ class CkanPTBackend(CkanBackend):
                 continue
             dataset.extras[extra["key"]] = extra["value"]
 
-        # We don't want spatial to be added on harvester
-        if self.harvest_config.get("geozones", False):
-            dataset.spatial = SpatialCoverage()
-            dataset.spatial.zones = []
-            for zone in self.harvest_config.get("geozones"):
-                geo_zone = GeoZone.objects.get(id=zone)
-                dataset.spatial.zones.append(geo_zone)
+        # Zones configured on the source win over whatever the remote declares.
+        if self.configured_geozones:
+            dataset.spatial = SpatialCoverage(zones=self.configured_geozones)
         #
         # if spatial_geom:
         #     dataset.spatial = SpatialCoverage()

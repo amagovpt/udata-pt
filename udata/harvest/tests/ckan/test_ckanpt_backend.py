@@ -117,6 +117,21 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
             organization=self.org,
         )
 
+    def configured(self, license=None, geozones=None, description=""):
+        """A source carrying its config in `extra_configs`, not in the description."""
+        extra_configs = [
+            {"key": key, "value": value}
+            for key, value in (("license", license), ("geozones", geozones))
+            if value is not None
+        ]
+        return HarvestSourceFactory(
+            backend="ckanpt",
+            url=self.ckan_url,
+            description=description,
+            organization=self.org,
+            config={"extra_configs": extra_configs},
+        )
+
     def assert_previewed_one_item(self, job):
         assert job.status == "done", [error.message for error in job.errors]
         assert job.errors == []
@@ -150,22 +165,36 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
     def test_preview_with_malformed_json_description(self):
         self.assert_previewed_one_item(actions.preview(self.source('{"license": ')))
 
-    def test_preview_with_json_description(self):
-        """A valid JSON description still feeds `harvest_config`."""
+    def test_preview_ignores_a_json_description(self, caplog):
+        """The description is free text again: config left there no longer applies."""
         license = LicenseFactory()
         zone = GeoZoneFactory()
         source = self.source(json.dumps({"license": license.id, "geozones": [zone.id]}))
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert dataset.license != license
+        assert not dataset.spatial
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert "no longer read" in warnings[0]
+
+    def test_preview_with_extra_configs(self):
+        license = LicenseFactory()
+        zone = GeoZoneFactory()
+        source = self.configured(license=license.id, geozones=zone.id)
 
         dataset = self.assert_previewed_one_item(actions.preview(source))
 
         assert dataset.license == license
         assert [z.id for z in dataset.spatial.zones] == [zone.id]
 
-    def test_run_with_json_description(self):
-        """The real harvest keeps honouring a valid JSON config."""
+    def test_run_with_extra_configs(self):
+        """The real harvest honours the configured license and zones."""
         license = LicenseFactory()
         zone = GeoZoneFactory()
-        source = self.source(json.dumps({"license": license.id, "geozones": [zone.id]}))
+        source = self.configured(license=license.id, geozones=zone.id)
 
         actions.run(source)
 
@@ -176,10 +205,32 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         assert dataset.license == license
         assert [z.id for z in dataset.spatial.zones] == [zone.id]
 
+    def test_several_geozones_travel_comma_separated(self):
+        """`HarvestExtraConfig` only admits scalars, so the list travels as CSV."""
+        first, second = GeoZoneFactory(), GeoZoneFactory()
+        source = self.configured(geozones=f" {first.id} , {second.id} ,")
+
+        dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert [z.id for z in dataset.spatial.zones] == [first.id, second.id]
+
+    def test_unknown_geozone_is_skipped(self, caplog):
+        """A typo in the config must not fail every dataset of the source."""
+        zone = GeoZoneFactory()
+        source = self.configured(geozones=f"no-such-zone,{zone.id}")
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert [z.id for z in dataset.spatial.zones] == [zone.id]
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert "no-such-zone" in warnings[0]
+
     def test_unknown_configured_license_falls_back(self, caplog):
         """An id that matches no license must not fail the whole harvest."""
         default = LicenseFactory(id="notspecified")
-        source = self.source(json.dumps({"license": "no-such-license"}))
+        source = self.configured(license="no-such-license")
 
         with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
             dataset = self.assert_previewed_one_item(actions.preview(source))
@@ -192,7 +243,7 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
     def test_configured_license_is_matched_case_insensitively(self):
         """Identifiers are stored lower case but typed by hand."""
         license = LicenseFactory(id="cc-by-4.0")
-        source = self.source(json.dumps({"license": "  CC-BY-4.0  "}))
+        source = self.configured(license="  CC-BY-4.0  ")
 
         dataset = self.assert_previewed_one_item(actions.preview(source))
 
@@ -202,7 +253,7 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         """The identifier comes from user input and must never reach the query."""
         LicenseFactory(id="notspecified")
         target = LicenseFactory(id="cc-by")
-        source = self.source(json.dumps({"license": {"$regex": "^cc"}}))
+        source = self.configured(license={"$regex": "^cc"})
 
         with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
             dataset = self.assert_previewed_one_item(actions.preview(source))
@@ -215,7 +266,7 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         """A crafted identifier must not be able to fake a log entry."""
         LicenseFactory(id="notspecified")
         forged = "x\nWARNING [udata] Harvest source approved by sysadmin"
-        source = self.source(json.dumps({"license": forged}))
+        source = self.configured(license=forged)
 
         with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
             self.assert_previewed_one_item(actions.preview(source))
@@ -240,7 +291,7 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
             status_code=200,
             headers={"Content-Type": "application/json"},
         )
-        source = self.source(json.dumps({"license": "no-such-license"}))
+        source = self.configured(license="no-such-license")
 
         with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
             job = actions.preview(source)
@@ -253,7 +304,7 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         configured = LicenseFactory()
         remote = LicenseFactory()
         self.package["result"]["license_id"] = remote.id
-        source = self.source(json.dumps({"license": configured.id}))
+        source = self.configured(license=configured.id)
 
         dataset = self.assert_previewed_one_item(actions.preview(source))
 
@@ -277,23 +328,26 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         ]
 
     @pytest.mark.parametrize(
-        "description",
+        ("description", "warns"),
         [
-            '{"license": ',  # a typo in a config someone meant to write
-            "[1, 2]",  # deliberate JSON, but not an object
-            "2026",  # a bare scalar
+            ('{"geozones": ["pt:distrito:11"]}', True),  # config that no longer applies
+            ('{"title": "Dados abertos"}', False),  # a JSON object, but never config
+            ('{"license": ', False),  # a typo that never parsed, so never applied
+            ("[1, 2]", False),
+            ("2026", False),
         ],
     )
-    def test_unusable_json_description_is_logged(self, caplog, description):
-        """Deliberate JSON we cannot use must not be discarded in silence."""
+    def test_legacy_config_in_the_description_is_logged(self, caplog, description, warns):
+        """Only a description that really was config gets a deprecation warning."""
         source = self.source(description)
 
         with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
             self.assert_previewed_one_item(actions.preview(source))
 
         warnings = self.backend_warnings(caplog)
-        assert len(warnings) == 1
-        assert str(source.id) in warnings[0]
+        assert len(warnings) == (1 if warns else 0)
+        if warns:
+            assert str(source.id) in warnings[0]
 
     def test_warning_names_an_unsaved_source(self, caplog):
         """`preview_from_config` has no source id yet - the very path of this fix."""
@@ -302,7 +356,7 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
                 name="A new harvester",
                 url=self.ckan_url,
                 backend="ckanpt",
-                description='{"license": ',
+                description='{"license": "cc-by"}',
                 organization=self.org,
             )
 
@@ -312,25 +366,17 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
         assert "None" not in warnings[0]
 
     @pytest.mark.parametrize(
-        ("description", "warns"),
-        [
-            # Decoded before the "looks like config" test, or bytes never warn.
-            (b'{"license": ', True),
-            ({"license": 1}, True),
-            # Renders as "True": no more config-looking than any other prose.
-            (True, False),
-        ],
+        "description",
+        [b'{"geozones": ["pt:distrito:11"]}', {"license": 1}, True, None],
     )
-    def test_non_string_description_is_handled(self, caplog, description, warns):
+    def test_non_string_description_is_handled(self, description):
         """A StringField, but a CLI or a migration can still put anything in it."""
         source = self.source("placeholder")
         source.description = description
 
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            backend = CkanPTBackend(source, dryrun=True)
+        backend = CkanPTBackend(source, dryrun=True)
 
-        assert backend.harvest_config == {}
-        assert len(self.backend_warnings(caplog)) == (1 if warns else 0)
+        assert backend.configured_geozones == []
 
     def test_http_error_fails_the_item(self):
         """Inherited from upstream: `get_action` calls `raise_for_status`.
