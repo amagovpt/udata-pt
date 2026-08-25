@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 from mongoengine.connection import get_db
 
-from udata.core.dataset.factories import LicenseFactory
+from udata.core.dataset.factories import DatasetFactory, LicenseFactory
+from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.spatial.factories import GeoZoneFactory
 from udata.harvest.backends.ckanpt import CkanPTBackend
 from udata.harvest.tests.factories import HarvestSourceFactory
@@ -165,3 +166,104 @@ class DescriptionConfigMigrationTest(PytestOnlyDBTestCase):
         source.reload()
         assert source.config.get("extra_configs") is None
         assert source.description == '{"geozones": ["pt:concelho:1106"]}'
+
+
+class LegacyExtrasMigrationTest(PytestOnlyDBTestCase):
+    @pytest.fixture(autouse=True)
+    def migration(self):
+        self.migrate = load_migration("2026-08-25-migrate-legacy-ckanpt-extras.py").migrate
+
+    def harvested(self, source, backend="CKAN PT", **extras):
+        return DatasetFactory(
+            extras=extras,
+            harvest=HarvestDatasetMetadata(source_id=str(source.id), backend=backend),
+        )
+
+    def test_extras_move_onto_the_harvest_metadata(self):
+        source = HarvestSourceFactory(backend="ckanpt")
+        dataset = self.harvested(
+            source,
+            **{
+                "remote_url": "https://dados.example.pt/dataset/x",
+                "ckan:name": "x",
+                "ckan:source": "https://dados.example.pt/x",
+                "harvest:name": "Dados Abertos X",
+                "keep-me": "yes",
+            },
+        )
+
+        self.migrate(get_db())
+
+        dataset.reload()
+        assert dataset.harvest.remote_url == "https://dados.example.pt/dataset/x"
+        assert dataset.harvest.ckan_name == "x"
+        assert dataset.harvest.ckan_source == "https://dados.example.pt/x"
+        assert dataset.extras == {"keep-me": "yes"}
+
+    def test_a_value_already_on_the_harvest_metadata_is_not_overwritten(self):
+        source = HarvestSourceFactory(backend="ckanpt")
+        dataset = DatasetFactory(
+            extras={"remote_url": "https://stale.example.pt/x"},
+            harvest=HarvestDatasetMetadata(
+                source_id=str(source.id),
+                backend="CKAN PT",
+                remote_url="https://current.example.pt/x",
+            ),
+        )
+
+        self.migrate(get_db())
+
+        dataset.reload()
+        assert dataset.harvest.remote_url == "https://current.example.pt/x"
+        assert "remote_url" not in dataset.extras
+
+    def test_is_idempotent(self):
+        source = HarvestSourceFactory(backend="ckanpt")
+        dataset = self.harvested(source, **{"remote_url": "https://dados.example.pt/dataset/x"})
+
+        self.migrate(get_db())
+        self.migrate(get_db())
+
+        dataset.reload()
+        assert dataset.harvest.remote_url == "https://dados.example.pt/dataset/x"
+        assert dataset.extras == {}
+
+    def test_datasets_of_other_backends_are_left_alone(self):
+        """`cswudata` writes `extras.remote_url` too, and is out of scope here."""
+        source = HarvestSourceFactory(backend="csw-udata")
+        dataset = DatasetFactory(
+            extras={"remote_url": "https://dados.example.pt/dataset/x"},
+            harvest=HarvestDatasetMetadata(source_id=str(source.id), backend="CSW-udata"),
+        )
+
+        self.migrate(get_db())
+
+        dataset.reload()
+        assert dataset.extras == {"remote_url": "https://dados.example.pt/dataset/x"}
+        assert dataset.harvest.remote_url is None
+
+    def test_a_dataset_with_no_harvest_backend_is_found_by_its_source(self):
+        """294 of the 1413 predate `harvest.backend` being written at all."""
+        source = HarvestSourceFactory(backend="ckanpt")
+        dataset = self.harvested(
+            source, backend=None, **{"ckan:name": "x", "harvest:name": "Dados Abertos X"}
+        )
+
+        self.migrate(get_db())
+
+        dataset.reload()
+        assert dataset.harvest.ckan_name == "x"
+        assert dataset.extras == {}
+
+    def test_a_dataset_whose_source_is_gone_is_found_by_its_backend(self):
+        """A deleted source leaves its datasets behind; the display name catches them."""
+        dataset = DatasetFactory(
+            extras={"ckan:name": "x"},
+            harvest=HarvestDatasetMetadata(source_id="deadbeefdeadbeefdeadbeef", backend="CKAN PT"),
+        )
+
+        self.migrate(get_db())
+
+        dataset.reload()
+        assert dataset.harvest.ckan_name == "x"
+        assert dataset.extras == {}
