@@ -598,7 +598,19 @@ class BaseBackend(object):
         - Using the table name of the originating data as identifier, and
           generating several datasets out of the same table.
         - "TODO", "A REMPLIR", etc. in the identifier field.
+
+        Diverges from upstream: a record this very source already harvested is
+        never a conflict, whoever owns it. Upstream can compare owners directly
+        because none of its backends writes `dataset.organization`, but `ckanpt`
+        and `odspt` deliberately re-own each dataset to the remote publisher's
+        organization, which routinely differs from the source's. Without this
+        check those sources would reject their own records from the second
+        harvest onwards. The takeover this guards against is by definition
+        another source claiming the record.
         """
+        if item.harvest and item.harvest.source_id == str(self.source.id):
+            return
+
         other_owner = None
         if item.organization and item.organization != self.source.organization:
             other_owner = item.organization

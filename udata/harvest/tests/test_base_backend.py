@@ -603,6 +603,40 @@ class BaseBackendTest(PytestOnlyDBTestCase):
                 assert item.status == "failed"
                 assert getattr(backend1.source, owner_param).page() in item.errors[0].message
 
+    @pytest.mark.options(CDATA_BASE_URL="http://localhost")
+    def test_unique_ownership_allows_the_source_to_reharvest_what_it_reowned(self):
+        """A source must keep updating its own records after re-owning them.
+
+        `ckanpt` and `odspt` map each remote publisher onto a local organization
+        and assign it to the dataset, so a harvested record routinely ends up
+        owned by someone other than its own source.
+        """
+        publisher = OrganizationFactory()
+
+        class ReowningBackend(FakeBackend):
+            def inner_process_dataset(self, item):
+                dataset = super().inner_process_dataset(item)
+                dataset.organization = publisher
+                return dataset
+
+        source = HarvestSourceFactory(
+            url="https://data.example.com/catalog",
+            config={"dataset_remote_ids": ["dataset-1", "dataset-2"]},
+            organization=OrganizationFactory(),
+        )
+
+        job1 = ReowningBackend(source).harvest()
+        assert job1.status == "done"
+        assert Dataset.objects.count() == 2
+        assert Dataset.objects.first().organization == publisher
+
+        job2 = ReowningBackend(source).harvest()
+        assert job2.status == "done", [
+            error.message for item in job2.items for error in item.errors
+        ]
+        assert all(item.status == "done" for item in job2.items)
+        assert Dataset.objects.count() == 2
+
 
 class BaseBackendValidateTest(PytestOnlyDBTestCase):
     @pytest.fixture
