@@ -305,15 +305,23 @@ class CkanPTBackend(CkanBackend):
         # CKAN organization onto a local one by acronym, creating it when it is new.
         acronym = data["organization"]["name"]
         organization = Organization.objects(acronym=acronym).first()
-        if not organization:
+        if organization:
+            dataset.organization = organization
+        elif not self.dryrun:
             organization = Organization(
                 acronym=acronym,
                 name=data["organization"]["title"],
                 description=data["organization"]["description"],
             )
-            # LEDG-2320: this runs on a preview too, where nothing should be saved.
             organization.save()
-        dataset.organization = organization
+            dataset.organization = organization
+        # A preview creates nothing, so an organization that does not exist yet cannot
+        # be shown on the item: `organization` is a `ReferenceField` and mongoengine
+        # refuses to reference an unsaved document, which would fail the whole item on
+        # the `validate()` a dryrun runs instead of `save()`. The field is left
+        # untouched rather than set to `None`, so re-previewing an already harvested
+        # dataset does not look like its organization was taken away. Same reasoning as
+        # upstream for contact points (`contact_points_from_rdf`).
 
         # Which source a dataset came from, as a tag. `super()` rebuilds the tag list
         # from the remote ones, so this has to come after it.
