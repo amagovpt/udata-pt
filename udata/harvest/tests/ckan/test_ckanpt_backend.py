@@ -1,9 +1,10 @@
-"""Harvest config parsing for the CKAN PT backend (LEDG-2315).
+"""Tests for the CKAN PT backend.
 
-This backend carries its optional config (`license`, `geozones`) as a JSON blob in
-the source description, which is a free-text field in the UI. Anything that is not
-a JSON object means "no config" - in a preview (`dryrun=True`) exactly as in a real
-harvest.
+Two concerns live here. The harvest config (`license`, `geozones`) that this
+backend carries as a JSON blob in the source description, a free-text field in the
+UI where anything that is not a JSON object means "no config" - in a preview
+(`dryrun=True`) exactly as in a real harvest (LEDG-2315). And the behaviour the
+backend now inherits from `CkanBackend` instead of duplicating it (LEDG-2319).
 """
 
 import json
@@ -330,6 +331,25 @@ class CkanPTHarvestConfigTest(PytestOnlyDBTestCase):
 
         assert backend.harvest_config == {}
         assert len(self.backend_warnings(caplog)) == (1 if warns else 0)
+
+    def test_http_error_fails_the_item(self):
+        """Inherited from upstream: `get_action` calls `raise_for_status`.
+
+        The copy of `get_action` this backend used to carry had no
+        `raise_for_status`, so a 5xx whose body happened to be a well-formed CKAN
+        envelope was harvested as if it had succeeded.
+        """
+        self.rmock.get(
+            self.ckan.PACKAGE_SHOW_URL,
+            json=self.package,
+            status_code=500,
+            headers={"Content-Type": "application/json"},
+        )
+
+        job = actions.preview(self.source(""))
+
+        assert len(job.items) == 1
+        assert job.items[0].status == "failed"
 
     def test_preview_persists_an_unknown_organization(self):
         """Characterisation, not an endorsement: a preview should persist nothing.

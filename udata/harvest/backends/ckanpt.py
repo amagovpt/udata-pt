@@ -1,40 +1,33 @@
-# Base: udata-ckan
-# Version: 2.9-beta
-# Summary: CKAN integration for udata
-# Home-page: https://github.com/opendatateam/udata-ckan
+"""CKAN PT harvester: the upstream CKAN backend plus the Portuguese specifics.
+
+Historically a copy-paste fork of `udata.harvest.backends.ckan.harvesters`, which
+left it frozen on the state of that file at the time of the copy. It is now a
+subclass, so upstream fixes reach this backend on their own instead of having to
+be reapplied by hand on every sync.
+"""
 
 import json
 import logging
 from functools import cached_property
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from uuid import UUID
 
 from udata import uris
 from udata.frontend.markdown import parse_html
-from udata.harvest.backends.base import BaseBackend, HarvestFilter
-from udata.harvest.exceptions import HarvestException, HarvestSkipException
+from udata.harvest.exceptions import HarvestSkipException
 from udata.harvest.models import HarvestItem
-from udata.i18n import lazy_gettext as _
 from udata.models import GeoZone, License, Organization, Resource, SpatialCoverage, db
 from udata.utils import daterange_end, daterange_start, get_by, safe_unicode
 
-from .ckan.schemas.ckan import schema as ckan_schema
+from .ckan.harvesters import ALLOWED_RESOURCE_TYPES, CkanBackend
 from .tools.harvester_utils import normalize_url_slashes
 
 log = logging.getLogger(__name__)
 
-# dkan is a dummy value for dkan that does not provide resource_type
-ALLOWED_RESOURCE_TYPES = ("dkan", "file", "file.upload", "api", "metadata")
 
-
-class CkanPTBackend(BaseBackend):
+class CkanPTBackend(CkanBackend):
     name = "ckanpt"
     display_name = "CKAN PT"
-    filters = (
-        HarvestFilter(_("Organization"), "organization", str, _("A CKAN Organization name")),
-        HarvestFilter(_("Tag"), "tags", str, _("A CKAN tag name")),
-    )
-    schema = ckan_schema
 
     def __init__(self, source_or_job, dryrun=False, max_items=None):
         super(CkanPTBackend, self).__init__(source_or_job, dryrun=dryrun, max_items=max_items)
@@ -123,89 +116,6 @@ class CkanPTBackend(BaseBackend):
             self.source_label(),
         )
         return License.default()
-
-    def get_headers(self):
-        headers = super(CkanPTBackend, self).get_headers()
-        headers["content-type"] = "application/json"
-        if self.config.get("apikey"):
-            headers["Authorization"] = self.config["apikey"]
-        return headers
-
-    def action_url(self, endpoint):
-        path = "/".join(["api/3/action", endpoint])
-        return urljoin(self.source.url, path)
-
-    def dataset_url(self, name):
-        path = "/".join(["dataset", name])
-        return urljoin(self.source.url, path)
-
-    def get_action(self, endpoint, fix=False, **kwargs):
-        url = self.action_url(endpoint)
-        if fix:
-            response = self.post(url, "{}", params=kwargs)
-        else:
-            response = self.get(url, params=kwargs)
-
-        content_type = response.headers.get("Content-Type", "")
-        mime_type = content_type.split(";", 1)[0]
-
-        if mime_type == "application/json":  # Standard API JSON response
-            data = response.json()
-            # CKAN API always returns 200 even on errors
-            # Only the `success` property allows to detect errors
-            if data.get("success", False):
-                return data
-            else:
-                error = data.get("error")
-                if isinstance(error, dict):
-                    # Error object with message
-                    msg = error.get("message", "Unknown error")
-                    if "__type" in error:
-                        # Typed error
-                        msg = ": ".join((error["__type"], msg))
-                else:
-                    # Error only contains a message
-                    msg = error
-                raise HarvestException(msg)
-
-        elif mime_type == "text/html":  # Standard html error page
-            raise HarvestException("Unknown Error: {} returned HTML".format(url))
-        else:
-            # If it's not HTML, CKAN respond with raw quoted text
-            msg = response.text.strip('"')
-            raise HarvestException(msg)
-
-    def get_status(self):
-        url = urljoin(self.source.url, "/api/util/status")
-        response = self.get(url)
-        return response.json()
-
-    def inner_harvest(self):
-        """List all datasets for a given ..."""
-        fix = False  # Fix should be True for CKAN < '1.8'
-
-        filters = self.config.get("filters", [])
-        if len(filters) > 0:
-            # Build a q search query based on filters
-            # use package_search because package_list doesn't allow filtering
-            # use q parameters because fq is broken with multiple filters
-            params = []
-            for f in filters:
-                param = "{key}:{value}".format(**f)
-                if f.get("type") == "exclude":
-                    param = "-" + param
-                params.append(param)
-            q = " AND ".join(params)
-            response = self.get_action("package_search", fix=fix, q=q, rows=1000)
-            names = [r["name"] for r in response["result"]["results"]]
-        else:
-            response = self.get_action("package_list", fix=fix)
-            names = response["result"]
-        if self.max_items:
-            names = names[: self.max_items]
-        for name in names:
-            # self.add_item(name)
-            self.process_dataset(name)
 
     def inner_process_dataset(self, item: HarvestItem):
         response = self.get_action("package_show", id=item.remote_id)
