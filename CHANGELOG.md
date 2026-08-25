@@ -37,6 +37,119 @@
     `formato_other` exists for the first time. `rotulo_high_value` also moves
     from the raw `hvd` tag to the HVD badge, which is what the listing has been
     filtering on since that option switched to `?badge=hvd`.
+- **fix: a harvest preview no longer writes to the database**
+  - A preview runs a harvest backend with `dryrun=True` and is meant to persist
+    nothing: the framework validates each dataset instead of saving it, and never
+    saves the job or its items. Three of the Portuguese backends did not honour
+    that on their own. The CKAN PT and ODS PT harvesters created and saved an
+    organization whenever the remote publisher matched no local acronym, and the
+    OGC one minted a contact point for the remote provider. None of the three had
+    a `dryrun` guard.
+  - The preview endpoint only requires an account to be logged in, so this handed
+    every authenticated user a way to create arbitrary organizations in the
+    database by pointing a preview at a portal they control - no membership, no
+    organization-creation flow, no trace beyond the document itself. Not a
+    privilege escalation, since the organizations come out with no members. But
+    the name, the description and therefore the slug all came from the remote
+    payload, so it was more than catalogue pollution: it was a way to take names
+    in the public organization URL namespace and to put chosen text on a page the
+    portal serves as its own.
+  - A preview now resolves those documents without creating them, and leaves the
+    item without one when nothing matches. It is deliberately not building them
+    in memory instead: both fields are references, and mongoengine refuses to
+    reference a document that was never saved, so the whole item would fail
+    validation. This is the same choice upstream made for contact points on the
+    DCAT path, which these backends never inherited because they carry their own
+    copy of the mapping. A real harvest is unchanged and still creates what it
+    needs.
+  - Where the organization was already filled in from the harvest source, that
+    value stays rather than being cleared - which means the item shows the
+    source's organization while a real run would file the dataset under a new
+    one. That is the question a preview gets consulted about, so it is no longer
+    left to be inferred: the backend logs the difference onto the item, and the
+    preview response carries it.
+  - `udata organizations audit-unowned` lists what may already be in a database
+    from before the fix: organizations with no member, no pending membership
+    request, and nothing filed under them - no dataset, reuse, dataservice,
+    topic, page, contact point or harvest source. It prints the slug and the
+    description alongside the name, because on an organization a harvester
+    created those came from the remote and are what tells it apart from one
+    somebody created by hand. It only reads - the shape it looks for is a
+    candidate, not a verdict.
+
+- **refactor: the CKAN PT harvester is a specialisation of the upstream CKAN backend, not a copy of it**
+  - `ckanpt` was introduced as a copy-paste fork of the upstream CKAN harvester
+    and never reconciled, so 90 lines of it were literal duplication —
+    `get_headers`, `action_url`, `dataset_url`, `get_status`, `get_action`,
+    `inner_harvest` — and the rest was frozen at the state of the upstream file
+    the day it was copied. It now subclasses `CkanBackend` and overrides only
+    what is actually specific to this portal: mapping the remote CKAN
+    organization onto a local one by acronym, tagging the dataset with the source
+    hostname, letting the configured geozones win over the remote spatial
+    extras, and pruning resources the source stopped publishing. Upstream fixes
+    reach it on its own from now on instead of having to be reapplied by hand on
+    every sync.
+  - Four things the fork was getting wrong come back for free. Update frequency
+    was hardcoded to "unknown" for every dataset this backend harvested,
+    whatever the remote portal declared. `remote_url`, `ckan:name`, `ckan:source`
+    and `harvest:name` were written into extras — exactly what an earlier
+    migration had removed — instead of onto the harvest metadata that the API,
+    the dataset page and the harvest job items actually read, which is why the
+    "see at source" link was empty for every CKAN PT dataset. The remote
+    `spatial`, `spatial-text` and temporal extras were parsed and discarded. And
+    a license set by hand on the portal was reset on every re-harvest.
+  - The source description stops doubling as a config blob. `license` and
+    `geozones` are declared extra configs now, the way `remote_url_prefix` is on
+    the DCAT backend, so the harvester form shows and validates them; the zone
+    list travels comma-separated because an extra config only holds a scalar. A
+    zone identifier that matches no document is dropped with a warning instead of
+    failing every dataset of the source over a single typo. Two migrations carry
+    the existing data across: the config moves out of the description — which is
+    restored to the prose the blobs nested inside it — and the legacy extras move
+    onto the harvest metadata.
+  - The description field also stops being marked as required in the harvester
+    form, which it never was: nothing validated it, and the backend has always
+    described it as optional details about the harvester.
+  - What inheriting must not cost: the remote `metadata_created` /
+    `metadata_modified` dates keep being recorded, because the public listing sorts
+    on them and upstream only keeps the first, on the harvest metadata. A remote
+    geometry upstream cannot map — anything that is not a polygon — no longer fails
+    the whole dataset, which it would have, since this backend used to parse that
+    value and discard it. And a dataset keeps the geographic zones it already has
+    when its source configures none, so the window between deploying and running
+    the migration cannot wipe them.
+  - A remote can no longer take over a file uploaded on the portal by publishing a
+    resource with its identifier, which would have repointed the shared
+    `/api/1/datasets/r/<id>` link at remote content and left the file prunable.
+    And the zone list is bounded: it is deduplicated, capped and resolved in one
+    query, so a large value cannot tie up a request or grow a harvest job past the
+    size it can still be saved at.
+
+- **fix: previewing a CKAN PT harvester no longer fails when the description is not JSON**
+  - This backend carries its optional config (`license`, `geozones`) as a JSON
+    blob in the harvest source description, which is a free-text field in the
+    UI. `inner_harvest` re-parsed that description and re-raised the decoding
+    error whenever `dryrun` was set — and previewing is exactly what runs with
+    `dryrun` — so every preview of a CKAN PT harvester ended in the raw
+    `Expecting value: line 1 column 1 (char 0)` with zero items unless someone
+    had typed valid JSON into the description. The real harvest swallowed the
+    same error, making the preview stricter than the run it previews.
+  - The redundant re-parse is gone: the constructor already parses the same
+    source instance, and nothing can change the description in between. A
+    description that is not a JSON object now simply means "no config", in a
+    preview as in a real harvest, and bare JSON scalars (`2026`, `null`) are
+    rejected too — they parse fine but are not a config and used to break
+    every lookup downstream. A malformed blob is no longer silent: it logs a
+    warning, but only when the text starts with `{` or `[`, so prose in a
+    free-text field does not warn on every run.
+  - Fixes the configured `license` along the way. It is stored as an
+    identifier and was handed straight to `License.guess` as its default,
+    while `Dataset.license` is a reference — so every item whose remote
+    license could not be guessed failed validation. The identifier is now
+    resolved to a license, matched case-insensitively the way `License.guess`
+    matches, and an unknown one warns once per job and falls back to the
+    default instead of failing the harvest.
+
 - **fix: CMD login no longer locks out accounts holding stale `auth_nic` values**
   - Any value in `extras.auth_nic` used to be treated as "already linked to
     another CMD identity", which excluded the account from the migration
