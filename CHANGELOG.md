@@ -36,10 +36,14 @@
     other; that is the legitimate source-migration case, and it is what keeps
     re-harvesting from duplicating. A record with neither an organization nor an
     owner is likewise still claimable — no such record was observed in
-    production, though purging an organization would create them in bulk. The
-    INE harvester also builds its own lookup instead of going through the shared
-    one, so it stays outside this guard; reaching its records would require a
-    source declaring the INE's own domain, which would then harvest the real INE.
+    production, though purging an organization would create them in bulk.
+  - The INE harvester builds its own lookup and writes through a bulk path
+    instead of going through the shared one, so it stays outside this guard
+    entirely. Its records are therefore no better protected than before, and the
+    domain scoping it does apply is not itself a defence — `HarvestSource.domain`
+    reads `netloc` rather than `hostname`, so any URL can claim any domain
+    through a userinfo prefix. That is being tracked separately; nothing here
+    depends on it.
   - Production was audited before the change: of 19 144 harvested datasets
     across 38 sources, 61 carry a URI-shaped remote id — the only ones that ever
     reached the unscoped lookup — and all 61 sit on the two sources that
