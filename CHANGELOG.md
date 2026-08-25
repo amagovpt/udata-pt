@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **fix: a harvest preview no longer writes to the database**
+  - A preview runs a harvest backend with `dryrun=True` and is meant to persist
+    nothing: the framework validates each dataset instead of saving it, and never
+    saves the job or its items. Three of the Portuguese backends did not honour
+    that on their own. The CKAN PT and ODS PT harvesters created and saved an
+    organization whenever the remote publisher matched no local acronym, and the
+    OGC one minted a contact point for the remote provider. None of the three had
+    a `dryrun` guard.
+  - The preview endpoint only requires an account to be logged in, so this handed
+    every authenticated user a way to create arbitrary organizations in the
+    database by pointing a preview at a portal they control - no membership, no
+    organization-creation flow, no trace beyond the document itself. Not a
+    privilege escalation, since the organizations come out with no members, but a
+    write primitive the endpoint was never meant to expose, and a way to pollute
+    the catalogue.
+  - A preview now resolves those documents without creating them, and leaves the
+    item without one when nothing matches. It is deliberately not building them
+    in memory instead: both fields are references, and mongoengine refuses to
+    reference a document that was never saved, so the whole item would fail
+    validation. Where the field was already filled from the harvest source, that
+    value stays - so an item still shows the organization its dataset would be
+    filed under. This is the same choice upstream made for contact points on the
+    DCAT path, which these backends never inherited because they carry their own
+    copy of the mapping. A real harvest is unchanged and still creates what it
+    needs.
+  - `udata organizations audit-unowned` lists what may already be in a database
+    from before the fix: organizations with no member and with no dataset, reuse,
+    dataservice or harvest source attached. It only reads and prints - the shape
+    it looks for is a candidate, not a verdict, because an organization created by
+    hand ahead of its first dataset looks identical.
+
 - **refactor: the CKAN PT harvester is a specialisation of the upstream CKAN backend, not a copy of it**
   - `ckanpt` was introduced as a copy-paste fork of the upstream CKAN harvester
     and never reconciled, so 90 lines of it were literal duplication —
