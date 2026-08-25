@@ -168,7 +168,7 @@ class OdsBackendPT(BaseBackend):
             orgObj = Organization.objects(acronym=organization_acronym).first()
             if orgObj:
                 dataset.organization = orgObj
-            else:
+            elif not self.dryrun:
                 orgObj = Organization()
                 orgObj.acronym = organization_acronym
                 orgObj.name = organization_acronym
@@ -176,6 +176,12 @@ class OdsBackendPT(BaseBackend):
                 orgObj.save()
 
                 dataset.organization = orgObj
+            # A preview creates nothing, so an unknown publisher cannot be shown on
+            # the item: `organization` is a `ReferenceField` and mongoengine refuses
+            # to reference an unsaved document, which would fail the item on the
+            # `validate()` a dryrun runs instead of `save()`. The field is left
+            # untouched rather than set to `None`, so the organization `get_dataset`
+            # seeds from the source stays in place.
 
         tags = set()
         if "keyword" in ods_metadata:
