@@ -37,6 +37,28 @@
     `formato_other` exists for the first time. `rotulo_high_value` also moves
     from the raw `hvd` tag to the HVD badge, which is what the listing has been
     filtering on since that option switched to `?badge=hvd`.
+- **chore: the CKAN PT harvester no longer takes a default license or geographic zones**
+  - Both were declared as harvest extra configs, so both appeared as fields on
+    the harvester form - and nobody filled them. Of the nine CKAN PT sources
+    configured, eight carry no value at all, and the one that does carries the
+    display names rather than the identifiers the backend expects, which the
+    backend was already discarding with a warning on every run. A field that is
+    never used correctly and warns when it is used is worse than no field.
+  - The declaration is what the form renders, so removing it removes the fields
+    from both the creation and the edit screens with no frontend change at all.
+    The code that read them goes with it, because a setting that can no longer be
+    entered but is still applied to every harvest is the worse of the two states.
+  - Nothing is lost by it. The license fallback was seeded onto the dataset ahead
+    of upstream, whose own rule is `dataset.license or License.default()` - so the
+    same default still applies, and a license set by hand on the portal still
+    survives a re-harvest. The zones configured on a source used to override the
+    spatial coverage; what remains is the guard that keeps the zones a dataset
+    already has when its source starts publishing a geometry, which is what
+    actually protected them.
+  - Values the migration already wrote into `extra_configs` are inert from here
+    on: the backend does not read them, and the admin drops keys the backend does
+    not declare the next time a source is saved.
+
 - **fix: a harvest preview no longer writes to the database**
   - A preview runs a harvest backend with `dryrun=True` and is meant to persist
     nothing: the framework validates each dataset instead of saving it, and never
