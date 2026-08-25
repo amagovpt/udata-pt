@@ -3,7 +3,16 @@ import logging
 import click
 
 from udata.commands import cli, exit_with_error, success, white
-from udata.models import GeoZone, Organization
+from udata.models import (
+    ContactPoint,
+    Dataservice,
+    Dataset,
+    GeoZone,
+    Organization,
+    Page,
+    Reuse,
+    Topic,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,30 +58,43 @@ def detach_zone(organization_id_or_slug):
 
 
 def find_unowned_organizations():
-    """Organizations with no members and nothing filed under them.
+    """Organizations with no members, no pending request, and nothing filed under them.
 
     A harvester creating an organization on its own leaves exactly this shape: an
-    acronym and a name from the remote, no member, and - if the harvest never ran
-    for real afterwards - no dataset either. The shape is a candidate, not a
-    verdict: an organization whose members were just removed, or one created by
-    hand ahead of its first dataset, looks the same. Hence read-only.
-    """
-    # Imported here rather than at module level: this module is loaded while the CLI
-    # is being built, before the harvest package is importable.
-    from udata.harvest.models import HarvestSource
-    from udata.models import Dataservice, Dataset, Reuse
+    acronym, a name and a description from the remote, no member, and - if the
+    harvest never ran for real afterwards - nothing filed under it either.
 
-    # `members` is filtered in Python on purpose: a document written with an empty
-    # list and one written without the key at all are both memberless, and a
-    # `members__size=0` query would only match the first.
+    The shape is a candidate, not a verdict: an organization whose members were
+    just removed, or one created by hand ahead of its first dataset, looks the
+    same. Hence read-only. What is checked is every `Owned` document plus harvest
+    sources; an organization referenced only from an activity, a follow or an
+    OAuth2 client still shows up here, so judge each candidate before acting.
+    """
+    # `udata.harvest.models` cannot be imported at module level: it imports back
+    # through `udata.models`, which is still initialising when this module loads.
+    from udata.harvest.models import HarvestSource
+
+    owning_documents = (Dataservice, Dataset, Page, Reuse, Topic, ContactPoint, HarvestSource)
+    # One `distinct` per collection rather than a count per organization: the
+    # question is answered in as many queries as there are collections, instead of
+    # four per organization on a database that can hold thousands of them.
+    used_ids = set()
+    for document in owning_documents:
+        for owner in document.objects.distinct("organization"):
+            if owner is not None:
+                # `distinct` dereferences a `ReferenceField`, so this is usually an
+                # `Organization`; `pk` normalises it, and falls through for a raw id.
+                used_ids.add(getattr(owner, "pk", owner))
+
+    # `members` and `requests` are filtered in Python on purpose: a document
+    # written with an empty list and one written without the key at all are both
+    # empty, and a `__size=0` query would only match the first.
     return [
         organization
         for organization in Organization.objects(deleted=None)
         if not organization.members
-        and not Dataset.objects(organization=organization).count()
-        and not Reuse.objects(organization=organization).count()
-        and not Dataservice.objects(organization=organization).count()
-        and not HarvestSource.objects(organization=organization).count()
+        and not organization.requests
+        and organization.id not in used_ids
     ]
 
 
@@ -89,11 +111,24 @@ def audit_unowned():
         success("No organization without members and without content")
         return
 
+    # Slug and description are printed because on an organization a harvester
+    # created they came straight from the remote portal - and the slug is the one
+    # that took a name in the public URL namespace. They are what tells a
+    # harvester's leftover apart from an organization someone created by hand.
     for organization in organizations:
         click.echo(
             white(
-                "{0.id}\t{0.acronym}\t{0.name}\tcreated {0.created_at:%Y-%m-%d}".format(
-                    organization
+                "\t".join(
+                    (
+                        str(organization.id),
+                        organization.acronym or "-",
+                        organization.slug,
+                        organization.name,
+                        "created {0:%Y-%m-%d}".format(organization.created_at),
+                        # Collapsed onto one line: the row is tab-separated, and a
+                        # remote-supplied description can be any number of lines.
+                        " ".join((organization.description or "").split())[:120],
+                    )
                 )
             )
         )

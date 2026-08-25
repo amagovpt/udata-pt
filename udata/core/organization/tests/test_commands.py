@@ -1,9 +1,12 @@
+from udata.core.contact_point.factories import ContactPointFactory
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.organization.commands import find_unowned_organizations
 from udata.core.organization.factories import OrganizationFactory
-from udata.core.organization.models import Member, Organization
+from udata.core.organization.models import Member, MembershipRequest, Organization
+from udata.core.pages.factories import PageFactory
 from udata.core.reuse.factories import ReuseFactory
+from udata.core.topic.factories import TopicFactory
 from udata.core.user.factories import UserFactory
 from udata.harvest.tests.factories import HarvestSourceFactory
 from udata.tests.api import PytestOnlyDBTestCase
@@ -50,16 +53,40 @@ class FindUnownedOrganizationsTest(PytestOnlyDBTestCase):
 
         assert find_unowned_organizations() == []
 
+    def test_organization_with_a_topic_is_not_listed(self):
+        organization = OrganizationFactory(members=[])
+        TopicFactory(organization=organization)
+
+        assert find_unowned_organizations() == []
+
+    def test_organization_with_a_page_is_not_listed(self):
+        organization = OrganizationFactory(members=[])
+        PageFactory(organization=organization)
+
+        assert find_unowned_organizations() == []
+
+    def test_organization_with_a_contact_point_is_not_listed(self):
+        organization = OrganizationFactory(members=[])
+        ContactPointFactory(organization=organization)
+
+        assert find_unowned_organizations() == []
+
+    def test_organization_with_a_pending_request_is_not_listed(self):
+        """A request means someone is trying to join: not a leftover."""
+        OrganizationFactory(
+            members=[],
+            requests=[MembershipRequest(user=UserFactory(), kind="request", comment="por favor")],
+        )
+
+        assert find_unowned_organizations() == []
+
     def test_deleted_organization_is_not_listed(self):
-        OrganizationFactory(members=[], deleted=None)
+        alive = OrganizationFactory(members=[], deleted=None)
         deleted = OrganizationFactory(members=[])
         deleted.deleted = deleted.created_at
         deleted.save()
 
-        listed = find_unowned_organizations()
-
-        assert deleted not in listed
-        assert len(listed) == 1
+        assert find_unowned_organizations() == [alive]
 
 
 class AuditUnownedCommandTest(PytestOnlyDBTestCase):
