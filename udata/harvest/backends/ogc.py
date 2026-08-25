@@ -212,11 +212,19 @@ class OGCBackend(BaseBackend):
                         # A preview creates nothing: only reuse an existing contact
                         # point, never mint one. Mongoengine cannot reference an
                         # unsaved document, so there is nothing to put on the item
-                        # when none matches. Same guard as upstream applies in
+                        # when none matches - the same guard upstream applies in
                         # `contact_points_from_rdf` for the DCAT path.
-                        contact = ContactPoint.objects.filter(
-                            name=name, email=email, role="publisher", **org_or_owner
-                        ).first()
+                        #
+                        # `get()`, not `first()`: `get_or_create` ends on a `get`, so
+                        # duplicates matching this query fail a real run. Predicting
+                        # that failure is the preview's job - `first()` would quietly
+                        # pick one of them and report the item as fine.
+                        try:
+                            contact = ContactPoint.objects.get(
+                                name=name, email=email, role="publisher", **org_or_owner
+                            )
+                        except ContactPoint.DoesNotExist:
+                            contact = None
                     else:
                         contact, _ = ContactPoint.objects.get_or_create(
                             name=name, email=email, role="publisher", **org_or_owner

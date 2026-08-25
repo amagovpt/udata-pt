@@ -255,6 +255,30 @@ class OGCBackendContactPointTest(PytestOnlyDBTestCase):
 
         assert job.items[0].dataset.contact_points == [contact]
 
+    def test_preview_fails_on_duplicates_like_a_real_run_does(self, rmock):
+        """A preview must predict the run, including how it breaks.
+
+        `get_or_create` ends on a `get`, so two contact points matching the lookup
+        fail the item on a real harvest. Resolving with `first()` instead would
+        report the item as fine and silently pick one of them.
+        """
+        source = self._source()
+        for contact_form in ("https://a.example.pt", "https://b.example.pt"):
+            ContactPoint.objects.create(
+                name="Camara",
+                email="geo@example.pt",
+                contact_form=contact_form,
+                role="publisher",
+                organization=source.organization,
+            )
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_provider("Camara", "geo@example.pt")]))
+
+        preview = OGCBackend(source, dryrun=True).harvest()
+        run = OGCBackend(source).harvest()
+
+        assert [item.status for item in preview.items] == ["failed"]
+        assert [item.status for item in run.items] == ["failed"]
+
     def test_run_creates_the_contact_point(self, rmock):
         """A real harvest keeps creating it, as before."""
         rmock.get(OGC_URL, text=_ogc_payload([_item_with_provider("Camara", "geo@example.pt")]))
