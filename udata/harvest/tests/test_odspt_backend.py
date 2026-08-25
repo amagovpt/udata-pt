@@ -59,6 +59,15 @@ class OdsBackendPTOrganizationTest(PytestOnlyDBTestCase):
         assert Organization.objects(acronym="brand-new-org").count() == 0
         assert job.items[0].dataset.organization is None
 
+    def test_preview_says_an_unknown_publisher_would_be_created(self, rmock):
+        """The gap between preview and run is logged onto the item, not swallowed."""
+        rmock.get(SEARCH_URL, json=_ods_payload("brand-new-org"))
+
+        job = OdsBackendPT(self._source(), dryrun=True).harvest()
+
+        messages = [entry.message for entry in job.items[0].logs]
+        assert any("brand-new-org" in message for message in messages), messages
+
     def test_preview_maps_a_known_publisher(self, rmock):
         """Not writing must not degrade into not resolving at all."""
         org = OrganizationFactory(acronym="known-org")

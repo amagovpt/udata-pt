@@ -799,15 +799,36 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         # in place instead of overwriting it with an unknown remote.
         assert dataset.organization == self.org
 
+    def test_preview_says_an_unknown_organization_would_be_created(self):
+        """The item must not silently claim the source's organization.
+
+        Leaving the seeded organization in place means the item shows one the real
+        run would not use, which is the very thing the preview is consulted about -
+        so the difference is logged onto the item the API returns.
+        """
+        self.package["result"]["organization"]["name"] = "brand-new-org"
+
+        job = actions.preview(self.source(""))
+
+        messages = [entry.message for entry in job.items[0].logs]
+        assert any("brand-new-org" in message for message in messages), messages
+
     def test_preview_maps_a_known_organization(self):
         """The other half of the guard: an organization that exists is still mapped.
 
         Not writing in a preview must not degrade into not resolving at all - the
         item has to keep showing the organization the dataset would be filed under.
+        The remote acronym deliberately points at an organization the source is
+        *not* attached to: with the source's own one, `get_dataset` seeds the field
+        anyway and the assertion could not tell the mapping from the seeding.
         """
+        other = OrganizationFactory(acronym="another-ckanpt-org")
+        self.package["result"]["organization"]["name"] = other.acronym
+
         dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
 
-        assert dataset.organization == self.org
+        assert dataset.organization == other
+        assert dataset.organization != self.org
 
     def test_prose_description_is_not_logged(self, caplog):
         """Prose is the normal case: it must not log on every single run."""

@@ -315,13 +315,25 @@ class CkanPTBackend(CkanBackend):
             )
             organization.save()
             dataset.organization = organization
-        # A preview creates nothing, so an organization that does not exist yet cannot
-        # be shown on the item: `organization` is a `ReferenceField` and mongoengine
-        # refuses to reference an unsaved document, which would fail the whole item on
-        # the `validate()` a dryrun runs instead of `save()`. The field is left
-        # untouched rather than set to `None`, so re-previewing an already harvested
-        # dataset does not look like its organization was taken away. Same reasoning as
-        # upstream for contact points (`contact_points_from_rdf`).
+        else:
+            # A preview creates nothing, so an organization that does not exist yet
+            # cannot be shown on the item: `organization` is a `ReferenceField` and
+            # mongoengine refuses to reference an unsaved document, which would fail
+            # the whole item on the `validate()` a dryrun runs instead of `save()`.
+            # Same reasoning as upstream for contact points
+            # (`contact_points_from_rdf`).
+            #
+            # The field is left untouched rather than set to `None`, which means it
+            # keeps whatever `get_dataset` seeded from the source - so the item shows
+            # the source's organization while a real run would file the dataset under
+            # a new one. That is exactly the question a preview is used to answer, so
+            # it is said out loud: `process_dataset` collects these onto `item.logs`,
+            # which the preview API returns.
+            log.info(
+                "Organization %s does not exist yet; a real harvest would create it, "
+                "the preview does not",
+                repr(acronym),
+            )
 
         # Which source a dataset came from, as a tag. `super()` rebuilds the tag list
         # from the remote ones, so this has to come after it.
