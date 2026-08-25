@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from udata.models import Dataset
+from udata.core.organization.factories import OrganizationFactory
+from udata.models import ContactPoint, Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.ogc import OGCBackend
@@ -201,3 +202,89 @@ class OGCResourceIdentityTest(PytestOnlyDBTestCase):
 
         assert [r.url for r in dataset.resources] == [GEOJSON_URL]
         assert [r.id for r in dataset.resources] == [kept_id]
+
+
+def _item_with_provider(provider_name, provider_email, remote_id="a"):
+    item = _item(remote_id, "Dataset A", ["geo"])
+    item["provider"] = {"name": provider_name, "contactPoint": {"email": provider_email}}
+    return item
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCBackendContactPointTest(PytestOnlyDBTestCase):
+    """The provider mapping is the one place this backend writes on its own.
+
+    `get_dataset` only fills `dataset.organization` when the source carries one,
+    and the provider block is skipped without an organization or an owner - so the
+    source needs an organization for any of this to run.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(
+            backend="ogc", url=OGC_URL, config={}, organization=OrganizationFactory()
+        )
+
+    def test_preview_does_not_create_a_contact_point(self, rmock):
+        """A preview persists nothing, the provider mapping included.
+
+        The backend used to `get_or_create` the contact point with no `dryrun`
+        guard, which the preview endpoint made reachable by any authenticated
+        account. Upstream fixed the same thing in the DCAT path; this backend
+        carries its own copy of the code and never got it.
+        """
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_provider("Camara", "geo@example.pt")]))
+
+        job = OGCBackend(self._source(), dryrun=True).harvest()
+
+        assert [item.status for item in job.items] == ["done"]
+        assert ContactPoint.objects.count() == 0
+        assert job.items[0].dataset.contact_points == []
+
+    def test_preview_reuses_an_existing_contact_point(self, rmock):
+        """Not writing must not degrade into not resolving at all."""
+        source = self._source()
+        contact = ContactPoint.objects.create(
+            name="Camara",
+            email="geo@example.pt",
+            role="publisher",
+            organization=source.organization,
+        )
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_provider("Camara", "geo@example.pt")]))
+
+        job = OGCBackend(source, dryrun=True).harvest()
+
+        assert job.items[0].dataset.contact_points == [contact]
+
+    def test_preview_fails_on_duplicates_like_a_real_run_does(self, rmock):
+        """A preview must predict the run, including how it breaks.
+
+        `get_or_create` ends on a `get`, so two contact points matching the lookup
+        fail the item on a real harvest. Resolving with `first()` instead would
+        report the item as fine and silently pick one of them.
+        """
+        source = self._source()
+        for contact_form in ("https://a.example.pt", "https://b.example.pt"):
+            ContactPoint.objects.create(
+                name="Camara",
+                email="geo@example.pt",
+                contact_form=contact_form,
+                role="publisher",
+                organization=source.organization,
+            )
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_provider("Camara", "geo@example.pt")]))
+
+        preview = OGCBackend(source, dryrun=True).harvest()
+        run = OGCBackend(source).harvest()
+
+        assert [item.status for item in preview.items] == ["failed"]
+        assert [item.status for item in run.items] == ["failed"]
+
+    def test_run_creates_the_contact_point(self, rmock):
+        """A real harvest keeps creating it, as before."""
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_provider("Camara", "geo@example.pt")]))
+
+        job = OGCBackend(self._source()).harvest()
+
+        assert [item.status for item in job.items] == ["done"]
+        assert ContactPoint.objects.count() == 1
+        assert job.items[0].dataset.contact_points[0].email == "geo@example.pt"

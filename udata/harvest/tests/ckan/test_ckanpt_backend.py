@@ -781,20 +781,58 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         assert len(job.items) == 1
         assert job.items[0].status == "failed"
 
-    def test_preview_persists_an_unknown_organization(self):
-        """Characterisation, not an endorsement: a preview should persist nothing.
+    def test_preview_does_not_persist_an_unknown_organization(self):
+        """A preview persists nothing, the organization mapping included.
 
-        `inner_process_dataset` saves the organization with no `dryrun` guard, so
-        previewing a source whose remote organization is unknown creates it for
-        real. Pre-existing and out of scope here (it is not about the description
-        being JSON), but the assertion above only holds because the fixture
-        pre-creates the organization - so it is documented rather than implied.
+        `inner_process_dataset` used to save the organization with no `dryrun`
+        guard, so previewing a source whose remote organization was unknown created
+        it for real - reachable by any authenticated account through the preview
+        endpoint, which is a write primitive it was never meant to hand out.
         """
         self.package["result"]["organization"]["name"] = "brand-new-org"
 
-        actions.preview(self.source(""))
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
 
-        assert Organization.objects(acronym="brand-new-org").count() == 1
+        assert Organization.objects(acronym="brand-new-org").count() == 0
+        # The item is not left without an organization: `get_dataset` seeds a new
+        # dataset with the one the source is attached to, and the guard leaves that
+        # in place instead of overwriting it with an unknown remote.
+        assert dataset.organization == self.org
+
+    def test_preview_says_an_unknown_organization_would_be_created(self):
+        """The item must not silently claim the source's organization.
+
+        Leaving the seeded organization in place means the item shows one the real
+        run would not use, which is the very thing the preview is consulted about -
+        so the difference is logged onto the item the API returns.
+        """
+        self.package["result"]["organization"]["name"] = "brand-new-org"
+
+        job = actions.preview(self.source(""))
+
+        # The level matters, not just the text: the collector hangs off the app
+        # logger, which `init_logging` pins at WARNING outside debug and testing -
+        # an `info` would never become a record in production.
+        entries = [entry for entry in job.items[0].logs if "brand-new-org" in entry.message]
+        assert entries, [entry.message for entry in job.items[0].logs]
+        assert [entry.level for entry in entries] == ["WARNING"]
+
+    def test_preview_maps_a_known_organization(self):
+        """The other half of the guard: an organization that exists is still mapped.
+
+        Not writing in a preview must not degrade into not resolving at all - the
+        item has to keep showing the organization the dataset would be filed under.
+        The remote acronym deliberately points at an organization the source is
+        *not* attached to: with the source's own one, `get_dataset` seeds the field
+        anyway and the assertion could not tell the mapping from the seeding.
+        """
+        other = OrganizationFactory(acronym="another-ckanpt-org")
+        self.package["result"]["organization"]["name"] = other.acronym
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.organization == other
+        assert dataset.organization != self.org
 
     def test_prose_description_is_not_logged(self, caplog):
         """Prose is the normal case: it must not log on every single run."""
