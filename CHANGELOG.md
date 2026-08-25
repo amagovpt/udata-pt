@@ -2,6 +2,461 @@
 
 ## Unreleased
 
+- **feat(dataset)!: filter multiple tags with OR instead of AND**
+  - The dataset listing's keyword filter is multi-select, and every other
+    multi-select filter already answered OR (`license`, `format`, `frequency`,
+    `badge`, `organization`, `geozone`, `granularity` are all `__in`). Tags were
+    the single AND, so picking two keywords returned the near-empty intersection
+    instead of the union and read as a broken filter — 974 datasets for one tag,
+    807 for another, 6 for both.
+  - This is a breaking change to `GET /api/1/datasets/?tag=a&tag=b` and to the
+    apiv2 dataset search: they now return datasets carrying *either* tag. It
+    diverges from upstream udata, which chose AND deliberately; the two upstream
+    tests that pinned it now pin the OR, each with a comment recording the
+    divergence, and both assert on tag pairs no single dataset shares so they
+    fail if the AND ever returns. Topics keep the upstream AND — they are not
+    exposed through a multi-select UI.
+- **feat(dataset): filter on resource format families via `?format_family=`**
+  - The listing sidebar offers a coarse "Formato" group (Tabular / Estruturado /
+    Geográfico / Documentos / Outros) but the API only accepted individual
+    extensions, so clients carried their own copy of the format lists and
+    expanded a group into `?format=csv&format=xls&…`. "Outros" cannot be
+    expressed that way at all — it is the complement of the other groups — so
+    that option wrote no filter and behaved exactly like "Todos".
+  - `?format_family=` filters on the family instead, reusing the `FormatFamily`
+    classification and the `*_FORMATS` settings the search adapter already
+    indexes on, so the Mongo listing and the search service classify a dataset
+    the same way. Repeats are OR'ed and it composes with `?format=` as an AND.
+    A dataset belongs to `other` when it has a resource outside every family or
+    no resources at all, which needs `$elemMatch`: on an array field,
+    `resources__format__nin` means "no resource matches", the complement of the
+    wrong set.
+  - The `/site/datasets-listing/` sidebar counts drop their private copy of the
+    format lists and count each family through the same query the filter
+    applies, so a number can no longer disagree with the listing it opens;
+    `formato_other` exists for the first time. `rotulo_high_value` also moves
+    from the raw `hvd` tag to the HVD badge, which is what the listing has been
+    filtering on since that option switched to `?badge=hvd`.
+- **chore: the CKAN PT harvester no longer takes a default license or geographic zones**
+  - Both were declared as harvest extra configs, so both appeared as fields on
+    the harvester form - and nobody filled them. Of the nine CKAN PT sources
+    configured, eight carry no value at all, and the one that does carries the
+    display names rather than the identifiers the backend expects, which the
+    backend was already discarding with a warning on every run. A field that is
+    never used correctly and warns when it is used is worse than no field.
+  - The declaration is what the form renders, so removing it removes the fields
+    from both the creation and the edit screens with no frontend change at all.
+    The code that read them goes with it, because a setting that can no longer be
+    entered but is still applied to every harvest is the worse of the two states.
+  - Nothing is lost by it. The license fallback was seeded onto the dataset ahead
+    of upstream, whose own rule is `dataset.license or License.default()` - so the
+    same default still applies, and a license set by hand on the portal still
+    survives a re-harvest. The zones configured on a source used to override the
+    spatial coverage; what remains is the guard that keeps the zones a dataset
+    already has when its source starts publishing a geometry, which is what
+    actually protected them.
+  - Values the migration already wrote into `extra_configs` are inert from here
+    on: the backend does not read them, and the admin drops keys the backend does
+    not declare the next time a source is saved.
+
+- **fix: a harvest preview no longer writes to the database**
+  - A preview runs a harvest backend with `dryrun=True` and is meant to persist
+    nothing: the framework validates each dataset instead of saving it, and never
+    saves the job or its items. Three of the Portuguese backends did not honour
+    that on their own. The CKAN PT and ODS PT harvesters created and saved an
+    organization whenever the remote publisher matched no local acronym, and the
+    OGC one minted a contact point for the remote provider. None of the three had
+    a `dryrun` guard.
+  - The preview endpoint only requires an account to be logged in, so this handed
+    every authenticated user a way to create arbitrary organizations in the
+    database by pointing a preview at a portal they control - no membership, no
+    organization-creation flow, no trace beyond the document itself. Not a
+    privilege escalation, since the organizations come out with no members. But
+    the name, the description and therefore the slug all came from the remote
+    payload, so it was more than catalogue pollution: it was a way to take names
+    in the public organization URL namespace and to put chosen text on a page the
+    portal serves as its own.
+  - A preview now resolves those documents without creating them, and leaves the
+    item without one when nothing matches. It is deliberately not building them
+    in memory instead: both fields are references, and mongoengine refuses to
+    reference a document that was never saved, so the whole item would fail
+    validation. This is the same choice upstream made for contact points on the
+    DCAT path, which these backends never inherited because they carry their own
+    copy of the mapping. A real harvest is unchanged and still creates what it
+    needs.
+  - Where the organization was already filled in from the harvest source, that
+    value stays rather than being cleared - which means the item shows the
+    source's organization while a real run would file the dataset under a new
+    one. That is the question a preview gets consulted about, so it is no longer
+    left to be inferred: the backend logs the difference onto the item, and the
+    preview response carries it.
+  - `udata organizations audit-unowned` lists what may already be in a database
+    from before the fix: organizations with no member, no pending membership
+    request, and nothing filed under them - no dataset, reuse, dataservice,
+    topic, page, contact point or harvest source. It prints the slug and the
+    description alongside the name, because on an organization a harvester
+    created those came from the remote and are what tells it apart from one
+    somebody created by hand. It only reads - the shape it looks for is a
+    candidate, not a verdict.
+
+- **refactor: the CKAN PT harvester is a specialisation of the upstream CKAN backend, not a copy of it**
+  - `ckanpt` was introduced as a copy-paste fork of the upstream CKAN harvester
+    and never reconciled, so 90 lines of it were literal duplication —
+    `get_headers`, `action_url`, `dataset_url`, `get_status`, `get_action`,
+    `inner_harvest` — and the rest was frozen at the state of the upstream file
+    the day it was copied. It now subclasses `CkanBackend` and overrides only
+    what is actually specific to this portal: mapping the remote CKAN
+    organization onto a local one by acronym, tagging the dataset with the source
+    hostname, letting the configured geozones win over the remote spatial
+    extras, and pruning resources the source stopped publishing. Upstream fixes
+    reach it on its own from now on instead of having to be reapplied by hand on
+    every sync.
+  - Four things the fork was getting wrong come back for free. Update frequency
+    was hardcoded to "unknown" for every dataset this backend harvested,
+    whatever the remote portal declared. `remote_url`, `ckan:name`, `ckan:source`
+    and `harvest:name` were written into extras — exactly what an earlier
+    migration had removed — instead of onto the harvest metadata that the API,
+    the dataset page and the harvest job items actually read, which is why the
+    "see at source" link was empty for every CKAN PT dataset. The remote
+    `spatial`, `spatial-text` and temporal extras were parsed and discarded. And
+    a license set by hand on the portal was reset on every re-harvest.
+  - The source description stops doubling as a config blob. `license` and
+    `geozones` are declared extra configs now, the way `remote_url_prefix` is on
+    the DCAT backend, so the harvester form shows and validates them; the zone
+    list travels comma-separated because an extra config only holds a scalar. A
+    zone identifier that matches no document is dropped with a warning instead of
+    failing every dataset of the source over a single typo. Two migrations carry
+    the existing data across: the config moves out of the description — which is
+    restored to the prose the blobs nested inside it — and the legacy extras move
+    onto the harvest metadata.
+  - The description field also stops being marked as required in the harvester
+    form, which it never was: nothing validated it, and the backend has always
+    described it as optional details about the harvester.
+  - What inheriting must not cost: the remote `metadata_created` /
+    `metadata_modified` dates keep being recorded, because the public listing sorts
+    on them and upstream only keeps the first, on the harvest metadata. A remote
+    geometry upstream cannot map — anything that is not a polygon — no longer fails
+    the whole dataset, which it would have, since this backend used to parse that
+    value and discard it. And a dataset keeps the geographic zones it already has
+    when its source configures none, so the window between deploying and running
+    the migration cannot wipe them.
+  - A remote can no longer take over a file uploaded on the portal by publishing a
+    resource with its identifier, which would have repointed the shared
+    `/api/1/datasets/r/<id>` link at remote content and left the file prunable.
+    And the zone list is bounded: it is deduplicated, capped and resolved in one
+    query, so a large value cannot tie up a request or grow a harvest job past the
+    size it can still be saved at.
+
+- **fix: previewing a CKAN PT harvester no longer fails when the description is not JSON**
+  - This backend carries its optional config (`license`, `geozones`) as a JSON
+    blob in the harvest source description, which is a free-text field in the
+    UI. `inner_harvest` re-parsed that description and re-raised the decoding
+    error whenever `dryrun` was set — and previewing is exactly what runs with
+    `dryrun` — so every preview of a CKAN PT harvester ended in the raw
+    `Expecting value: line 1 column 1 (char 0)` with zero items unless someone
+    had typed valid JSON into the description. The real harvest swallowed the
+    same error, making the preview stricter than the run it previews.
+  - The redundant re-parse is gone: the constructor already parses the same
+    source instance, and nothing can change the description in between. A
+    description that is not a JSON object now simply means "no config", in a
+    preview as in a real harvest, and bare JSON scalars (`2026`, `null`) are
+    rejected too — they parse fine but are not a config and used to break
+    every lookup downstream. A malformed blob is no longer silent: it logs a
+    warning, but only when the text starts with `{` or `[`, so prose in a
+    free-text field does not warn on every run.
+  - Fixes the configured `license` along the way. It is stored as an
+    identifier and was handed straight to `License.guess` as its default,
+    while `Dataset.license` is a reference — so every item whose remote
+    license could not be guessed failed validation. The identifier is now
+    resolved to a license, matched case-insensitively the way `License.guess`
+    matches, and an unknown one warns once per job and falls back to the
+    default instead of failing the harvest.
+
+- **fix: CMD login no longer locks out accounts holding stale `auth_nic` values**
+  - Any value in `extras.auth_nic` used to be treated as "already linked to
+    another CMD identity", which excluded the account from the migration
+    wizard. Accounts carrying stale non-hashed values left by older portal
+    versions (plain digit NICs, legacy-encrypted ciphertexts, junk) could
+    therefore never log in via CMD: the hash lookup missed, the wizard
+    refused them, and every attempt minted a duplicate account without the
+    user's organizations or roles.
+  - Two changes, both gated on `is_nic_hashed`: a plain stored NIC identical
+    to the one in the signed autenticacao.gov assertion now logs the user in
+    directly and is upgraded to the hashed format in place (lazy migration,
+    covers environments where `migrate-nics` has not run yet); and accounts
+    whose `auth_nic` is not a valid hash are again eligible for the wizard
+    (email/name match + ownership confirmation), which overwrites the stale
+    value with a fresh hash on completion — this re-links the
+    legacy-encrypted accounts without needing the old portal's decryption
+    key. Accounts with a properly hashed link keep the exact same
+    protections as before.
+- **fix: guard the NIC migration against legacy-encrypted values and consolidate it into `udata user migrate-nics`**
+  - `hash-nics` hashed *any* value in `extras.auth_nic` that was not already a
+    64-hex HMAC digest. Production data still holds three other formats —
+    plain digit NICs from the old SAML plugin, long hex ciphertexts (512
+    chars) encrypted by the previous portal, and stray non-NIC junk — so a run
+    would have irreversibly destroyed the ciphertexts (the only recoverable
+    form of those NICs) and hashed garbage. Values are now classified first
+    and only plain digit NICs are hashed; everything else is reported and
+    left untouched. Users whose NIC is stored plain cannot log in via CMD at
+    all (the login only matches the HMAC form) and ended up with duplicate
+    accounts lacking their organization memberships.
+  - `fix-cmd-duplicates` re-hashed NICs that duplicates created by the
+    current plugin already store hashed (corrupting the link), could merge
+    into soft-deleted accounts (no `deleted=None` filter), and silently
+    overwrote a target's existing link to a *different* CMD identity. All
+    three are fixed; conflicts are now skipped and reported for a manual
+    `merge-saml` decision.
+  - Both commands were replaced by a single idempotent
+    `udata user migrate-nics [--dry-run]` that runs hash → dedupe in order
+    (hashing first repairs logins immediately and makes the merge comparisons
+    canonical) and ends with a report of what was migrated and what still
+    needs manual or decryption-based follow-up. `merge-saml` stays for the
+    manual cases and now refuses unexpected NIC formats.
+  - Duplicates are matched to their traditional account by the hashed NIC
+    first — the NIC identifies the person, so a name spelled differently
+    (e.g. CMD returns the full civil name) no longer leaves a redundant
+    duplicate behind sharing the same NIC hash, which made the CMD login
+    ambiguous. Name matching remains as fallback.
+  - A failure while merging one duplicate (the first production run tripped
+    over an unrelated broken unique index it had to build on first access to
+    another collection) no longer aborts the whole run: the duplicate is
+    reported as unresolved and the migration carries on to the final report,
+    which now also lists NIC hashes shared by multiple accounts (one person
+    with a personal and an institutional account — ambiguous CMD login that
+    needs a manual decision on which account keeps the link).
+  - The `_hash_nic`/`_is_nic_hashed` helpers, duplicated verbatim between the
+    user commands and the SAML plugin, moved to a shared `udata.core.user.nic`
+    module.
+- **fix: SP-initiated SAML logout terminates the local session before the IdP dance**
+  - "Sair" for CMD/eIDAS sessions navigates to `/saml/logout`, which only
+    ended the dados.gov.pt session at the IdP's single-logout postback — if
+    any step of that round-trip failed, the user stayed logged in and the
+    button appeared to do nothing. This path had never been exercised:
+    until `saml_login` was actually returned by `/api/1/me/`, every user
+    took the plain logout path. The local session (flask-login +
+    `saml_login` flag) is now terminated immediately when `/saml/logout`
+    or `/saml/eidas/logout` is hit; the IdP hand-off form is still
+    returned as best effort.
+  - The LogoutRequest also stops sending a dummy NameID (the literal
+    format string): the SSO postbacks now record the authenticated
+    Subject NameID (+format) in the session and the logout uses it, so
+    the IdP can resolve the right session; the historical dummy remains
+    the fallback for sessions created before this change.
+- **fix: align the eIDAS AuthnRequest with the Minimum Data Set and stop over-requesting attributes**
+  - The four eIDAS natural-person MDS attributes (PersonIdentifier,
+    CurrentFamilyName, CurrentGivenName, DateOfBirth) are now requested
+    as required, per the eIDAS specification — only PersonIdentifier was;
+    the PT node was silently upgrading the rest downstream, and relying
+    on that normalisation was fragile.
+  - CurrentAddress, Gender and PlaceOfBirth are no longer requested:
+    they were never read nor stored, and they appeared on the citizen's
+    consent screen as data dados.gov.pt collects without any use (data
+    minimisation). DateOfBirth still arrives (MDS) but is intentionally
+    not stored — the User model has no birth-date field.
+- **fix: read eIDAS attributes by the friendly names pysaml2 actually delivers**
+  - Root cause of the DEV `missing_attributes` failures: pysaml2 ships
+    built-in attribute maps that translate the known eIDAS natural-person
+    URIs into friendly names — `get_identity()` keys them as
+    `PersonIdentifier`, `FirstName` and `FamilyName`, never as the full
+    URIs. The CMD MDC/Cidadao URIs are in no map, so they stay raw — which
+    is why the CMD URI lookups always matched while the eIDAS ones never
+    could. Extraction now tries MDC URI → eIDAS URI → pysaml2 friendly
+    name for each field; the `ava` fallback added the day before is
+    removed (in pysaml2 7.x `ava` is the same dict as `get_identity()`,
+    so it was a no-op).
+  - The eIDAS postback also gains the CMD "step 0" StatusCode pre-check
+    (shared `_idp_status_rejection` helper): an IdP-side rejection now
+    produces a clean `saml_error=idp_denied` redirect instead of a
+    pysaml2 `StatusError` 500.
+- **fix: eIDAS attribute extraction falls back to `ava` and reports received attribute URIs**
+  - DEV validation showed `saml_error=missing_attributes`: the eIDAS
+    response passes every security check but `get_identity()` yields no
+    usable attribute. The CMD postback already falls back to the pysaml2
+    `ava` mapping when `get_identity()` comes back empty — the eIDAS
+    postback now does the same (plus the same empty-identity diagnostic
+    log).
+  - When a response still carries neither email nor NIC/PersonIdentifier,
+    the rejection redirect now includes `saml_detail=<attribute URIs>`
+    (schema names only, never values) so a browser network trace alone
+    shows exactly what the IdP returned and the next fix can be targeted.
+- **feat: expose the SAML rejection code in the login redirect (`?saml_error=`)**
+  - Every fail-closed exit of the CMD/eIDAS SSO callbacks redirects to the
+    frontend login page; without backend-log access the failure modes are
+    indistinguishable from a browser trace. The redirect now carries a short
+    internal code (`signature_invalid`, `issuer_untrusted`,
+    `subject_nic_mismatch`, `replay`, `idp_denied`,
+    `missing_attributes`, …) so the reason is readable straight from the
+    browser network log. Codes only — no log text or identity data leaks
+    into the URL.
+- **fix: eIDAS logins were rejected by the NameID binding once PersonIdentifier extraction landed**
+  - Observed in TST: after completing the eIDAS flow the user was bounced
+    back to the login page. autenticacao.gov emits the Subject NameID as an
+    opaque pseudonym with Format=unspecified — unrelated to the
+    PersonIdentifier attribute — so the strict Subject↔identifier equality
+    check rejected every eIDAS login (`subject_nic_mismatch`). The CMD
+    postback already skips the binding for pseudonym NameIDs for exactly
+    this reason; the eIDAS postback now applies the same rule, keeping XSW
+    protection via the Response signature, Issuer whitelist, replay cache
+    and `allow_unsolicited=False`, and still rejecting a mismatched NameID
+    that carries a specific format.
+  - Diagnostics: the eIDAS attribute-extraction log now includes
+    `identity_keys` and `name_id_format`, so a failing TST login pinpoints
+    whether the IdP returned unexpected attribute URIs or NameID formats.
+- **test: update SAML wizard assertions to the prefix-free /migrate-account path**
+  - Five tests still asserted the legacy `/pages/migrate-account` redirect
+    target, but generated frontend URLs dropped the `/pages` segment when
+    the frontend moved its routes to the `[locale]/(pages)` route group —
+    so the whole `test_saml.py` suite never ran green. Assertions and the
+    wizard docstring now match the real `/migrate-account` path; no
+    behaviour change.
+- **fix: eIDAS login never extracted the eIDAS attributes it requests**
+  - The eIDAS AuthnRequest asks for the eidas.europa.eu natural-person
+    attributes (`PersonIdentifier` required, `CurrentGivenName`,
+    `CurrentFamilyName`, …), but the `/saml/eidas/sso` postback only read
+    the CMD MDC/Cidadao URIs — and eIDAS carries neither a NIC nor an email,
+    so a foreign citizen's login always dead-ended in "error" and a redirect
+    to /login: no account, no stored identifier, no email flow.
+  - The postback now reads both namespaces (MDC first, in case the PT node
+    translates), mapping `CurrentGivenName` → `first_name` (NomeProprio),
+    `CurrentFamilyName` → `last_name` (NomeApelido), and `PersonIdentifier`
+    into the same `extras.auth_nic` slot as the CMD NIC (HMAC-hashed; the
+    formats cannot collide), so repeat logins resolve the same account and
+    the migration wizard, Subject↔identifier binding (kept strict,
+    fail-closed) and admin commands work identically to CMD. eIDAS has no
+    email attribute, so eIDAS accounts get a placeholder email and go
+    through the complete-registration page like any CMD account without a
+    usable email. Attribute URIs are now shared constants between the
+    AuthnRequests and the extraction so they cannot drift again.
+  - Tests: new `SAMLEidasSSOTest` success-path suite (account shape, repeat
+    login, wizard candidate, NameID binding, MDC-translated responses) —
+    the existing eIDAS tests were rejection-only and mocked CMD attributes,
+    which is why this was never caught. Real-IdP validation in TST is
+    required before promoting (confirm which URIs the PT node returns and
+    that NameID == PersonIdentifier).
+- **fix: actually return `saml_login` on `GET /api/1/me/`**
+  - The field was defined on the `me_fields` model, but the endpoint marshals
+    `user_fields`, so it was never present in the response — the frontend's
+    `samlLogin` state was always false (e.g. the profile page never hid the
+    change-email control for SAML sessions as intended). The field now lives
+    in `user_fields`, returned only when the serialized user is the
+    authenticated caller: the flag comes from the caller's session, so on any
+    other user it would leak the viewer's own session state — it is `null`
+    there instead. The stale duplicate was removed from `me_fields`, which is
+    documented as currently unused.
+- **feat: force CMD/SAML accounts with a placeholder email to complete registration with a real one**
+  - Accounts created from a CMD identity without a usable email get a minted
+    `saml-*@autenticacao.gov.pt` placeholder and could previously browse
+    indefinitely with it. Now any CMD/eIDAS login that lands on a placeholder
+    email — a freshly created account, or an older one from before this
+    check — is redirected to the frontend `/complete-registration` page
+    instead of its destination, where the user must provide a valid email
+    (verified through the existing change-email confirmation link) to
+    conclude registration. `/saml/migration/skip` also reports
+    `pending_registration` in its JSON response so the wizard can route the
+    user there.
+  - `GET /api/1/me/` now exposes a `pending_registration` boolean (guarded
+    like `email`: only for admins and on `/me`) so the frontend can gate
+    navigation. Placeholder mint and detection share constants in
+    `udata/core/user/constants.py` (`User.has_placeholder_email`).
+  - `/change-email` is now rate-limited (5/min keyed per authenticated user,
+    not per IP, because the PRD proxy chain collapses visitors onto shared
+    egress IPs) so the confirmation-mail sender cannot be used as an open
+    relay, and `ChangeEmailForm` rejects an already-registered email at
+    submit time instead of only after the confirmation link is clicked.
+- **feat: CMD (Chave Móvel Digital) account linking with mandatory ownership confirmation**
+  - Direct login on a CMD/SAML callback now happens ONLY when the NIC is
+    already linked to an account. Any other match — by email or by
+    first+last name — redirects to the migration wizard
+    (`/pages/migrate-account`), where the user either proves ownership of
+    the default account (full email+password login, or a 6-digit code
+    emailed to the account) to link the CMD identity, or explicitly
+    chooses to create a new account. Linking preserves the password (both
+    login methods remain available), roles, organization memberships and
+    owned content. With no match at all, a new account is created and the
+    redirect carries `cmd_new_account=1` so the frontend informs the user.
+  - `migration/confirm` password method performs a full login
+    (email + password) capped at 5 attempts per session, with a generic
+    error to avoid account enumeration; accounts already linked to another
+    CMD identity are excluded from matching and refused by the wizard.
+  - `MIGRATION_MODE_ENABLED` now defaults to `True` (kill-switch kept);
+    when disabled, a matched account is never logged into without proof —
+    a new account is created instead.
+  - Tests: `SAMLMigrationWizardTest` end-to-end coverage plus updated
+    resolution-order unit tests in `udata/tests/frontend/test_saml.py`.
+  - **security: bind the email verification code to its target account.**
+    The migration code was stored in the session without recording which
+    account it was emailed to, while `migration/search` can re-point the
+    candidate. An attacker could request a code to their own account, then
+    re-point the candidate to a victim and replay the known code to link
+    their CMD identity to — and log in as — the victim (account takeover).
+    The code now carries the `legacy_user_id` it was issued for, `confirm`
+    rejects a code whose target no longer matches, and `search` clears any
+    pending code on re-point. Regression: `SAMLMigrationSecurityTest` in
+    `udata/tests/frontend/test_saml.py`.
+- **fix: harvested resources keep their id, and their download link, across harvests**
+  - Eight backends — `dgt`, `dgtIne`, `ogc`, `apambiente`, `cswudata`, `ine`,
+    `inehvd` and `maaf` — emptied `dataset.resources` and rebuilt every resource
+    from scratch on each run. `Resource.id` is auto-generated, so each nightly
+    harvest minted a brand new UUID for every resource of every dataset it
+    touched, and the `/api/1/datasets/r/<id>` permalink — the link users copy
+    and share, and the one external integrations consume — died with it. This is
+    what users were reporting as "the URLs keep changing"; files uploaded on the
+    portal kept working because harvesters never touch them.
+  - Resources are now reconciled instead of recreated, through a single
+    `sync_resources` helper: an entry matches an existing resource when their
+    URLs agree once normalized, and that resource object is kept and refreshed
+    in place, so the id survives. Matching by URL reuses the approach the
+    `odspt` backend already had in `get_resource`, and pruning what upstream
+    stopped publishing follows `ckanpt`. As a side effect the per-resource
+    `extras` — the availability check results — and `created_at` survive too,
+    and a URL that the source lists twice no longer yields two resources.
+  - Resources uploaded through the portal onto a harvested dataset are no longer
+    deleted by the next harvest. They never belonged to the harvester, and
+    dropping them both lost the file and left it orphaned in storage.
+  - The already broken links are not recoverable: the old UUIDs are gone. This
+    only stops them from breaking again from the next harvest onwards.
+  - Deploying this requires restarting the Celery worker and beat. A
+    long-running worker keeps the previous backend code in memory, so scheduled
+    harvests would go on recreating the resources.
+- **feat(storages): raise the resource upload ceiling to 1 GiB and make it environment-tunable**
+  - `RESOURCES_FILE_MAX_SIZE` goes from 800 MB to 1 GiB (1073741824 bytes). The
+    limit is enforced in `storages.api`: `combine_chunks` aborts mid-write as
+    soon as the reassembled size would cross it (so an oversized file is never
+    fully written to disk) and `handle_upload` re-checks the finished file, which
+    also covers single-shot uploads. Nothing else in the upload path changes —
+    parts are still ~1 MB, so the perimeter WAF still sees only small requests.
+  - The value is now read from `udata.cfg` as `_env_int("RESOURCES_FILE_MAX_SIZE",
+    …)` instead of being fixed in `settings.py`. Environments that need a
+    different ceiling set it in `.env` (documented in `.env.example`) rather than
+    editing the tracked config on the host — the failure mode that left PRD
+    running an undocumented download-proxy timeout.
+  - The upload endpoints get their own harakiri budget of 600 s in
+    `uwsgi/front.ini` (`route = /upload/ harakiri:600`), up from the 120 s every
+    route inherited from `route-run`. The combine request reads every part,
+    writes the reassembled file and hashes it in one request — ~1074 parts at the
+    new ceiling — so on the old budget the worker was killed mid-combine and the
+    upload was lost after the user had already sent the whole file. The nginx
+    `proxy_read_timeout` in front must cover the same value, or the combine
+    response is abandoned with a 502 even when the backend finishes cleanly.
+  - The resource download endpoints get the same 600 s budget
+    (`route = ^/api/1/datasets/(r/|proxy/download/) harakiri:600`): the permanent
+    `/r/<id>` link that serves hosted files as attachments, and the proxy that
+    pulls remote resources (already allowed 300 s per chunk). On local storage
+    uWSGI hands the transfer to its offload threads and harakiri never applies,
+    but when the transfer runs inside the worker — an S3 backend, whose handle is
+    not a real file descriptor, or the remote proxy — a 1 GiB file does not fit in
+    120 s. Capacity note: with nginx `proxy_buffering` on (the default) the
+    backend writes at LAN speed and nginx feeds the slow client, so this budget
+    is not exposed to the user's connection; with buffering off, or a response
+    larger than `proxy_max_temp_file_size` (default exactly 1024m), nginx paces
+    the backend at the client's speed and a slow download can hold a worker for
+    the full 600 s.
+  - Still worth checking before raising the ceiling further: each upload needs
+    roughly twice the file size in transient space under `FS_ROOT` (chunk parts
+    plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
+    frontend sends up to three files in parallel.
+
 - **fix: restore the twelve tests that had been failing on `develop`**
   - `.gitignore` carried a bare `data` entry, which git matches against any
     file or directory of that name at any depth rather than the local data

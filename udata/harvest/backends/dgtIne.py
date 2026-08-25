@@ -4,9 +4,9 @@ import unicodedata
 
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
-from udata.models import License, Resource
+from udata.models import License
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import sync_resources
 
 
 class DGTINEBackend(BaseBackend):
@@ -105,17 +105,20 @@ class DGTINEBackend(BaseBackend):
         dataset.tags = ["ine.pt"] + slug_tags
         dataset.extras["original_tags"] = original_tags
 
-        # Resources
-        dataset.resources = []
-        for url in data.get("resources", []):
-            if url:
-                dataset.resources.append(
-                    Resource(
-                        title=data["title"],
-                        url=normalize_url_slashes(url),
-                        filetype="remote",
-                        format=url.split(".")[-1] if "." in url else "file",
-                    )
-                )
+        # Resources: reconciled against the ones already stored so that their
+        # download permalinks survive the harvest (LEDG-2251).
+        sync_resources(
+            dataset,
+            [
+                {
+                    "title": data["title"],
+                    "url": url,
+                    "filetype": "remote",
+                    "format": url.split(".")[-1] if "." in url else "file",
+                }
+                for url in data.get("resources", [])
+                if url
+            ],
+        )
         dataset.extras["harvest:name"] = self.source.name
         return dataset

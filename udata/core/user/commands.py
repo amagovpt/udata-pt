@@ -1,6 +1,5 @@
-import hashlib
-import hmac
 import logging
+import re
 from datetime import datetime
 
 import click
@@ -10,24 +9,16 @@ from flask_security.utils import hash_password
 from werkzeug.datastructures import MultiDict
 
 from udata.commands import cli, exit_with_error, success
+from udata.core.user.constants import SAML_PLACEHOLDER_EMAIL_PREFIX
+from udata.core.user.nic import (
+    hash_nic,
+    is_nic_hashed,
+    is_nic_legacy_encrypted,
+    is_nic_plain,
+)
 from udata.models import User, datastore
 
 log = logging.getLogger(__name__)
-
-
-def _hash_nic(nic):
-    """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY."""
-    secret = current_app.config["SECRET_KEY"]
-    if isinstance(secret, str):
-        secret = secret.encode("utf-8")
-    return hmac.new(secret, nic.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _is_nic_hashed(nic_value):
-    """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
-    return bool(
-        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
-    )
 
 
 @cli.group("user")
@@ -127,73 +118,116 @@ def rotate_password(email):
     datastore.set_uniquifier(user)
 
 
-@grp.command()
-@click.option(
-    "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
-)
-def fix_cmd_duplicates(dry_run):
-    """Find and merge duplicate SAML accounts into their traditional counterparts.
+def _hash_plain_nics(dry_run):
+    """Hash every plain (digits-only) NIC stored in ``extras.auth_nic``.
 
-    Identifies users with placeholder SAML emails (saml-*@autenticacao.gov.pt),
-    finds the matching traditional account by first_name + last_name, merges the
-    NIC into the traditional account, and deletes the duplicate.
+    Already-hashed values are left alone. Legacy-encrypted ciphertexts and
+    unrecognized values are never touched — hashing them would irreversibly
+    destroy the only recoverable form of the identifier.
     """
-    import re
+    stats = {"hashed": 0, "already_hashed": 0, "legacy_encrypted": 0, "unrecognized": 0}
 
-    duplicates = list(User.objects(email__startswith="saml-"))
-    if not duplicates:
-        success("No duplicate SAML accounts found")
-        return
-
-    log.info("Found %d duplicate SAML account(s)", len(duplicates))
-    merged = 0
-    skipped = 0
-
-    for dup in duplicates:
-        nic = (dup.extras or {}).get("auth_nic")
-        fname = dup.first_name or ""
-        lname = dup.last_name or ""
-
+    for user in User.objects(extras__auth_nic__exists=True):
+        nic = (user.extras or {}).get("auth_nic")
         if not nic:
-            log.warning("SKIP %s — no NIC to merge", dup.email)
-            skipped += 1
             continue
 
-        # Find traditional account by name (case-insensitive, exact match)
+        if is_nic_hashed(nic):
+            stats["already_hashed"] += 1
+        elif is_nic_legacy_encrypted(nic):
+            stats["legacy_encrypted"] += 1
+        elif is_nic_plain(nic):
+            if dry_run:
+                log.info("WOULD HASH NIC for %s (id=%s)", user.email, user.id)
+            else:
+                user.extras["auth_nic"] = hash_nic(nic)
+                user.save()
+                log.info("HASHED NIC for %s (id=%s)", user.email, user.id)
+            stats["hashed"] += 1
+        else:
+            log.warning(
+                "UNRECOGNIZED NIC format for %s (id=%s): %r — left untouched",
+                user.email,
+                user.id,
+                nic[:12],
+            )
+            stats["unrecognized"] += 1
+
+    return stats
+
+
+def _merge_cmd_duplicates(dry_run):
+    """Merge duplicate SAML accounts into their traditional counterparts.
+
+    Identifies users with placeholder SAML emails (saml-*@autenticacao.gov.pt)
+    and finds the matching traditional account: first by the hashed NIC (the
+    NIC identifies the person, regardless of name spelling), then by
+    first_name + last_name as fallback. Merges the NIC into the traditional
+    account and deletes the duplicate. Duplicates it cannot safely resolve
+    are returned for a manual ``merge-saml`` decision, and a failure on one
+    duplicate never aborts the rest of the run.
+    """
+    stats = {"merged": 0, "unresolved": []}
+
+    def unresolved(dup, reason):
+        log.warning(
+            "SKIP %s (%s %s) — %s", dup.email, dup.first_name or "", dup.last_name or "", reason
+        )
+        stats["unresolved"].append((dup.email, reason))
+
+    for dup in User.objects(email__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX):
+        nic = (dup.extras or {}).get("auth_nic")
+
+        if not nic:
+            unresolved(dup, "no NIC to merge")
+            continue
+
+        # Duplicates created by the current plugin already store the hash;
+        # older ones store the plain NIC. Anything else is not mergeable.
+        if is_nic_hashed(nic):
+            hashed_nic = nic
+        elif is_nic_plain(nic):
+            hashed_nic = hash_nic(nic)
+        else:
+            unresolved(dup, "unexpected NIC format on the duplicate")
+            continue
+
+        # A traditional account already holding this exact hash IS the same
+        # person — the duplicate is redundant no matter how the names are
+        # spelled. Name matching is only the fallback.
         candidates = list(
             User.objects(
-                first_name=re.compile(f"^{re.escape(fname)}$", re.IGNORECASE),
-                last_name=re.compile(f"^{re.escape(lname)}$", re.IGNORECASE),
-                email__not__startswith="saml-",
+                extras__auth_nic=hashed_nic,
+                id__ne=dup.id,
+                email__not__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX,
+                deleted=None,
             )
         )
+        if not candidates:
+            # Fallback: traditional account by name (case-insensitive, exact)
+            candidates = list(
+                User.objects(
+                    first_name=re.compile(f"^{re.escape(dup.first_name or '')}$", re.IGNORECASE),
+                    last_name=re.compile(f"^{re.escape(dup.last_name or '')}$", re.IGNORECASE),
+                    email__not__startswith=SAML_PLACEHOLDER_EMAIL_PREFIX,
+                    deleted=None,
+                )
+            )
 
         if len(candidates) == 0:
-            log.warning(
-                "SKIP %s (%s %s) — no traditional account found",
-                dup.email,
-                fname,
-                lname,
-            )
-            skipped += 1
+            unresolved(dup, "no traditional account found")
             continue
 
         if len(candidates) > 1:
-            emails = [c.email for c in candidates]
-            log.warning(
-                "SKIP %s (%s %s) — multiple matches: %s",
-                dup.email,
-                fname,
-                lname,
-                emails,
-            )
-            skipped += 1
+            unresolved(dup, f"multiple matches: {[c.email for c in candidates]}")
             continue
 
         target = candidates[0]
         existing_nic = (target.extras or {}).get("auth_nic")
 
-        hashed_nic = _hash_nic(nic)
+        if existing_nic and existing_nic != hashed_nic:
+            unresolved(dup, f"target {target.email} is already linked to a different CMD identity")
+            continue
 
         if dry_run:
             if existing_nic == hashed_nic:
@@ -209,20 +243,102 @@ def fix_cmd_duplicates(dry_run):
                     dup.email,
                 )
         else:
-            if not target.extras:
-                target.extras = {}
-            target.extras["auth_nic"] = hashed_nic
-            target.save()
-            dup._delete()
+            # One bad document (e.g. a cascade-delete tripping over broken
+            # data elsewhere) must not abort the whole migration run.
+            try:
+                if not target.extras:
+                    target.extras = {}
+                target.extras["auth_nic"] = hashed_nic
+                target.save()
+                dup._delete()
+            except Exception as e:
+                unresolved(dup, f"merge failed: {e}")
+                continue
             log.info(
                 "MERGED hashed NIC into %s | deleted %s",
                 target.email,
                 dup.email,
             )
-        merged += 1
+        stats["merged"] += 1
 
-    action = "Would merge" if dry_run else "Merged"
-    success(f"{action} {merged} account(s), skipped {skipped}")
+    return stats
+
+
+def _find_shared_nics():
+    """Return hashed NIC values held by more than one account.
+
+    Two accounts sharing the same hash (typically one person who registered
+    both a personal and an institutional account with the same NIC) make the
+    CMD login ambiguous — the lookup returns an arbitrary one. These need a
+    manual decision on which account keeps the link.
+    """
+    pipeline = [
+        {"$match": {"extras.auth_nic": {"$exists": True}}},
+        {"$group": {"_id": "$extras.auth_nic", "n": {"$sum": 1}, "emails": {"$push": "$email"}}},
+        {"$match": {"n": {"$gt": 1}}},
+    ]
+    return [group for group in User.objects.aggregate(pipeline) if is_nic_hashed(str(group["_id"]))]
+
+
+@grp.command()
+@click.option(
+    "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
+)
+def migrate_nics(dry_run):
+    """Migrate stored CMD/eIDAS identifiers to the hashed format and merge duplicates.
+
+    Phase 1 hashes every plain (digits-only) NIC in extras.auth_nic so the
+    SAML login can match those accounts again. Phase 2 merges duplicate
+    accounts with placeholder SAML emails into their traditional counterparts.
+
+    Legacy-encrypted ciphertexts (long hex values from the previous portal)
+    and unrecognized values are reported but never modified — they require a
+    separate decryption-based migration.
+
+    Both phases are idempotent: the command can be re-run safely.
+    """
+    prefix = "[dry-run] " if dry_run else ""
+
+    log.info("%sPhase 1/2 — hashing plain NICs", prefix)
+    hash_stats = _hash_plain_nics(dry_run)
+
+    log.info("%sPhase 2/2 — merging duplicate SAML accounts", prefix)
+    merge_stats = _merge_cmd_duplicates(dry_run)
+
+    verb = "would be " if dry_run else ""
+    log.info("%sReport:", prefix)
+    log.info("  plain NICs %shashed: %d", verb, hash_stats["hashed"])
+    log.info("  already hashed (untouched): %d", hash_stats["already_hashed"])
+    log.info(
+        "  legacy-encrypted (untouched, need the legacy decryption migration): %d",
+        hash_stats["legacy_encrypted"],
+    )
+    log.info("  unrecognized values (untouched, listed above): %d", hash_stats["unrecognized"])
+    log.info("  duplicate SAML accounts %smerged: %d", verb, merge_stats["merged"])
+    if merge_stats["unresolved"]:
+        log.info(
+            "  unresolved duplicates (handle manually with "
+            "'udata user merge-saml <saml_email> <target_email>'):"
+        )
+        for email, reason in merge_stats["unresolved"]:
+            log.info("    - %s — %s", email, reason)
+
+    shared = _find_shared_nics()
+    if shared:
+        log.warning(
+            "  NIC hashes shared by multiple accounts (ambiguous CMD login, "
+            "needs a manual decision on which account keeps the link): %d",
+            len(shared),
+        )
+        for group in shared:
+            log.warning("    - %s", " | ".join(group["emails"]))
+
+    success(
+        f"{'Would migrate' if dry_run else 'Migrated'}: "
+        f"{hash_stats['hashed']} NIC(s) hashed, "
+        f"{merge_stats['merged']} duplicate(s) merged, "
+        f"{len(merge_stats['unresolved'])} unresolved"
+    )
 
 
 @grp.command()
@@ -262,8 +378,14 @@ def merge_saml(saml_email, target_email, dry_run):
         [r.name for r in target.roles],
     )
 
-    # Hash the NIC if it's still in plain/numeric form
-    hashed_nic = nic if _is_nic_hashed(nic) else _hash_nic(nic)
+    # Hash the NIC if it's still in plain/numeric form; refuse formats that
+    # must not be hashed (legacy ciphertexts / unrecognized values).
+    if is_nic_hashed(nic):
+        hashed_nic = nic
+    elif is_nic_plain(nic):
+        hashed_nic = hash_nic(nic)
+    else:
+        exit_with_error(f"SAML account {saml_email} holds an unexpected NIC format; not merging")
 
     if dry_run:
         success(f"Would merge hashed NIC into {target.email} and delete {dup.email}")
@@ -275,38 +397,3 @@ def merge_saml(saml_email, target_email, dry_run):
     target.save()
     dup._delete()
     success(f"Merged hashed NIC into {target.email} | deleted {dup.email}")
-
-
-@grp.command()
-@click.option(
-    "--dry-run", is_flag=True, help="Only show what would be done, without making changes"
-)
-def hash_nics(dry_run):
-    """Hash all unhashed NIC values stored in extras.auth_nic.
-
-    Finds users with plain-text (numeric) NIC values and replaces them
-    with HMAC-SHA256 hashes. Already-hashed values (64 hex chars) are skipped.
-    """
-    users_with_nic = User.objects(extras__auth_nic__exists=True)
-    hashed = 0
-    skipped = 0
-
-    for user in users_with_nic:
-        nic = (user.extras or {}).get("auth_nic")
-        if not nic:
-            continue
-
-        if _is_nic_hashed(nic):
-            skipped += 1
-            continue
-
-        if dry_run:
-            log.info("WOULD HASH NIC for %s (id=%s)", user.email, user.id)
-        else:
-            user.extras["auth_nic"] = _hash_nic(nic)
-            user.save()
-            log.info("HASHED NIC for %s (id=%s)", user.email, user.id)
-        hashed += 1
-
-    action = "Would hash" if dry_run else "Hashed"
-    success(f"{action} {hashed} NIC(s), skipped {skipped} (already hashed)")

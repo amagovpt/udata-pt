@@ -4,11 +4,12 @@ import pytest
 from flask import url_for
 
 from udata.app import limiter
+from udata.core.constants import HVD
 from udata.core.dataservices.factories import (
     DataserviceFactory,  # noqa: F401 - registers Dataservice model
 )
-from udata.core.dataset.constants import INSPIRE
-from udata.core.dataset.factories import DatasetFactory, LicenseFactory
+from udata.core.dataset.constants import INSPIRE, FormatFamily
+from udata.core.dataset.factories import DatasetFactory, LicenseFactory, ResourceFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.pages.factories import PageFactory
 from udata.core.reuse.factories import ReuseFactory
@@ -478,10 +479,11 @@ class SiteDatasetsListingAPITest(APITestCase):
         org = OrganizationFactory()
         license = LicenseFactory()
         DatasetFactory.create_batch(3, organization=org, license=license)
-        DatasetFactory(tags=["hvd"], organization=org)
+        DatasetFactory(organization=org).add_badge(HVD)
         DatasetFactory(organization=org).add_badge(INSPIRE)
-        # Carries the `inspire` tag but never got the badge: `rotulo_inspire`
-        # follows the badge, so this one must not be counted.
+        # Carry the tag but never got the badge: both `rotulo_*` counts follow the
+        # badge, which is what the listing filters on, so these must not be counted.
+        DatasetFactory(tags=["hvd"], organization=org)
         DatasetFactory(tags=["inspire"], organization=org)
 
         response = self.get(url_for("api.site_datasets_listing"))
@@ -506,10 +508,7 @@ class SiteDatasetsListingAPITest(APITestCase):
         counts = payload["filter_counts"]
         for key in (
             "formato_all",
-            "formato_tabular",
-            "formato_structured",
-            "formato_geographic",
-            "formato_documents",
+            *(f"formato_{family.value}" for family in FormatFamily),
             "atualizacao_all",
             "atualizacao_30_days",
             "atualizacao_12_months",
@@ -520,15 +519,49 @@ class SiteDatasetsListingAPITest(APITestCase):
         ):
             assert key in counts, f"missing filter count: {key}"
         assert counts["formato_all"] == counts["atualizacao_all"] == counts["rotulo_all"]
-        assert counts["rotulo_high_value"] >= 1
-        # Only the badged dataset counts; the merely tagged one is excluded.
+        # Only the badged datasets count; the merely tagged ones are excluded.
+        assert counts["rotulo_high_value"] == 1
         assert counts["rotulo_inspire"] == 1
-        assert counts["atualizacao_all"] >= 6
+        assert counts["atualizacao_all"] >= 7
 
         assert any(o["id"] == str(org.id) for o in payload["organizations"])
         assert any(lic["id"] == license.id for lic in payload["licenses"])
         assert payload["frequencies"]
         assert payload["granularities"]
+
+    def test_format_family_counts_match_what_the_filter_returns(self):
+        """Each `formato_<family>` count must equal the listing it filters on.
+
+        The count and the filter used to be computed from two different copies of
+        the format lists, and `formato_other` had no count at all — which is how
+        the sidebar's "Outros" option ended up showing no number and returning
+        every dataset.
+        """
+        DatasetFactory(resources=[ResourceFactory(format="csv")])
+        DatasetFactory(resources=[ResourceFactory(format="json")])
+        DatasetFactory(resources=[ResourceFactory(format="shp")])
+        DatasetFactory(resources=[ResourceFactory(format="pdf")])
+        DatasetFactory(resources=[ResourceFactory(format="some-unclassified-format")])
+        # No resources at all: classified as OTHER, matching how the search
+        # adapter indexes a dataset with nothing to derive a family from.
+        DatasetFactory()
+
+        counts = self.get(url_for("api.site_datasets_listing")).json["filter_counts"]
+
+        for family in FormatFamily:
+            listing = self.get(
+                url_for("api.site_datasets_listing", format_family=family.value)
+            ).json["listing"]
+            assert counts[f"formato_{family.value}"] == listing["total"], (
+                f"count and filter disagree for family {family.value}"
+            )
+
+        assert counts["formato_tabular"] == 1
+        assert counts["formato_machine_readable"] == 1
+        assert counts["formato_geographical"] == 1
+        assert counts["formato_documents"] == 1
+        # The unclassified format and the resource-less dataset.
+        assert counts["formato_other"] == 2
 
     def test_get_respects_query_filter(self):
         org = OrganizationFactory()

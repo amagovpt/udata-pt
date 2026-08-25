@@ -4,9 +4,9 @@ from udata.core.contact_point.models import ContactPoint
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
-from udata.models import License, Resource
+from udata.models import License
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import sync_resources
 
 
 class OGCBackend(BaseBackend):
@@ -129,8 +129,10 @@ class OGCBackend(BaseBackend):
         elif isinstance(keywords, str) and keywords:
             dataset.tags.append(keywords)
 
-        # Recreate all resources
-        dataset.resources = []
+        # Reconcile the resources with the payload instead of recreating them,
+        # which used to give every distribution a new download permalink on
+        # every run (LEDG-2251).
+        resources = []
 
         distributions = item_data.get("distributions", [])
         if isinstance(distributions, list):
@@ -159,13 +161,16 @@ class OGCBackend(BaseBackend):
                     # Use link title or create a descriptive title
                     resource_title = dist.get("description") or dist.get("name") or "Resource"
 
-                    new_resource = Resource(
-                        title=resource_title,
-                        url=normalize_url_slashes(url),
-                        filetype="remote",
-                        format=format_value,
+                    resources.append(
+                        {
+                            "title": resource_title,
+                            "url": url,
+                            "filetype": "remote",
+                            "format": format_value,
+                        }
                     )
-                    dataset.resources.append(new_resource)
+
+        sync_resources(dataset, resources)
 
         # Add extra metadata
         dataset.extras["harvest:name"] = self.source.name
@@ -203,15 +208,34 @@ class OGCBackend(BaseBackend):
                     org_or_owner = {"owner": dataset.owner}
 
                 if org_or_owner:
-                    contact, _ = ContactPoint.objects.get_or_create(
-                        name=name, email=email, role="publisher", **org_or_owner
-                    )
+                    if self.dryrun:
+                        # A preview creates nothing: only reuse an existing contact
+                        # point, never mint one. Mongoengine cannot reference an
+                        # unsaved document, so there is nothing to put on the item
+                        # when none matches - the same guard upstream applies in
+                        # `contact_points_from_rdf` for the DCAT path.
+                        #
+                        # `get()`, not `first()`: `get_or_create` ends on a `get`, so
+                        # duplicates matching this query fail a real run. Predicting
+                        # that failure is the preview's job - `first()` would quietly
+                        # pick one of them and report the item as fine.
+                        try:
+                            contact = ContactPoint.objects.get(
+                                name=name, email=email, role="publisher", **org_or_owner
+                            )
+                        except ContactPoint.DoesNotExist:
+                            contact = None
+                    else:
+                        contact, _ = ContactPoint.objects.get_or_create(
+                            name=name, email=email, role="publisher", **org_or_owner
+                        )
 
-                    if not dataset.contact_points:
-                        dataset.contact_points = []
+                    if contact:
+                        if not dataset.contact_points:
+                            dataset.contact_points = []
 
-                    if contact not in dataset.contact_points:
-                        dataset.contact_points.append(contact)
+                        if contact not in dataset.contact_points:
+                            dataset.contact_points.append(contact)
 
         return dataset
 

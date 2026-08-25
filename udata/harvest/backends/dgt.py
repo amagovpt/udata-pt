@@ -2,9 +2,9 @@ from urllib.parse import parse_qs, urlparse
 
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
-from udata.models import License, Resource
+from udata.models import License
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import sync_resources
 
 
 class DGTBackend(BaseBackend):
@@ -113,9 +113,9 @@ class DGTBackend(BaseBackend):
             for keyword in data.get("keywords"):
                 dataset.tags.append(keyword)
 
-        # Recreate all resources
-        # Force recreation of all resources
-        dataset.resources = []
+        # Reconcile the resources with the payload, keeping the id — and hence
+        # the download permalink — of the ones already known (LEDG-2251).
+        resources = []
 
         for resource in data.get("resources"):
             parsed = urlparse(resource["url"])
@@ -124,14 +124,16 @@ class DGTBackend(BaseBackend):
             except KeyError:
                 format = resource["url"].split(".")[-1]
 
-            new_resource = Resource(
-                title=data["title"],
-                url=normalize_url_slashes(resource["url"]),
-                filetype="remote",
-                format=format,
+            resources.append(
+                {
+                    "title": data["title"],
+                    "url": resource["url"],
+                    "filetype": "remote",
+                    "format": format,
+                }
             )
 
-            dataset.resources.append(new_resource)
+        sync_resources(dataset, resources)
 
         # Add extra metadata
         dataset.extras["harvest:name"] = self.source.name
