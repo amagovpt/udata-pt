@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **feat(dataset)!: filter multiple tags with OR instead of AND**
+  - The dataset listing's keyword filter is multi-select, and every other
+    multi-select filter already answered OR (`license`, `format`, `frequency`,
+    `badge`, `organization`, `geozone`, `granularity` are all `__in`). Tags were
+    the single AND, so picking two keywords returned the near-empty intersection
+    instead of the union and read as a broken filter — 974 datasets for one tag,
+    807 for another, 6 for both.
+  - This is a breaking change to `GET /api/1/datasets/?tag=a&tag=b` and to the
+    apiv2 dataset search: they now return datasets carrying *either* tag. It
+    diverges from upstream udata, which chose AND deliberately; the two upstream
+    tests that pinned it now pin the OR, each with a comment recording the
+    divergence, and both assert on tag pairs no single dataset shares so they
+    fail if the AND ever returns. Topics keep the upstream AND — they are not
+    exposed through a multi-select UI.
+- **feat(dataset): filter on resource format families via `?format_family=`**
+  - The listing sidebar offers a coarse "Formato" group (Tabular / Estruturado /
+    Geográfico / Documentos / Outros) but the API only accepted individual
+    extensions, so clients carried their own copy of the format lists and
+    expanded a group into `?format=csv&format=xls&…`. "Outros" cannot be
+    expressed that way at all — it is the complement of the other groups — so
+    that option wrote no filter and behaved exactly like "Todos".
+  - `?format_family=` filters on the family instead, reusing the `FormatFamily`
+    classification and the `*_FORMATS` settings the search adapter already
+    indexes on, so the Mongo listing and the search service classify a dataset
+    the same way. Repeats are OR'ed and it composes with `?format=` as an AND.
+    A dataset belongs to `other` when it has a resource outside every family or
+    no resources at all, which needs `$elemMatch`: on an array field,
+    `resources__format__nin` means "no resource matches", the complement of the
+    wrong set.
+  - The `/site/datasets-listing/` sidebar counts drop their private copy of the
+    format lists and count each family through the same query the filter
+    applies, so a number can no longer disagree with the listing it opens;
+    `formato_other` exists for the first time. `rotulo_high_value` also moves
+    from the raw `hvd` tag to the HVD badge, which is what the listing has been
+    filtering on since that option switched to `?badge=hvd`.
 - **chore: the CKAN PT harvester no longer takes a default license or geographic zones**
   - Both were declared as harvest extra configs, so both appeared as fields on
     the harvester form - and nobody filled them. Of the nine CKAN PT sources
