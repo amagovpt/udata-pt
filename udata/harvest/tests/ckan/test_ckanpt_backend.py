@@ -9,6 +9,8 @@ backend now inherits from `CkanBackend` instead of duplicating it (LEDG-2319).
 
 import json
 import logging
+from contextlib import contextmanager
+from unittest import mock
 from urllib.parse import urljoin
 
 import pytest
@@ -25,6 +27,24 @@ from udata.utils import faker
 
 DATASET_NAME = "ckanpt-dataset"
 BACKEND_LOGGER = "udata.harvest.backends.ckanpt"
+
+
+@contextmanager
+def caplog_at_warning(logger_name):
+    """Collect a logger's warnings without pytest's `caplog`, which `mock.patch` hides."""
+    records = []
+
+    class Collector(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Collector(level=logging.WARNING)
+    logger = logging.getLogger(logger_name)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
 
 
 def ckanpt_organization(acronym):
@@ -375,17 +395,25 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         assert "None" not in warnings[0]
 
     @pytest.mark.parametrize(
-        "description",
-        [b'{"geozones": ["pt:distrito:11"]}', {"license": 1}, True, None],
+        ("description", "warns"),
+        [
+            # Decoded before the shape test, so bytes config still warns.
+            (b'{"geozones": ["pt:distrito:11"]}', True),
+            # Rendered by `safe_unicode` as "{'license': 1}", which is not JSON.
+            ({"license": 1}, False),
+            (True, False),
+            (None, False),
+        ],
     )
-    def test_non_string_description_is_handled(self, description):
+    def test_non_string_description_is_handled(self, caplog, description, warns):
         """A StringField, but a CLI or a migration can still put anything in it."""
         source = self.source("placeholder")
         source.description = description
 
-        backend = CkanPTBackend(source, dryrun=True)
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            CkanPTBackend(source, dryrun=True)
 
-        assert backend.configured_geozones == []
+        assert len(self.backend_warnings(caplog)) == (1 if warns else 0)
 
     # --- Behaviour now inherited from CkanBackend instead of duplicated (LEDG-2319)
 
@@ -503,6 +531,236 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         assert harvested_id in [r.id for r in job.items[0].dataset.resources]
         dataset.reload()
         assert [r.id for r in dataset.resources] == [harvested_id]
+
+    # --- The config is only type-checked, and a preview needs nothing but a login
+
+    def test_many_unknown_geozones_produce_one_warning(self, caplog):
+        """One log record whatever the input size.
+
+        Warning per identifier let a 20k-entry value buy minutes of server time and
+        a `HarvestJob` too big to save, from any authenticated account through
+        `POST /harvest/source/preview/`. The single `id__in` query behind this is
+        not observable from here; what is observable is that the log does not scale
+        with the input.
+        """
+        zone = GeoZoneFactory()
+        source = self.configured(
+            geozones=",".join([zone.id] + [f"no-such-{i}" for i in range(200)])
+        )
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            zones = CkanPTBackend(source, dryrun=True).configured_geozones
+
+        assert zones == [zone]
+        warnings = self.backend_warnings(caplog)
+        # One for the cap, one naming the unknown ones - not 200.
+        assert len(warnings) == 2
+
+    def test_geozones_are_capped(self, caplog):
+        zones = [GeoZoneFactory() for _ in range(3)]
+        source = self.configured(geozones=",".join(z.id for z in zones))
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            with mock.patch.object(CkanPTBackend, "MAX_GEOZONES", 2):
+                resolved = CkanPTBackend(source, dryrun=True).configured_geozones
+
+        assert resolved == zones[:2]
+        assert "keeping the first 2" in self.backend_warnings(caplog)[0]
+
+    def test_repeated_geozones_are_deduplicated(self):
+        zone = GeoZoneFactory()
+        source = self.configured(geozones=f"{zone.id},{zone.id},{zone.id}")
+
+        dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert [z.id for z in dataset.spatial.zones] == [zone.id]
+
+    def test_a_non_string_geozones_value_is_ignored(self):
+        """The form only type-checks; a CLI or a migration can write anything."""
+        source = self.configured(geozones={"$ne": None})
+
+        dataset = self.assert_previewed_one_item(actions.preview(source))
+
+        assert dataset.spatial is None
+
+    def test_an_unsaved_source_name_cannot_forge_a_log_line(self, caplog):
+        """`source_label` falls back to the name, which is free text from the caller.
+
+        These warnings are captured into `HarvestLog` and rendered in the admin job
+        detail, so a newline in the name would show as a log entry of its own.
+        """
+        forged = "ok\nWARNING [udata.harvest] Harvest source approved by sysadmin"
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            actions.preview_from_config(
+                name=forged,
+                url=self.ckan_url,
+                backend="ckanpt",
+                organization=self.org,
+                config={"extra_configs": [{"key": "geozones", "value": "no-such-zone"}]},
+            )
+
+        warnings = self.backend_warnings(caplog)
+        assert len(warnings) == 1
+        assert "\n" not in warnings[0]
+        assert "approved by sysadmin" in warnings[0]
+
+    def test_a_remote_cannot_claim_an_uploaded_resource_to_get_it_pruned(self):
+        """Upstream matches by id and sets `filetype = "remote"` on every match.
+
+        So reading `filetype` after `super()` is too late: a remote publishing a
+        resource whose id collides with a portal upload would have turned that
+        upload into a harvested resource - the `/r/<id>` permalink serving remote
+        content - and the next run would prune it.
+        """
+        source = self.source("")
+        actions.run(source)
+        dataset = Dataset.objects.first()
+        uploaded = Resource(title="Uploaded on the portal", url=faker.unique_url(), filetype="file")
+        dataset.resources.append(uploaded)
+        dataset.save()
+
+        # The remote claims the uploaded resource's id, then stops publishing it.
+        self.package["result"]["resources"] = [
+            dict(self.package["result"]["resources"][0], id=str(uploaded.id))
+        ]
+        self.remote_returns_the_package()
+        actions.run(source)
+        self.package["result"]["resources"] = [
+            dict(self.package["result"]["resources"][0], id=faker.uuid4(), url=faker.unique_url())
+        ]
+        self.remote_returns_the_package()
+        actions.run(source)
+
+        dataset.reload()
+        kept = {resource.id: resource for resource in dataset.resources}
+        assert uploaded.id in kept
+        assert kept[uploaded.id].filetype == "file"
+        assert kept[uploaded.id].url == uploaded.url
+
+    # --- What converging on upstream must not break
+
+    def test_remote_dates_are_recorded(self):
+        """`created_at_internal` drives `DEFAULT_SORTING` on the public listing.
+
+        Upstream records the remote dates only on `harvest.created_at`, so without
+        this override every newly harvested dataset would sort as published today.
+        """
+        self.package["result"]["metadata_created"] = "1999-05-27T00:00:00"
+        self.package["result"]["metadata_modified"] = "2003-09-04T00:00:00"
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.created_at_internal.year == 1999
+        assert dataset.last_modified_internal.year == 2003
+        assert dataset.harvest.created_at.year == 1999
+
+    @pytest.mark.parametrize(
+        "geometry",
+        [
+            '{"type": "Point", "coordinates": [-9.1, 38.7]}',
+            '{"coordinates": [[[0, 0], [1, 1], [1, 0], [0, 0]]]}',
+            '{"type": "GeometryCollection", "geometries": []}',
+        ],
+    )
+    def test_an_unsupported_remote_geometry_does_not_fail_the_item(self, caplog, geometry):
+        """Upstream raises `HarvestException` for anything but Polygon/MultiPolygon.
+
+        That fails the whole item - title, resources, configured zones and all - for
+        datasets that have harvested here for years, because the fork parsed the
+        value and threw it away.
+        """
+        self.package["result"]["extras"] = [{"key": "spatial", "value": geometry}]
+
+        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
+            dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.title == self.package["result"]["title"]
+        assert "unsupported spatial geometry" in self.backend_warnings(caplog)[0]
+
+    def test_a_supported_remote_geometry_is_still_mapped(self):
+        self.package["result"]["extras"] = [
+            {
+                "key": "spatial",
+                "value": '{"type": "Polygon", "coordinates": [[[0, 0], [1, 1], [1, 0], [0, 0]]]}',
+            }
+        ]
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.spatial.geom["type"] == "MultiPolygon"
+
+    def test_a_configured_zone_survives_an_unsupported_remote_geometry(self):
+        """The zones override runs after `super()`, so a raise there loses them too."""
+        zone = GeoZoneFactory()
+        self.package["result"]["extras"] = [
+            {"key": "spatial", "value": '{"type": "Point", "coordinates": [-9.1, 38.7]}'}
+        ]
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.configured(geozones=zone.id)))
+
+        assert [z.id for z in dataset.spatial.zones] == [zone.id]
+
+    def test_stored_zones_survive_a_harvest_with_no_configured_zones(self):
+        """The window between deploying this code and running the migration.
+
+        A source whose config still lives in its description resolves no zones, and
+        upstream - unlike the fork - rebuilds `dataset.spatial` from the remote
+        extras. Without this the ~1100 datasets whose only spatial coverage came
+        from that config would lose it, irreversibly.
+        """
+        zone = GeoZoneFactory()
+        configured = self.configured(geozones=zone.id)
+        actions.run(configured)
+        dataset = Dataset.objects.first()
+        assert [z.id for z in dataset.spatial.zones] == [zone.id]
+
+        # Same source, config back in the description, and a remote that now
+        # publishes a geometry of its own.
+        configured.config = {}
+        configured.description = json.dumps({"geozones": [zone.id]})
+        configured.save()
+        self.package["result"]["extras"] = [
+            {
+                "key": "spatial",
+                "value": '{"type": "Polygon", "coordinates": [[[0, 0], [1, 1], [1, 0], [0, 0]]]}',
+            }
+        ]
+        self.remote_returns_the_package()
+        actions.run(configured)
+
+        dataset.reload()
+        assert [z.id for z in dataset.spatial.zones] == [zone.id]
+        # Not merged with the remote geometry: `SpatialCoverage` refuses to hold
+        # both, so keeping the zones means dropping the geometry.
+        assert dataset.spatial.geom is None
+
+    def test_the_remote_payload_is_not_reused_between_items(self):
+        """`_remote_data` is stashed in `validate`; a stale stash must be impossible."""
+        other_org = OrganizationFactory(acronym="second-org")
+        second = ckanpt_package(other_org.acronym)["result"]
+        second["name"] = "ckanpt-dataset-2"
+        self.rmock.get(
+            self.ckan.PACKAGE_LIST_URL,
+            json={"success": True, "result": [DATASET_NAME, "ckanpt-dataset-2"]},
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+        self.rmock.get(
+            urljoin(self.ckan.PACKAGE_SHOW_URL, "?id=ckanpt-dataset-2"),
+            json={"success": True, "result": second},
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+
+        job = actions.preview(self.source(""))
+
+        assert len(job.items) == 2
+        by_title = {item.dataset.title: item.dataset for item in job.items}
+        assert by_title[self.package["result"]["title"]].organization.acronym == "ckanpt-org"
+        assert by_title[second["title"]].organization.acronym == "second-org"
+        for item in job.items:
+            assert len(item.dataset.resources) == 1
 
     def test_http_error_fails_the_item(self):
         """Inherited from upstream: `get_action` calls `raise_for_status`.

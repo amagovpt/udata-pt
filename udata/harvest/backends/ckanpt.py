@@ -27,6 +27,11 @@ log = logging.getLogger(__name__)
 class CkanPTBackend(CkanBackend):
     name = "ckanpt"
     display_name = "CKAN PT"
+    # No real source configures more than one zone; the cap is there because the
+    # value is only type-checked, and a preview needs nothing but a login.
+    MAX_GEOZONES = 50
+    # What `CkanBackend.inner_process_dataset` can map; anything else makes it raise.
+    SPATIAL_GEOMETRY_TYPES = ("Polygon", "MultiPolygon")
     extra_configs = (
         HarvestExtraConfig(
             _("License"),
@@ -50,9 +55,14 @@ class CkanPTBackend(CkanBackend):
         """How to name the source in logs.
 
         `preview_from_config` previews an unsaved source, so there is no id yet -
-        and that is exactly the path this backend's previews come from.
+        and that is exactly the path this backend's previews come from. Which means
+        the fallback is the source *name*, free text from whoever asked for the
+        preview: `repr` so it cannot forge a log line, since these warnings are
+        captured into `HarvestLog` and rendered in the admin job detail.
         """
-        return self.source.id or self.source.name or self.source.url
+        if self.source.id:
+            return str(self.source.id)
+        return repr(self.source.name or self.source.url)[:200]
 
     def _warn_if_description_holds_config(self) -> None:
         """Transitional: the description used to double as a config blob.
@@ -136,27 +146,43 @@ class CkanPTBackend(CkanBackend):
         the item: this used to go through `GeoZone.objects.get()`, so a single typo
         in the config failed every dataset of the source.
 
+        Bounded on purpose. `HarvestSourceForm` only checks that the value is a
+        string, and `POST /harvest/source/preview/` needs nothing but a login, so
+        the list is attacker-sized: it is deduplicated, cut at `MAX_GEOZONES`,
+        resolved in a single query, and reports the unknown identifiers in one
+        warning. One query and one log record whatever the input, otherwise a
+        20k-entry value buys minutes of server time and a `HarvestJob` big enough
+        to stop saving.
+
         Cached for the same reason as `default_license`: once per dataset otherwise.
         """
         configured = self.get_extra_config_value("geozones")
         if not isinstance(configured, str):
             return []
 
-        zones = []
-        for identifier in (part.strip() for part in configured.split(",")):
-            if not identifier:
-                continue
-            zone = GeoZone.objects(id=identifier).first()
-            if zone:
-                zones.append(zone)
-            else:
-                log.warning(
-                    "Unknown geozone %s configured on harvest source %s; ignoring it",
-                    # `repr` so a crafted identifier cannot forge log lines.
-                    repr(identifier)[:200],
-                    self.source_label(),
-                )
-        return zones
+        identifiers = list(
+            dict.fromkeys(part.strip() for part in configured.split(",") if part.strip())
+        )
+        if len(identifiers) > self.MAX_GEOZONES:
+            log.warning(
+                "Harvest source %s configures %d geozones; keeping the first %d",
+                self.source_label(),
+                len(identifiers),
+                self.MAX_GEOZONES,
+            )
+            identifiers = identifiers[: self.MAX_GEOZONES]
+
+        found = {zone.id: zone for zone in GeoZone.objects(id__in=identifiers)}
+        unknown = [identifier for identifier in identifiers if identifier not in found]
+        if unknown:
+            log.warning(
+                "Unknown geozones %s configured on harvest source %s; ignoring them",
+                # `repr` so a crafted identifier cannot forge log lines.
+                repr(unknown)[:500],
+                self.source_label(),
+            )
+
+        return [found[identifier] for identifier in identifiers if identifier in found]
 
     def validate(self, data, schema):
         """Keep the validated payload around: the PT deltas below need it.
@@ -166,21 +192,104 @@ class CkanPTBackend(CkanBackend):
         no way to see the organization or the resource list the source published.
         Stashing it here is the one seam that keeps the upstream file untouched.
         """
-        self._remote_data = super().validate(data, schema)
+        self._remote_data = self.drop_unsupported_spatial(super().validate(data, schema))
         return self._remote_data
 
+    def drop_unsupported_spatial(self, data: dict) -> dict:
+        """Keep a dataset whose remote publishes a geometry upstream cannot map.
+
+        Upstream raises `HarvestException` for any geometry that is not a `Polygon`
+        or a `MultiPolygon`, which fails the whole item - its title, its resources
+        and the zones this source configures, not just its spatial coverage. The
+        fork parsed that value and threw it away, so these datasets have always
+        harvested here; dropping only the extra keeps them harvesting and loses
+        nothing that was ever mapped.
+
+        A value that is not JSON at all is left alone: upstream raises on it and so
+        did the fork, so that is not a behaviour this convergence changes.
+        """
+        extras = data.get("extras")
+        if not extras:
+            return data
+
+        kept = []
+        for extra in extras:
+            if extra.get("key") != "spatial":
+                kept.append(extra)
+                continue
+
+            value = extra.get("value")
+            try:
+                geometry = value if isinstance(value, dict) else json.loads(value)
+            except (ValueError, TypeError, RecursionError):
+                kept.append(extra)
+                continue
+
+            if isinstance(geometry, dict) and geometry.get("type") in self.SPATIAL_GEOMETRY_TYPES:
+                kept.append(extra)
+            else:
+                log.warning(
+                    "Harvest source %s published an unsupported spatial geometry %s; ignoring it",
+                    self.source_label(),
+                    repr(geometry.get("type") if isinstance(geometry, dict) else geometry)[:100],
+                )
+
+        data["extras"] = kept
+        return data
+
     def get_dataset(self, remote_id):
-        """Seed a new dataset with the configured license.
+        """Seed a new dataset with the configured license, before upstream reads it.
 
         Upstream computes its fallback as `dataset.license or License.default()`, so
         putting the configured license on the dataset before it gets there turns the
         config into a default without touching the upstream file - and keeps
         upstream's rule that a license already stored wins on a re-harvest.
+
+        Also the last point where the stored resources and spatial coverage are still
+        untouched - upstream runs its resource loop after this - so it is where both
+        are noted down for the deltas that run once `super()` has returned.
         """
         dataset = super().get_dataset(remote_id)
+        self._uploaded_resource_ids = {
+            resource.id for resource in dataset.resources if resource.filetype == "file"
+        }
+        self._stored_spatial_zones = list(dataset.spatial.zones) if dataset.spatial else []
+        self.disown_uploaded_resources()
         if not dataset.license:
             dataset.license = self.default_license
         return dataset
+
+    def disown_uploaded_resources(self) -> None:
+        """Hide from upstream any remote entry claiming an uploaded resource's id.
+
+        Upstream matches remote entries to stored resources by id and sets
+        `filetype = "remote"`, the url, the title and the format on every match.
+        Resource ids are public - they are the `/api/1/datasets/r/<id>` permalinks
+        people copy - so a remote publishing one of them would take over a file
+        uploaded on the portal: the permalink would start serving remote content, and
+        once the entry is no longer published the resource is prunable like any other.
+
+        Guarding this after `super()` is too late, because by then the takeover has
+        happened and the next run cannot tell the resource apart from a harvested
+        one. So the entry is dropped from the payload before upstream reads it.
+        """
+        entries = self._remote_data.get("resources") or []
+        kept = []
+        for entry in entries:
+            try:
+                claimed = UUID(entry["id"]) in self._uploaded_resource_ids
+            except (KeyError, TypeError, ValueError):
+                claimed = False
+            if claimed:
+                log.warning(
+                    "Harvest source %s published a resource claiming the id of a file "
+                    "uploaded on the portal; ignoring the remote entry",
+                    self.source_label(),
+                )
+            else:
+                kept.append(entry)
+
+        self._remote_data["resources"] = kept
 
     def inner_process_dataset(self, item: HarvestItem):
         """The upstream CKAN mapping, plus what is specific to this portal.
@@ -210,9 +319,31 @@ class CkanPTBackend(CkanBackend):
         # from the remote ones, so this has to come after it.
         dataset.tags.append(urlparse(self.source.url).hostname)
 
-        # Zones configured on the source win over whatever the remote declares.
+        # Upstream records the remote dates only on `harvest.created_at`, but the
+        # public listing sorts on `created_at_internal` (`DEFAULT_SORTING` in
+        # `core/dataset/api.py`) and `Dataset.last_modified` falls back to
+        # `last_modified_internal`. Dropping these would make every newly harvested
+        # dataset look like it was published today.
+        dataset.created_at_internal = data["metadata_created"]
+        dataset.last_modified_internal = data["metadata_modified"]
+
+        stored_zones = getattr(self, "_stored_spatial_zones", [])
         if self.configured_geozones:
+            # Zones configured on the source own the spatial coverage.
             dataset.spatial = SpatialCoverage(zones=self.configured_geozones)
+        elif stored_zones and not (dataset.spatial and dataset.spatial.zones):
+            # Nothing configured: keep the zones the dataset already had instead of
+            # letting the remote drop them. On this portal the zones never came from
+            # the remote, they came from the source config - and between deploying
+            # this code and running the migration, `configured_geozones` is empty for
+            # a source whose config is still sitting in its description. A remote
+            # publishing a geometry would otherwise wipe the zones of every one of
+            # its datasets in that window, with no way back.
+            #
+            # The zones replace the coverage rather than joining it: `SpatialCoverage`
+            # refuses to hold a geozone and a geometry at once, so merging the two
+            # would fail the whole item on save.
+            dataset.spatial = SpatialCoverage(zones=stored_zones)
 
         self.reconcile_resources(dataset, data["resources"])
 
@@ -227,6 +358,10 @@ class CkanPTBackend(CkanBackend):
         uploaded one, which never belonged to the harvester (the exception
         `sync_resources` documents).
 
+        Which resources were uploaded is read from the snapshot `get_dataset` takes
+        before upstream runs, not from `filetype` as it stands now: upstream will
+        have set `filetype = "remote"` on anything the remote claimed by id.
+
         A preview shows what the source has, it does not act on what it no longer
         has, so pruning is skipped on a dry run.
         """
@@ -240,9 +375,11 @@ class CkanPTBackend(CkanBackend):
                 # Already logged by `super()`, which could not store it either.
                 continue
 
+        uploaded = getattr(self, "_uploaded_resource_ids", frozenset())
+
         kept = []
         for resource in dataset.resources:
-            if resource.filetype == "file":
+            if resource.id in uploaded or resource.filetype == "file":
                 # Uploaded on the portal: not the harvester's to remove.
                 kept.append(resource)
                 continue
