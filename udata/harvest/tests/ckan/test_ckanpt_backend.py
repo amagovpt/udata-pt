@@ -10,7 +10,6 @@ backend now inherits from `CkanBackend` instead of duplicating it (LEDG-2319).
 import json
 import logging
 from contextlib import contextmanager
-from unittest import mock
 from urllib.parse import urljoin
 
 import pytest
@@ -21,7 +20,7 @@ from udata.core.spatial.factories import GeoZoneFactory
 from udata.harvest import actions
 from udata.harvest.backends.ckanpt import CkanPTBackend
 from udata.harvest.tests.factories import HarvestSourceFactory
-from udata.models import Dataset, Organization, Resource
+from udata.models import Dataset, Organization, Resource, SpatialCoverage
 from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import faker
 
@@ -146,21 +145,6 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
             organization=self.org,
         )
 
-    def configured(self, license=None, geozones=None, description=""):
-        """A source carrying its config in `extra_configs`, not in the description."""
-        extra_configs = [
-            {"key": key, "value": value}
-            for key, value in (("license", license), ("geozones", geozones))
-            if value is not None
-        ]
-        return HarvestSourceFactory(
-            backend="ckanpt",
-            url=self.ckan_url,
-            description=description,
-            organization=self.org,
-            config={"extra_configs": extra_configs},
-        )
-
     def assert_previewed_one_item(self, job):
         assert job.status == "done", [error.message for error in job.errors]
         assert job.errors == []
@@ -207,137 +191,7 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         assert not dataset.spatial
         warnings = self.backend_warnings(caplog)
         assert len(warnings) == 1
-        assert "no longer read" in warnings[0]
-
-    def test_preview_with_extra_configs(self):
-        license = LicenseFactory()
-        zone = GeoZoneFactory()
-        source = self.configured(license=license.id, geozones=zone.id)
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert dataset.license == license
-        assert [z.id for z in dataset.spatial.zones] == [zone.id]
-
-    def test_run_with_extra_configs(self):
-        """The real harvest honours the configured license and zones."""
-        license = LicenseFactory()
-        zone = GeoZoneFactory()
-        source = self.configured(license=license.id, geozones=zone.id)
-
-        actions.run(source)
-
-        source.reload()
-        job = source.get_last_job()
-        assert job.status == "done", [error.message for error in job.errors]
-        dataset = Dataset.objects.get(id=job.items[0].dataset.id)
-        assert dataset.license == license
-        assert [z.id for z in dataset.spatial.zones] == [zone.id]
-
-    def test_several_geozones_travel_comma_separated(self):
-        """`HarvestExtraConfig` only admits scalars, so the list travels as CSV."""
-        first, second = GeoZoneFactory(), GeoZoneFactory()
-        source = self.configured(geozones=f" {first.id} , {second.id} ,")
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert [z.id for z in dataset.spatial.zones] == [first.id, second.id]
-
-    def test_unknown_geozone_is_skipped(self, caplog):
-        """A typo in the config must not fail every dataset of the source."""
-        zone = GeoZoneFactory()
-        source = self.configured(geozones=f"no-such-zone,{zone.id}")
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert [z.id for z in dataset.spatial.zones] == [zone.id]
-        warnings = self.backend_warnings(caplog)
-        assert len(warnings) == 1
-        assert "no-such-zone" in warnings[0]
-
-    def test_unknown_configured_license_falls_back(self, caplog):
-        """An id that matches no license must not fail the whole harvest."""
-        default = LicenseFactory(id="notspecified")
-        source = self.configured(license="no-such-license")
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert dataset.license == default
-        warnings = self.backend_warnings(caplog)
-        assert len(warnings) == 1
-        assert "no-such-license" in warnings[0]
-
-    def test_configured_license_is_matched_case_insensitively(self):
-        """Identifiers are stored lower case but typed by hand."""
-        license = LicenseFactory(id="cc-by-4.0")
-        source = self.configured(license="  CC-BY-4.0  ")
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert dataset.license == license
-
-    def test_configured_license_cannot_inject_mongo_operators(self, caplog):
-        """The identifier comes from user input and must never reach the query."""
-        LicenseFactory(id="notspecified")
-        target = LicenseFactory(id="cc-by")
-        source = self.configured(license={"$regex": "^cc"})
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert dataset.license != target
-        assert dataset.license.id == "notspecified"
-        assert len(self.backend_warnings(caplog)) == 1
-
-    def test_configured_license_cannot_forge_log_lines(self, caplog):
-        """A crafted identifier must not be able to fake a log entry."""
-        LicenseFactory(id="notspecified")
-        forged = "x\nWARNING [udata] Harvest source approved by sysadmin"
-        source = self.configured(license=forged)
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            self.assert_previewed_one_item(actions.preview(source))
-
-        warnings = self.backend_warnings(caplog)
-        assert len(warnings) == 1
-        assert "\n" not in warnings[0]
-
-    def test_unknown_license_is_only_logged_once_per_job(self, caplog):
-        """`default_license` runs per dataset; the job must not collect one line each."""
-        LicenseFactory(id="notspecified")
-        second = dict(self.package["result"], id=faker.uuid4(), name="ckanpt-dataset-2")
-        self.rmock.get(
-            self.ckan.PACKAGE_LIST_URL,
-            json={"success": True, "result": [DATASET_NAME, "ckanpt-dataset-2"]},
-            status_code=200,
-            headers={"Content-Type": "application/json"},
-        )
-        self.rmock.get(
-            urljoin(self.ckan.PACKAGE_SHOW_URL, "?id=ckanpt-dataset-2"),
-            json={"success": True, "result": second},
-            status_code=200,
-            headers={"Content-Type": "application/json"},
-        )
-        source = self.configured(license="no-such-license")
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            job = actions.preview(source)
-
-        assert len(job.items) == 2
-        assert len(self.backend_warnings(caplog)) == 1
-
-    def test_remote_license_wins_over_configured_one(self):
-        """The config is a fallback, not an override."""
-        configured = LicenseFactory()
-        remote = LicenseFactory()
-        self.package["result"]["license_id"] = remote.id
-        source = self.configured(license=configured.id)
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert dataset.license == remote
+        assert "free text" in warnings[0]
 
     def test_run_with_prose_description(self):
         source = self.source("Harvester dos dados abertos do municipio.")
@@ -436,14 +290,17 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         assert "harvest:name" not in dataset.extras
 
     def test_reharvest_preserves_a_license_set_on_the_portal(self):
-        """Upstream keeps a stored license; the configured one is only a default."""
-        configured = LicenseFactory()
+        """Upstream keeps a stored license: `dataset.license or License.default()`.
+
+        The fork used to reset it on every run. Nothing on this backend seeds the
+        license any more, so what is asserted here is purely upstream's rule - and
+        it is asserted because that is the behaviour a re-harvest must not lose.
+        """
         chosen = LicenseFactory()
-        source = self.configured(license=configured.id)
+        source = self.source("")
 
         actions.run(source)
         dataset = Dataset.objects.first()
-        assert dataset.license == configured
         dataset.license = chosen
         dataset.save()
 
@@ -467,16 +324,6 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
 
         assert Organization.objects(acronym="brand-new-org").count() == 1
         assert Dataset.objects.first().organization.acronym == "brand-new-org"
-
-    def test_configured_geozones_win_over_the_remote_spatial_text(self):
-        remote = GeoZoneFactory()
-        configured = GeoZoneFactory()
-        self.package["result"]["extras"] = [{"key": "spatial-text", "value": remote.name}]
-        source = self.configured(geozones=configured.id)
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert [z.id for z in dataset.spatial.zones] == [configured.id]
 
     def test_resource_urls_are_slash_normalized(self):
         self.package["result"]["resources"][0]["url"] = "http://dados.example.pt//a//b.csv"
@@ -534,55 +381,6 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
 
     # --- The config is only type-checked, and a preview needs nothing but a login
 
-    def test_many_unknown_geozones_produce_one_warning(self, caplog):
-        """One log record whatever the input size.
-
-        Warning per identifier let a 20k-entry value buy minutes of server time and
-        a `HarvestJob` too big to save, from any authenticated account through
-        `POST /harvest/source/preview/`. The single `id__in` query behind this is
-        not observable from here; what is observable is that the log does not scale
-        with the input.
-        """
-        zone = GeoZoneFactory()
-        source = self.configured(
-            geozones=",".join([zone.id] + [f"no-such-{i}" for i in range(200)])
-        )
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            zones = CkanPTBackend(source, dryrun=True).configured_geozones
-
-        assert zones == [zone]
-        warnings = self.backend_warnings(caplog)
-        # One for the cap, one naming the unknown ones - not 200.
-        assert len(warnings) == 2
-
-    def test_geozones_are_capped(self, caplog):
-        zones = [GeoZoneFactory() for _ in range(3)]
-        source = self.configured(geozones=",".join(z.id for z in zones))
-
-        with caplog.at_level(logging.WARNING, logger=BACKEND_LOGGER):
-            with mock.patch.object(CkanPTBackend, "MAX_GEOZONES", 2):
-                resolved = CkanPTBackend(source, dryrun=True).configured_geozones
-
-        assert resolved == zones[:2]
-        assert "keeping the first 2" in self.backend_warnings(caplog)[0]
-
-    def test_repeated_geozones_are_deduplicated(self):
-        zone = GeoZoneFactory()
-        source = self.configured(geozones=f"{zone.id},{zone.id},{zone.id}")
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert [z.id for z in dataset.spatial.zones] == [zone.id]
-
-    def test_a_non_string_geozones_value_is_ignored(self):
-        """The form only type-checks; a CLI or a migration can write anything."""
-        source = self.configured(geozones={"$ne": None})
-
-        dataset = self.assert_previewed_one_item(actions.preview(source))
-
-        assert dataset.spatial is None
-
     def test_an_unsaved_source_name_cannot_forge_a_log_line(self, caplog):
         """`source_label` falls back to the name, which is free text from the caller.
 
@@ -597,7 +395,7 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
                 url=self.ckan_url,
                 backend="ckanpt",
                 organization=self.org,
-                config={"extra_configs": [{"key": "geozones", "value": "no-such-zone"}]},
+                description=json.dumps({"geozones": ["pt:concelho:1106"]}),
             )
 
         warnings = self.backend_warnings(caplog)
@@ -690,36 +488,24 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
 
         assert dataset.spatial.geom["type"] == "MultiPolygon"
 
-    def test_a_configured_zone_survives_an_unsupported_remote_geometry(self):
-        """The zones override runs after `super()`, so a raise there loses them too."""
-        zone = GeoZoneFactory()
-        self.package["result"]["extras"] = [
-            {"key": "spatial", "value": '{"type": "Point", "coordinates": [-9.1, 38.7]}'}
-        ]
+    def test_stored_zones_survive_a_remote_that_starts_publishing_a_geometry(self):
+        """Zones on this portal never came from the remote, so a remote cannot drop them.
 
-        dataset = self.assert_previewed_one_item(actions.preview(self.configured(geozones=zone.id)))
-
-        assert [z.id for z in dataset.spatial.zones] == [zone.id]
-
-    def test_stored_zones_survive_a_harvest_with_no_configured_zones(self):
-        """The window between deploying this code and running the migration.
-
-        A source whose config still lives in its description resolves no zones, and
-        upstream - unlike the fork - rebuilds `dataset.spatial` from the remote
-        extras. Without this the ~1100 datasets whose only spatial coverage came
-        from that config would lose it, irreversibly.
+        Upstream - unlike the fork this backend replaced - rebuilds
+        `dataset.spatial` from the remote extras. Without the guard the ~1100
+        datasets whose only spatial coverage was set on the portal would lose it,
+        irreversibly, the first time their source published a geometry.
         """
         zone = GeoZoneFactory()
-        configured = self.configured(geozones=zone.id)
-        actions.run(configured)
+        source = self.source("")
+        actions.run(source)
         dataset = Dataset.objects.first()
-        assert [z.id for z in dataset.spatial.zones] == [zone.id]
 
-        # Same source, config back in the description, and a remote that now
-        # publishes a geometry of its own.
-        configured.config = {}
-        configured.description = json.dumps({"geozones": [zone.id]})
-        configured.save()
+        # The coverage as the portal holds it, which is where it comes from here.
+        dataset.spatial = SpatialCoverage(zones=[zone.id])
+        dataset.save()
+
+        # The remote now publishes a geometry of its own.
         self.package["result"]["extras"] = [
             {
                 "key": "spatial",
@@ -727,7 +513,7 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
             }
         ]
         self.remote_returns_the_package()
-        actions.run(configured)
+        actions.run(source)
 
         dataset.reload()
         assert [z.id for z in dataset.spatial.zones] == [zone.id]
@@ -781,20 +567,58 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
         assert len(job.items) == 1
         assert job.items[0].status == "failed"
 
-    def test_preview_persists_an_unknown_organization(self):
-        """Characterisation, not an endorsement: a preview should persist nothing.
+    def test_preview_does_not_persist_an_unknown_organization(self):
+        """A preview persists nothing, the organization mapping included.
 
-        `inner_process_dataset` saves the organization with no `dryrun` guard, so
-        previewing a source whose remote organization is unknown creates it for
-        real. Pre-existing and out of scope here (it is not about the description
-        being JSON), but the assertion above only holds because the fixture
-        pre-creates the organization - so it is documented rather than implied.
+        `inner_process_dataset` used to save the organization with no `dryrun`
+        guard, so previewing a source whose remote organization was unknown created
+        it for real - reachable by any authenticated account through the preview
+        endpoint, which is a write primitive it was never meant to hand out.
         """
         self.package["result"]["organization"]["name"] = "brand-new-org"
 
-        actions.preview(self.source(""))
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
 
-        assert Organization.objects(acronym="brand-new-org").count() == 1
+        assert Organization.objects(acronym="brand-new-org").count() == 0
+        # The item is not left without an organization: `get_dataset` seeds a new
+        # dataset with the one the source is attached to, and the guard leaves that
+        # in place instead of overwriting it with an unknown remote.
+        assert dataset.organization == self.org
+
+    def test_preview_says_an_unknown_organization_would_be_created(self):
+        """The item must not silently claim the source's organization.
+
+        Leaving the seeded organization in place means the item shows one the real
+        run would not use, which is the very thing the preview is consulted about -
+        so the difference is logged onto the item the API returns.
+        """
+        self.package["result"]["organization"]["name"] = "brand-new-org"
+
+        job = actions.preview(self.source(""))
+
+        # The level matters, not just the text: the collector hangs off the app
+        # logger, which `init_logging` pins at WARNING outside debug and testing -
+        # an `info` would never become a record in production.
+        entries = [entry for entry in job.items[0].logs if "brand-new-org" in entry.message]
+        assert entries, [entry.message for entry in job.items[0].logs]
+        assert [entry.level for entry in entries] == ["WARNING"]
+
+    def test_preview_maps_a_known_organization(self):
+        """The other half of the guard: an organization that exists is still mapped.
+
+        Not writing in a preview must not degrade into not resolving at all - the
+        item has to keep showing the organization the dataset would be filed under.
+        The remote acronym deliberately points at an organization the source is
+        *not* attached to: with the source's own one, `get_dataset` seeds the field
+        anyway and the assertion could not tell the mapping from the seeding.
+        """
+        other = OrganizationFactory(acronym="another-ckanpt-org")
+        self.package["result"]["organization"]["name"] = other.acronym
+
+        dataset = self.assert_previewed_one_item(actions.preview(self.source("")))
+
+        assert dataset.organization == other
+        assert dataset.organization != self.org
 
     def test_prose_description_is_not_logged(self, caplog):
         """Prose is the normal case: it must not log on every single run."""

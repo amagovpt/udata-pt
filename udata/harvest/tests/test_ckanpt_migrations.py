@@ -1,8 +1,14 @@
 """Tests for the CKAN PT data migrations (LEDG-2319).
 
 The migrations move config out of places it should never have been written to, so
-what they must prove is that nothing is lost on the way: the harvester ends up
-reading the same values it read before, and running twice changes nothing.
+what they must prove is that nothing is lost on the way, and that running twice
+changes nothing.
+
+One thing they no longer prove: that the harvester reads what was migrated. The
+default license and the geographic zones stopped being harvest settings, so the
+`extra_configs` the description migration writes have no reader. What still
+matters about it is the other half of its job - a description that was a JSON
+config blob goes back to being the prose the blob carried.
 """
 
 import importlib.util
@@ -17,7 +23,6 @@ from mongoengine.errors import ValidationError
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.spatial.factories import GeoZoneFactory
-from udata.harvest.backends.ckanpt import CkanPTBackend
 from udata.harvest.models import HarvestSource
 from udata.harvest.tests.factories import HarvestSourceFactory
 from udata.tests.api import PytestOnlyDBTestCase
@@ -81,16 +86,6 @@ class DescriptionConfigMigrationTest(PytestOnlyDBTestCase):
         self.migrate(get_db())
 
         assert extra_configs(source) == {"geozones": f"{first.id},{second.id}"}
-
-    def test_the_harvester_reads_the_same_zones_afterwards(self):
-        """The point of the migration: no loss between the two storage places."""
-        zone = GeoZoneFactory()
-        source = self.source('{"geozones": ["%s"]}' % zone.id)
-
-        self.migrate(get_db())
-        source.reload()
-
-        assert CkanPTBackend(source, dryrun=True).configured_geozones == [zone]
 
     def test_prose_description_is_left_alone(self):
         source = self.source("Dados abertos do municipio.")

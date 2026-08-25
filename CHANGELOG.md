@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- **chore: the CKAN PT harvester no longer takes a default license or geographic zones**
+  - Both were declared as harvest extra configs, so both appeared as fields on
+    the harvester form - and nobody filled them. Of the nine CKAN PT sources
+    configured, eight carry no value at all, and the one that does carries the
+    display names rather than the identifiers the backend expects, which the
+    backend was already discarding with a warning on every run. A field that is
+    never used correctly and warns when it is used is worse than no field.
+  - The declaration is what the form renders, so removing it removes the fields
+    from both the creation and the edit screens with no frontend change at all.
+    The code that read them goes with it, because a setting that can no longer be
+    entered but is still applied to every harvest is the worse of the two states.
+  - Nothing is lost by it. The license fallback was seeded onto the dataset ahead
+    of upstream, whose own rule is `dataset.license or License.default()` - so the
+    same default still applies, and a license set by hand on the portal still
+    survives a re-harvest. The zones configured on a source used to override the
+    spatial coverage; what remains is the guard that keeps the zones a dataset
+    already has when its source starts publishing a geometry, which is what
+    actually protected them.
+  - Values the migration already wrote into `extra_configs` are inert from here
+    on: the backend does not read them, and the admin drops keys the backend does
+    not declare the next time a source is saved.
+
+- **fix: a harvest preview no longer writes to the database**
+  - A preview runs a harvest backend with `dryrun=True` and is meant to persist
+    nothing: the framework validates each dataset instead of saving it, and never
+    saves the job or its items. Three of the Portuguese backends did not honour
+    that on their own. The CKAN PT and ODS PT harvesters created and saved an
+    organization whenever the remote publisher matched no local acronym, and the
+    OGC one minted a contact point for the remote provider. None of the three had
+    a `dryrun` guard.
+  - The preview endpoint only requires an account to be logged in, so this handed
+    every authenticated user a way to create arbitrary organizations in the
+    database by pointing a preview at a portal they control - no membership, no
+    organization-creation flow, no trace beyond the document itself. Not a
+    privilege escalation, since the organizations come out with no members. But
+    the name, the description and therefore the slug all came from the remote
+    payload, so it was more than catalogue pollution: it was a way to take names
+    in the public organization URL namespace and to put chosen text on a page the
+    portal serves as its own.
+  - A preview now resolves those documents without creating them, and leaves the
+    item without one when nothing matches. It is deliberately not building them
+    in memory instead: both fields are references, and mongoengine refuses to
+    reference a document that was never saved, so the whole item would fail
+    validation. This is the same choice upstream made for contact points on the
+    DCAT path, which these backends never inherited because they carry their own
+    copy of the mapping. A real harvest is unchanged and still creates what it
+    needs.
+  - Where the organization was already filled in from the harvest source, that
+    value stays rather than being cleared - which means the item shows the
+    source's organization while a real run would file the dataset under a new
+    one. That is the question a preview gets consulted about, so it is no longer
+    left to be inferred: the backend logs the difference onto the item, and the
+    preview response carries it.
+  - `udata organizations audit-unowned` lists what may already be in a database
+    from before the fix: organizations with no member, no pending membership
+    request, and nothing filed under them - no dataset, reuse, dataservice,
+    topic, page, contact point or harvest source. It prints the slug and the
+    description alongside the name, because on an organization a harvester
+    created those came from the remote and are what tells it apart from one
+    somebody created by hand. It only reads - the shape it looks for is a
+    candidate, not a verdict.
+
 - **refactor: the CKAN PT harvester is a specialisation of the upstream CKAN backend, not a copy of it**
   - `ckanpt` was introduced as a copy-paste fork of the upstream CKAN harvester
     and never reconciled, so 90 lines of it were literal duplication —

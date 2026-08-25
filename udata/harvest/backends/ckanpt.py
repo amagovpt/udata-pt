@@ -8,14 +8,11 @@ be reapplied by hand on every sync.
 
 import json
 import logging
-from functools import cached_property
 from urllib.parse import urlparse
 from uuid import UUID
 
-from udata.harvest.backends.base import HarvestExtraConfig
 from udata.harvest.models import HarvestItem
-from udata.i18n import lazy_gettext as _
-from udata.models import GeoZone, License, Organization, SpatialCoverage
+from udata.models import Organization, SpatialCoverage
 from udata.utils import safe_unicode
 
 from .ckan.harvesters import ALLOWED_RESOURCE_TYPES, CkanBackend
@@ -27,25 +24,8 @@ log = logging.getLogger(__name__)
 class CkanPTBackend(CkanBackend):
     name = "ckanpt"
     display_name = "CKAN PT"
-    # No real source configures more than one zone; the cap is there because the
-    # value is only type-checked, and a preview needs nothing but a login.
-    MAX_GEOZONES = 50
     # What `CkanBackend.inner_process_dataset` can map; anything else makes it raise.
     SPATIAL_GEOMETRY_TYPES = ("Polygon", "MultiPolygon")
-    extra_configs = (
-        HarvestExtraConfig(
-            _("License"),
-            "license",
-            str,
-            _("Identifier of the license to fall back on, e.g. cc-by"),
-        ),
-        HarvestExtraConfig(
-            _("Geozones"),
-            "geozones",
-            str,
-            _("Comma-separated GeoZone identifiers, e.g. pt:concelho:1106"),
-        ),
-    )
 
     def __init__(self, source_or_job, dryrun=False, max_items=None):
         super().__init__(source_or_job, dryrun=dryrun, max_items=max_items)
@@ -67,11 +47,11 @@ class CkanPTBackend(CkanBackend):
     def _warn_if_description_holds_config(self) -> None:
         """Transitional: the description used to double as a config blob.
 
-        `license` and `geozones` are extra configs now, and the description is back
-        to being what the form has always called it - free text. A description that
-        is still a JSON object carrying those keys was written as config, and that
-        config no longer applies: say so once per job instead of letting it look
-        like it still works.
+        The description is what the form has always called it - free text. A
+        description that is still a JSON object carrying `license` or `geozones`
+        was written as config back when this backend read it from there, and it
+        applies nowhere now: say so once per job instead of letting it look like
+        it still works.
         """
         # Decode once: the description is a StringField, but nothing stops a CLI or a
         # migration from putting bytes or another type in there.
@@ -90,99 +70,10 @@ class CkanPTBackend(CkanBackend):
             return
 
         log.warning(
-            "Description of harvest source %s still holds JSON config; license and "
-            "geozones are extra configs now and the description is no longer read",
+            "Description of harvest source %s still holds JSON config; it is free "
+            "text and neither the license nor the geozones in it are read",
             self.source_label(),
         )
-
-    @cached_property
-    def default_license(self) -> License | None:
-        """The license to fall back on when the remote one cannot be guessed.
-
-        The extra config stores the license as its identifier, but `Dataset.license`
-        is a reference: handing the raw string to `License.guess` as its default made
-        every item fail validation whenever the remote license was not resolvable.
-
-        Cached: the config cannot change during a run, and this is called once per
-        dataset - an unknown identifier would otherwise re-query and re-log for
-        every single item of the job.
-
-        Returns `None` when the license list has never been seeded, since
-        `License.default()` does; `Dataset.license` is not required.
-        """
-        configured = self.get_extra_config_value("license")
-        if not configured:
-            return License.default()
-
-        # Identifiers are stored lower case and typed by hand, so match the way
-        # `License.guess_one` does. Anything that is not a string is not an
-        # identifier - and must never reach the query, where a dict would be read
-        # as Mongo operators.
-        license = (
-            License.objects(id__iexact=configured.strip()).first()
-            if isinstance(configured, str)
-            else None
-        )
-        if license:
-            return license
-
-        log.warning(
-            "Unknown license %s configured on harvest source %s; using the default one",
-            # `repr` so a crafted identifier cannot forge log lines with newlines.
-            repr(configured)[:200],
-            self.source_label(),
-        )
-        return License.default()
-
-    @cached_property
-    def configured_geozones(self) -> list[GeoZone]:
-        """The geozones configured on the source, resolved to documents.
-
-        Stored comma-separated because `HarvestExtraConfig` only admits the scalar
-        types of `HarvestFilter.TYPES`, and a zone identifier (`pt:concelho:1106`)
-        never contains a comma.
-
-        An identifier matching no zone is dropped with a warning rather than failing
-        the item: this used to go through `GeoZone.objects.get()`, so a single typo
-        in the config failed every dataset of the source.
-
-        Bounded on purpose. `HarvestSourceForm` only checks that the value is a
-        string, and `POST /harvest/source/preview/` needs nothing but a login, so
-        the list is attacker-sized: it is deduplicated, cut at `MAX_GEOZONES`,
-        resolved in a single query, and reports the unknown identifiers in one
-        warning. One query and one log record whatever the input, otherwise a
-        20k-entry value buys minutes of server time and a `HarvestJob` big enough
-        to stop saving.
-
-        Cached for the same reason as `default_license`: once per dataset otherwise.
-        """
-        configured = self.get_extra_config_value("geozones")
-        if not isinstance(configured, str):
-            return []
-
-        identifiers = list(
-            dict.fromkeys(part.strip() for part in configured.split(",") if part.strip())
-        )
-        if len(identifiers) > self.MAX_GEOZONES:
-            log.warning(
-                "Harvest source %s configures %d geozones; keeping the first %d",
-                self.source_label(),
-                len(identifiers),
-                self.MAX_GEOZONES,
-            )
-            identifiers = identifiers[: self.MAX_GEOZONES]
-
-        found = {zone.id: zone for zone in GeoZone.objects(id__in=identifiers)}
-        unknown = [identifier for identifier in identifiers if identifier not in found]
-        if unknown:
-            log.warning(
-                "Unknown geozones %s configured on harvest source %s; ignoring them",
-                # `repr` so a crafted identifier cannot forge log lines.
-                repr(unknown)[:500],
-                self.source_label(),
-            )
-
-        return [found[identifier] for identifier in identifiers if identifier in found]
 
     def validate(self, data, schema):
         """Keep the validated payload around: the PT deltas below need it.
@@ -238,16 +129,10 @@ class CkanPTBackend(CkanBackend):
         return data
 
     def get_dataset(self, remote_id):
-        """Seed a new dataset with the configured license, before upstream reads it.
+        """The last point where the stored resources and spatial coverage are intact.
 
-        Upstream computes its fallback as `dataset.license or License.default()`, so
-        putting the configured license on the dataset before it gets there turns the
-        config into a default without touching the upstream file - and keeps
-        upstream's rule that a license already stored wins on a re-harvest.
-
-        Also the last point where the stored resources and spatial coverage are still
-        untouched - upstream runs its resource loop after this - so it is where both
-        are noted down for the deltas that run once `super()` has returned.
+        Upstream runs its resource loop after this, so this is where both are noted
+        down for the deltas that run once `super()` has returned.
         """
         dataset = super().get_dataset(remote_id)
         self._uploaded_resource_ids = {
@@ -255,8 +140,6 @@ class CkanPTBackend(CkanBackend):
         }
         self._stored_spatial_zones = list(dataset.spatial.zones) if dataset.spatial else []
         self.disown_uploaded_resources()
-        if not dataset.license:
-            dataset.license = self.default_license
         return dataset
 
     def disown_uploaded_resources(self) -> None:
@@ -305,15 +188,43 @@ class CkanPTBackend(CkanBackend):
         # CKAN organization onto a local one by acronym, creating it when it is new.
         acronym = data["organization"]["name"]
         organization = Organization.objects(acronym=acronym).first()
-        if not organization:
+        if organization:
+            dataset.organization = organization
+        elif not self.dryrun:
             organization = Organization(
                 acronym=acronym,
                 name=data["organization"]["title"],
                 description=data["organization"]["description"],
             )
-            # LEDG-2320: this runs on a preview too, where nothing should be saved.
             organization.save()
-        dataset.organization = organization
+            dataset.organization = organization
+        else:
+            # A preview creates nothing, so an organization that does not exist yet
+            # cannot be shown on the item: `organization` is a `ReferenceField` and
+            # mongoengine refuses to reference an unsaved document, which would fail
+            # the whole item on the `validate()` a dryrun runs instead of `save()`.
+            # Same reasoning as upstream for contact points
+            # (`contact_points_from_rdf`).
+            #
+            # The field is left untouched rather than set to `None`, which means it
+            # keeps whatever `get_dataset` seeded from the source - so the item shows
+            # the source's organization while a real run would file the dataset under
+            # a new one. That is exactly the question a preview is used to answer, so
+            # it is said out loud: `process_dataset` collects these onto `item.logs`,
+            # which the preview API returns.
+            #
+            # `warning`, not `info`: `init_logging` puts the app logger at WARNING
+            # outside debug, and the collector hangs off that logger - an `info`
+            # would be dropped before it ever became a record. Warning is also the
+            # honest level here, and this branch only runs on a preview, so it
+            # cannot become noise on a scheduled harvest.
+            log.warning(
+                "Organization %s does not exist yet; a real harvest would create it, "
+                "the preview does not",
+                # `repr` and bounded, like the other warnings here: the value is
+                # remote and these records are returned in the preview response.
+                repr(acronym)[:200],
+            )
 
         # Which source a dataset came from, as a tag. `super()` rebuilds the tag list
         # from the remote ones, so this has to come after it.
@@ -328,17 +239,11 @@ class CkanPTBackend(CkanBackend):
         dataset.last_modified_internal = data["metadata_modified"]
 
         stored_zones = getattr(self, "_stored_spatial_zones", [])
-        if self.configured_geozones:
-            # Zones configured on the source own the spatial coverage.
-            dataset.spatial = SpatialCoverage(zones=self.configured_geozones)
-        elif stored_zones and not (dataset.spatial and dataset.spatial.zones):
-            # Nothing configured: keep the zones the dataset already had instead of
-            # letting the remote drop them. On this portal the zones never came from
-            # the remote, they came from the source config - and between deploying
-            # this code and running the migration, `configured_geozones` is empty for
-            # a source whose config is still sitting in its description. A remote
-            # publishing a geometry would otherwise wipe the zones of every one of
-            # its datasets in that window, with no way back.
+        if stored_zones and not (dataset.spatial and dataset.spatial.zones):
+            # Keep the zones the dataset already had instead of letting the remote
+            # drop them. On this portal the zones never came from the remote, so a
+            # remote publishing a geometry would otherwise wipe the zones of every
+            # one of its datasets, with no way back.
             #
             # The zones replace the coverage rather than joining it: `SpatialCoverage`
             # refuses to hold a geozone and a geometry at once, so merging the two
