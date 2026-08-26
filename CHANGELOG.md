@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **fix(harvest): authorize the config preview, and give it a rate limit of its own**
+  - `POST /harvest/source/preview/` tested `organization.permissions["harvest"]`
+    only when the payload named an organization, so a payload that named none
+    passed no authorization test at all beyond being logged in. It now requires a
+    sysadmin in that case. The decision, for the record: this is the one route
+    that makes the server run a whole harvest backend against a URL the caller
+    supplies, which is why it gets a gate that creating a source does not need —
+    a created source lands `VALIDATION_PENDING`, validating it is
+    `admin_permission`, and a manual run refuses anything not accepted. With no
+    organization in the payload there is nothing else to weigh the request
+    against, so a sysadmin is the only defensible answer.
+  - Two alternatives were considered and rejected. Requiring harvest permission
+    on *any* organization the caller belongs to would authorize fetching an
+    arbitrary URL because they happen to administer something unrelated, and has
+    no precedent in the codebase; leaving the behaviour as intentional and only
+    documenting it would leave the endpoint executing remote harvests for any
+    account that can log in. The alternative that mattered was on the client:
+    an organization's editors and the owner of an owner-only source may preview
+    and may not edit, so the backoffice now previews a *saved* source through
+    `GET /harvest/source/<id>/preview/`, whose per-source permission admits them,
+    and reserves the config route for a config that is not stored yet.
+  - Added `HARVEST_PREVIEW_LIMIT` (5/min, 30/h, 100/day), keyed by `user_or_ip`
+    and declared in the resource's `decorators` rather than on the verb, so the
+    limiter runs outside `@api.secure` and a flood of unauthorized attempts is
+    counted too. What this rations is not writes but outbound cost: every request
+    walks a remote catalogue and produces traffic in the portal's name.
+
 - **fix(discussions): stop leaving orphaned notifications behind a deleted discussion**
   - Deleting a discussion, or a single comment, through the API left every notification
     that referenced it in place, pointing at a document that no longer exists. Both

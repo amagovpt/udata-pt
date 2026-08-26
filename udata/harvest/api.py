@@ -3,6 +3,8 @@ from flask_login import current_user
 from werkzeug.exceptions import BadRequest
 
 from udata.api import API, api, fields
+from udata.api.limits import HARVEST_PREVIEW_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api_fields import dataset_fields, dataset_ref_fields
@@ -490,6 +492,19 @@ class ScheduleSourceAPI(API):
 
 @ns.route("/source/preview/", endpoint="preview_harvest_source_config")
 class PreviewSourceConfigAPI(API):
+    # Every request here walks a remote catalogue on the caller's behalf, so the
+    # cost is outbound rather than stored. Declared at class level, not on the
+    # verb: `decorators` run outside `@api.secure`, which is what keeps the limit
+    # counting a flood of unauthorized attempts instead of only the ones that get
+    # past authentication.
+    decorators = [
+        limiter.limit(
+            HARVEST_PREVIEW_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.expect(source_fields)
     @api.doc("preview_harvest_source_config")

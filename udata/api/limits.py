@@ -87,6 +87,23 @@ FEED_LIMIT = "120 per minute; 2400 per hour"
 PUBLIC_READ_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
+# Harvest config preview (`POST /harvest/source/preview/`). Unlike the limits
+# above, what this one rations is not writes: it is the only route that makes the
+# server run a whole harvest backend against a URL the caller supplies, so each
+# request means outbound traffic in the portal's name and a remote catalogue
+# walked. That is expensive regardless of who asks, which is why it carries a
+# limit even though the endpoint now also requires authorization.
+#
+# The numbers are CONTENT_CREATE_LIMIT's, and a separate constant on purpose
+# (COMMENT_CREATE_LIMIT is the same shape for the same reason): the two ceilings
+# answer to different things — content creation to abuse of public content,
+# this one to outbound cost — and would have to move apart the first time either
+# is calibrated. Sized for the real workflow, which is a sysadmin iterating on a
+# harvester configuration and re-previewing after each change, so a handful per
+# minute has to pass. Keyed by `user_or_ip`, and since the route is `@api.secure`
+# the key is always `user:{id}`, so the daily cap is per-publisher and does not
+# become the site-wide daily block that the anonymous endpoints above avoid.
+HARVEST_PREVIEW_LIMIT = "5 per minute; 30 per hour; 100 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 # File upload on existing/new dataset resources. Keyed by `user_or_ip` and the
 # endpoint is authenticated (`@api.secure`), so the key is always `user:{id}` —
