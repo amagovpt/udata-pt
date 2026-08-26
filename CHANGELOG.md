@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **fix(tests): restore a green backend test suite and gate it in CI**
+  - `develop` entered red: 43 failures, 3 errors and 15 lint problems. With a red
+    baseline nobody could tell "my failure" from "the failure that was already
+    there" without running the suite twice and diffing the lists by hand, which
+    is what the previous two tickets had to do — one of them closed with an
+    explicit override of the push gate.
+  - Fourteen failures and all three errors were the suite disagreeing with the
+    code rather than the code being wrong: upstream registration fixtures used a
+    password this fork's policy rejects, a real reCAPTCHA secret leaked from a
+    local `.env` into the test app, the CORS allowlist was never declared for the
+    two tests that send an origin, `license_title` reached `DatasetFactory` as a
+    computed key, and six expectations were stale (membership accept is
+    deliberately idempotent now, invites of registered users are direct adds,
+    contact mail paragraphs are `<p>` not `<br><br>`, organization metrics iterate
+    four keys, the spam report links to a tab). Each was fixed at the smallest
+    honest scope, never by relaxing a shared setting: the password policy stays
+    strict in `settings.Testing`, because the regression test that pins it exists
+    to catch exactly that drift.
+  - Three collection errors came from a search-integration class connecting to
+    Elasticsearch from an autouse fixture. The marker meant for that already
+    existed and already guarded its sibling class; this one simply never got it,
+    so the three are now explicit skips that still run wherever the search stack
+    is up.
+  - Twenty-nine failures belong to six root causes left open and owned
+    elsewhere: notification details classes missing from the model's choices,
+    a discussion status member that does not exist, a field typed as string
+    instead of UUID with its cleanup receivers missing, a badges key forcing 403
+    on a full organization save, a scalar filter iterated character by character,
+    and a missing invitation guard on membership accept. They are marked strict
+    xfail, each reason naming the owning ticket and the production line, so the
+    suite can gate merges while the bugs stay visible — and so that fixing any of
+    them turns the marker red and forces its removal in the same change.
+  - Lint and format are clean across the tree. The pre-commit hook was pinned to
+    a ruff four minor versions behind the project's, so hook and `uv run ruff`
+    formatted the same files differently and eleven of them kept drifting; the
+    pin now follows the lockfile. The SAML package's re-export keeps a noqa
+    rather than ruff's suggested fix, which renames the export and breaks CMD
+    login.
+  - Merges into `develop` were gated by nothing at all: CircleCI is configured
+    in-tree but has never reported a status or a check-run to GitHub. A GitHub
+    Actions workflow now runs lint and the suite on every push and pull request.
+    It skips loading `udata.cfg`, which is tracked and overrides the defaults, so
+    the gate no longer depends on a deployment config file or on whichever `.env`
+    keys a runner happens to carry. Requiring the check on `develop` needs
+    repository admin and has to be enabled separately.
+
 - **feat(dataset)!: filter multiple tags with OR instead of AND**
   - The dataset listing's keyword filter is multi-select, and every other
     multi-select filter already answered OR (`license`, `format`, `frequency`,
