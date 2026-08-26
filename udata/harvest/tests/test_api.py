@@ -1,5 +1,6 @@
 import logging
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytest
 from flask import url_for
@@ -585,6 +586,25 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         data = {"name": faker.word(), "url": faker.url(), "backend": "factory"}
         response = self.post(url_for("api.preview_harvest_source_config"), data)
         assert200(response)
+
+    def test_source_from_config_refuses_before_resolving_the_url(self):
+        """It should authorize before the form resolves the submitted hostname
+
+        Validating the form resolves the URL's hostname, so authorizing after it
+        still hands any authenticated account an out-of-band DNS probe against
+        any host outside the denylist — the VULN-2084 pattern. The refusal has to
+        come first.
+        """
+        self.login()
+        data = {"name": faker.word(), "url": "http://probe.example.org", "backend": "factory"}
+
+        with patch(
+            "udata.uris.resolve_hostname",
+            side_effect=AssertionError("DNS leak: the URL was resolved before authorization"),
+        ):
+            response = self.post(url_for("api.preview_harvest_source_config"), data)
+
+        assert403(response)
 
     def test_source_from_config_with_org_not_member(self):
         """It should refuse a config preview for an organization the user only edits

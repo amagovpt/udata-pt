@@ -490,6 +490,21 @@ class ScheduleSourceAPI(API):
         return actions.unschedule(source), 204
 
 
+def _names_an_organization() -> bool:
+    """Whether the raw request body carries a non-empty `organization`.
+
+    Read before the form is validated, so it cannot rely on the resolved field.
+    A body that is not JSON at all answers False and falls through to the
+    permission test, then to `api.validate`, which is what turns it into the 400
+    it has always been — the alternative, letting `request.get_json` raise here,
+    would answer 400 to an unauthorized caller and leak that the payload parsed.
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("organization"))
+
+
 @ns.route("/source/preview/", endpoint="preview_harvest_source_config")
 class PreviewSourceConfigAPI(API):
     # Every request here walks a remote catalogue on the caller's behalf, so the
@@ -511,17 +526,27 @@ class PreviewSourceConfigAPI(API):
     @api.marshal_with(preview_job_fields)
     def post(self):
         """Preview an harvesting from a source created with the given payload"""
+        # Authorized BEFORE `api.validate`, which is the order every other route
+        # in this file uses. Validating the form resolves the submitted hostname
+        # (`HarvestURLField` -> `URLField.pre_validate` -> `uris.resolve_hostname`,
+        # with URLS_RESOLVE_HOSTNAME on), so authorizing afterwards still let any
+        # authenticated account fire an out-of-band DNS lookup at any hostname
+        # outside HARVEST_URL_HOST_DENYLIST — which is the probe VULN-2084 was
+        # about. This closes it for a payload that names no organization; a caller
+        # naming an organization they administer still validates first, because
+        # resolving the organization needs the form, and that is a smaller and
+        # accountable population.
+        if not _names_an_organization():
+            # No organization to weigh the request against, and this is the one
+            # route that makes the server run a harvest backend against a URL the
+            # caller chose. Creating a source is inert by comparison: it lands
+            # VALIDATION_PENDING, validating is admin_permission, and
+            # RunSourceAPI refuses anything not accepted.
+            admin_permission.test()
+
         form = api.validate(HarvestSourceForm)
         if form.organization.data:
             form.organization.data.permissions["harvest"].test()
-        else:
-            # A payload that names no organization used to pass no authorization
-            # test at all, and this is the one route that makes the server run a
-            # harvest backend against a URL the caller chose. Creating a source
-            # is inert by comparison (it lands VALIDATION_PENDING, validating is
-            # admin_permission, and RunSourceAPI refuses anything not accepted),
-            # so there is nothing else to weigh the organization against here.
-            admin_permission.test()
         return actions.preview_from_config(**form.data)
 
 
