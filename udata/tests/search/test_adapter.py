@@ -32,6 +32,7 @@ from udata.i18n import gettext as _
 from udata.search import as_task_param, reindex
 from udata.search.commands import finalize_reindex, index_model
 from udata.tests.api import APITestCase
+from udata.tests.helpers import requires_search_service
 from udata.utils import clean_string
 
 from . import FakeSearch
@@ -117,8 +118,14 @@ class SearchAdaptorTest:
         assertHasArgument(parser, "page_size", int)
 
 
+@requires_search_service
 class ConfigureIndicesTest:
-    """Requires a running Elasticsearch on localhost:9200."""
+    """Requires a running Elasticsearch on localhost:9200.
+
+    Gated behind the same marker as SearchIntegrationTest: the autouse fixture
+    below connects to Elasticsearch before the first test body runs, so without
+    the marker the whole class errors out wherever no search stack is up.
+    """
 
     ES_URL = "http://localhost:9200"
     PREFIX = "test-configure-indices"

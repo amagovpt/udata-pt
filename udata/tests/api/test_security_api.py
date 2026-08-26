@@ -24,8 +24,8 @@ class SecurityAPITest(PytestOnlyAPITestCase):
                 "last_name": "Doe",
                 "accept_conditions": True,
                 "email": "jane@example.org",
-                "password": "Password123",
-                "password_confirm": "Password123",
+                "password": "Password123!@#",
+                "password_confirm": "Password123!@#",
                 "submit": True,
             },
         )
@@ -45,14 +45,14 @@ class SecurityAPITest(PytestOnlyAPITestCase):
                 "last_name": "Doe",
                 "accept_conditions": True,
                 "email": "jane@example.org",
-                "password": "Password123",
-                "password_confirm": "Password123",
+                "password": "Password123!@#",
+                "password_confirm": "Password123!@#",
                 "submit": True,
             },
         )
         self.assertStatus(response, 200)
 
-    @pytest.mark.options(CAPTCHETAT_BASE_URL=None)
+    @pytest.mark.options(CAPTCHETAT_BASE_URL=None, GOOGLE_RECAPTCHA_SECRET_KEY=None)
     def test_ask_for_reset(self):
         # We cannot test for mail sending since they are sent with Flask
         # directly and not with our system but if the sending is working
@@ -181,8 +181,8 @@ class TwoFactorSecurityAPITest(PytestOnlyAPITestCase):
         response = self.post(
             url_for("security.reset_password", token=token),
             {
-                "password": "Password123",
-                "password_confirm": "Password123",
+                "password": "Password123!@#",
+                "password_confirm": "Password123!@#",
                 "submit": True,
             },
         )

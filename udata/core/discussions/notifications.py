@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 class DiscussionStatus(str, enum.Enum):
     NEW_DISCUSSION = "new_discussion"
     NEW_COMMENT = "new_comment"
+    CLOSED = "closed"
 
 
 @generate_fields()

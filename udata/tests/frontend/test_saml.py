@@ -32,6 +32,7 @@ from udata.auth.saml.saml_plugin.saml_govpt import (
 )
 from udata.core.user.factories import UserFactory
 from udata.tests.api import APITestCase
+from udata.tests.helpers import requires_saml_credentials
 
 # Placeholder email shape generated when the IdP does not return an email:
 # saml-<uuid4().hex[:8]>@autenticacao.gov.pt — 8 lowercase hex characters.
@@ -1559,6 +1560,7 @@ class SAMLEidasSSOTest(APITestCase):
         assert "CurrentGivenName" in location
 
 
+@requires_saml_credentials
 class SAMLLogoutInitiationTest(APITestCase):
     """SP-initiated logout (/saml/logout, /saml/eidas/logout).
 

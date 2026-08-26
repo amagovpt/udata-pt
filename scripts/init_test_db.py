@@ -30,8 +30,18 @@ from udata.core.organization.models import Member, Organization
 from udata.core.reuse.models import Reuse
 from udata.core.user.models import User
 
-ADMIN = {"email": "e2e-admin@dados.gov.pt", "first_name": "E2E", "last_name": "Admin", "password": "E2eAdmin2026!"}
-EDITOR = {"email": "e2e-editor@dados.gov.pt", "first_name": "E2E", "last_name": "Editor", "password": "E2eEditor2026!"}
+ADMIN = {
+    "email": "e2e-admin@dados.gov.pt",
+    "first_name": "E2E",
+    "last_name": "Admin",
+    "password": "E2eAdmin2026!",
+}
+EDITOR = {
+    "email": "e2e-editor@dados.gov.pt",
+    "first_name": "E2E",
+    "last_name": "Editor",
+    "password": "E2eEditor2026!",
+}
 
 ORG_NAME = "E2E Test Organization"
 ORG_SLUG = "e2e-test-organization"
@@ -41,7 +51,9 @@ REUSE_TITLE = "E2E Test Reuse"
 REUSE_SLUG = "e2e-test-reuse"
 
 
-def get_or_create_user(email: str, first_name: str, last_name: str, password: str, admin: bool) -> User:
+def get_or_create_user(
+    email: str, first_name: str, last_name: str, password: str, admin: bool
+) -> User:
     user = User.objects(email=email).first()
     if user:
         return user

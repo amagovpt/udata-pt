@@ -1,5 +1,6 @@
 from datetime import datetime
 
+import pytest
 from flask import url_for
 
 from udata.core.dataset.factories import DatasetFactory, ResourceFactory
@@ -8,6 +9,7 @@ from udata.tests.helpers import assert_status
 
 
 class CorsTest(APITestCase):
+    @pytest.mark.options(CORS_ALLOWED_ORIGINS=["http://localhost"])
     def test_cors_on_allowed_routes(self):
         cors_headers = {
             "Origin": "http://localhost",

@@ -837,6 +837,29 @@ class Testing(object):
     ELASTICSEARCH_URL = None
     ELASTICSEARCH_INDEX_BASENAME = "udata-test"
 
+    # The SAML views read these straight from the config and none of them has a default
+    # in Defaults - they only ever existed in udata.cfg, fed from a developer's .env. That
+    # made every /saml/* test depend on the machine running it: with no udata.cfg the
+    # views raise (saml_govpt.py does `config.get("SECURITY_SAML_IDP_METADATA").split(",")`
+    # on None) and answer 500 instead of the redirect under test. Declared here so the
+    # tests carry their own configuration and behave the same on a laptop and in CI.
+    # Values are inert: every test that exercises a real pysaml2 client sets its own paths
+    # in a fixture and is gated behind requires_saml_credentials.
+    SECURITY_SAML_ENTITY_ID = "udata.test"
+    SECURITY_SAML_ENTITY_NAME = "udata test"
+    SECURITY_SAML_KEY_FILE = "udata/auth/saml/credentials/private.pem"
+    SECURITY_SAML_CERT_FILE = "udata/auth/saml/credentials/AMA.pem"
+    SECURITY_SAML_IDP_METADATA = "udata/auth/saml/credentials/metadata.xml"
+    SECURITY_SAML_FA_URL = "https://preprod.autenticacao.gov.pt/fa/"
+    SECURITY_SAML_FAAALEVEL = 3
+    MIGRATION_MODE_ENABLED = True
+    # _trusted_saml_issuers() builds its allowlist from the entityID of each metadata
+    # file, and the metadata is part of the git-ignored credentials, so on a fresh
+    # checkout there is nothing to trust and every mocked SSO response is rejected with
+    # issuer_untrusted. The function takes this config as a second source for exactly
+    # this reason; the value is the issuer the test fixtures sign their responses with.
+    TRUSTED_SAML_ISSUERS = ["https://autenticacao.cartaodecidadao.pt"]
+
 
 class Debug(Defaults):
     DEBUG = True

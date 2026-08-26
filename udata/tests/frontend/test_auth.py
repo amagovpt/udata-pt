@@ -49,7 +49,7 @@ class AuthTest(APITestCase):
 
     def test_change_mail_after_password_change(self):
         """Changing password rotates fs_uniquifier and invalidates email change token"""
-        user = UserFactory(password="Password123")
+        user = UserFactory(password="Password123!@#")
         self.login(user)
         old_uniquifier = user.fs_uniquifier
 
@@ -65,9 +65,9 @@ class AuthTest(APITestCase):
         resp = self.post(
             url_for("security.change_password"),
             {
-                "password": "Password123",
-                "new_password": "NewPassword456",
-                "new_password_confirm": "NewPassword456",
+                "password": "Password123!@#",
+                "new_password": "NewPassword456!@#",
+                "new_password_confirm": "NewPassword456!@#",
                 "submit": True,
             },
         )
