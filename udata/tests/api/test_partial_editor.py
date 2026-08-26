@@ -356,6 +356,39 @@ class PartialEditorInvitationAssignmentTest(APITestCase):
         )
         self.assert400(response)
 
+    def test_invite_partial_editor_by_email_persists_assignments(self):
+        """An email invitation carries its assignments through to the pending request.
+
+        This is the branch that still creates a MembershipRequest, so it is the only
+        place where the endpoint itself is responsible for storing assignments; the
+        registered-user branch adds a Member directly and creates the Assignment rows
+        immediately. Asserted through the API rather than by building a
+        MembershipRequest by hand, so dropping the field in the endpoint fails here.
+        """
+        self.login(self.admin_user)
+        response = self.post(
+            url_for("api.invite_member", org=self.org),
+            {
+                "email": "newcomer@example.org",
+                "role": "partial_editor",
+                "assignments": [
+                    {"class": "Dataset", "id": str(self.dataset1.id)},
+                    {"class": "Dataset", "id": str(self.dataset2.id)},
+                ],
+            },
+        )
+        self.assert201(response)
+        self.assertEqual(len(response.json["assignments"]), 2)
+
+        self.org.reload()
+        invitation = self.org.requests[-1]
+        self.assertEqual(invitation.kind, "invitation")
+        self.assertEqual(invitation.email, "newcomer@example.org")
+        self.assertEqual(
+            {str(subject.id) for subject in invitation.assignments},
+            {str(self.dataset1.id), str(self.dataset2.id)},
+        )
+
     def test_add_partial_editor_without_assignments_still_works(self):
         """Adding a partial_editor without assignments works (assignments added later)."""
         invited_user = UserFactory()
