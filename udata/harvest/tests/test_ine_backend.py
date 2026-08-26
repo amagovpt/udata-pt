@@ -276,3 +276,51 @@ class INEPreviewDoesNotWriteTest(PytestOnlyDBTestCase):
         existing.reload()
         assert existing.title == "Título anterior"
         assert existing.description == "Descrição anterior"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEMaxItemsTest(PytestOnlyDBTestCase):
+    """`HARVEST_PREVIEW_MAX_ITEMS` has to actually cap an INE preview.
+
+    `actions.preview` passes it as `max_items`, but this backend never read the
+    attribute, so a single preview request processed the whole remote catalog.
+    """
+
+    def _harvest(self, rmock, tmp_path, source, **kwargs):
+        rmock.get(INE_URL, text=_catalog_xml(["0001", "0002", "0003", "0004", "0005"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source, **kwargs)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def test_preview_stops_at_max_items(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._harvest(rmock, tmp_path, source, dryrun=True, max_items=2)
+
+        assert len(job.items) == 2
+        # Truncation is expected in a preview, so it is not reported as an error.
+        assert job.errors == []
+
+    def test_unlimited_harvest_processes_the_whole_catalog(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert len(job.items) == 5
+        assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 5
+
+    def test_truncated_real_harvest_records_an_error(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._harvest(rmock, tmp_path, source, max_items=2)
+
+        assert len(job.items) == 2
+        assert len(job.errors) == 1
+        assert "max items reached" in job.errors[0].message

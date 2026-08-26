@@ -12,7 +12,7 @@ from flask import current_app
 from slugify import slugify
 
 from udata.harvest.backends.base import BaseBackend
-from udata.harvest.models import HarvestItem, HarvestJob
+from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
 
 from .tools.harvester_utils import normalize_url_slashes, sync_resources
@@ -625,6 +625,7 @@ class INEBackend(BaseBackend):
 
             metadata_map = {}  # {remote_id: metadata_dict}
             total_parsed = 0
+            truncated = False
 
             for event, elem in context:
                 if event == "end" and elem.tag == "indicator":
@@ -641,10 +642,37 @@ class INEBackend(BaseBackend):
                     elem.clear()
                     root.clear()  # Limpa memoria da arvore XML
 
+                    # `max_items` has to be honoured here, not in phase 2. The
+                    # convention elsewhere is to call `has_reached_max_items()`
+                    # per item, but that reads `len(self.job.items)` and this
+                    # backend only pushes into that list every `BULK_SIZE * 2`
+                    # items (or at the very end), so for a 20-item preview it
+                    # would never be true. Cutting the parse in document order is
+                    # what the dcat backend does too.
+                    if self.max_items and len(metadata_map) >= self.max_items:
+                        truncated = True
+                        break
+
             self._log.info(
                 "[INE] Parsing XML concluído. Total items: %s. Iniciando processamento...",
                 total_parsed,
             )
+
+            if truncated and not self.dryrun:
+                # Expected in a preview, worth an error on a real harvest: with
+                # `source.autoarchive` on, everything below the cut would be
+                # archived as if it had disappeared from the remote catalog.
+                self._log.warning(
+                    "[INE] max_items=%s atingido: nem todos os indicadores foram retirados",
+                    self.max_items,
+                )
+                self.job.errors.append(
+                    HarvestError(
+                        message=(
+                            f"{self.max_items} max items reached, not all datasets were retrieved"
+                        )
+                    )
+                )
 
         except Exception as e:
             self._log.error("[INE] Erro no download/parsing do XML: %s", e)
