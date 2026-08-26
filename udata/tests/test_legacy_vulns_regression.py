@@ -92,9 +92,7 @@ class PasswordPolicyRegressionTest(PytestOnlyAPITestCase):
         # in both production (``SECURITY_PASSWORD_LENGTH_MIN`` = 8, no
         # symbols required) and test (``= 13`` + symbols required) profiles.
         errors = self._validate(util, "StrongPass1!@#")
-        assert errors == [], (
-            f"strong password should be accepted, got errors: {errors}"
-        )
+        assert errors == [], f"strong password should be accepted, got errors: {errors}"
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +111,7 @@ class SvgXssSanitizationRegressionTest(PytestOnlyAPITestCase):
     SVG_WITH_SCRIPT = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="-52 -53 100 100">'
         '<g fill="none"><ellipse stroke="#66899a" rx="6" ry="44"/></g>'
-        '<script type="text/javascript">alert(\'XSS\')</script>'
+        "<script type=\"text/javascript\">alert('XSS')</script>"
         "</svg>"
     )
 
@@ -127,8 +125,7 @@ class SvgXssSanitizationRegressionTest(PytestOnlyAPITestCase):
         cleaned = sanitize_strict(self.SVG_WITH_SCRIPT)
         assert "<script" not in cleaned
         assert "alert('XSS')" not in cleaned or "<script" not in cleaned, (
-            "alert text alone is harmless plain text, but the <script> "
-            "wrapper must be gone"
+            "alert text alone is harmless plain text, but the <script> wrapper must be gone"
         )
 
     def test_strict_sanitizer_strips_event_handler_from_svg(self):
@@ -150,9 +147,7 @@ class SvgXssSanitizationRegressionTest(PytestOnlyAPITestCase):
 
     def test_markdown_sanitizer_strips_javascript_uri_from_svg_link(self, app):
         payload = (
-            '<svg xmlns="http://www.w3.org/2000/svg">'
-            '<a href="javascript:alert(1)">click</a>'
-            "</svg>"
+            '<svg xmlns="http://www.w3.org/2000/svg"><a href="javascript:alert(1)">click</a></svg>'
         )
         with app.app_context():
             cleaned = sanitize_markdown_html(payload)

@@ -1,3 +1,6 @@
+import logging
+from unittest import mock
+
 import pytest
 
 from udata.core.organization.constants import (
@@ -74,3 +77,28 @@ class NotifyBadgeTest(PytestOnlyAPITestCase):
         assert notification.details.organization.name == organization.name
         assert notification.details.kind == badge_type
         assert notification.user == user
+
+    def test_badge_notification_failure_logs_traceback(self, caplog):
+        """
+        Test that a notification that fails to save logs its traceback
+        """
+        user = UserFactory()
+        organization = OrganizationFactory(members=[Member(user=user, role="admin")])
+
+        with (
+            mock.patch.object(Notification, "save", side_effect=ValueError("cannot save")),
+            capture_mails(),
+            caplog.at_level(logging.ERROR, logger="udata.core.organization.tasks"),
+        ):
+            organization.add_badge(CERTIFIED)
+
+        failures = [
+            record
+            for record in caplog.records
+            if "Failed to create new badge notification" in record.getMessage()
+        ]
+        assert failures, [record.getMessage() for record in caplog.records]
+
+        # The error must carry its traceback: swallowing it is what hid this bug
+        # in production for the whole time the details class was unregistered.
+        assert failures[0].exc_info is not None

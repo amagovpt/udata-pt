@@ -1,8 +1,18 @@
+import logging
+from datetime import UTC, datetime
+from unittest import mock
+
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
 from udata.core.discussions.notifications import DiscussionNotificationDetails, DiscussionStatus
+from udata.core.organization.constants import CERTIFIED
+from udata.core.organization.factories import OrganizationFactory
+from udata.core.organization.notifications import (
+    MembershipRequestNotificationDetails,
+    NewBadgeNotificationDetails,
+)
 from udata.core.user.factories import AdminFactory, UserFactory
-from udata.features.notifications.models import Notification
+from udata.features.notifications.models import Notification, NotificationQuerySet
 from udata.features.transfer.factories import TransferFactory
 from udata.harvest.notifications import ValidateHarvesterNotificationDetails
 from udata.harvest.tests.factories import HarvestSourceFactory
@@ -117,6 +127,36 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         # Verify notification is cleaned up (via purge function)
         assert Notification.objects.count() == 0
 
+    def test_organization_notification_cleanup_on_organization_purge(self):
+        """Test that notifications are cleaned up when an organization is purged."""
+        from udata.core.organization import tasks
+
+        user = UserFactory()
+        org = OrganizationFactory(deleted=datetime.now(UTC))
+
+        # One notification per branch of with_organization_in_details: badge details
+        # keep the organization in `details.organization`, a membership request keeps
+        # it in `details.request_organization`.
+        Notification(
+            user=user,
+            details=NewBadgeNotificationDetails(organization=org, kind=CERTIFIED),
+        ).save()
+        Notification(
+            user=user,
+            details=MembershipRequestNotificationDetails(
+                request_organization=org, request_user=user
+            ),
+        ).save()
+
+        # Verify notifications exist
+        assert Notification.objects.count() == 2
+
+        # Purge the deleted organization
+        tasks.purge_organizations()
+
+        # Verify notifications are cleaned up (via purge function)
+        assert Notification.objects.count() == 0
+
     def test_multiple_notifications_cleanup(self):
         """Test that multiple notifications are cleaned up correctly."""
         # Create users and discussions
@@ -189,3 +229,41 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         discussion.remove_message(1)
 
         assert Notification.objects.count() == 0
+
+    def test_discussion_cleanup_failure_logs_traceback(self, caplog):
+        """Test that a cleanup that fails to delete logs its traceback"""
+        user = UserFactory()
+        dataset = DatasetFactory()
+        message = MessageDiscussionFactory(posted_by=user)
+        discussion = DiscussionFactory(user=user, subject=dataset, discussion=[message])
+
+        notification = Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=discussion.discussion[0].id,
+            ),
+        )
+        notification.save()
+
+        # Patch the notification queryset only: patching QuerySet.delete outright would also
+        # hit the super().delete() that runs before the signal is sent.
+        with (
+            mock.patch.object(
+                NotificationQuerySet, "delete", side_effect=ValueError("cannot delete")
+            ),
+            caplog.at_level(logging.ERROR, logger="udata.core.discussions.notifications"),
+        ):
+            discussion.delete()
+
+        failures = [
+            record
+            for record in caplog.records
+            if "Error cleaning up notifications for discussion" in record.getMessage()
+        ]
+        assert failures, [record.getMessage() for record in caplog.records]
+
+        # The error must carry its traceback: a swallowed one is what kept the missing
+        # receivers invisible in production.
+        assert failures[0].exc_info is not None

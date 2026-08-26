@@ -2,6 +2,188 @@
 
 ## Unreleased
 
+- **fix(discussions): stop leaving orphaned notifications behind a deleted discussion**
+  - Deleting a discussion, or a single comment, through the API left every notification
+    that referenced it in place, pointing at a document that no longer exists. Both
+    signals were being emitted all along — `Discussion.delete()` and
+    `Discussion.remove_message()` send them — and nobody was listening: the same merge
+    that unregistered the badge notification classes also resolved the discussions
+    notification module to the fork's older copy, which predates the two upstream cleanup
+    receivers. They are back.
+  - `details.message_id` was a `StringField` where upstream declares a UUID, so the
+    producers compensated with `str(message.id)` and the cleanup query — which passes the
+    message's real `UUID` — matched nothing. The field is now a `UUIDField`, and the casts
+    are gone from both the task and the January backfill migration. It is declared
+    `binary=False`, unlike upstream: mongoengine's default would store BSON Binary, and
+    every `message_id` written so far was saved as a string, so the query would have
+    matched none of the existing documents and the change would have needed a backfill.
+    `binary=False` stores the identical bytes, so old and new documents both match and no
+    data migration is needed. The API is unaffected — a `UUIDField` still serializes to
+    the same JSON string.
+  - This covers deletion through the API. Purging a dataset, reuse, dataservice or topic
+    deletes its discussions with a queryset, which never instantiates a document and so
+    never emits the signal; that path still leaves orphans and needs its own change.
+  - The cleanup receivers keep the `try`/`except` — the signals arrive after the delete
+    has already happened, so raising would turn a completed `DELETE` into a 500 — but they
+    log with `log.exception`, and so does the backfill migration. A swallowed traceback is
+    what kept all of this invisible in production, and a test now asserts the record
+    carries one. The four tests that had recorded these bugs as strict expected failures
+    pass again, so their markers are gone.
+
+- **fix(notifications): create badge and membership-response notifications again**
+  - Adding a badge to an organization, or accepting or refusing a membership request, never
+    produced the in-app notification. The mail went out — it is sent before the `try` — and
+    the failure surfaced only as a `log.error` line reading "not all arguments converted
+    during string formatting", with no traceback and nothing at all in the UI.
+  - `Notification.details` declared 4 of the 7 detail classes. A merge kept the upstream
+    producers and tests but resolved the model file to the fork's older copy, so the badge
+    and membership-response classes were never registered. mongoengine rejected the document
+    and then crashed formatting its own error message, and the `except Exception` blocks
+    around the save turned that into one silent log line. Registering the three classes is
+    the whole fix; the fifteen tests that had recorded the bug as a strict expected failure
+    pass again, so their markers are gone.
+  - The purge query only matched notifications that keep their organization under
+    `details.request_organization`, which would have left the newly-saved badge and
+    membership-response notifications behind, pointing at a deleted organization. It now
+    matches both field shapes.
+  - Those `except` blocks now log with `log.exception`, so the traceback survives. The
+    messages are unchanged, so existing log greps and alerts keep matching.
+
+- **test(tests): allow a distinct Mongo test database per checkout**
+  - The xdist worker split already gave each worker its own database, but the name was
+    hardcoded, so the isolation ended at the run: `_clean_db` truncates every collection
+    before each test, and two runs sharing a name therefore wipe each other's fixtures
+    mid-test. That happens whenever the repository is checked out twice — a git worktree
+    per branch, one session per ticket — and both run pytest.
+  - `UDATA_TEST_MONGO_PREFIX` now sets the database prefix, with or without xdist. Unset,
+    every path resolves to exactly the same name as before, so nothing changes for CI or
+    for a normal local run; set, each checkout gets its own databases and the suites can
+    run at the same time.
+
+- **fix(tests): restore a green backend test suite and gate it in CI**
+  - `develop` entered red: 44 failures, 9 errors and 15 lint problems. With a red
+    baseline nobody could tell "my failure" from "the failure that was already
+    there" without running the suite twice and diffing the lists by hand, which
+    is what the previous two tickets had to do — one of them closed with an
+    explicit override of the push gate. Seven of those failures had been written
+    off as flaky and left out of the count; none of them was flaky.
+  - Fourteen failures and three errors were the suite disagreeing with the
+    code rather than the code being wrong: upstream registration fixtures used a
+    password this fork's policy rejects, a real reCAPTCHA secret leaked from a
+    local `.env` into the test app, the CORS allowlist was never declared for the
+    two tests that send an origin, `license_title` reached `DatasetFactory` as a
+    computed key, and six expectations were stale (membership accept is
+    deliberately idempotent now, invites of registered users are direct adds,
+    contact mail paragraphs are `<p>` not `<br><br>`, organization metrics iterate
+    four keys, the spam report links to a tab). Each was fixed at the smallest
+    honest scope, never by relaxing a shared setting: the password policy stays
+    strict in `settings.Testing`, because the regression test that pins it exists
+    to catch exactly that drift.
+  - Three collection errors came from a search-integration class connecting to
+    Elasticsearch from an autouse fixture. The marker meant for that already
+    existed and already guarded its sibling class; this one simply never got it,
+    so the three are now explicit skips that still run wherever the search stack
+    is up.
+  - One of the causes turned out to be a single missing enum member: closing a
+    discussion built a notification with a status the enum did not define, so the
+    task died in the worker while the API answered 200. Fixed here rather than
+    recorded, because the test it would have marked is the only coverage for the
+    whole close endpoint — the open-discussions metric, the closing comment, and
+    the refusal to comment on a closed discussion.
+  - Twenty-five failures belong to five root causes left open and owned
+    elsewhere: notification details classes missing from the model's choices, a
+    notification field typed as string instead of UUID with its cleanup receivers
+    missing, a badges key forcing 403 on a full organization save, scalar filters
+    iterated character by character, and a missing invitation guard on membership
+    accept. They are marked strict xfail, each reason naming the owning ticket and
+    the production line, so the suite can gate merges while the bugs stay visible
+    — and so that fixing any of them turns the marker red and forces its removal
+    in the same change. Note that several of those tests assert more than the cause
+    they are marked for, so that coverage is inactive until the marker goes.
+  - Six errors that had been written off as flaky, and blamed on network access,
+    were neither: the download endpoints stream their response, and Flask only
+    pops the request context once the body is consumed, so tests asserting on
+    headers alone left a context on the stack and the next teardown failed. They
+    now read the relayed bytes, which also closes a gap — the body those tests
+    exist to check was going unasserted. A seventh failure came from a suggestion
+    test seeding two organization names with faker and then asserting every result
+    contains the query; suggestion folds accents, so a random word matched and the
+    test's outcome depended on how many tests had run before it.
+  - Lint and format are clean across the tree. The pre-commit hook was pinned to
+    a ruff four minor versions behind the project's, so hook and `uv run ruff`
+    formatted the same files differently and eleven of them kept drifting; the
+    pin now follows the lockfile. The SAML package's re-export keeps a noqa
+    rather than ruff's suggested fix, which renames the export and breaks CMD
+    login.
+  - Merges into `develop` were gated by nothing at all: CircleCI is configured
+    in-tree but has never reported a status or a check-run to GitHub. A GitHub
+    Actions workflow now runs lint and the suite on every push and pull request.
+    It skips loading `udata.cfg`, which is tracked and overrides the defaults, so
+    the gate no longer depends on a deployment config file or on whichever `.env`
+    keys a runner happens to carry — with no `.env` that file resolves the password
+    policy to zero length and no requirements, which is worth a look on its own. A
+    separate step re-runs the download-proxy timeout assertions with the tracked
+    config loaded, so drift there still fails the build rather than resurfacing as a
+    502 in production. Requiring the check on `develop` needs repository admin and
+    has to be enabled separately.
+  - Two things only a clean checkout reveals, and nothing had ever run on one: the
+    dependency install named extras this project does not define, so the job would
+    have gone red without executing a single test; and three SAML tests read
+    service-provider credentials that are deliberately git-ignored, so they are now
+    skipped when those files are absent and still run where they exist.
+
+- **fix(harvest): refuse to update a record that already belongs to another org or user**
+  - `BaseBackend.get_dataset` looked a dataset up by `harvest.remote_id` alone
+    whenever that id parsed as a URI, skipping the source/domain scoping the
+    non-URI branch has always applied. Remote ids are attacker-supplied — they
+    come straight out of the remote catalogue's payload — and they are public,
+    since `harvest.remote_id` is served on `/api/1/datasets/<id>/`. Anyone able
+    to register a harvest source (any authenticated user) could therefore point
+    one at a catalogue they control, echo a URI-shaped remote id belonging to
+    someone else's source, and have the harvest silently repoint that dataset:
+    its `harvest.source_id` moved to the attacker's source and its content was
+    overwritten from the attacker's payload.
+  - The unscoped URI lookup is deliberate — it deduplicates the same DCAT record
+    harvested under two different domains when `dct:identifier` is a stable URI —
+    so the fix keeps it and refuses the *match* instead: a lookup that lands on a
+    record harvested by a different source and owned by a different organization
+    or user now raises, the harvest item is reported as failed, and the record is
+    left untouched. The guard lives on the base class, so it covers every backend
+    and dataservices as well as datasets, rather than being worked around in one
+    harvester.
+  - Scoping it to *other* sources is a deliberate departure from the upstream
+    guard this is based on, and it is what makes it safe here. Upstream compares
+    owners outright, which it can afford because none of its backends writes
+    `dataset.organization`; `ckanpt` and `odspt` do, mapping each remote
+    publisher onto a local organization, so their records routinely belong to
+    someone other than the source harvesting them. Compared against production
+    first: the owner-only form would have failed 229 datasets across five sources
+    on every subsequent run — 131 of the 144 on the health transparency portal,
+    84 of the 400 on Lisbon's, and the rest on Porto, Oeiras and ICNF. A record
+    the current source already harvested is never the takeover being guarded
+    against.
+  - Two sources under the *same* owner can still hand a record over to each
+    other; that is the legitimate source-migration case, and it is what keeps
+    re-harvesting from duplicating. A record with neither an organization nor an
+    owner is likewise still claimable — no such record was observed in
+    production, though purging an organization would create them in bulk.
+  - The INE harvester builds its own lookup and writes through a bulk path
+    instead of going through the shared one, so it stays outside this guard
+    entirely. Its records are therefore no better protected than before, and the
+    domain scoping it does apply is not itself a defence — `HarvestSource.domain`
+    reads `netloc` rather than `hostname`, so any URL can claim any domain
+    through a userinfo prefix. That is being tracked separately; nothing here
+    depends on it.
+  - Production was audited before the change: of 19 144 harvested datasets
+    across 38 sources, 61 carry a URI-shaped remote id — the only ones that ever
+    reached the unscoped lookup — and all 61 sit on the two sources that
+    legitimately publish them. The 84 remote ids shared between sources are all
+    UUID-shaped and each resolved to two distinct datasets, which is the scoped
+    branch working as intended, and no remote id was duplicated within a single
+    source. No record appears to have been taken over. The audit cannot be
+    conclusive on its own — a completed takeover leaves a single dataset on the
+    attacker's source and looks exactly like an ordinary harvest — so the
+    evidence is the absence of any URI-shaped remote id on more than one source.
 - **feat(dataset)!: filter multiple tags with OR instead of AND**
   - The dataset listing's keyword filter is multi-select, and every other
     multi-select filter already answered OR (`license`, `format`, `frequency`,

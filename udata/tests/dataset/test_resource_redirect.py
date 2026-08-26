@@ -163,6 +163,8 @@ class ResourceRedirectForceDownloadTest(APITestCase):
 
         assert response.status_code == 200
         assert "Lista de Apoios 2026.csv" in response.headers["Content-Disposition"]
+        # Drain the streamed body so the request context pops.
+        assert response.data == b"a,b\n1,2\n"
 
     def test_hosted_resource_falls_back_to_basename_when_no_title(self):
         """No title → use the fs_filename basename (preserves extension)."""
@@ -394,6 +396,7 @@ class ResourceRedirectForceDownloadTest(APITestCase):
         assert response.status_code == 200
         assert response.headers["Content-Disposition"].startswith("attachment;")
         upstream.assert_called_once()
+        assert response.data == b"a,b\n1,2\n"
 
     # ------------------------------------------------------------------
     # 404 path — unchanged from the pre-LEDG-1765 behavior
