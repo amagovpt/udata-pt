@@ -853,6 +853,12 @@ class Testing(object):
     SECURITY_SAML_FA_URL = "https://preprod.autenticacao.gov.pt/fa/"
     SECURITY_SAML_FAAALEVEL = 3
     MIGRATION_MODE_ENABLED = True
+    # _trusted_saml_issuers() builds its allowlist from the entityID of each metadata
+    # file, and the metadata is part of the git-ignored credentials, so on a fresh
+    # checkout there is nothing to trust and every mocked SSO response is rejected with
+    # issuer_untrusted. The function takes this config as a second source for exactly
+    # this reason; the value is the issuer the test fixtures sign their responses with.
+    TRUSTED_SAML_ISSUERS = ["https://autenticacao.cartaodecidadao.pt"]
 
 
 class Debug(Defaults):
