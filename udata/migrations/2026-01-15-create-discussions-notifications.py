@@ -62,6 +62,6 @@ def migrate(db):
                             notification.save()
                             created_count += 1
             except Exception as e:
-                log.error(f"Error creating notification for discussion {discussion.id}: {e}")
+                log.exception(f"Error creating notification for discussion {discussion.id}: {e}")
 
     log.info(f"Created {created_count} DiscussionNotifications")
