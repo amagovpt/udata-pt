@@ -1,4 +1,5 @@
 import os
+from datetime import date, timedelta
 
 import pytest
 
@@ -136,7 +137,7 @@ def _catalog_xml(ids, revision=""):
         f"""<indicator id='{i}'>
         <title><![CDATA[Indicador {i}]]></title>
         <description><![CDATA[Descrição {i}{revision}]]></description>
-        <html><bdd_url><![CDATA[https://www.ine.pt/xurl/indx/{i}/PT]]></bdd_url></html>
+        <html><bdd_url><![CDATA[https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod={i}]]></bdd_url></html>
         <json>
         <json_dataset><![CDATA[https://www.ine.pt/js/{i}.json]]></json_dataset>
         </json>
@@ -471,6 +472,17 @@ class INELocalFilePathTest(PytestOnlyDBTestCase):
     def _source(self):
         return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
 
+    def _confine_to(self, monkeypatch, tmp_path):
+        """Keep both the shared path and the per-preview one inside tmp_path.
+
+        Patching only the class attribute is not enough: `__init__` overrides it
+        for previews, so the download would still land in the real system temp
+        directory — and a test that names the real /tmp is a test that collides
+        with whatever else is running on the machine.
+        """
+        monkeypatch.setattr(INEBackend, "LOCAL_FILE_PATH", str(tmp_path / "ine.xml"))
+        monkeypatch.setattr("udata.harvest.backends.ine.tempfile.gettempdir", lambda: str(tmp_path))
+
     def test_previews_get_a_path_of_their_own(self):
         source = self._source()
 
@@ -487,24 +499,31 @@ class INELocalFilePathTest(PytestOnlyDBTestCase):
         assert INEBackend(self._source()).LOCAL_FILE_PATH == INEBackend.LOCAL_FILE_PATH
 
     def test_preview_leaves_the_harvest_cache_alone(self, rmock, tmp_path, monkeypatch):
-        # Never let this touch the real /tmp/ine.xml: other sessions run pytest
-        # against this repo at the same time.
+        # Both the shared path and the per-instance one have to land inside
+        # tmp_path: other sessions run pytest against this repo at the same time,
+        # and the behaviour under test is precisely "does not write the shared
+        # path", which would otherwise be the machine's real /tmp/ine.xml.
+        self._confine_to(monkeypatch, tmp_path)
         shared = tmp_path / "ine.xml"
         shared.write_text(COMPLETE_XML)
-        monkeypatch.setattr(INEBackend, "LOCAL_FILE_PATH", str(shared))
         rmock.get(INE_URL, text=_catalog_xml(["0001", "0002"]))
         rmock.get(INE_HVD_URL, text="<indicators/>")
 
-        INEBackend(self._source(), dryrun=True).harvest()
+        backend = INEBackend(self._source(), dryrun=True)
+        # The instance really did opt out of the shared path.
+        assert backend.LOCAL_FILE_PATH != str(shared)
+
+        backend.harvest()
 
         assert shared.exists()
         assert shared.read_text() == COMPLETE_XML
 
     def test_preview_removes_its_own_file(self, rmock, tmp_path, monkeypatch):
-        monkeypatch.setattr(INEBackend, "LOCAL_FILE_PATH", str(tmp_path / "ine.xml"))
+        self._confine_to(monkeypatch, tmp_path)
         rmock.get(INE_URL, text=_catalog_xml(["0001"]))
         rmock.get(INE_HVD_URL, text="<indicators/>")
         backend = INEBackend(self._source(), dryrun=True)
+        assert backend.LOCAL_FILE_PATH.startswith(str(tmp_path))
 
         backend.harvest()
 
@@ -561,3 +580,111 @@ class INEXmlHardeningTest(PytestOnlyDBTestCase):
 
         assert job.status == "failed"
         assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 0
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INETruncatedHarvestDoesNotArchiveTest(PytestOnlyDBTestCase):
+    """Capping the parse must not turn a preview into a mass-archive report.
+
+    `BaseBackend.autoarchive` treats every remote_id absent from `job.items` as
+    gone from the remote platform, and it runs in dryrun too. Once the parse
+    stops at `max_items`, everything past the cut looks missing — so a preview of
+    a source whose real harvest has been failing for longer than the grace
+    period would report the whole rest of the catalog as archived.
+    """
+
+    def _existing_dataset(self, source, remote_id):
+        stale = date.today() - timedelta(days=400)
+        dataset = DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id=remote_id,
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=stale,
+            )
+        )
+        return dataset
+
+    def _harvest(self, rmock, tmp_path, source, **kwargs):
+        rmock.get(INE_URL, text=_catalog_xml(["0001", "0002", "0003", "0004", "0005"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source, **kwargs)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def test_truncated_preview_archives_nothing(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), autoarchive=True
+        )
+        # Present in the catalog, but past the cut — and stale enough to qualify.
+        stale = self._existing_dataset(source, "0005")
+
+        job = self._harvest(rmock, tmp_path, source, dryrun=True, max_items=2)
+
+        assert [item.status for item in job.items] == ["done"] * 2
+        assert not any(item.status == "archived" for item in job.items)
+        stale.reload()
+        assert stale.harvest.archived_at is None
+
+    def test_untruncated_harvest_still_archives(self, rmock, tmp_path):
+        # The guard must be about truncation, not about disabling autoarchive.
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), autoarchive=True
+        )
+        gone = self._existing_dataset(source, "9999")  # not in the catalog at all
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert any(item.status == "archived" for item in job.items)
+        gone.reload()
+        assert gone.harvest.archived_at is not None
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESlugAndEscapingTest(PytestOnlyDBTestCase):
+    def _harvest(self, rmock, tmp_path, source, text):
+        rmock.get(INE_URL, text=text)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def test_slug_does_not_inherit_the_html_escaping(self, rmock, tmp_path):
+        # Sanitizing escapes the `&`; slugifying that directly would mint a
+        # permalink carrying a spurious "-amp-" segment, forever.
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        catalog = (
+            "<?xml version='1.0' encoding='UTF-8'?>\n<catalog>\n"
+            "<indicator id='0001'>"
+            "<title><![CDATA[Investigação e Desenvolvimento (I&D)]]></title>"
+            "</indicator>\n</catalog>\n"
+        )
+
+        self._harvest(rmock, tmp_path, source, catalog)
+
+        dataset = Dataset.objects(
+            __raw__={"harvest.source_id": str(source.id), "harvest.remote_id": "0001"}
+        ).first()
+        assert "amp" not in dataset.slug
+        assert dataset.slug == "investigacao-e-desenvolvimento-i-d-0001"
+
+    def test_query_string_in_the_remote_url_is_escaped_inside_the_description(
+        self, rmock, tmp_path
+    ):
+        # Accepted, and pinned because it is the reason the first harvest after
+        # this change rewrites the whole catalog: the real INE bdd_url is a query
+        # string, and sanitizing the description escapes each of its `&`.
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        self._harvest(rmock, tmp_path, source, _catalog_xml(["0001"]))
+
+        dataset = Dataset.objects(
+            __raw__={"harvest.source_id": str(source.id), "harvest.remote_id": "0001"}
+        ).first()
+        assert "xpid=INE&amp;xpgid=" in dataset.description
+        # `remote_url` is stored raw — it is a URL, not rendered content.
+        assert dataset.harvest.remote_url.startswith("https://www.ine.pt/xportal/xmain?xpid=INE&")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import random
 import re
@@ -77,6 +78,7 @@ class INEBackend(BaseBackend):
         super().__init__(*args, **kwargs)
 
         self._cc_by_license = None
+        self._catalog_truncated = False
 
         if self.dryrun and not self.IS_TEST_MODE:
             # Previews must not share the download path with the real harvest.
@@ -508,7 +510,11 @@ class INEBackend(BaseBackend):
         # Adiciona remote_id ao final para garantir unicidade
         if not getattr(dataset, "id", None):
             if not getattr(dataset, "slug", None) and dataset.title:
-                base_slug = slugify(dataset.title, to_lower=True)
+                # Unescaped first: the title is sanitized, and bleach escapes
+                # what it does not strip, so slugifying it directly turns
+                # "Investigação e Desenvolvimento (I&D)" into a permalink
+                # carrying a spurious "-amp-" segment.
+                base_slug = slugify(html.unescape(dataset.title), to_lower=True)
                 dataset.slug = f"{base_slug}-{remote_id}" if base_slug else f"ine-{remote_id}"
 
         return dataset
@@ -611,6 +617,25 @@ class INEBackend(BaseBackend):
                 # instance and would leave it behind for good.
                 self._cleanup_local_file()
 
+    def autoarchive(self):
+        """Skip archiving when the catalog was only partly read.
+
+        `BaseBackend.autoarchive` treats every remote_id missing from
+        `job.items` as gone from the remote platform. That is sound for a run
+        that read the whole catalog and false for one that stopped at
+        `max_items` — which is every preview, since `actions.preview` always
+        passes `HARVEST_PREVIEW_MAX_ITEMS`. Without this, a preview of a source
+        whose real harvest has been failing for longer than the grace period
+        would report the entire rest of the catalog as archived.
+        """
+        if self._catalog_truncated:
+            self._log.warning(
+                "[INE] Autoarchive ignorado: o catálogo foi truncado em max_items=%s",
+                self.max_items,
+            )
+            return
+        super().autoarchive()
+
     def _cleanup_local_file(self):
         if not self.USE_LOCAL_FILE:
             return
@@ -696,10 +721,23 @@ class INEBackend(BaseBackend):
 
             metadata_map = {}  # {remote_id: metadata_dict}
             total_parsed = 0
+            # `max_items` has to be honoured here, not in phase 2. The convention
+            # elsewhere is to call `has_reached_max_items()` per item, but that
+            # reads `len(self.job.items)` and this backend only pushes into that
+            # list every `BULK_SIZE * 2` items (or at the very end), so for a
+            # 20-item preview it would never be true. Cutting the parse in
+            # document order is what the dcat backend does too.
             truncated = False
 
             for event, elem in context:
                 if event == "end" and elem.tag == "indicator":
+                    # Checked before processing, not after: deciding on the way in
+                    # means a catalog holding exactly `max_items` indicators ends
+                    # the loop naturally and is not reported as truncated.
+                    if self.max_items and len(metadata_map) >= self.max_items:
+                        truncated = True
+                        break
+
                     total_parsed += 1
                     md = self._extract_metadata(elem)
                     remote_id = elem.get("id")
@@ -713,21 +751,12 @@ class INEBackend(BaseBackend):
                     elem.clear()
                     root.clear()  # Limpa memoria da arvore XML
 
-                    # `max_items` has to be honoured here, not in phase 2. The
-                    # convention elsewhere is to call `has_reached_max_items()`
-                    # per item, but that reads `len(self.job.items)` and this
-                    # backend only pushes into that list every `BULK_SIZE * 2`
-                    # items (or at the very end), so for a 20-item preview it
-                    # would never be true. Cutting the parse in document order is
-                    # what the dcat backend does too.
-                    if self.max_items and len(metadata_map) >= self.max_items:
-                        truncated = True
-                        break
-
             self._log.info(
                 "[INE] Parsing XML concluído. Total items: %s. Iniciando processamento...",
                 total_parsed,
             )
+
+            self._catalog_truncated = truncated
 
             if truncated and not self.dryrun:
                 # Expected in a preview, worth an error on a real harvest: with
