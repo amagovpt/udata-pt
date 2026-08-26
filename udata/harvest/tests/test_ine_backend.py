@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from udata.core.dataset.factories import DatasetFactory
@@ -455,3 +457,55 @@ class INEPreviewReportsItemsTest(PytestOnlyDBTestCase):
         job = self._preview(rmock, tmp_path, source)
 
         assert job.pk is None
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INELocalFilePathTest(PytestOnlyDBTestCase):
+    """A preview must not share the download file with the real harvest.
+
+    `LOCAL_FILE_PATH` is a class attribute, so every INE run in the process used
+    the same file: a preview could overwrite the catalog a running harvest was
+    reading, and its cleanup deleted the cached file that harvest falls back on.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def test_previews_get_a_path_of_their_own(self):
+        source = self._source()
+
+        first = INEBackend(source, dryrun=True)
+        second = INEBackend(source, dryrun=True)
+
+        assert first.LOCAL_FILE_PATH != second.LOCAL_FILE_PATH
+        assert first.LOCAL_FILE_PATH != INEBackend.LOCAL_FILE_PATH
+        assert second.LOCAL_FILE_PATH != INEBackend.LOCAL_FILE_PATH
+
+    def test_real_harvest_keeps_the_shared_path(self):
+        # Deliberate: the shared file is the download cache `_download_to_file`
+        # falls back on when every attempt against the slow INE endpoint fails.
+        assert INEBackend(self._source()).LOCAL_FILE_PATH == INEBackend.LOCAL_FILE_PATH
+
+    def test_preview_leaves_the_harvest_cache_alone(self, rmock, tmp_path, monkeypatch):
+        # Never let this touch the real /tmp/ine.xml: other sessions run pytest
+        # against this repo at the same time.
+        shared = tmp_path / "ine.xml"
+        shared.write_text(COMPLETE_XML)
+        monkeypatch.setattr(INEBackend, "LOCAL_FILE_PATH", str(shared))
+        rmock.get(INE_URL, text=_catalog_xml(["0001", "0002"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+
+        INEBackend(self._source(), dryrun=True).harvest()
+
+        assert shared.exists()
+        assert shared.read_text() == COMPLETE_XML
+
+    def test_preview_removes_its_own_file(self, rmock, tmp_path, monkeypatch):
+        monkeypatch.setattr(INEBackend, "LOCAL_FILE_PATH", str(tmp_path / "ine.xml"))
+        rmock.get(INE_URL, text=_catalog_xml(["0001"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(self._source(), dryrun=True)
+
+        backend.harvest()
+
+        assert not os.path.exists(backend.LOCAL_FILE_PATH)

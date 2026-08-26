@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import random
 import re
+import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import requests
 from flask import current_app
@@ -73,6 +76,22 @@ class INEBackend(BaseBackend):
         super().__init__(*args, **kwargs)
 
         self._cc_by_license = None
+
+        if self.dryrun and not self.IS_TEST_MODE:
+            # Previews must not share the download path with the real harvest.
+            # `LOCAL_FILE_PATH` is a class attribute, so every INE run in the
+            # process reads and writes the same file: a preview could overwrite
+            # the catalog a running harvest was reading, and its cleanup deletes
+            # the cached file that harvest falls back on. The real harvest keeps
+            # the shared path deliberately — that cache is what saves it when the
+            # slow INE endpoint drops the connection on every attempt. The cost
+            # of the split is disk: the body is downloaded before any `max_items`
+            # cut, so N concurrent previews now hold N bodies instead of one.
+            # `IS_TEST_MODE` is excluded because there the file is placed at the
+            # class path by hand, and overriding it would make every run fail.
+            self.LOCAL_FILE_PATH = os.path.join(
+                tempfile.gettempdir(), f"ine-preview-{uuid4().hex}.xml"
+            )
 
         try:
             self._log = current_app.logger
@@ -580,6 +599,35 @@ class INEBackend(BaseBackend):
     # inner_harvest (2 fases)
     # --------------------------
     def inner_harvest(self):
+        try:
+            self._inner_harvest()
+        finally:
+            if self.dryrun and not self.IS_TEST_MODE:
+                # The success-path cleanup at the end of `_inner_harvest` does not
+                # run when phase 2 raises, and the phase 1 handler keeps the file
+                # on purpose, for debugging. Both are fine for the real harvest,
+                # which reuses one shared path; a preview owns a unique file per
+                # instance and would leave it behind for good.
+                self._cleanup_local_file()
+
+    def _cleanup_local_file(self):
+        if not self.USE_LOCAL_FILE:
+            return
+        try:
+            if os.path.exists(self.LOCAL_FILE_PATH):
+                os.remove(self.LOCAL_FILE_PATH)
+                self._log.info(
+                    "[INE] Ficheiro descarregado removido após processamento: %s",
+                    self.LOCAL_FILE_PATH,
+                )
+        except Exception as e:
+            self._log.warning(
+                "[INE] Falha ao remover ficheiro %s: %s",
+                self.LOCAL_FILE_PATH,
+                e,
+            )
+
+    def _inner_harvest(self):
         self._log.info("[INE] Iniciando harvester de %s", self.source.url)
         self._log.info(
             "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s, TestMode=%s",
@@ -921,19 +969,5 @@ class INEBackend(BaseBackend):
 
         # Remover ficheiro descarregado após processamento bem-sucedido
         # (não remover em modo teste)
-        if not self.IS_TEST_MODE and self.USE_LOCAL_FILE:
-            try:
-                import os
-
-                if os.path.exists(self.LOCAL_FILE_PATH):
-                    os.remove(self.LOCAL_FILE_PATH)
-                    self._log.info(
-                        "[INE] Ficheiro descarregado removido após processamento: %s",
-                        self.LOCAL_FILE_PATH,
-                    )
-            except Exception as e:
-                self._log.warning(
-                    "[INE] Falha ao remover ficheiro %s: %s",
-                    self.LOCAL_FILE_PATH,
-                    e,
-                )
+        if not self.IS_TEST_MODE:
+            self._cleanup_local_file()
