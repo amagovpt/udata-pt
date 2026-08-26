@@ -492,6 +492,21 @@ class INEBackend(BaseBackend):
         if not ops:
             return 0, 0, 0  # matched, modified, upserted
 
+        if self.dryrun:
+            # A preview must never touch the database. This backend does not go
+            # through `BaseBackend.process_dataset`, so the dryrun guard around
+            # `dataset.save()` in `base.py` never applies here: `inner_harvest`
+            # writes the datasets itself, and every one of those writes — the
+            # `ReplaceOne` of a changed dataset and the upserting `UpdateOne` of a
+            # new one — funnels through this method. Guarding here therefore
+            # closes both call sites (the per-chunk flush and the final one) at
+            # once. Logged at WARNING because suppressed writes are an
+            # operationally meaningful event; note that, unlike the LEDG-2320
+            # backends, nothing on this path installs a `LogCatcher`, so this
+            # does not reach the preview response.
+            self._log.warning("[INE] Dryrun: discarding %s pending write(s)", len(ops))
+            return 0, 0, 0
+
         t0 = time.time()
         try:
             res = collection.bulk_write(ops, ordered=False)

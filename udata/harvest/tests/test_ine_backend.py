@@ -226,3 +226,53 @@ class INEResourceIdentityTest(PytestOnlyDBTestCase):
         dataset = self._dataset(source)
         assert "(revista)" in dataset.description
         assert [r.id for r in dataset.resources] == before
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEPreviewDoesNotWriteTest(PytestOnlyDBTestCase):
+    """A preview must not create or replace a single dataset.
+
+    This backend never calls `BaseBackend.process_dataset`, so the dryrun guard
+    around `dataset.save()` in `base.py` never applies to it: `inner_harvest`
+    writes the datasets itself, in raw pymongo. Both of those writes — the
+    upserting `UpdateOne` for a new dataset and the `ReplaceOne` for a changed
+    one — go through `_flush_bulk`, which is where the guard lives.
+    """
+
+    def _preview(self, rmock, tmp_path, source, ids, revision=""):
+        rmock.get(INE_URL, text=_catalog_xml(ids, revision=revision))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source, dryrun=True)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def test_preview_creates_no_dataset(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._preview(rmock, tmp_path, source, ["0001", "0002", "0003"])
+
+        assert job.status == "done"
+        assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 0
+
+    def test_preview_does_not_replace_an_existing_dataset(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        existing = DatasetFactory(
+            title="Título anterior",
+            description="Descrição anterior",
+            harvest=HarvestDatasetMetadata(
+                remote_id="0001", source_id=str(source.id), domain=source.domain
+            ),
+        )
+
+        # The remote catalog carries a different description, so change detection
+        # lets this dataset through to the `ReplaceOne` branch.
+        job = self._preview(rmock, tmp_path, source, ["0001"], revision=" (revista)")
+
+        assert job.status == "done"
+        existing.reload()
+        assert existing.title == "Título anterior"
+        assert existing.description == "Descrição anterior"
