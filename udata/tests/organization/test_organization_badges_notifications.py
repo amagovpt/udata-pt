@@ -1,3 +1,6 @@
+import logging
+from unittest import mock
+
 import pytest
 
 from udata.core.organization.constants import (
@@ -14,27 +17,11 @@ from udata.features.notifications.models import Notification
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.tests.helpers import capture_mails
 
-# Known failures owned by out-of-scope root causes. Each reason names the ticket that
-# owns the production bug; strict=True means a fix turns the XPASS red and forces the
-# marker to be removed by the same change.
-
-R1 = (
-    "LEDG-2322 pending. Notification.details "
-    "(udata/features/notifications/models.py:57-65) lists only 4 of the 7 "
-    "*NotificationDetails classes, leaving out NewBadgeNotificationDetails, "
-    "MembershipAcceptedNotificationDetails and MembershipRefusedNotificationDetails. "
-    "mongoengine rejects the document and udata/core/organization/tasks.py swallows the "
-    "error, so badge and membership-response notifications are never created. This is a "
-    "production bug being recorded, not a stale test: when it is fixed this starts "
-    "passing and strict=True turns the XPASS red, forcing the marker out."
-)
-
 
 class NotifyBadgeTest(PytestOnlyAPITestCase):
     @pytest.mark.parametrize(
         "badge_type", [CERTIFIED, PUBLIC_SERVICE, LOCAL_AUTHORITY, COMPANY, ASSOCIATION]
     )
-    @pytest.mark.xfail(strict=True, reason=R1)
     def test_notify_badge_creates_notifications(self, badge_type):
         """
         Test that notify_badge_* creates in-app notifications for organization members
@@ -69,7 +56,6 @@ class NotifyBadgeTest(PytestOnlyAPITestCase):
     @pytest.mark.parametrize(
         "badge_type", [CERTIFIED, PUBLIC_SERVICE, LOCAL_AUTHORITY, COMPANY, ASSOCIATION]
     )
-    @pytest.mark.xfail(strict=True, reason=R1)
     def test_notify_badge_notification_details(self, badge_type):
         """
         Test that notifications have correct details for organization badge
@@ -91,3 +77,28 @@ class NotifyBadgeTest(PytestOnlyAPITestCase):
         assert notification.details.organization.name == organization.name
         assert notification.details.kind == badge_type
         assert notification.user == user
+
+    def test_badge_notification_failure_logs_traceback(self, caplog):
+        """
+        Test that a notification that fails to save logs its traceback
+        """
+        user = UserFactory()
+        organization = OrganizationFactory(members=[Member(user=user, role="admin")])
+
+        with (
+            mock.patch.object(Notification, "save", side_effect=ValueError("cannot save")),
+            capture_mails(),
+            caplog.at_level(logging.ERROR, logger="udata.core.organization.tasks"),
+        ):
+            organization.add_badge(CERTIFIED)
+
+        failures = [
+            record
+            for record in caplog.records
+            if "Failed to create new badge notification" in record.getMessage()
+        ]
+        assert failures, [record.getMessage() for record in caplog.records]
+
+        # The error must carry its traceback: swallowing it is what hid this bug
+        # in production for the whole time the details class was unregistered.
+        assert failures[0].exc_info is not None

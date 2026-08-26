@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **fix(notifications): create badge and membership-response notifications again**
+  - Adding a badge to an organization, or accepting or refusing a membership request, never
+    produced the in-app notification. The mail went out — it is sent before the `try` — and
+    the failure surfaced only as a `log.error` line reading "not all arguments converted
+    during string formatting", with no traceback and nothing at all in the UI.
+  - `Notification.details` declared 4 of the 7 detail classes. A merge kept the upstream
+    producers and tests but resolved the model file to the fork's older copy, so the badge
+    and membership-response classes were never registered. mongoengine rejected the document
+    and then crashed formatting its own error message, and the `except Exception` blocks
+    around the save turned that into one silent log line. Registering the three classes is
+    the whole fix; the fifteen tests that had recorded the bug as a strict expected failure
+    pass again, so their markers are gone.
+  - The purge query only matched notifications that keep their organization under
+    `details.request_organization`, which would have left the newly-saved badge and
+    membership-response notifications behind, pointing at a deleted organization. It now
+    matches both field shapes.
+  - Those `except` blocks now log with `log.exception`, so the traceback survives. The
+    messages are unchanged, so existing log greps and alerts keep matching.
+
 - **test(tests): allow a distinct Mongo test database per checkout**
   - The xdist worker split already gave each worker its own database, but the name was
     hardcoded, so the isolation ended at the run: `_clean_db` truncates every collection
