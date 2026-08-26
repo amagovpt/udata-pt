@@ -411,3 +411,47 @@ class INESanitizationTest(PytestOnlyDBTestCase):
         job = self._harvest(rmock, tmp_path, source)
 
         assert [item.status for item in job.items] == ["skipped"] * 2
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEPreviewReportsItemsTest(PytestOnlyDBTestCase):
+    """A preview still has to say what it would have done.
+
+    Contrary to what LEDG-2324 assumed, `_append_job_items` never discarded the
+    items in dryrun — it guards only the `$push` to the database and extends
+    `job.items` unconditionally. This pins that, because the dryrun guard in
+    `_flush_bulk` changed the path around it: the created-ids lookup that runs
+    after the flush now finds nothing, so those items come back without a
+    dataset reference and must still be reported.
+    """
+
+    def _preview(self, rmock, tmp_path, source):
+        rmock.get(INE_URL, text=_catalog_xml(["0001", "0002", "0003"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source, dryrun=True)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def test_preview_reports_every_item_it_processed(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._preview(rmock, tmp_path, source)
+
+        assert job.status == "done"
+        assert len(job.items) == 3
+        assert [item.status for item in job.items] == ["done"] * 3
+        assert sorted(item.remote_id for item in job.items) == ["0001", "0002", "0003"]
+        # No dataset reference, because nothing was written — and nothing was.
+        assert all(item.dataset is None for item in job.items)
+        assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 0
+
+    def test_preview_persists_no_job(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._preview(rmock, tmp_path, source)
+
+        assert job.pk is None
