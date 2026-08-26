@@ -27,9 +27,17 @@
     harvest. The sanitization runs at extraction, not at apply, and the placement is
     load-bearing: change detection compares the stored values against the extracted ones
     and runs first, so sanitizing later would compare a sanitized title against a raw one
-    and rewrite every indicator carrying markup on every single harvest. Expect one
-    larger-than-usual run of changes the first time, because bleach escapes what it does
-    not strip, so bare `&` and `<` in titles are rewritten too.
+    and rewrite every indicator carrying markup on every single harvest. **Expect the
+    first real harvest after this to rewrite the whole catalog**, not just the entries
+    carrying markup: bleach escapes what it does not strip, and the description always
+    ends with INE's `?xpid=INE&xpgid=…` link, so every description changes by at least
+    that `&`. It is a one-off — the transformation is idempotent — and the raw-pymongo
+    path fires no `post_save`, so it triggers no reindexing storm. Slugs are built from
+    the unescaped title, so the escaping does not reach new permalinks.
+  - Capping the parse had a second-order effect worth naming: `autoarchive` treats every
+    remote_id absent from the job as gone from the remote platform, and it runs in dryrun
+    too, so a truncated run would have reported everything past the cut as archived. It is
+    now skipped when the catalog was truncated.
   - Previews download to their own file. `LOCAL_FILE_PATH` is a class attribute, so every
     run in the process shared `/tmp/ine.xml`: a preview could overwrite the catalog a
     running harvest was reading, and its cleanup deleted the cached file that harvest
