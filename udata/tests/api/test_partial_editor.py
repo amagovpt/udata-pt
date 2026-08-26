@@ -287,8 +287,14 @@ class PartialEditorInvitationAssignmentTest(APITestCase):
         self.dataset1 = DatasetFactory(organization=self.org)
         self.dataset2 = DatasetFactory(organization=self.org)
 
-    def test_invite_partial_editor_with_assignments_then_accept(self):
-        """Inviting a partial_editor with assignments creates assignments on acceptance."""
+    def test_add_partial_editor_with_assignments_directly(self):
+        """Adding a registered user as partial_editor creates the assignments at once.
+
+        A registered user is added straight to the members list, so the response
+        marshals a Member (no ``id``, no ``assignments``) and there is no
+        invitation left to accept. The assignments are persisted by the same
+        request.
+        """
         invited_user = UserFactory()
         self.login(self.admin_user)
         response = self.post(
@@ -303,19 +309,17 @@ class PartialEditorInvitationAssignmentTest(APITestCase):
             },
         )
         self.assert201(response)
-        self.assertEqual(len(response.json["assignments"]), 2)
+        self.assertEqual(response.json["role"], "partial_editor")
 
-        # Accept the invitation
-        invitation_id = response.json["id"]
-        self.login(invited_user)
-        response = self.post(url_for("api.accept_org_invitation", id=invitation_id))
-        self.assert200(response)
+        self.org.reload()
+        self.assertTrue(self.org.is_member(invited_user))
+        self.assertEqual(len(self.org.pending_requests), 0)
 
-        # Verify assignments were created
         assignments = Assignment.objects(user=invited_user, organization=self.org)
         self.assertEqual(assignments.count(), 2)
 
         # Verify partial_editor can edit assigned datasets
+        self.login(invited_user)
         data = self.dataset1.to_dict()
         data["description"] = "updated by partial editor"
         response = self.put(url_for("api.dataset", dataset=self.dataset1), data)
@@ -352,8 +356,8 @@ class PartialEditorInvitationAssignmentTest(APITestCase):
         )
         self.assert400(response)
 
-    def test_invite_without_assignments_still_works(self):
-        """Inviting a partial_editor without assignments works (assignments added later)."""
+    def test_add_partial_editor_without_assignments_still_works(self):
+        """Adding a partial_editor without assignments works (assignments added later)."""
         invited_user = UserFactory()
         self.login(self.admin_user)
         response = self.post(
@@ -364,7 +368,11 @@ class PartialEditorInvitationAssignmentTest(APITestCase):
             },
         )
         self.assert201(response)
-        self.assertEqual(len(response.json["assignments"]), 0)
+        self.assertEqual(response.json["role"], "partial_editor")
+
+        self.org.reload()
+        self.assertTrue(self.org.is_member(invited_user))
+        self.assertEqual(Assignment.objects(user=invited_user, organization=self.org).count(), 0)
 
     def test_list_invitations_includes_assignments(self):
         """Pending invitations listing includes assignments."""
