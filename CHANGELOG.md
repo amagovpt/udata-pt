@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **fix(discussions): stop leaving orphaned notifications behind a deleted discussion**
+  - Deleting a discussion, or a single comment, through the API left every notification
+    that referenced it in place, pointing at a document that no longer exists. Both
+    signals were being emitted all along — `Discussion.delete()` and
+    `Discussion.remove_message()` send them — and nobody was listening: the same merge
+    that unregistered the badge notification classes also resolved the discussions
+    notification module to the fork's older copy, which predates the two upstream cleanup
+    receivers. They are back.
+  - `details.message_id` was a `StringField` where upstream declares a UUID, so the
+    producers compensated with `str(message.id)` and the cleanup query — which passes the
+    message's real `UUID` — matched nothing. The field is now a `UUIDField`, and the casts
+    are gone from both the task and the January backfill migration. It is declared
+    `binary=False`, unlike upstream: mongoengine's default would store BSON Binary, and
+    every `message_id` written so far was saved as a string, so the query would have
+    matched none of the existing documents and the change would have needed a backfill.
+    `binary=False` stores the identical bytes, so old and new documents both match and no
+    data migration is needed. The API is unaffected — a `UUIDField` still serializes to
+    the same JSON string.
+  - This covers deletion through the API. Purging a dataset, reuse, dataservice or topic
+    deletes its discussions with a queryset, which never instantiates a document and so
+    never emits the signal; that path still leaves orphans and needs its own change.
+  - The cleanup receivers keep the `try`/`except` — the signals arrive after the delete
+    has already happened, so raising would turn a completed `DELETE` into a 500 — but they
+    log with `log.exception`, and so does the backfill migration. A swallowed traceback is
+    what kept all of this invisible in production, and a test now asserts the record
+    carries one. The four tests that had recorded these bugs as strict expected failures
+    pass again, so their markers are gone.
+
 - **fix(notifications): create badge and membership-response notifications again**
   - Adding a badge to an organization, or accepting or refusing a membership request, never
     produced the in-app notification. The mail went out — it is sent before the `try` — and
