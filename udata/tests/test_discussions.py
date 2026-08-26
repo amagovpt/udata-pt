@@ -158,8 +158,11 @@ class DiscussionsTest(APITestCase):
 
             def check_signal(kwargs):
                 self.assertIsNotNone(discussion_id)
+                # The report now links to the dataset's discussions tab. Note it
+                # no longer carries discussion_id, so a moderator lands on the
+                # tab rather than on the reported discussion.
                 self.assertIn(
-                    f"https://data.gouv.fr/datasets/{dataset.slug}/discussions?discussion_id={discussion_id}",
+                    f"https://data.gouv.fr/datasets/{dataset.slug}?tab=discussions",
                     kwargs["message"],
                 )
 
