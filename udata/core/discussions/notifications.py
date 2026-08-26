@@ -94,6 +94,15 @@ def cleanup_message_notifications(discussion, message=None, **kwargs):
             Notification.objects(
                 details__discussion=discussion, details__message_id=message.id
             ).delete()
+        else:
+            # Unreachable from remove_message, which always passes a real Message. Logged
+            # rather than skipped because a silent no-op here is the same shape of failure
+            # that let the missing receivers go unnoticed in the first place.
+            log.warning(
+                "Skipped notification cleanup for discussion %s: no usable message (%r)",
+                discussion.id,
+                message,
+            )
     except Exception:
         log.exception(
             "Error cleaning up message notification for discussion %s, message %s",
