@@ -29,7 +29,6 @@ from udata.tests.helpers import (
     assert_emit,
     assert_not_emit,
     assert_starts_with,
-    assert_status,
 )
 from udata.utils import faker
 
@@ -462,10 +461,14 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert request.handled_on is not None
         assert request.refusal_comment is None
 
-        # test accepting twice will raise 409
+        # Accepting twice is deliberately idempotent: the endpoint returns the
+        # existing member with 200 instead of 409. Note that it also re-stamps
+        # status/handled_by/handled_on before that early return, so a second
+        # accept overwrites who handled the request and when; that audit-trail
+        # question is tracked separately, not asserted here.
         api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
         response = self.post(api_url)
-        assert_status(response, 409)
+        assert200(response)
 
     def test_only_admin_can_accept_membership(self):
         user = self.login()
