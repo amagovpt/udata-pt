@@ -37,7 +37,7 @@ from udata.utils import faker
 # marker to be removed by the same change.
 
 R4 = (
-    "LEDG-2329 pending. udata/core/organization/api.py:245-247 demands site admin "
+    "LEDG-2335 pending. udata/core/organization/api.py:245-247 demands site admin "
     "whenever the payload carries a badges key, and to_dict() "
     "(udata/mongo/document.py:55-67) always emits one, so an organization admin gets 403 "
     "on a full PUT while editing anything at all. This is a production bug being "
@@ -46,7 +46,7 @@ R4 = (
 )
 
 R6 = (
-    "LEDG-2329 pending. MembershipAcceptAPI.post (udata/core/organization/api.py:528-553) "
+    "LEDG-2337 pending. MembershipAcceptAPI.post (udata/core/organization/api.py:528-553) "
     "lost the invitation-kind guard that MembershipRefuseAPI still has at :568-569, so an "
     "organization admin can force-accept an invitation without the invitee consenting. "
     "This is a production bug being recorded, not a stale test: when it is fixed this "

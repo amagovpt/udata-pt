@@ -23,7 +23,7 @@ from udata.tests.helpers import assert_not_emit
 # marker to be removed by the same change.
 
 R5 = (
-    "LEDG-2329 pending. udata/core/dataset/search.py declares badge as a scalar Filter "
+    "LEDG-2336 pending. udata/core/dataset/search.py declares badge as a scalar Filter "
     "while udata/core/dataset/api.py:276-277 consumes it with badges__kind__in, so "
     "mongoengine iterates the string character by character and the filter silently "
     "matches nothing. format_family has the identical defect. This is a production bug "
