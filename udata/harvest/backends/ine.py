@@ -11,6 +11,7 @@ import requests
 from flask import current_app
 from slugify import slugify
 
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
@@ -248,11 +249,23 @@ class INEBackend(BaseBackend):
     # Extrai metadados do indicator (já normalizados)
     # --------------------------
     def _extract_metadata(self, elem: ET.Element) -> dict:
+        """Read one `<indicator>` into a metadata dict, sanitized.
+
+        Title and description are sanitized *here*, at extraction, and not in
+        `_apply_metadata_to_dataset`. This backend writes `dataset.to_mongo()`
+        straight to pymongo, so the `Dataset.pre_save` signal that sanitizes
+        every other write in the portal never fires for it; the sanitization has
+        to be reproduced by hand. It cannot happen in the apply step, though,
+        because `_has_changed` compares the *stored* values against this dict
+        and runs before it: sanitizing later would compare a sanitized title
+        against a raw one, so any indicator carrying markup would report as
+        changed on every nightly harvest and be rewritten forever.
+        """
         md = {}
 
         node = elem.find("title")
         if node is not None and node.text:
-            md["title"] = node.text
+            md["title"] = sanitize_strict(node.text)
 
         desc = ""
         remote_url = None
@@ -268,8 +281,10 @@ class INEBackend(BaseBackend):
                 desc = (desc + "\n" + bdd_url.text) if desc else bdd_url.text
 
         if desc:
-            md["description"] = desc
+            md["description"] = sanitize_markdown_html(desc)
         if remote_url:
+            # Not sanitized on purpose: this is a URL, not markup, and it is
+            # stored in `harvest.remote_url` rather than rendered as content.
             md["remote_url"] = remote_url
 
         resources = []

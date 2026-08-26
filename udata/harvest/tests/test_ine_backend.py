@@ -324,3 +324,90 @@ class INEMaxItemsTest(PytestOnlyDBTestCase):
         assert len(job.items) == 2
         assert len(job.errors) == 1
         assert "max items reached" in job.errors[0].message
+
+
+def _hostile_catalog_xml():
+    """A catalog whose title and description carry markup, plus a plain one.
+
+    `0002` has no markup at all: it is there to pin the escaping `bleach` does
+    to bare ampersands and angle brackets, which is abundant in a statistics
+    catalog and is the bulk of what changes on the first harvest after this fix.
+    """
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<catalog>\n"
+        "<indicator id='0001'>"
+        "<title><![CDATA[Indicador <script>alert(1)</script>]]></title>"
+        "<description><![CDATA[Texto <img src=x onerror=alert(1)> final]]></description>"
+        "</indicator>\n"
+        "<indicator id='0002'>"
+        "<title><![CDATA[Investigação e Desenvolvimento (I&D)]]></title>"
+        "<description><![CDATA[População com <15 anos]]></description>"
+        "</indicator>\n"
+        "</catalog>\n"
+    )
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESanitizationTest(PytestOnlyDBTestCase):
+    """Titles and descriptions must be sanitized on the raw-pymongo write path.
+
+    `Dataset.pre_save` sanitizes every other write in the portal, but it is a
+    mongoengine signal and this backend never calls `.save()`, so remote HTML
+    used to be stored verbatim.
+    """
+
+    def _harvest(self, rmock, tmp_path, source):
+        rmock.get(INE_URL, text=_hostile_catalog_xml())
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def _dataset(self, source, remote_id):
+        return Dataset.objects(
+            __raw__={"harvest.source_id": str(source.id), "harvest.remote_id": remote_id}
+        ).first()
+
+    def test_markup_is_stripped_from_title_and_description(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        self._harvest(rmock, tmp_path, source)
+
+        dataset = self._dataset(source, "0001")
+        # `strip=True` drops the tags and keeps their text, which is the same
+        # contract `Dataset.pre_save` applies everywhere else: what must not
+        # survive is the markup, not the words.
+        assert "<script>" not in dataset.title
+        assert "</script>" not in dataset.title
+        assert dataset.title == "Indicador alert(1)"
+        # The description keeps the markdown allow-list, so `<img>` survives and
+        # the event handler on it does not — again the same policy as elsewhere.
+        assert "onerror" not in dataset.description
+        assert "alert(1)" not in dataset.description
+
+    def test_bare_ampersands_and_brackets_are_escaped(self, rmock, tmp_path):
+        # Accepted consequence, not a bug: bleach escapes what it does not strip,
+        # which is exactly what `Dataset.pre_save` already does everywhere else.
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        self._harvest(rmock, tmp_path, source)
+
+        dataset = self._dataset(source, "0002")
+        assert dataset.title == "Investigação e Desenvolvimento (I&amp;D)"
+
+    def test_sanitization_is_idempotent_across_harvests(self, rmock, tmp_path):
+        # If the stored (sanitized) value were compared against a raw one, every
+        # one of these datasets would report as changed on every single run.
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        self._harvest(rmock, tmp_path, source)
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["skipped"] * 2
