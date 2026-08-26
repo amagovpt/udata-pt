@@ -25,15 +25,31 @@
     existed and already guarded its sibling class; this one simply never got it,
     so the three are now explicit skips that still run wherever the search stack
     is up.
-  - Twenty-nine failures belong to six root causes left open and owned
-    elsewhere: notification details classes missing from the model's choices,
-    a discussion status member that does not exist, a field typed as string
-    instead of UUID with its cleanup receivers missing, a badges key forcing 403
-    on a full organization save, a scalar filter iterated character by character,
-    and a missing invitation guard on membership accept. They are marked strict
-    xfail, each reason naming the owning ticket and the production line, so the
-    suite can gate merges while the bugs stay visible — and so that fixing any of
-    them turns the marker red and forces its removal in the same change.
+  - One of the causes turned out to be a single missing enum member: closing a
+    discussion built a notification with a status the enum did not define, so the
+    task died in the worker while the API answered 200. Fixed here rather than
+    recorded, because the test it would have marked is the only coverage for the
+    whole close endpoint — the open-discussions metric, the closing comment, and
+    the refusal to comment on a closed discussion.
+  - Twenty-five failures belong to five root causes left open and owned
+    elsewhere: notification details classes missing from the model's choices, a
+    notification field typed as string instead of UUID with its cleanup receivers
+    missing, a badges key forcing 403 on a full organization save, scalar filters
+    iterated character by character, and a missing invitation guard on membership
+    accept. They are marked strict xfail, each reason naming the owning ticket and
+    the production line, so the suite can gate merges while the bugs stay visible
+    — and so that fixing any of them turns the marker red and forces its removal
+    in the same change. Note that several of those tests assert more than the cause
+    they are marked for, so that coverage is inactive until the marker goes.
+  - Six errors that had been written off as flaky, and blamed on network access,
+    were neither: the download endpoints stream their response, and Flask only
+    pops the request context once the body is consumed, so tests asserting on
+    headers alone left a context on the stack and the next teardown failed. They
+    now read the relayed bytes, which also closes a gap — the body those tests
+    exist to check was going unasserted. A seventh failure came from a suggestion
+    test seeding two organization names with faker and then asserting every result
+    contains the query; suggestion folds accents, so a random word matched and the
+    test's outcome depended on how many tests had run before it.
   - Lint and format are clean across the tree. The pre-commit hook was pinned to
     a ruff four minor versions behind the project's, so hook and `uv run ruff`
     formatted the same files differently and eleven of them kept drifting; the
@@ -45,8 +61,17 @@
     Actions workflow now runs lint and the suite on every push and pull request.
     It skips loading `udata.cfg`, which is tracked and overrides the defaults, so
     the gate no longer depends on a deployment config file or on whichever `.env`
-    keys a runner happens to carry. Requiring the check on `develop` needs
-    repository admin and has to be enabled separately.
+    keys a runner happens to carry — with no `.env` that file resolves the password
+    policy to zero length and no requirements, which is worth a look on its own. A
+    separate step re-runs the download-proxy timeout assertions with the tracked
+    config loaded, so drift there still fails the build rather than resurfacing as a
+    502 in production. Requiring the check on `develop` needs repository admin and
+    has to be enabled separately.
+  - Two things only a clean checkout reveals, and nothing had ever run on one: the
+    dependency install named extras this project does not define, so the job would
+    have gone red without executing a single test; and three SAML tests read
+    service-provider credentials that are deliberately git-ignored, so they are now
+    skipped when those files are absent and still run where they exist.
 
 - **feat(dataset)!: filter multiple tags with OR instead of AND**
   - The dataset listing's keyword filter is multi-select, and every other
