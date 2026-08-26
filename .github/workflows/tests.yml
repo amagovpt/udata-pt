@@ -71,4 +71,8 @@ jobs:
       - name: Deployment config assertions
         env:
           UDATA_SETTINGS: ${{ github.workspace }}/udata.cfg
+          # udata.cfg builds MONGODB_HOST and the Redis URLs from these, and neither has a
+          # default - without them the host is literally "None" and the step cannot connect.
+          SERVER_MONGO: localhost
+          SERVER_REDIS: localhost
         run: uv run pytest udata/tests/dataset/test_proxy_download.py -k ProxyDownloadTimeoutConfigTest
