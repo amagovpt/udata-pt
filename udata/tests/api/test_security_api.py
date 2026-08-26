@@ -24,8 +24,8 @@ class SecurityAPITest(PytestOnlyAPITestCase):
                 "last_name": "Doe",
                 "accept_conditions": True,
                 "email": "jane@example.org",
-                "password": "Password123",
-                "password_confirm": "Password123",
+                "password": "Password123!@#",
+                "password_confirm": "Password123!@#",
                 "submit": True,
             },
         )
@@ -45,8 +45,8 @@ class SecurityAPITest(PytestOnlyAPITestCase):
                 "last_name": "Doe",
                 "accept_conditions": True,
                 "email": "jane@example.org",
-                "password": "Password123",
-                "password_confirm": "Password123",
+                "password": "Password123!@#",
+                "password_confirm": "Password123!@#",
                 "submit": True,
             },
         )
@@ -181,8 +181,8 @@ class TwoFactorSecurityAPITest(PytestOnlyAPITestCase):
         response = self.post(
             url_for("security.reset_password", token=token),
             {
-                "password": "Password123",
-                "password_confirm": "Password123",
+                "password": "Password123!@#",
+                "password_confirm": "Password123!@#",
                 "submit": True,
             },
         )
