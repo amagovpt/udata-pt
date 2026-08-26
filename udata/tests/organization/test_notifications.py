@@ -1,5 +1,3 @@
-import pytest
-
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.organization.notifications import (
     MembershipAcceptedNotificationDetails,
@@ -12,21 +10,6 @@ from udata.features.notifications.models import Notification
 from udata.models import Member, MembershipRequest
 from udata.tests.api import DBTestCase, PytestOnlyAPITestCase, PytestOnlyDBTestCase
 from udata.tests.helpers import assert_equal_dates
-
-# Known failures owned by out-of-scope root causes. Each reason names the ticket that
-# owns the production bug; strict=True means a fix turns the XPASS red and forces the
-# marker to be removed by the same change.
-
-R1 = (
-    "LEDG-2322 pending. Notification.details "
-    "(udata/features/notifications/models.py:57-65) lists only 4 of the 7 "
-    "*NotificationDetails classes, leaving out NewBadgeNotificationDetails, "
-    "MembershipAcceptedNotificationDetails and MembershipRefusedNotificationDetails. "
-    "mongoengine rejects the document and udata/core/organization/tasks.py swallows the "
-    "error, so badge and membership-response notifications are never created. This is a "
-    "production bug being recorded, not a stale test: when it is fixed this starts "
-    "passing and strict=True turns the XPASS red, forcing the marker out."
-)
 
 
 class OrganizationNotificationsTest(PytestOnlyDBTestCase):
@@ -115,7 +98,6 @@ class MembershipRequestNotificationTest(DBTestCase):
 
 
 class MembershipResponseNotificationTest(PytestOnlyAPITestCase):
-    @pytest.mark.xfail(strict=True, reason=R1)
     def test_accept_membership_creates_notification(self):
         """Accepting a membership request creates a notification for the applicant"""
 
@@ -140,7 +122,6 @@ class MembershipResponseNotificationTest(PytestOnlyAPITestCase):
         assert notification.details.organization == org
         assert isinstance(notification.details, MembershipAcceptedNotificationDetails)
 
-    @pytest.mark.xfail(strict=True, reason=R1)
     def test_refuse_membership_creates_notification(self):
         """Refusing a membership request creates a notification for the applicant"""
 
@@ -165,7 +146,6 @@ class MembershipResponseNotificationTest(PytestOnlyAPITestCase):
         assert notification.details.organization == org
         assert isinstance(notification.details, MembershipRefusedNotificationDetails)
 
-    @pytest.mark.xfail(strict=True, reason=R1)
     def test_full_membership_request_cycle_with_refusal_then_approval(self):
         """Test full cycle: request -> refused -> new request -> approved"""
         from datetime import datetime

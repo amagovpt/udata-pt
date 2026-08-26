@@ -3,7 +3,12 @@ from mongoengine import NULLIFY
 
 from udata.api_fields import field, generate_fields
 from udata.core.discussions.notifications import DiscussionNotificationDetails
-from udata.core.organization.notifications import MembershipRequestNotificationDetails
+from udata.core.organization.notifications import (
+    MembershipAcceptedNotificationDetails,
+    MembershipRefusedNotificationDetails,
+    MembershipRequestNotificationDetails,
+    NewBadgeNotificationDetails,
+)
 from udata.core.user.api_fields import user_ref_fields
 from udata.core.user.models import User
 from udata.features.transfer.notifications import TransferRequestNotificationDetails
@@ -58,7 +63,10 @@ class Notification(Datetimed, db.Document):
         db.GenericEmbeddedDocumentField(
             choices=(
                 DiscussionNotificationDetails,
+                MembershipAcceptedNotificationDetails,
+                MembershipRefusedNotificationDetails,
                 MembershipRequestNotificationDetails,
+                NewBadgeNotificationDetails,
                 TransferRequestNotificationDetails,
                 ValidateHarvesterNotificationDetails,
             )
