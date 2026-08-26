@@ -23,11 +23,16 @@
     and may not edit, so the backoffice now previews a *saved* source through
     `GET /harvest/source/<id>/preview/`, whose per-source permission admits them,
     and reserves the config route for a config that is not stored yet.
-  - Added `HARVEST_PREVIEW_LIMIT` (5/min, 30/h, 100/day), keyed by `user_or_ip`
+  - Added `HARVEST_PREVIEW_LIMIT` (20/min, 120/h, 400/day), keyed by `user_or_ip`
     and declared in the resource's `decorators` rather than on the verb, so the
     limiter runs outside `@api.secure` and a flood of unauthorized attempts is
     counted too. What this rations is not writes but outbound cost: every request
-    walks a remote catalogue and produces traffic in the portal's name.
+    walks a remote catalogue and produces traffic in the portal's name. Both
+    preview routes carry it, including `GET /harvest/source/<id>/preview/`, which
+    had no limit of its own and so fell under the IP-keyed `RATELIMIT_DEFAULT` —
+    one shared bucket for every visitor behind the F5, where a single caller
+    previewing in a loop answers 429 to everyone else. It matters more now that
+    the backoffice sends every read-only preview there.
 
 - **fix(discussions): stop leaving orphaned notifications behind a deleted discussion**
   - Deleting a discussion, or a single comment, through the API left every notification

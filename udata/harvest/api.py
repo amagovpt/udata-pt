@@ -527,6 +527,22 @@ class PreviewSourceConfigAPI(API):
 
 @ns.route("/source/<harvest_source:source>/preview/", endpoint="preview_harvest_source")
 class PreviewSourceAPI(API):
+    # Same cost as the config route — `actions.preview` walks the same remote
+    # catalogue under the same HARVEST_PREVIEW_MAX_ITEMS — so the same ceiling,
+    # and the same `user_or_ip` key. Without this it fell under
+    # RATELIMIT_DEFAULT, which is keyed on the remote address: behind the F5
+    # every visitor arrives from one origin IP, so that ceiling is shared
+    # site-wide and one caller previewing in a loop answers 429 to everybody
+    # else. That matters more now that the backoffice sends every read-only
+    # preview here.
+    decorators = [
+        limiter.limit(
+            HARVEST_PREVIEW_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("preview_harvest_source")
     @api.marshal_with(preview_job_fields)

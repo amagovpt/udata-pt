@@ -87,23 +87,33 @@ FEED_LIMIT = "120 per minute; 2400 per hour"
 PUBLIC_READ_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
-# Harvest config preview (`POST /harvest/source/preview/`). Unlike the limits
-# above, what this one rations is not writes: it is the only route that makes the
-# server run a whole harvest backend against a URL the caller supplies, so each
-# request means outbound traffic in the portal's name and a remote catalogue
-# walked. That is expensive regardless of who asks, which is why it carries a
-# limit even though the endpoint now also requires authorization.
+# Harvest preview, both routes (`POST /harvest/source/preview/` for a config that
+# is not stored yet, `GET /harvest/source/<id>/preview/` for a saved source).
+# Unlike the limits above, what this one rations is not writes: these are the
+# routes that make the server run a whole harvest backend against a remote
+# catalogue, so each request means outbound traffic in the portal's name. That is
+# expensive regardless of who asks, which is why they carry a limit even though
+# both also require authorization. The two share the constant deliberately —
+# they cost the same and the backoffice picks between them by who is asking, so
+# a tighter ceiling on one would just be a ceiling on some users.
 #
-# The numbers are CONTENT_CREATE_LIMIT's, and a separate constant on purpose
+# A separate constant from CONTENT_CREATE_LIMIT even where the numbers coincide
 # (COMMENT_CREATE_LIMIT is the same shape for the same reason): the two ceilings
-# answer to different things — content creation to abuse of public content,
-# this one to outbound cost — and would have to move apart the first time either
-# is calibrated. Sized for the real workflow, which is a sysadmin iterating on a
-# harvester configuration and re-previewing after each change, so a handful per
-# minute has to pass. Keyed by `user_or_ip`, and since the route is `@api.secure`
-# the key is always `user:{id}`, so the daily cap is per-publisher and does not
-# become the site-wide daily block that the anonymous endpoints above avoid.
-HARVEST_PREVIEW_LIMIT = "5 per minute; 30 per hour; 100 per day"
+# answer to different things — content creation to abuse of public content, this
+# one to outbound cost — and would have to move apart the first time either is
+# calibrated. Which happened immediately: 5/min was the first choice and it
+# 429'd a test that walks the seven canary URLs of the VULN-2084 replay, so it
+# would equally 429 a sysadmin tuning filters and re-previewing after each
+# change, which is the actual workflow. 20/min is out of reach for someone
+# clicking a button and still an order of magnitude under the 200/h IP-keyed
+# default these routes would otherwise fall under. Note the limiter is live in
+# the test suite: `RATELIMIT_ENABLED = False` sits in `settings.Debug`, not in
+# `settings.Testing`.
+#
+# Keyed by `user_or_ip`, and since both routes are `@api.secure` the key is
+# always `user:{id}` — a per-publisher bucket, so the daily cap never becomes the
+# site-wide daily block that the anonymous endpoints above have to avoid.
+HARVEST_PREVIEW_LIMIT = "20 per minute; 120 per hour; 400 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 # File upload on existing/new dataset resources. Keyed by `user_or_ip` and the
 # endpoint is authenticated (`@api.secure`), so the key is always `user:{id}` —

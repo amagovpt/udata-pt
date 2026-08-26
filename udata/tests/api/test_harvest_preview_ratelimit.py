@@ -31,12 +31,17 @@ import pytest
 from flask import url_for
 
 from udata.app import limiter
+from udata.harvest.tests.factories import HarvestSourceFactory, MockBackendsMixin
 from udata.tests.api import PytestOnlyAPITestCase
 
 RATELIMIT_OPTIONS = dict(RATELIMIT_ENABLED=True)
 
 # Mirrored from udata/api/limits.py.
-HARVEST_PREVIEW_PER_MIN = 5  # HARVEST_PREVIEW_LIMIT = "5 per minute; ..."
+HARVEST_PREVIEW_PER_MIN = 20  # HARVEST_PREVIEW_LIMIT = "20 per minute; ..."
+# What the per-source route fell under before it carried a limit of its own:
+# RATELIMIT_DEFAULT = "1000 per day;200 per hour" (udata/settings.py), keyed on
+# the remote address rather than the user.
+IP_DEFAULT_PER_HOUR = 200
 
 BLOCK_STATUSES = (429, 403)
 
@@ -98,4 +103,29 @@ class HarvestConfigPreviewLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
         )
         assert statuses[-1] == 429, (
             f"the attempt past the ceiling was not rate-limited. statuses={statuses}"
+        )
+
+
+class HarvestSourcePreviewLiftedAboveIpDefaultTest(MockBackendsMixin, PytestOnlyAPITestCase):
+    """The per-source preview route must carry the same limit as the config route.
+
+    It is the route the backoffice sends every read-only preview to — an org
+    editor's, an owner's — and it costs exactly what the config route costs: the
+    same `actions.preview` walking the same remote catalogue. Left unlimited it
+    fell under the IP-keyed `RATELIMIT_DEFAULT`, which behind the F5 is one
+    bucket for the whole site, so a single caller previewing in a loop answers
+    429 to everyone else's preview.
+    """
+
+    @pytest.mark.options(**RATELIMIT_OPTIONS)
+    def test_source_preview_throttles_at_harvest_preview_limit(self):
+        source = HarvestSourceFactory()
+        url = url_for("api.preview_harvest_source", source=source)
+        statuses = _statuses(self.get(url) for _ in range(HARVEST_PREVIEW_PER_MIN + 3))
+        _assert_throttled_at(statuses, HARVEST_PREVIEW_PER_MIN, "preview_harvest_source")
+
+        assert HARVEST_PREVIEW_PER_MIN < IP_DEFAULT_PER_HOUR, (
+            "the route must be throttled well before the shared IP-keyed default "
+            "it used to fall under, or moving the backoffice's previews here made "
+            "the outbound ceiling looser rather than tighter"
         )
