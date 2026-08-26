@@ -3,12 +3,13 @@
 ## Unreleased
 
 - **fix(tests): restore a green backend test suite and gate it in CI**
-  - `develop` entered red: 43 failures, 3 errors and 15 lint problems. With a red
+  - `develop` entered red: 44 failures, 9 errors and 15 lint problems. With a red
     baseline nobody could tell "my failure" from "the failure that was already
     there" without running the suite twice and diffing the lists by hand, which
     is what the previous two tickets had to do — one of them closed with an
-    explicit override of the push gate.
-  - Fourteen failures and all three errors were the suite disagreeing with the
+    explicit override of the push gate. Seven of those failures had been written
+    off as flaky and left out of the count; none of them was flaky.
+  - Fourteen failures and three errors were the suite disagreeing with the
     code rather than the code being wrong: upstream registration fixtures used a
     password this fork's policy rejects, a real reCAPTCHA secret leaked from a
     local `.env` into the test app, the CORS allowlist was never declared for the
@@ -73,6 +74,58 @@
     service-provider credentials that are deliberately git-ignored, so they are now
     skipped when those files are absent and still run where they exist.
 
+- **fix(harvest): refuse to update a record that already belongs to another org or user**
+  - `BaseBackend.get_dataset` looked a dataset up by `harvest.remote_id` alone
+    whenever that id parsed as a URI, skipping the source/domain scoping the
+    non-URI branch has always applied. Remote ids are attacker-supplied — they
+    come straight out of the remote catalogue's payload — and they are public,
+    since `harvest.remote_id` is served on `/api/1/datasets/<id>/`. Anyone able
+    to register a harvest source (any authenticated user) could therefore point
+    one at a catalogue they control, echo a URI-shaped remote id belonging to
+    someone else's source, and have the harvest silently repoint that dataset:
+    its `harvest.source_id` moved to the attacker's source and its content was
+    overwritten from the attacker's payload.
+  - The unscoped URI lookup is deliberate — it deduplicates the same DCAT record
+    harvested under two different domains when `dct:identifier` is a stable URI —
+    so the fix keeps it and refuses the *match* instead: a lookup that lands on a
+    record harvested by a different source and owned by a different organization
+    or user now raises, the harvest item is reported as failed, and the record is
+    left untouched. The guard lives on the base class, so it covers every backend
+    and dataservices as well as datasets, rather than being worked around in one
+    harvester.
+  - Scoping it to *other* sources is a deliberate departure from the upstream
+    guard this is based on, and it is what makes it safe here. Upstream compares
+    owners outright, which it can afford because none of its backends writes
+    `dataset.organization`; `ckanpt` and `odspt` do, mapping each remote
+    publisher onto a local organization, so their records routinely belong to
+    someone other than the source harvesting them. Compared against production
+    first: the owner-only form would have failed 229 datasets across five sources
+    on every subsequent run — 131 of the 144 on the health transparency portal,
+    84 of the 400 on Lisbon's, and the rest on Porto, Oeiras and ICNF. A record
+    the current source already harvested is never the takeover being guarded
+    against.
+  - Two sources under the *same* owner can still hand a record over to each
+    other; that is the legitimate source-migration case, and it is what keeps
+    re-harvesting from duplicating. A record with neither an organization nor an
+    owner is likewise still claimable — no such record was observed in
+    production, though purging an organization would create them in bulk.
+  - The INE harvester builds its own lookup and writes through a bulk path
+    instead of going through the shared one, so it stays outside this guard
+    entirely. Its records are therefore no better protected than before, and the
+    domain scoping it does apply is not itself a defence — `HarvestSource.domain`
+    reads `netloc` rather than `hostname`, so any URL can claim any domain
+    through a userinfo prefix. That is being tracked separately; nothing here
+    depends on it.
+  - Production was audited before the change: of 19 144 harvested datasets
+    across 38 sources, 61 carry a URI-shaped remote id — the only ones that ever
+    reached the unscoped lookup — and all 61 sit on the two sources that
+    legitimately publish them. The 84 remote ids shared between sources are all
+    UUID-shaped and each resolved to two distinct datasets, which is the scoped
+    branch working as intended, and no remote id was duplicated within a single
+    source. No record appears to have been taken over. The audit cannot be
+    conclusive on its own — a completed takeover leaves a single dataset on the
+    attacker's source and looks exactly like an ordinary harvest — so the
+    evidence is the absence of any URI-shaped remote id on more than one source.
 - **feat(dataset)!: filter multiple tags with OR instead of AND**
   - The dataset listing's keyword filter is multi-select, and every other
     multi-select filter already answered OR (`license`, `format`, `frequency`,
