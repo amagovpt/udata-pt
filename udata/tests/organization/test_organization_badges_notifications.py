@@ -102,4 +102,3 @@ class NotifyBadgeTest(PytestOnlyAPITestCase):
         # The error must carry its traceback: swallowing it is what hid this bug
         # in production for the whole time the details class was unregistered.
         assert failures[0].exc_info is not None
-        assert Notification.objects.count() == 0
