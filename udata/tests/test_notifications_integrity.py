@@ -1,8 +1,16 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
 from udata.core.discussions.notifications import DiscussionNotificationDetails, DiscussionStatus
+from udata.core.organization.constants import CERTIFIED
+from udata.core.organization.factories import OrganizationFactory
+from udata.core.organization.notifications import (
+    MembershipRequestNotificationDetails,
+    NewBadgeNotificationDetails,
+)
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.features.notifications.models import Notification
 from udata.features.transfer.factories import TransferFactory
@@ -131,6 +139,36 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         purge_sources()
 
         # Verify notification is cleaned up (via purge function)
+        assert Notification.objects.count() == 0
+
+    def test_organization_notification_cleanup_on_organization_purge(self):
+        """Test that notifications are cleaned up when an organization is purged."""
+        from udata.core.organization import tasks
+
+        user = UserFactory()
+        org = OrganizationFactory(deleted=datetime.now(UTC))
+
+        # One notification per branch of with_organization_in_details: badge details
+        # keep the organization in `details.organization`, a membership request keeps
+        # it in `details.request_organization`.
+        Notification(
+            user=user,
+            details=NewBadgeNotificationDetails(organization=org, kind=CERTIFIED),
+        ).save()
+        Notification(
+            user=user,
+            details=MembershipRequestNotificationDetails(
+                request_organization=org, request_user=user
+            ),
+        ).save()
+
+        # Verify notifications exist
+        assert Notification.objects.count() == 2
+
+        # Purge the deleted organization
+        tasks.purge_organizations()
+
+        # Verify notifications are cleaned up (via purge function)
         assert Notification.objects.count() == 0
 
     @pytest.mark.xfail(strict=True, reason=R3)

@@ -1,5 +1,5 @@
 from flask_restx.inputs import boolean
-from mongoengine import NULLIFY
+from mongoengine import NULLIFY, Q
 
 from udata.api_fields import field, generate_fields
 from udata.core.discussions.notifications import DiscussionNotificationDetails
@@ -22,7 +22,9 @@ from udata.mongo.uuid_fields import AutoUUIDField
 class NotificationQuerySet(UDataQuerySet):
     def with_organization_in_details(self, organization):
         """This function must be updated to handle new details cases"""
-        return self(details__request_organization=organization)
+        return self.filter(
+            Q(details__request_organization=organization) | Q(details__organization=organization)
+        )
 
     def with_user_in_details(self, user):
         """This function must be updated to handle new details cases"""
