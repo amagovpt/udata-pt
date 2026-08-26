@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import defusedxml.ElementTree as DET
 import requests
 from flask import current_app
 from slugify import slugify
@@ -256,7 +257,7 @@ class INEBackend(BaseBackend):
             # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
             resp = self.get(url, timeout=30)
             resp.raise_for_status()
-            root = ET.fromstring(resp.content)
+            root = DET.fromstring(resp.content)
             ids = {ind.attrib["id"] for ind in root.findall(".//indicator") if "id" in ind.attrib}
             self._log.info("[INE] HVD IDs carregados: %s", len(ids))
             return ids
@@ -682,7 +683,14 @@ class INEBackend(BaseBackend):
 
             # Fase 1: Criação do iterador sobre o XML
             # source_context pode ser file path ou file-like object (BytesIO)
-            context = ET.iterparse(source_context, events=("start", "end"))
+            # Hardened parser: the catalog body is remote and, through the
+            # preview endpoint, caller-supplied. defusedxml refuses DTD entity
+            # definitions and external references by default, which is what
+            # turns a billion-laughs body from a worker-memory DoS into a clean
+            # harvest failure. The elements it yields are ordinary stdlib ones,
+            # so `elem.clear()` and the `ET.Element` type hints still hold — the
+            # stdlib import stays because defusedxml does not re-export Element.
+            context = DET.iterparse(source_context, events=("start", "end"))
             context = iter(context)
             event, root = next(context)  # Pega o elemento raiz
 

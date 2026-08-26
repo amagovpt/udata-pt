@@ -509,3 +509,55 @@ class INELocalFilePathTest(PytestOnlyDBTestCase):
         backend.harvest()
 
         assert not os.path.exists(backend.LOCAL_FILE_PATH)
+
+
+# Billion laughs, cut short enough to stay a test: each entity expands into ten
+# of the one below it. The closing </catalog> matters — without it the download
+# integrity check rejects the payload and the parser is never reached.
+ENTITY_BOMB_XML = (
+    "<?xml version='1.0' encoding='UTF-8'?>\n"
+    "<!DOCTYPE catalog [\n"
+    "<!ENTITY a 'aaaaaaaaaa'>\n"
+    "<!ENTITY b '&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;'>\n"
+    "<!ENTITY c '&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;'>\n"
+    "]>\n"
+    "<catalog>\n"
+    "<indicator id='0001'><title><![CDATA[Indicador]]></title>"
+    "<description>&c;</description></indicator>\n"
+    "</catalog>\n"
+)
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEXmlHardeningTest(PytestOnlyDBTestCase):
+    """The catalog body is remote, and through the preview endpoint it is
+    caller-supplied. The stdlib parser expands internal general entities, so the
+    same request that previews a harvester was also a worker-memory DoS."""
+
+    def _harvest(self, rmock, tmp_path, source, **kwargs):
+        rmock.get(INE_URL, text=ENTITY_BOMB_XML)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source, **kwargs)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def test_entity_expansion_fails_the_harvest_instead_of_expanding(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert job.status == "failed"
+        assert job.errors
+        assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 0
+
+    def test_preview_of_a_hostile_catalog_fails_cleanly(self, rmock, tmp_path):
+        source = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+
+        job = self._harvest(rmock, tmp_path, source, dryrun=True)
+
+        assert job.status == "failed"
+        assert Dataset.objects(__raw__={"harvest.source_id": str(source.id)}).count() == 0
