@@ -2,12 +2,20 @@ name: Tests
 
 on:
   push:
+    # Environment branches only. Feature branches are covered by the
+    # pull_request trigger, so this avoids running the suite twice per PR.
+    branches: [develop, tst, ppr, main]
   pull_request:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   python:
     name: Lint and test suite
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     services:
       mongo:
@@ -23,8 +31,11 @@ jobs:
       # Run against settings.Defaults + settings.Testing only. udata.cfg is tracked in
       # this repo and create_app loads it over the defaults, so leaving it in place would
       # make the suite depend on a deployment config file (and on whichever .env keys the
-      # runner happens to have). Pointing UDATA_SETTINGS at a path that does not exist
-      # skips that load entirely, which is what udata/tests/__init__.py asks for.
+      # runner happens to have -- with no .env its unconditional _env_int/_env_bool calls
+      # resolve the password policy to zero length and no requirements). Pointing
+      # UDATA_SETTINGS at a path that does not exist skips that load entirely, which is
+      # what udata/tests/__init__.py asks for. The deployment config is checked on its
+      # own, in the step at the end of this job.
       UDATA_SETTINGS: /nonexistent/udata.cfg
 
     steps:
@@ -38,8 +49,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # Plain `uv sync` installs the default dependency-group. This project has no
+      # [project.optional-dependencies] table, so `--extra dev` / `--extra test` are not
+      # valid here and abort the install.
       - name: Install dependencies
-        run: uv sync --frozen --extra dev --extra test
+        run: uv sync --frozen
 
       - name: Lint
         run: uv run ruff check --extend-select I .
@@ -49,3 +63,12 @@ jobs:
 
       - name: Test suite
         run: uv run inv test --ci
+
+      # The suite above deliberately ignores udata.cfg, which would otherwise hide drift
+      # in the file itself. Run the download-proxy config assertions once more with the
+      # tracked config loaded, so lowering a timeout there fails here instead of
+      # surfacing as a 502 in production.
+      - name: Deployment config assertions
+        env:
+          UDATA_SETTINGS: ${{ github.workspace }}/udata.cfg
+        run: uv run pytest udata/tests/dataset/test_proxy_download.py -k ProxyDownloadTimeoutConfigTest
