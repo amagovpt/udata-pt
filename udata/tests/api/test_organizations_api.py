@@ -977,8 +977,13 @@ class MembershipAPITest(PytestOnlyAPITestCase):
     def test_suggest_organizations_api(self):
         """It should suggest organizations"""
         for i in range(3):
+            # The non-matching names are fixed rather than faker-generated. Suggestion is
+            # not a substring match - it folds accents - so a random word can come back
+            # for "tes" (a run picked up "site"), which made the assertions below depend
+            # on faker's sequence, and therefore on how many tests ran before this one.
             OrganizationFactory(
-                name="test-{0}".format(i) if i % 2 else faker.word(), metrics={"followers": i}
+                name="test-{0}".format(i) if i % 2 else "unrelated-{0}".format(i),
+                metrics={"followers": i},
             )
         max_follower_organization = OrganizationFactory(name="test-4", metrics={"followers": 10})
         response = self.get(url_for("api.suggest_organizations", q="tes", size=5))
