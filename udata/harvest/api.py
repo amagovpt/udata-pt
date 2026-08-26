@@ -499,6 +499,14 @@ class PreviewSourceConfigAPI(API):
         form = api.validate(HarvestSourceForm)
         if form.organization.data:
             form.organization.data.permissions["harvest"].test()
+        else:
+            # A payload that names no organization used to pass no authorization
+            # test at all, and this is the one route that makes the server run a
+            # harvest backend against a URL the caller chose. Creating a source
+            # is inert by comparison (it lands VALIDATION_PENDING, validating is
+            # admin_permission, and RunSourceAPI refuses anything not accepted),
+            # so there is nothing else to weigh the organization against here.
+            admin_permission.test()
         return actions.preview_from_config(**form.data)
 
 

@@ -554,10 +554,56 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         launch.assert_not_called()
 
     def test_source_from_config(self):
+        """It should preview a config for an organization the user may harvest for"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        data = {
+            "name": faker.word(),
+            "url": faker.url(),
+            "backend": "factory",
+            "organization": str(org.id),
+        }
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
+        assert200(response)
+
+    def test_source_from_config_without_org_requires_admin(self):
+        """It should refuse a config preview that names no organization
+
+        This is the route that makes the server run a harvest backend against a
+        URL the caller chose, and a payload with no organization leaves nothing
+        to weigh that against. Being logged in used to be the whole test.
+        """
         self.login()
         data = {"name": faker.word(), "url": faker.url(), "backend": "factory"}
         response = self.post(url_for("api.preview_harvest_source_config"), data)
+        assert403(response)
+
+    def test_source_from_config_without_org_as_admin(self):
+        """It should preview a config with no organization for a sysadmin"""
+        self.login(AdminFactory())
+        data = {"name": faker.word(), "url": faker.url(), "backend": "factory"}
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
         assert200(response)
+
+    def test_source_from_config_with_org_not_member(self):
+        """It should refuse a config preview for an organization the user only edits
+
+        `Organization.permissions["harvest"]` is `EditOrganizationPermission`,
+        which admits org admins and not editors — the same line `POST
+        /harvest/sources/` already draws.
+        """
+        user = self.login()
+        member = Member(user=user, role="editor")
+        org = OrganizationFactory(members=[member])
+        data = {
+            "name": faker.word(),
+            "url": faker.url(),
+            "backend": "factory",
+            "organization": str(org.id),
+        }
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
+        assert403(response)
 
     def test_delete_source(self):
         user = self.login()
