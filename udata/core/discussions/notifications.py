@@ -31,7 +31,9 @@ class DiscussionNotificationDetails(db.EmbeddedDocument):
         auditable=False,
     )
     message_id = field(
-        db.StringField(),
+        # binary=False on purpose: upstream's plain UUIDField() would store BSON Binary,
+        # which no notification written so far matches -- every one was saved as str(uuid).
+        db.UUIDField(binary=False),
         readonly=True,
         auditable=False,
     )

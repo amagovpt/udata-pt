@@ -41,7 +41,7 @@ def migrate(db):
                                 user=user,
                                 details=DiscussionNotificationDetails(
                                     status=DiscussionStatus.NEW_COMMENT,
-                                    message_id=str(last_comment.id),
+                                    message_id=last_comment.id,
                                     discussion=discussion,
                                 ),
                             )
