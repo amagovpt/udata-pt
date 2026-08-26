@@ -976,16 +976,21 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
     def test_suggest_organizations_api(self):
         """It should suggest organizations"""
+        # Both the names and the descriptions are fixed rather than faker-generated.
+        # The endpoint matches the query against name, acronym *and* description, so a
+        # faker-generated description containing "tes" makes an organization whose name
+        # does not match come back anyway - which broke the name assertion below
+        # depending on how many tests had consumed faker before this one.
+        NO_MATCH = "fixture description without the query"
         for i in range(3):
-            # The non-matching names are fixed rather than faker-generated. Suggestion is
-            # not a substring match - it folds accents - so a random word can come back
-            # for "tes" (a run picked up "site"), which made the assertions below depend
-            # on faker's sequence, and therefore on how many tests ran before this one.
             OrganizationFactory(
                 name="test-{0}".format(i) if i % 2 else "unrelated-{0}".format(i),
+                description=NO_MATCH,
                 metrics={"followers": i},
             )
-        max_follower_organization = OrganizationFactory(name="test-4", metrics={"followers": 10})
+        max_follower_organization = OrganizationFactory(
+            name="test-4", description=NO_MATCH, metrics={"followers": 10}
+        )
         response = self.get(url_for("api.suggest_organizations", q="tes", size=5))
         assert200(response)
 
@@ -999,7 +1004,10 @@ class MembershipAPITest(PytestOnlyAPITestCase):
             assert "image_url" in suggestion
             assert "acronym" in suggestion
             assert "tes" in suggestion["name"]
-            assert response.json[0]["id"] == str(max_follower_organization.id)
+
+        # Ranked by followers: the organization with 10 comes first. Asserted once,
+        # outside the loop it used to sit in.
+        assert response.json[0]["id"] == str(max_follower_organization.id)
 
     def test_suggest_organizations_with_special_chars(self):
         """It should suggest organizations with special caracters"""
