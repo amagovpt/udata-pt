@@ -1,6 +1,6 @@
+import logging
 from datetime import UTC, datetime
-
-import pytest
+from unittest import mock
 
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
@@ -12,30 +12,16 @@ from udata.core.organization.notifications import (
     NewBadgeNotificationDetails,
 )
 from udata.core.user.factories import AdminFactory, UserFactory
-from udata.features.notifications.models import Notification
+from udata.features.notifications.models import Notification, NotificationQuerySet
 from udata.features.transfer.factories import TransferFactory
 from udata.harvest.notifications import ValidateHarvesterNotificationDetails
 from udata.harvest.tests.factories import HarvestSourceFactory
 from udata.tests.api import PytestOnlyDBTestCase
 
-# Known failures owned by out-of-scope root causes. Each reason names the ticket that
-# owns the production bug; strict=True means a fix turns the XPASS red and forces the
-# marker to be removed by the same change.
-
-R3 = (
-    "LEDG-2328 pending. Notification.message_id is a StringField where upstream has a "
-    "UUIDField (udata/core/discussions/notifications.py:32-36), and the cleanup receivers "
-    "for on_discussion_deleted and on_discussion_message_deleted are missing entirely, so "
-    "deleting a discussion or a message leaves orphaned notifications. This is a "
-    "production bug being recorded, not a stale test: when it is fixed this starts "
-    "passing and strict=True turns the XPASS red, forcing the marker out."
-)
-
 
 class NotificationIntegrityTest(PytestOnlyDBTestCase):
     """Test notification cleanup when referenced documents are deleted."""
 
-    @pytest.mark.xfail(strict=True, reason=R3)
     def test_discussion_notification_cleanup_on_discussion_delete(self):
         """Test that notifications are cleaned up when a discussion is deleted."""
         # Create a user and discussion with messages
@@ -171,7 +157,6 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         # Verify notifications are cleaned up (via purge function)
         assert Notification.objects.count() == 0
 
-    @pytest.mark.xfail(strict=True, reason=R3)
     def test_multiple_notifications_cleanup(self):
         """Test that multiple notifications are cleaned up correctly."""
         # Create users and discussions
@@ -220,7 +205,6 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         # Verify all notifications are cleaned up
         assert Notification.objects.count() == 0
 
-    @pytest.mark.xfail(strict=True, reason=R3)
     def test_discussion_notification_survives_message_delete(self):
         """Test that notifications are not broken when referenced messages are deleted."""
         user = UserFactory()
@@ -245,3 +229,41 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         discussion.remove_message(1)
 
         assert Notification.objects.count() == 0
+
+    def test_discussion_cleanup_failure_logs_traceback(self, caplog):
+        """Test that a cleanup that fails to delete logs its traceback"""
+        user = UserFactory()
+        dataset = DatasetFactory()
+        message = MessageDiscussionFactory(posted_by=user)
+        discussion = DiscussionFactory(user=user, subject=dataset, discussion=[message])
+
+        notification = Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=discussion.discussion[0].id,
+            ),
+        )
+        notification.save()
+
+        # Patch the notification queryset only: patching QuerySet.delete outright would also
+        # hit the super().delete() that runs before the signal is sent.
+        with (
+            mock.patch.object(
+                NotificationQuerySet, "delete", side_effect=ValueError("cannot delete")
+            ),
+            caplog.at_level(logging.ERROR, logger="udata.core.discussions.notifications"),
+        ):
+            discussion.delete()
+
+        failures = [
+            record
+            for record in caplog.records
+            if "Error cleaning up notifications for discussion" in record.getMessage()
+        ]
+        assert failures, [record.getMessage() for record in caplog.records]
+
+        # The error must carry its traceback: a swallowed one is what kept the missing
+        # receivers invisible in production.
+        assert failures[0].exc_info is not None
