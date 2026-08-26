@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **test(tests): allow a distinct Mongo test database per checkout**
+  - The xdist worker split already gave each worker its own database, but the name was
+    hardcoded, so the isolation ended at the run: `_clean_db` truncates every collection
+    before each test, and two runs sharing a name therefore wipe each other's fixtures
+    mid-test. That happens whenever the repository is checked out twice — a git worktree
+    per branch, one session per ticket — and both run pytest.
+  - `UDATA_TEST_MONGO_PREFIX` now sets the database prefix, with or without xdist. Unset,
+    every path resolves to exactly the same name as before, so nothing changes for CI or
+    for a normal local run; set, each checkout gets its own databases and the suites can
+    run at the same time.
+
 - **fix(tests): restore a green backend test suite and gate it in CI**
   - `develop` entered red: 44 failures, 9 errors and 15 lint problems. With a red
     baseline nobody could tell "my failure" from "the failure that was already
