@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: Lint and test suite
+    runs-on: ubuntu-latest
+
+    services:
+      mongo:
+        image: mongo:7.0.28
+        ports:
+          - 27017:27017
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    env:
+      # Run against settings.Defaults + settings.Testing only. udata.cfg is tracked in
+      # this repo and create_app loads it over the defaults, so leaving it in place would
+      # make the suite depend on a deployment config file (and on whichever .env keys the
+      # runner happens to have). Pointing UDATA_SETTINGS at a path that does not exist
+      # skips that load entirely, which is what udata/tests/__init__.py asks for.
+      UDATA_SETTINGS: /nonexistent/udata.cfg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev --extra test
+
+      - name: Lint
+        run: uv run ruff check --extend-select I .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Test suite
+        run: uv run inv test --ci
