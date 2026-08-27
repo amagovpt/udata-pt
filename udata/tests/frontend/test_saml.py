@@ -569,19 +569,47 @@ class SAMLLoginFlowTest(APITestCase):
             assert response.status_code == 302
             assert "login" not in response.location.lower()
 
-    def test_unconfirmed_user_is_auto_confirmed_and_logged_in(self):
-        """SAML users are auto-confirmed since autenticacao.gov already verified them."""
+    def test_unconfirmed_user_without_pending_marker_is_auto_confirmed(self):
+        """The SAML auto-confirm survives, but only where it was ever
+        justified: autenticacao.gov vouches for the IDENTITY, so a legacy
+        account, or one created by the wizard-disabled fallback, is confirmed
+        and logged in. It says nothing about an address the user declared
+        themselves — that case carries the pending marker and is gated
+        instead (see test_pending_marker_blocks_auto_confirm_and_login)."""
         from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
 
         with self.app.test_request_context():
             self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
             user = UserFactory(confirmed_at=None)
+            assert not (user.extras or {}).get("pending_email_confirmation")
 
             response = _handle_saml_user_login(user)
 
             assert response.status_code == 302
             assert user.confirmed_at is not None
             assert "login" not in response.location.lower()
+
+    def test_pending_marker_blocks_auto_confirm_and_login(self):
+        """The counterpart: with the marker set and no confirmation yet, the
+        same call neither confirms nor logs in, and sends the user back to
+        the wizard to be told a confirmation is pending."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
+
+        with self.app.test_request_context():
+            self.app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+            user = UserFactory(
+                confirmed_at=None,
+                extras={"auth_nic": _hash_nic("55556666"), "pending_email_confirmation": True},
+            )
+
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = _handle_saml_user_login(user)
+                assert mock_login.call_count == 0
+
+            assert response.status_code == 302
+            assert "/migrate-account" in response.location
+            user.reload()
+            assert user.confirmed_at is None
 
     def test_deleted_user_redirects_home(self):
         from udata.auth.saml.saml_plugin.saml_govpt import _handle_saml_user_login
