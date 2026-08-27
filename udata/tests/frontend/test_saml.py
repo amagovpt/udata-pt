@@ -2736,6 +2736,532 @@ class SAMLMigrationWizardTest(APITestCase):
         assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_with_own_legacy_email_points_the_candidate(self, mock_client_for):
+        """The dead end this ticket exists for. A CMD whose email and name both
+        miss lands on the account-creation step; the address the person then
+        types is their own portal account. Refusing it sends them back to retype
+        an address the server has already resolved. Point the candidate instead
+        — still linking nothing, still 409, ownership still unproven."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="teresa@example.pt",
+            password="S3cretPass!",
+            first_name="Teresa",
+            last_name="Matos",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="teresa.matos@servico.gov.pt",
+            nic="53535353",
+            first_name="Teresa Alexandra",
+            last_name="Matos Ribeiro",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["no_match"] is True
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        users_before = User.objects.count()
+
+        # Typed in a different casing, which only resolves because the search
+        # lookup is case-insensitive.
+        response = self.client.post("/saml/migration/skip", json={"email": "Teresa@Example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+        assert response.json["candidate_found"] is True
+        assert response.json["email"] == "t***@example.pt"
+
+        # Nothing was created and nothing was linked: this only points.
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+
+        with self.client.session_transaction() as sess:
+            pending = sess.get("saml_migration_pending")
+            # The wizard did not end — it moved to the linking branch.
+            assert pending is not None
+            assert pending["legacy_user_id"] == str(existing.id)
+            # Re-pointing kills any code issued for the previous target.
+            assert "migration_code" not in sess
+
+        # And the linking branch now works from here.
+        assert self.client.get("/saml/migration/pending").json["candidate"] is True
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_link_via_skip_divert_keeps_ownership_proof_and_next_login_is_direct(
+        self, mock_client_for
+    ):
+        """The whole path the divert opens, end to end: no_match -> own address
+        on the creation step -> candidate pointed -> code mailed to that same
+        account -> linked -> the next CMD login walks straight in.
+
+        The negative assertion is the point of the test as much as the positive
+        one: between the divert and the confirm, nothing is linked. The divert
+        is a signpost, not a grant.
+        """
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="joana@example.pt",
+            password="S3cretPass!",
+            first_name="Joana",
+            last_name="Pinto",
+        )
+        users_before = User.objects.count()
+
+        # 1. CMD brings a different address and a name that does not match.
+        response = self._sso_with(
+            mock_client_for,
+            email="joana.pinto@servico.gov.pt",
+            nic="55555555",
+            first_name="Joana Cristina",
+            last_name="Pinto Azevedo",
+        )
+        assert "/migrate-account" in response.headers["Location"]
+        assert self.client.get("/saml/migration/pending").json["no_match"] is True
+
+        # 2. On the creation step the user types their own portal address.
+        response = self.client.post("/saml/migration/skip", json={"email": "joana@example.pt"})
+        assert response.status_code == 409
+        assert response.json["candidate_found"] is True
+
+        # Still nothing linked, and nothing created.
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+        assert User.objects.count() == users_before
+
+        # 3. The code goes to the candidate account's own address — the one
+        #    thing that makes this a proof of ownership rather than a claim.
+        captured = {}
+
+        def _capture(user, code):
+            captured["user"] = user
+            captured["code"] = code
+
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
+            side_effect=_capture,
+        ):
+            response = self.client.post("/saml/migration/send-code")
+            assert response.status_code == 200
+        assert captured["user"].id == existing.id
+        assert captured["user"].email == "joana@example.pt"
+
+        # Ownership is still unproven right up to the confirm.
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+
+        # 4. Proving it links the identity to the existing account.
+        response = self.client.post(
+            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
+        )
+        assert response.status_code == 200
+        assert response.json["success"] is True
+
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert existing.extras.get("auth_nic") == _hash_nic("55555555")
+
+        # 5. The next CMD login resolves by NIC and skips the wizard entirely.
+        self.client.get("/logout", follow_redirects=False)
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                email="joana.pinto@servico.gov.pt",
+                nic="55555555",
+                first_name="Joana Cristina",
+                last_name="Pinto Azevedo",
+            )
+            assert mock_login.call_count == 1
+            assert mock_login.call_args[0][0].id == existing.id
+        assert response.status_code == 302
+        assert "/migrate-account" not in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_pending_does_not_suggest_an_address_taken_in_another_casing(self, mock_client_for):
+        """suggested_email exists so the creation step is never pre-filled with
+        an address that would only produce a guaranteed rejection. Checking it
+        exactly missed the case the skip's own uniqueness check catches: with
+        the CMD carrying Rui@Example.pt and the account at rui@example.pt, the
+        wizard offered the address and the submit then bounced it."""
+        UserFactory(
+            email="rui@example.pt",
+            password="S3cretPass!",
+            first_name="Rui",
+            last_name="Tavares",
+        )
+
+        # The name deliberately misses, so the identity reaches the creation
+        # step rather than being offered the account as a candidate.
+        self._sso_with(
+            mock_client_for,
+            email="Rui@Example.pt",
+            nic="60606060",
+            first_name="Rui Alexandre",
+            last_name="Tavares Pinho",
+        )
+
+        data = self.client.get("/saml/migration/pending").json
+        assert data["suggested_email"] is None
+        assert data["has_email"] is True
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_search_refuses_a_query_operator_instead_of_answering_it(self, mock_client_for):
+        """A JSON body can carry a dict, and a dict reaching a MongoEngine
+        query turns a field lookup into an operator lookup: {"$regex": "^adm"}
+        made `found` a per-character oracle over every registered address, and
+        handed back the domain plus the first character of the match."""
+        UserFactory(
+            email="admin.geral@example.pt",
+            password="S3cretPass!",
+            first_name="Admin",
+            last_name="Geral",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="tiago.cmd@servico.gov.pt",
+            nic="59595959",
+            first_name="Tiago Manuel",
+            last_name="Brito Faria",
+        )
+
+        for payload in (
+            {"email": {"$regex": "^adm"}},
+            {"email": {"$gt": ""}},
+            {"first_name": {"$ne": None}, "last_name": {"$ne": None}},
+        ):
+            response = self.client.post("/saml/migration/search", json=payload)
+            # Answered, not crashed, and nothing disclosed.
+            assert response.status_code == 200, payload
+            assert response.json["found"] is False, payload
+            assert "email" not in response.json, payload
+            with self.client.session_transaction() as sess:
+                assert sess["saml_migration_pending"]["legacy_user_id"] is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_case_insensitive_lookups_prefer_the_exactly_matching_row(self, mock_client_for):
+        """The unique index on User.email is case-sensitive, so a shadow row
+        differing only in case can exist — the email-change form and
+        _create_saml_user both still check exact. User orders by -created_at,
+        so a bare __iexact lookup hands back whichever row is NEWER. That would
+        point the wizard at the shadow and link the CMD to an empty account,
+        orphaning the real one. Where two rows answer to one address, the row
+        that matches exactly is the one the caller meant.
+        """
+        from udata.core.user.models import User
+
+        real = UserFactory(
+            email="sara@example.pt",
+            password="S3cretPass!",
+            first_name="Sara",
+            last_name="Nunes",
+        )
+        shadow = UserFactory(
+            email="SARA@example.pt",
+            password="0therPass!",
+            first_name="Shadow",
+            last_name="Row",
+        )
+        # Both rows really do coexist, and the shadow is the newer one.
+        assert User.objects(email__iexact="sara@example.pt").count() == 2
+        assert User.objects(email__iexact="sara@example.pt").first().id == shadow.id
+
+        self._sso_with(
+            mock_client_for,
+            email="joao.cmd@servico.gov.pt",
+            nic="56565656",
+            first_name="Joao Carlos",
+            last_name="Mendes Rocha",
+        )
+
+        # The search resolves the row the user typed, not the newest one.
+        response = self.client.post("/saml/migration/search", json={"email": "sara@example.pt"})
+        assert response.status_code == 200
+        assert response.json["found"] is True
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(real.id)
+
+        # And the ownership proof accepts the real account's own password,
+        # which is the path the shadow would otherwise have blocked.
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": "sara@example.pt", "password": "S3cretPass!"},
+        )
+        assert response.status_code == 200
+        real.reload()
+        assert real.extras.get("auth_nic") == _hash_nic("56565656")
+        shadow.reload()
+        assert not (shadow.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_divert_does_not_fire_for_an_identity_that_already_has_an_account(
+        self, mock_client_for
+    ):
+        """The `not linked` guard. The Flask session is a client-held signed
+        cookie, so a copy taken before the first skip can be replayed with the
+        pending state intact. Pointing a candidate then would let one identity
+        end up claiming a second account, so the divert stays off and the plain
+        refusal stands."""
+        from udata.core.user.models import User
+
+        legacy = UserFactory(
+            email="vera@example.pt",
+            password="S3cretPass!",
+            first_name="Vera",
+            last_name="Antunes",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="bruno.cmd@servico.gov.pt",
+            nic="57575757",
+            first_name="Bruno Filipe",
+            last_name="Costa Neves",
+        )
+        # Keep the pending state as it was before the first skip consumed it.
+        with self.client.session_transaction() as sess:
+            replayed = dict(sess["saml_migration_pending"])
+
+        response = self.client.post("/saml/migration/skip", json={"email": "bruno@example.pt"})
+        assert response.status_code == 200
+        created = User.objects(extras__auth_nic=_hash_nic("57575757")).first()
+        assert created is not None
+
+        # Replay, then aim at a perfectly linkable legacy account.
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = replayed
+
+        response = self.client.post("/saml/migration/skip", json={"email": "vera@example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+        assert "candidate_found" not in response.json
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        legacy.reload()
+        assert not (legacy.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_divert_invalidates_a_code_issued_for_the_previous_target(self, mock_client_for):
+        """The same target-confusion hole the search endpoint had, reached
+        through the skip instead. A code emailed for candidate A must not be
+        accepted once the divert has re-pointed the session at B."""
+        first = UserFactory(
+            email="alice@example.pt",
+            password="S3cretPass!",
+            first_name="Alice",
+            last_name="Ramos",
+        )
+        second = UserFactory(
+            email="bianca@example.pt",
+            password="S3cretPass!",
+            first_name="Bianca",
+            last_name="Sousa",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="carla.cmd@servico.gov.pt",
+            nic="58585858",
+            first_name="Carla Sofia",
+            last_name="Lopes Dias",
+        )
+
+        # Point A and get a code issued for it.
+        response = self.client.post("/saml/migration/search", json={"email": first.email})
+        assert response.json["found"] is True
+        captured = {}
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
+            side_effect=lambda user, code: captured.update(code=code),
+        ):
+            assert self.client.post("/saml/migration/send-code").status_code == 200
+
+        # Now the divert re-points at B.
+        response = self.client.post("/saml/migration/skip", json={"email": second.email})
+        assert response.status_code == 409
+        assert response.json["candidate_found"] is True
+
+        # The old code is gone, not merely mismatched.
+        with self.client.session_transaction() as sess:
+            assert "migration_code" not in sess
+        response = self.client.post(
+            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
+        )
+        assert response.status_code != 200
+        for account in (first, second):
+            account.reload()
+            assert not (account.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_still_refuses_emails_of_non_candidate_accounts(self, mock_client_for):
+        """The divert must not become a way in. It fires only where
+        _find_legacy_user returns an account, so an address held by one this
+        identity cannot claim is still refused — and refused *without*
+        candidate_found, which is what tells the wizard to say so rather than
+        offer a confirmation screen.
+
+        The 'deleted' case is asserted defensively, not as a scenario from
+        production: User.mark_as_deleted rewrites the address to <id>@deleted
+        and clears password and extras, so the original email is free again and
+        the skip creates a new account instead of reaching this branch.
+        """
+        from udata.core.user.models import User
+
+        # Already linked to a different CMD identity: linking it would
+        # overwrite that link and lock the other person out of CMD login.
+        other_cmd = UserFactory(
+            email="ines@example.pt",
+            password="S3cretPass!",
+            first_name="Ines",
+            last_name="Duarte",
+            extras={"auth_nic": _hash_nic("99999999")},
+        )
+        # No password: not a legacy account with portal credentials to
+        # migrate. The argument is omitted, not passed as None — the factory
+        # hashes whatever it is given, and hash_password(None) yields a
+        # perfectly truthy hash.
+        no_password = UserFactory(
+            email="rita@example.pt",
+            first_name="Rita",
+            last_name="Gomes",
+        )
+        deleted = UserFactory(
+            email="hugo@example.pt",
+            password="S3cretPass!",
+            first_name="Hugo",
+            last_name="Silva",
+            deleted=datetime(2025, 1, 1),
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="nuno.cmd@servico.gov.pt",
+            nic="54545454",
+            first_name="Nuno Miguel",
+            last_name="Ferreira Lopes",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        users_before = User.objects.count()
+
+        for account in (other_cmd, no_password, deleted):
+            response = self.client.post("/saml/migration/skip", json={"email": account.email})
+            assert response.status_code == 409, account.email
+            assert response.json["error"] == "email_taken", account.email
+            assert "candidate_found" not in response.json, account.email
+
+            # No account created, and no candidate pointed to confirm against.
+            assert User.objects.count() == users_before, account.email
+            with self.client.session_transaction() as sess:
+                assert sess["saml_migration_pending"]["legacy_user_id"] is None
+
+        # The other person's CMD link is untouched.
+        other_cmd.reload()
+        assert other_cmd.extras.get("auth_nic") == _hash_nic("99999999")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_email_match_is_case_insensitive_for_the_wizard_candidate(self, mock_client_for):
+        """Rule 2 is what decides migration_candidate. Exact-matching there sent
+        the owner of maria@ whose CMD carries Maria@ down the no_match branch —
+        asked to create an account they already have. The name deliberately does
+        not match, so only the email rule can produce the candidate."""
+        existing = UserFactory(
+            email="beatriz@example.pt",
+            password="S3cretPass!",
+            first_name="Beatriz",
+            last_name="Lima",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="Beatriz@Example.pt",
+            nic="51515151",
+            first_name="Beatriz Maria",
+            last_name="Lima Correia",
+        )
+
+        data = self.client.get("/saml/migration/pending").json
+        assert data["candidate"] is True
+        assert data["no_match"] is False
+        assert data["email"] == "b***@example.pt"
+
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(existing.id)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_confirm_with_password_accepts_a_differently_cased_email(self, mock_client_for):
+        """This branch stands in for the login form, which is case-insensitive.
+        Exact-matching failed the ownership proof for a *correct* password, and
+        the deliberately generic error made that indistinguishable from a wrong
+        one — a dead end with no way to tell what went wrong."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="claudia@example.pt",
+            password="S3cretPass!",
+            first_name="Claudia",
+            last_name="Faria",
+        )
+        users_before = User.objects.count()
+
+        self._sso_with(
+            mock_client_for,
+            email="claudia.cmd@example.pt",
+            nic="52525252",
+            first_name="Claudia",
+            last_name="Faria",
+        )
+
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={
+                "method": "password",
+                "email": "CLAUDIA@example.pt",
+                "password": "S3cretPass!",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json["success"] is True
+
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert existing.extras.get("auth_nic") == _hash_nic("52525252")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_search_finds_the_legacy_account_whatever_the_email_casing(self, mock_client_for):
+        """The search lookup was the last exact-match one in the wizard. Login
+        and recovery are case-INSENSITIVE, so the owner of maria@ who types
+        Maria@ — the one address they are sure of — must still find their own
+        account here, not be told none exists."""
+        existing = UserFactory(
+            email="maria@example.pt",
+            password="S3cretPass!",
+            first_name="Maria",
+            last_name="Sousa",
+        )
+
+        # Neither the CMD email nor the CMD name matches the account, so the
+        # wizard opens with no candidate pointed at all.
+        self._sso_with(
+            mock_client_for,
+            email="maria.sousa@servico.gov.pt",
+            nic="48484848",
+            first_name="Maria Isabel",
+            last_name="Sousa Pereira",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+
+        response = self.client.post("/saml/migration/search", json={"email": "MARIA@example.pt"})
+        assert response.status_code == 200
+        assert response.json["found"] is True
+        assert response.json["email"] == "m***@example.pt"
+
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(existing.id)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_stores_the_normalised_address(self, mock_client_for):
         """The stored address is the normalised one, as on the registration
         path — not the raw string, whose casing would otherwise decide which of

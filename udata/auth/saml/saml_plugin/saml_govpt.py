@@ -758,6 +758,30 @@ def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
     return user
 
 
+def _find_user_by_email_ci(email):
+    """Resolve an address case-insensitively, preferring an exact match.
+
+    Every login and recovery lookup is case-insensitive, so the wizard has to
+    be too. But the unique index on ``User.email`` is case-SENSITIVE, so
+    "maria@x.pt" and "MARIA@x.pt" can coexist (the email-change form and
+    _create_saml_user both still check exact), and ``User`` orders by
+    ``-created_at`` — a bare ``__iexact`` lookup would hand back whichever row
+    was created last. Where two rows answer to one address, the one the caller
+    typed is the one they meant.
+    """
+    from udata.core.user.models import User
+
+    if not email:
+        return None
+    matches = list(User.objects(email__iexact=email))
+    if not matches:
+        return None
+    for user in matches:
+        if user.email == email:
+            return user
+    return matches[0]
+
+
 def _has_linked_nic(user):
     """True when the account holds a properly linked (hashed) CMD identity.
 
@@ -829,7 +853,11 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     #    (password or email code) via the migration wizard. Accounts
     #    already linked to another CMD identity are not candidates.
     if user_email:
-        user = datastore.find_user(email=user_email)
+        # Case-insensitive, as everywhere else the wizard resolves an
+        # address: an exact match here sends the owner of "maria@x.pt" whose
+        # CMD carries "Maria@x.pt" down the no_match branch, making them ask
+        # for an account they already have.
+        user = _find_user_by_email_ci(user_email)
         if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
@@ -993,6 +1021,23 @@ def _mask_email(email):
     return f"{masked}@{domain}"
 
 
+def _point_migration_candidate(pending, user):
+    """Point the pending migration at ``user`` as the account to link.
+
+    The single place that mutates the candidate reference. Any code already
+    emailed was issued for a different target, so it has to die with the
+    re-point — copying that invariant to a second call site is how
+    target-confusion gets reintroduced.
+    """
+    # Store only the candidate reference — saml_email must keep holding
+    # the email coming from the CMD identity (or None), never the
+    # legacy account's email.
+    pending["legacy_user_id"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.pop("migration_code", None)
+    session.modified = True
+
+
 def _send_migration_code(user, code):
     """Send a verification code email for account migration."""
     msg = MailMessage(
@@ -1014,7 +1059,13 @@ def _find_legacy_user(email=None, first_name=None, last_name=None):
     """Find a legacy user (has password, no NIC, not deleted) by email or name."""
     user = None
     if email:
-        user = datastore.find_user(email=email)
+        # Case-insensitive, for the same reason the skip uniqueness check
+        # is: every login and recovery lookup goes through
+        # SECURITY_USER_IDENTITY_ATTRIBUTES, which is case-INSENSITIVE. An
+        # exact match here would leave the owner of "maria@x.pt" unable to
+        # find their own account by typing "Maria@x.pt" — the one address
+        # they are sure of.
+        user = _find_user_by_email_ci(email)
     elif first_name and last_name:
         from udata.core.user.models import User
 
@@ -2094,9 +2145,7 @@ def migration_pending():
     # the wizard pre-fills the account-creation field with it, and offering an
     # address that is already taken would only produce a guaranteed rejection.
     saml_email = pending.get("saml_email")
-    suggested_email = (
-        saml_email if saml_email and not datastore.find_user(email=saml_email) else None
-    )
+    suggested_email = saml_email if saml_email and not _find_user_by_email_ci(saml_email) else None
 
     # True only when the identity matched no account at all (as opposed to
     # matching several homonyms) AND carries a NIC. Both cases reach the
@@ -2146,24 +2195,23 @@ def migration_search():
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
 
+    # Coerce to strings at the boundary, as confirm and skip already do. A
+    # JSON body can carry a dict, and a dict reaching a MongoEngine query is
+    # how a field lookup becomes an operator lookup: `{"$regex": "^adm"}`
+    # turned this endpoint's `found` flag into a per-character oracle over
+    # every registered address. The case-insensitive lookup happens to reject
+    # it now — re.escape raises on a dict — but that is an accident of the
+    # query type, and it comes back as a 500 rather than an answer.
     data = request.get_json(silent=True) or {}
-    email = data.get("email")
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
+    email = str(data.get("email") or "").strip()
+    first_name = str(data.get("first_name") or "").strip()
+    last_name = str(data.get("last_name") or "").strip()
 
     user = _find_legacy_user(email=email, first_name=first_name, last_name=last_name)
     if not user:
         return jsonify({"found": False})
 
-    # Store only the candidate reference — saml_email must keep holding
-    # the email coming from the CMD identity (or None), never the
-    # legacy account's email.
-    pending["legacy_user_id"] = str(user.id)
-    session["saml_migration_pending"] = pending
-    # Any code previously emailed was issued for a different target —
-    # invalidate it so it cannot be replayed against the new candidate.
-    session.pop("migration_code", None)
-    session.modified = True
+    _point_migration_candidate(pending, user)
 
     return jsonify(
         {
@@ -2281,7 +2329,11 @@ def migration_confirm():
 
         email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        user = datastore.find_user(email=email) if email else None
+        # Case-insensitive, to match the login form this branch stands in
+        # for. Exact-matching here failed the ownership proof for a correct
+        # password, and the generic error below made that indistinguishable
+        # from a wrong one.
+        user = _find_user_by_email_ci(email)
         # Generic error on any failure to avoid account enumeration.
         if (
             not user
@@ -2390,6 +2442,27 @@ def migration_skip():
     linked = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
 
     if existing and (not linked or existing.id != linked.id):
+        # The address is taken — but by whom? If it is a legacy account this
+        # identity could legitimately claim, refusing is the wrong answer:
+        # linking it is exactly what the wizard exists for, and the machinery
+        # is one step away. Point the candidate and say so, instead of
+        # sending the user back to retype an address the server has already
+        # resolved. Nothing is linked here: ownership still has to be proven
+        # at migration_confirm, by password or by a code mailed to that same
+        # account. Guarded on `not linked` to keep the replay hardening below
+        # intact — note this only narrows the skip: migration_search already
+        # points an arbitrary candidate with no such guard, so the guard is
+        # local prudence, not a boundary the flow enforces.
+        candidate = _find_legacy_user(email=email) if not linked else None
+        if candidate:
+            _point_migration_candidate(pending, candidate)
+            return jsonify(
+                {
+                    "error": "email_taken",
+                    "candidate_found": True,
+                    "email": _mask_email(candidate.email),
+                }
+            ), 409
         return jsonify({"error": "email_taken"}), 409
 
     if linked:
