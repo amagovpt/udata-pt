@@ -758,6 +758,30 @@ def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
     return user
 
 
+def _find_user_by_email_ci(email):
+    """Resolve an address case-insensitively, preferring an exact match.
+
+    Every login and recovery lookup is case-insensitive, so the wizard has to
+    be too. But the unique index on ``User.email`` is case-SENSITIVE, so
+    "maria@x.pt" and "MARIA@x.pt" can coexist (the email-change form and
+    _create_saml_user both still check exact), and ``User`` orders by
+    ``-created_at`` — a bare ``__iexact`` lookup would hand back whichever row
+    was created last. Where two rows answer to one address, the one the caller
+    typed is the one they meant.
+    """
+    from udata.core.user.models import User
+
+    if not email:
+        return None
+    matches = list(User.objects(email__iexact=email))
+    if not matches:
+        return None
+    for user in matches:
+        if user.email == email:
+            return user
+    return matches[0]
+
+
 def _has_linked_nic(user):
     """True when the account holds a properly linked (hashed) CMD identity.
 
@@ -829,11 +853,11 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     #    (password or email code) via the migration wizard. Accounts
     #    already linked to another CMD identity are not candidates.
     if user_email:
-        # case_insensitive, as everywhere else the wizard resolves an
+        # Case-insensitive, as everywhere else the wizard resolves an
         # address: an exact match here sends the owner of "maria@x.pt" whose
         # CMD carries "Maria@x.pt" down the no_match branch, making them ask
         # for an account they already have.
-        user = datastore.find_user(case_insensitive=True, email=user_email)
+        user = _find_user_by_email_ci(user_email)
         if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
@@ -1035,13 +1059,13 @@ def _find_legacy_user(email=None, first_name=None, last_name=None):
     """Find a legacy user (has password, no NIC, not deleted) by email or name."""
     user = None
     if email:
-        # case_insensitive, for the same reason the skip uniqueness check
-        # uses it: every login and recovery lookup goes through
+        # Case-insensitive, for the same reason the skip uniqueness check
+        # is: every login and recovery lookup goes through
         # SECURITY_USER_IDENTITY_ATTRIBUTES, which is case-INSENSITIVE. An
         # exact match here would leave the owner of "maria@x.pt" unable to
         # find their own account by typing "Maria@x.pt" — the one address
         # they are sure of.
-        user = datastore.find_user(case_insensitive=True, email=email)
+        user = _find_user_by_email_ci(email)
     elif first_name and last_name:
         from udata.core.user.models import User
 
@@ -2300,11 +2324,11 @@ def migration_confirm():
 
         email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        # case_insensitive, to match the login form this branch stands in
+        # Case-insensitive, to match the login form this branch stands in
         # for. Exact-matching here failed the ownership proof for a correct
         # password, and the generic error below made that indistinguishable
         # from a wrong one.
-        user = datastore.find_user(case_insensitive=True, email=email) if email else None
+        user = _find_user_by_email_ci(email)
         # Generic error on any failure to avoid account enumeration.
         if (
             not user
@@ -2420,8 +2444,10 @@ def migration_skip():
         # sending the user back to retype an address the server has already
         # resolved. Nothing is linked here: ownership still has to be proven
         # at migration_confirm, by password or by a code mailed to that same
-        # account. Guarded on `not linked` so a replayed session cannot point
-        # a second account at an identity that already has one.
+        # account. Guarded on `not linked` to keep the replay hardening below
+        # intact — note this only narrows the skip: migration_search already
+        # points an arbitrary candidate with no such guard, so the guard is
+        # local prudence, not a boundary the flow enforces.
         candidate = _find_legacy_user(email=email) if not linked else None
         if candidate:
             _point_migration_candidate(pending, candidate)

@@ -2878,6 +2878,160 @@ class SAMLMigrationWizardTest(APITestCase):
         assert "/migrate-account" not in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_case_insensitive_lookups_prefer_the_exactly_matching_row(self, mock_client_for):
+        """The unique index on User.email is case-sensitive, so a shadow row
+        differing only in case can exist — the email-change form and
+        _create_saml_user both still check exact. User orders by -created_at,
+        so a bare __iexact lookup hands back whichever row is NEWER. That would
+        point the wizard at the shadow and link the CMD to an empty account,
+        orphaning the real one. Where two rows answer to one address, the row
+        that matches exactly is the one the caller meant.
+        """
+        from udata.core.user.models import User
+
+        real = UserFactory(
+            email="sara@example.pt",
+            password="S3cretPass!",
+            first_name="Sara",
+            last_name="Nunes",
+        )
+        shadow = UserFactory(
+            email="SARA@example.pt",
+            password="0therPass!",
+            first_name="Shadow",
+            last_name="Row",
+        )
+        # Both rows really do coexist, and the shadow is the newer one.
+        assert User.objects(email__iexact="sara@example.pt").count() == 2
+        assert User.objects(email__iexact="sara@example.pt").first().id == shadow.id
+
+        self._sso_with(
+            mock_client_for,
+            email="joao.cmd@servico.gov.pt",
+            nic="56565656",
+            first_name="Joao Carlos",
+            last_name="Mendes Rocha",
+        )
+
+        # The search resolves the row the user typed, not the newest one.
+        response = self.client.post("/saml/migration/search", json={"email": "sara@example.pt"})
+        assert response.status_code == 200
+        assert response.json["found"] is True
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(real.id)
+
+        # And the ownership proof accepts the real account's own password,
+        # which is the path the shadow would otherwise have blocked.
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": "sara@example.pt", "password": "S3cretPass!"},
+        )
+        assert response.status_code == 200
+        real.reload()
+        assert real.extras.get("auth_nic") == _hash_nic("56565656")
+        shadow.reload()
+        assert not (shadow.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_divert_does_not_fire_for_an_identity_that_already_has_an_account(
+        self, mock_client_for
+    ):
+        """The `not linked` guard. The Flask session is a client-held signed
+        cookie, so a copy taken before the first skip can be replayed with the
+        pending state intact. Pointing a candidate then would let one identity
+        end up claiming a second account, so the divert stays off and the plain
+        refusal stands."""
+        from udata.core.user.models import User
+
+        legacy = UserFactory(
+            email="vera@example.pt",
+            password="S3cretPass!",
+            first_name="Vera",
+            last_name="Antunes",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="bruno.cmd@servico.gov.pt",
+            nic="57575757",
+            first_name="Bruno Filipe",
+            last_name="Costa Neves",
+        )
+        # Keep the pending state as it was before the first skip consumed it.
+        with self.client.session_transaction() as sess:
+            replayed = dict(sess["saml_migration_pending"])
+
+        response = self.client.post("/saml/migration/skip", json={"email": "bruno@example.pt"})
+        assert response.status_code == 200
+        created = User.objects(extras__auth_nic=_hash_nic("57575757")).first()
+        assert created is not None
+
+        # Replay, then aim at a perfectly linkable legacy account.
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = replayed
+
+        response = self.client.post("/saml/migration/skip", json={"email": "vera@example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+        assert "candidate_found" not in response.json
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        legacy.reload()
+        assert not (legacy.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_divert_invalidates_a_code_issued_for_the_previous_target(self, mock_client_for):
+        """The same target-confusion hole the search endpoint had, reached
+        through the skip instead. A code emailed for candidate A must not be
+        accepted once the divert has re-pointed the session at B."""
+        first = UserFactory(
+            email="alice@example.pt",
+            password="S3cretPass!",
+            first_name="Alice",
+            last_name="Ramos",
+        )
+        second = UserFactory(
+            email="bianca@example.pt",
+            password="S3cretPass!",
+            first_name="Bianca",
+            last_name="Sousa",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="carla.cmd@servico.gov.pt",
+            nic="58585858",
+            first_name="Carla Sofia",
+            last_name="Lopes Dias",
+        )
+
+        # Point A and get a code issued for it.
+        response = self.client.post("/saml/migration/search", json={"email": first.email})
+        assert response.json["found"] is True
+        captured = {}
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
+            side_effect=lambda user, code: captured.update(code=code),
+        ):
+            assert self.client.post("/saml/migration/send-code").status_code == 200
+
+        # Now the divert re-points at B.
+        response = self.client.post("/saml/migration/skip", json={"email": second.email})
+        assert response.status_code == 409
+        assert response.json["candidate_found"] is True
+
+        # The old code is gone, not merely mismatched.
+        with self.client.session_transaction() as sess:
+            assert "migration_code" not in sess
+        response = self.client.post(
+            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
+        )
+        assert response.status_code != 200
+        for account in (first, second):
+            account.reload()
+            assert not (account.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_still_refuses_emails_of_non_candidate_accounts(self, mock_client_for):
         """The divert must not become a way in. It fires only where
         _find_legacy_user returns an account, so an address held by one this
