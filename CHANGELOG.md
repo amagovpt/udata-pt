@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **fix(saml): request every MDC attribute the CMD login actually needs as required**
+  - `sp_initiated()` asked Autenticação.gov for NIC, NomeProprio and NomeApelido
+    with `isRequired="False"` while only CorreioElectronico was required. All
+    four are consumed unconditionally on the ACS side: the NIC feeds the
+    NameID ↔ NIC binding that rejects an XSW-style wrapper assertion, and the
+    two names build or match the account. Declaring them optional described an
+    SP that can work without them, which is not this one, and left the login
+    depending on the PT node volunteering them.
+  - Mirrors the alignment already done for the eIDAS AuthnRequest, where the
+    Minimum Data Set attributes were promoted for the same reason: relying on
+    the node's downstream normalisation instead of stating the requirement was
+    fragile. The consent screen still lists exactly the same four attributes —
+    nothing new is requested, and nothing stops being requested.
 - **fix(saml): the wizard no longer refuses the one address the person is sure of**
   - `POST /saml/migration/skip` rejected any email already held by an account.
     Correct for someone else's address; wrong for the caller's *own* legacy

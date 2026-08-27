@@ -1225,17 +1225,17 @@ def sp_initiated():
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_FIRST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
         ]
     )
