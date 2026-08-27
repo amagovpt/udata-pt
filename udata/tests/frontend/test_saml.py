@@ -3525,6 +3525,141 @@ class SAMLMigrationWizardTest(APITestCase):
         finally:
             self.app.config["MIGRATION_MODE_ENABLED"] = True
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_send_link_mails_the_account_own_address_and_grants_no_session(self, mock_client_for):
+        """LEDG-2357: the validation link goes to the address already on the
+        legacy account, and sending it leaves the caller unauthenticated —
+        the click is what grants the session."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+        from udata.core.user.models import User
+
+        legacy = UserFactory(
+            email="rita.old@example.pt",
+            password="S3cretPass!",
+            first_name="Rita",
+            last_name="Nunes",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            nic="91827364",
+            first_name="Rita",
+            last_name="Nunes",
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post("/saml/migration/send-link")
+
+        assert response.status_code == 200
+        assert response.json == {"sent": True}
+
+        # Recipient is the account's own address, never one from the request.
+        assert mock_send.call_count == 1
+        assert mock_send.call_args[0][0].id == legacy.id
+
+        # The body names the requesting identity and warns against opening it.
+        body = " ".join(str(p) for p in mock_send.call_args[0][1].paragraphs)
+        assert "Rita Nunes" in body
+        assert "do NOT open the link" in body
+
+        # The pending record landed on the account, and carries no cleartext NIC.
+        legacy.reload()
+        record = (legacy.extras or {})[MIGRATION_LINK_PENDING]
+        assert record["nonce"]
+        assert record["nic_hash"] != "91827364"
+        assert "91827364" not in str(record)
+
+        # Nothing is linked yet and there is no session.
+        assert not (legacy.extras or {}).get("auth_nic")
+        assert self.client.get("/api/1/me/").status_code == 401
+        assert User.objects(id=legacy.id).first().confirmed_at is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_send_link_caps_sends_per_window_without_locking_the_account_out(self, mock_client_for):
+        """LEDG-2357: the cap stops a mail flood, but it is a window and not a
+        lifetime ceiling — otherwise five anonymous requests would deny the
+        owner the email route for good."""
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MIGRATION_LINK_SEND_COUNT,
+            MIGRATION_LINK_SEND_WINDOW,
+        )
+
+        legacy = UserFactory(
+            email="hugo.old@example.pt",
+            password="S3cretPass!",
+            first_name="Hugo",
+            last_name="Matos",
+        )
+
+        self._sso_with(mock_client_for, nic="19283746", first_name="Hugo", last_name="Matos")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            for _i in range(5):
+                assert self.client.post("/saml/migration/send-link").status_code == 200
+
+            response = self.client.post("/saml/migration/send-link")
+            assert response.status_code == 429
+            assert response.json["error"] == "Maximum confirmation sends exceeded"
+
+            # Roll the window back: the account is usable again, not bricked.
+            legacy.reload()
+            tally = legacy.extras[MIGRATION_LINK_SEND_COUNT]
+            tally["window_start"] = (
+                datetime.utcnow() - MIGRATION_LINK_SEND_WINDOW - timedelta(minutes=1)
+            ).isoformat()
+            legacy.extras[MIGRATION_LINK_SEND_COUNT] = tally
+            legacy.save()
+
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_send_link_refuses_without_a_candidate_or_when_already_linked(self, mock_client_for):
+        """LEDG-2357: no candidate pointed, an account already bound to an
+        identity, and migration mode off are all refused before any mail."""
+        legacy = UserFactory(
+            email="ana.old@example.pt",
+            password="S3cretPass!",
+            first_name="Ana",
+            last_name="Ferreira",
+        )
+
+        # No pending migration at all.
+        assert self.client.post("/saml/migration/send-link").status_code == 400
+
+        # Pending, but SAML brought no email and no name matched: no candidate.
+        self._sso_with(mock_client_for, nic="12121212", first_name="Zzz", last_name="Yyy")
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"].get("legacy_user_id") is None
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 400
+            assert mock_send.call_count == 0
+
+        # A candidate that already holds a linked identity is refused, so the
+        # wizard never mails a link the click would reject.
+        legacy.extras = {"auth_nic": _hash_nic("55555555")}
+        legacy.save()
+        self._sso_with(mock_client_for, nic="23232323", first_name="Ana", last_name="Ferreira")
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(legacy.id),
+                "saml_nic": "23232323",
+                "saml_first_name": "Ana",
+                "saml_last_name": "Ferreira",
+                "saml_email": None,
+            }
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post("/saml/migration/send-link")
+            assert response.status_code == 400
+            assert response.json["error"] == "Invalid credentials"
+            assert mock_send.call_count == 0
+
+        # Migration mode off: 403, like every sibling endpoint.
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        try:
+            assert self.client.post("/saml/migration/send-link").status_code == 403
+        finally:
+            self.app.config["MIGRATION_MODE_ENABLED"] = True
+
 
 class SAMLMigrationSecurityTest(APITestCase):
     """Adversarial tests for the account-linking wizard.

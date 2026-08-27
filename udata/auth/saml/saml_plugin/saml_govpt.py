@@ -30,7 +30,12 @@ from flask import (
 from flask_login import login_user, logout_user
 from flask_security.confirmable import requires_confirmation, send_confirmation_instructions
 from flask_security.decorators import anonymous_user_required
-from flask_security.utils import do_flash, get_message, verify_and_update_password
+from flask_security.utils import (
+    do_flash,
+    get_message,
+    hash_data,
+    verify_and_update_password,
+)
 from saml2 import (
     BINDING_HTTP_POST,
     BINDING_HTTP_REDIRECT,
@@ -87,7 +92,7 @@ from udata.app import csrf
 from udata.core.user.nic import hash_nic as _hash_nic
 from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
-from udata.mail import MailMessage, send_mail
+from udata.mail import MailCTA, MailMessage, send_mail
 from udata.models import datastore
 
 from .faa_level import FAAALevel, LogoutUrl
@@ -737,6 +742,32 @@ PENDING_EMAIL_CONFIRMATION = "pending_email_confirmation"
 CONFIRMATION_SEND_COUNT = "confirmation_send_count"
 MAX_CONFIRMATION_SENDS = 5
 
+# The pending validation link for a legacy-account link request, held on the
+# account it points at. It lives on the document rather than in the session
+# because the link must work with no session at all — its owner may well open
+# it in another browser — and because a mailed token is stateless: once sent,
+# only destroying this record can invalidate it. The nonce is the secret; the
+# URL carries nothing but its hash.
+MIGRATION_LINK_PENDING = "migration_link_pending"
+
+# How long a validation link stays usable. Deliberately far shorter than the
+# five days flask-security allows its own confirmation links, because this one
+# both opens a session and binds an identity permanently. The deadline is kept
+# on the record instead of in SECURITY_CONFIRM_EMAIL_WITHIN: that setting also
+# governs the account-creation link, which this flow does not own.
+MIGRATION_LINK_TTL = timedelta(minutes=30)
+
+# How many links one account may be sent, and over what window. Unlike
+# CONFIRMATION_SEND_COUNT this is NOT monotonic for life: there the recipient
+# is an address the wizard user typed, so the ceiling stops a stranger being
+# mailed at all; here the recipient is always the account's own address, so
+# the cap only has to stop a mail flood. A lifetime ceiling would let five
+# anonymous requests permanently deny an account's owner the email route,
+# leaving them only the password they came to the wizard without.
+MIGRATION_LINK_SEND_COUNT = "migration_link_send_count"
+MAX_MIGRATION_LINK_SENDS = 5
+MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
+
 
 def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
     """Create an account from a user-declared email, left unconfirmed.
@@ -1050,6 +1081,108 @@ def _send_migration_code(user, code):
             _("Your verification code is: %(code)s", code=code),
             _("This code expires in 10 minutes."),
             _("If you did not request this, ignore this email."),
+        ],
+    )
+    send_mail(user, msg)
+
+
+def _parse_isoformat(value):
+    """Parse an ISO-8601 stamp we wrote ourselves, tolerating a bad one.
+
+    These stamps live in ``extras`` on the account, so a document written by
+    an older build — or edited by hand — must degrade to "no deadline known"
+    rather than 500 on a click the user cannot retry.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _migration_link_send_allowed(user):
+    """Whether ``user`` may be sent another validation link right now.
+
+    Returns the tally to store alongside the answer, so the caller writes back
+    a window that has already been rolled over rather than recomputing it.
+    """
+    tally = (user.extras or {}).get(MIGRATION_LINK_SEND_COUNT) or {}
+    started = _parse_isoformat(tally.get("window_start"))
+    count = tally.get("count", 0)
+
+    if started is None or datetime.utcnow() - started >= MIGRATION_LINK_SEND_WINDOW:
+        return True, {"count": 1, "window_start": datetime.utcnow().isoformat()}
+
+    if count >= MAX_MIGRATION_LINK_SENDS:
+        return False, tally
+
+    return True, {"count": count + 1, "window_start": tally["window_start"]}
+
+
+def _issue_migration_link(user, pending):
+    """Record a pending link request on ``user`` and return its token.
+
+    The record carries everything the click needs — the hashed NIC and the
+    names from the assertion — so the consuming route never has to read the
+    session. A fresh nonce is minted on every call, which is what makes a
+    resend invalidate the link that preceded it.
+    """
+    nonce = secrets.token_urlsafe(32)
+
+    if not user.extras:
+        user.extras = {}
+    user.extras[MIGRATION_LINK_PENDING] = {
+        "nonce": nonce,
+        "nic_hash": _hash_nic(pending["saml_nic"]),
+        "first_name": pending.get("saml_first_name"),
+        "last_name": pending.get("saml_last_name"),
+        "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
+    }
+
+    # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
+    # outstanding sessions (LEDG-2134), and a password reset rotates it too,
+    # either of which would silently void a link the owner had not opened yet.
+    # The id is not the secret here — the nonce is.
+    serializer = current_app.extensions["security"].confirm_serializer
+    return serializer.dumps([str(user.id), hash_data(nonce)])
+
+
+def _send_migration_link(user, pending, token):
+    """Email the validation link that completes a legacy-account link.
+
+    The body is a security control, not decoration. The wizard reaches this
+    account without proving anything about it, so this mail is what stands
+    between a request nobody made and an identity bound to someone else's
+    account. Where a code was inert to a click — the owner had to transcribe
+    it for an attacker to get anywhere — a link is not: so it names the
+    identity that asked, and says plainly not to open it otherwise.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    link = f"{frontend_url}/saml/migration/confirm-link/{token}"
+
+    requester = " ".join(
+        part.title()
+        for part in (pending.get("saml_first_name"), pending.get("saml_last_name"))
+        if part
+    )
+
+    msg = MailMessage(
+        subject=_("Confirm linking a digital identity to your account"),
+        paragraphs=[
+            _(
+                "Someone signed in with the digital identity of %(name)s and asked "
+                "to link it to your %(site)s account.",
+                name=requester or _("an unnamed identity"),
+                site=current_app.config.get("SITE_TITLE", "dados.gov.pt"),
+            ),
+            _("Open the link below to complete the linking and sign in."),
+            MailCTA(label=_("Confirm linking"), link=link),
+            _("The link is valid for 30 minutes and can only be used once."),
+            _(
+                "If it was not you who started this, do NOT open the link and "
+                "ignore this email. Your account will not be changed."
+            ),
         ],
     )
     send_mail(user, msg)
@@ -2219,6 +2352,61 @@ def migration_search():
             "email": _mask_email(user.email),
         }
     )
+
+
+@autenticacao_gov.route("/saml/migration/send-link", methods=["POST"])
+@csrf.exempt
+def migration_send_link():
+    """Email a validation link to the candidate account's own address.
+
+    Proof of ownership of the legacy account is the click, so this endpoint
+    reads no body at all: the recipient is the address already on the account,
+    never one supplied with the request. It deliberately does not log anyone
+    in — the link is what grants the session, exactly as on the
+    account-creation branch (see migration_skip).
+    """
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
+    pending = session.get("saml_migration_pending")
+    if not pending:
+        return jsonify({"error": "No pending migration"}), 400
+
+    legacy_user_id = pending.get("legacy_user_id")
+    if not legacy_user_id:
+        return jsonify({"error": "No legacy user found"}), 400
+
+    if not pending.get("saml_nic"):
+        # Nothing to link. The assertion is the only source of the NIC, so
+        # this is a broken wizard session rather than a user error.
+        return jsonify({"error": "No pending migration"}), 400
+
+    from udata.core.user.models import User
+
+    user = User.objects(id=legacy_user_id).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    if _has_linked_nic(user):
+        # Already linked to some identity. Refuse here as well as on the
+        # click, so the wizard never mails a link the consuming route would
+        # then reject. Same generic wording as the password branch.
+        return jsonify({"error": "Invalid credentials"}), 400
+
+    allowed, tally = _migration_link_send_allowed(user)
+    if not allowed:
+        # Same message as the resend endpoint: the frontend already maps this
+        # exact string onto its "too many sends" copy.
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    token = _issue_migration_link(user, pending)
+    user.extras[MIGRATION_LINK_SEND_COUNT] = tally
+    user.save()
+
+    _send_migration_link(user, pending, token)
+    current_app.logger.info(f"Migration validation link sent to user {legacy_user_id}")
+
+    return jsonify({"sent": True})
 
 
 @autenticacao_gov.route("/saml/migration/send-code", methods=["POST"])
