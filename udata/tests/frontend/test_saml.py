@@ -2547,6 +2547,93 @@ class SAMLMigrationWizardTest(APITestCase):
         assert new_user.confirmed_at is None
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_repeat_cmd_login_with_pending_confirmation_does_not_login(self, mock_client_for):
+        """Criterion 11: the account created by the wizard already carries the
+        NIC, so a repeat CMD login resolves straight to it. It must not be
+        auto-confirmed nor logged in — otherwise the confirmation requirement
+        is just a 'try again'."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="tiago.old@example.pt",
+            password="S3cretPass!",
+            first_name="Tiago",
+            last_name="Nunes",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="tiago.cmd@example.pt",
+            nic="31313131",
+            first_name="Tiago",
+            last_name="Nunes",
+        )
+        self.client.post("/saml/migration/skip", json={"email": "tiago.novo@example.pt"})
+        created = User.objects(email="tiago.novo@example.pt").first()
+        assert created.confirmed_at is None
+
+        # Same identity comes back through the IdP.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                email="tiago.cmd@example.pt",
+                nic="31313131",
+                first_name="Tiago",
+                last_name="Nunes",
+            )
+            assert mock_login.call_count == 0
+
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        created.reload()
+        assert created.confirmed_at is None
+
+        data = self.client.get("/saml/migration/pending").json
+        assert data["pending"] is False
+        assert data["awaiting_confirmation"] is True
+        assert data["email"] == "t***@example.pt"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_login_after_confirmation_enters_directly(self, mock_client_for):
+        """Criteria 12/13: once the link is followed, confirmed_at is set, the
+        gate stops matching and the NIC takes the user straight in — no
+        second trip through the wizard."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="clara.old@example.pt",
+            password="S3cretPass!",
+            first_name="Clara",
+            last_name="Matos",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="clara.cmd@example.pt",
+            nic="32323232",
+            first_name="Clara",
+            last_name="Matos",
+        )
+        self.client.post("/saml/migration/skip", json={"email": "clara.nova@example.pt"})
+
+        # Stand in for the user following the emailed confirmation link.
+        created = User.objects(email="clara.nova@example.pt").first()
+        created.confirmed_at = datetime.utcnow()
+        created.save()
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                email="clara.cmd@example.pt",
+                nic="32323232",
+                first_name="Clara",
+                last_name="Matos",
+            )
+            assert mock_login.call_count == 1
+            assert mock_login.call_args[0][0].id == created.id
+
+        assert response.status_code == 302
+        assert "/migrate-account" not in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_refuses_an_identity_without_a_nic(self, mock_client_for):
         """An account with no auth_nic would not be excluded by
         _has_linked_nic, so on the next CMD login it would match itself as a

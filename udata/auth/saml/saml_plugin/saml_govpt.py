@@ -874,17 +874,35 @@ def _handle_saml_user_login(user, new_account=False):
         # browser-trace diagnosis (see _reject_saml_login).
         return redirect(f"{frontend_url}/login?saml_error=missing_attributes")
 
-    if requires_confirmation(user):
-        # Auto-confirm on SAML login — autenticação.gov already verified the user.
-        user.confirmed_at = datetime.utcnow()
-        datastore.commit()
-
     if user.deleted:
         current_app.logger.warning(
             f"[DEBUG] _handle_saml_user_login: user.deleted=True, email={user.email!r}"
         )
         do_flash(*get_message("DISABLED_ACCOUNT"))
         return redirect(frontend_url or "/")
+
+    # An account created by the wizard from a self-declared email must not be
+    # let in — nor auto-confirmed — until its owner follows the emailed link.
+    # This gate has to sit BEFORE the auto-confirm below: the account already
+    # carries the NIC, so a repeat CMD login resolves straight to it, and the
+    # auto-confirm would otherwise turn the whole confirmation requirement
+    # into a "just try again". The gate needs no cleanup: once confirmed_at is
+    # set by the stock confirm flow, it stops matching and the marker is inert.
+    if user.confirmed_at is None and (user.extras or {}).get(PENDING_EMAIL_CONFIRMATION):
+        current_app.logger.info(
+            f"SAML: login blocked, email confirmation still pending for user {user.id}"
+        )
+        # Identifies the user to the resend endpoint without authenticating
+        # them — the wizard shows the pending-confirmation screen from it.
+        session["saml_confirmation_pending"] = {"user_id": str(user.id)}
+        return redirect(f"{frontend_url}/migrate-account")
+
+    if requires_confirmation(user):
+        # Auto-confirm on SAML login — autenticação.gov already verified the
+        # user. This vouches for the IDENTITY, which is why it does not apply
+        # to the self-declared addresses gated above.
+        user.confirmed_at = datetime.utcnow()
+        datastore.commit()
 
     login_user(user)
     session["saml_login"] = True
@@ -1999,6 +2017,23 @@ def migration_pending():
 
     pending = session.get("saml_migration_pending")
     if not pending:
+        # The wizard is over but the account it created is still waiting for
+        # its owner to follow the confirmation link. Tell the frontend so it
+        # can explain the situation and offer a resend, instead of bouncing
+        # the user to /login with no explanation.
+        awaiting = session.get("saml_confirmation_pending")
+        if awaiting:
+            from udata.core.user.models import User
+
+            user = User.objects(id=awaiting.get("user_id")).first()
+            if user and user.confirmed_at is None:
+                return jsonify(
+                    {
+                        "pending": False,
+                        "awaiting_confirmation": True,
+                        "email": _mask_email(user.email),
+                    }
+                )
         return jsonify({"pending": False})
 
     # Whether the CMD identity itself carries an email address.
