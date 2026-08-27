@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **chore(tests): stop the suite from loading the deployment config by default**
+  - `udata.cfg` is tracked in this repo and `create_app` loads it over
+    `settings.Testing`, so a plain `pytest` tested the deployment rather than the
+    defaults the suite is written against. Measured on `develop`, whole suite,
+    clean test databases: **617s and 10 failures with it loaded, against 236s and
+    green without it**. Every failure was a rate-limit test, which follows —
+    `udata.cfg` configures the limiter's storage, and `RATELIMIT_ENABLED=False`
+    lives in `settings.Debug`, not in `settings.Testing`.
+  - `pyproject.toml` now defaults `UDATA_SETTINGS` to a path that does not exist,
+    which is how `udata/tests/__init__.py` asks for the load to be skipped and
+    what the CI job already did on its own. The default now covers everyone:
+    local runs, IDE runs, and any new CI job that forgets the variable.
+  - The `D:` prefix is pytest-env for *only if not already set*, so a run that
+    deliberately loads the deployment config still wins — the CI step that
+    asserts the download-proxy timeouts against the real `udata.cfg` is
+    unaffected, and was re-run to confirm it.
+
 - **fix(saml): request every MDC attribute the CMD login actually needs as required**
   - `sp_initiated()` asked Autenticação.gov for NIC, NomeProprio and NomeApelido
     with `isRequired="False"` while only CorreioElectronico was required. All
