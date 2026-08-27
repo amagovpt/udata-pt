@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **feat(saml): a CMD account now needs a confirmed email before it has a session**
+  - Creating an account through the account-linking wizard used to mint one from
+    whatever the IdP happened to send: auto-confirmed, logged in on the spot, and
+    given a `saml-*` placeholder address whenever the CMD brought no email or the
+    one it brought was taken. autenticação.gov proves *who the person is*; it says
+    nothing about an address, and the address is the account's recovery and
+    notification channel. `POST /saml/migration/skip` now requires an email, checks
+    it is well-formed and unused, creates the account **unconfirmed**, mails the
+    stock Flask-Security confirmation link, and starts no session. No new token,
+    template or mechanism was introduced.
+  - The gate would have been trivially bypassable: the new account already carries
+    the NIC, so a repeat CMD login resolved straight to it and hit the auto-confirm
+    that ran on *every* SAML login — "try again" would have been enough to get in.
+    Accounts carrying the new `pending_email_confirmation` marker in `extras` are
+    now neither confirmed nor logged in until their owner follows the link; they
+    land back on the wizard, which explains why and offers a resend. Everything
+    without the marker keeps the previous behaviour, which is what the marker is
+    for. It never needs clearing: once `confirmed_at` is set the gate stops
+    matching.
+  - The requirement would also have missed the people it is most for. An identity
+    matching no account never reached the wizard at all — it was created and logged
+    in inside the SSO callback — so `_find_or_create_saml_user` is now a pure
+    resolver that returns `no_match` instead of creating. Both callbacks route that
+    through the wizard when it is enabled, and fall back to creating the account
+    outright when it is not, exactly as before. eIDAS follows, sharing the resolver.
+  - Resending the confirmation has to work with no session, since by design there
+    isn't one. A dedicated endpoint keyed on the pending-confirmation marker left in
+    the session identifies the user without authenticating them, so it takes no
+    email argument and can only ever mail the account's own address — an endpoint
+    accepting an arbitrary one would be an open relay. It carries its own limit of
+    three sends per session, because the stock `security.send_confirmation` view is
+    registered with no rate limit to lean on.
+  - **Requires `MIGRATION_MODE_ENABLED` to be on in the environment's `udata.cfg`.**
+    The flag has no value in `Defaults`, and with it off none of the above applies:
+    the fallback keeps creating auto-confirmed accounts with placeholder emails,
+    silently and without error.
+
 - **fix(harvest): authorize the config preview, and give it a rate limit of its own**
   - `POST /harvest/source/preview/` tested `organization.permissions["harvest"]`
     only when the payload named an organization, so a payload that named none
