@@ -2788,6 +2788,96 @@ class SAMLMigrationWizardTest(APITestCase):
         assert self.client.get("/saml/migration/pending").json["candidate"] is True
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_link_via_skip_divert_keeps_ownership_proof_and_next_login_is_direct(
+        self, mock_client_for
+    ):
+        """The whole path the divert opens, end to end: no_match -> own address
+        on the creation step -> candidate pointed -> code mailed to that same
+        account -> linked -> the next CMD login walks straight in.
+
+        The negative assertion is the point of the test as much as the positive
+        one: between the divert and the confirm, nothing is linked. The divert
+        is a signpost, not a grant.
+        """
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="joana@example.pt",
+            password="S3cretPass!",
+            first_name="Joana",
+            last_name="Pinto",
+        )
+        users_before = User.objects.count()
+
+        # 1. CMD brings a different address and a name that does not match.
+        response = self._sso_with(
+            mock_client_for,
+            email="joana.pinto@servico.gov.pt",
+            nic="55555555",
+            first_name="Joana Cristina",
+            last_name="Pinto Azevedo",
+        )
+        assert "/migrate-account" in response.headers["Location"]
+        assert self.client.get("/saml/migration/pending").json["no_match"] is True
+
+        # 2. On the creation step the user types their own portal address.
+        response = self.client.post("/saml/migration/skip", json={"email": "joana@example.pt"})
+        assert response.status_code == 409
+        assert response.json["candidate_found"] is True
+
+        # Still nothing linked, and nothing created.
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+        assert User.objects.count() == users_before
+
+        # 3. The code goes to the candidate account's own address — the one
+        #    thing that makes this a proof of ownership rather than a claim.
+        captured = {}
+
+        def _capture(user, code):
+            captured["user"] = user
+            captured["code"] = code
+
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
+            side_effect=_capture,
+        ):
+            response = self.client.post("/saml/migration/send-code")
+            assert response.status_code == 200
+        assert captured["user"].id == existing.id
+        assert captured["user"].email == "joana@example.pt"
+
+        # Ownership is still unproven right up to the confirm.
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+
+        # 4. Proving it links the identity to the existing account.
+        response = self.client.post(
+            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
+        )
+        assert response.status_code == 200
+        assert response.json["success"] is True
+
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert existing.extras.get("auth_nic") == _hash_nic("55555555")
+
+        # 5. The next CMD login resolves by NIC and skips the wizard entirely.
+        self.client.get("/logout", follow_redirects=False)
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._sso_with(
+                mock_client_for,
+                email="joana.pinto@servico.gov.pt",
+                nic="55555555",
+                first_name="Joana Cristina",
+                last_name="Pinto Azevedo",
+            )
+            assert mock_login.call_count == 1
+            assert mock_login.call_args[0][0].id == existing.id
+        assert response.status_code == 302
+        assert "/migrate-account" not in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_still_refuses_emails_of_non_candidate_accounts(self, mock_client_for):
         """The divert must not become a way in. It fires only where
         _find_legacy_user returns an account, so an address held by one this
