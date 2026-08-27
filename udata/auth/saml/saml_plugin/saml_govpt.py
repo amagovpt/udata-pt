@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+from bson import ObjectId
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
 from email_validator import EmailNotValidError, validate_email
@@ -751,6 +752,14 @@ MAX_CONFIRMATION_SENDS = 5
 # URL carries nothing but its hash.
 MIGRATION_LINK_PENDING = "migration_link_pending"
 
+# First element of the token payload. The confirm serializer and its salt are
+# shared with flask-security's own confirmation token, whose payload is also a
+# two-element list of strings ([fs_uniquifier, hash_data(email)]) — anyone who
+# registers gets one in their inbox. Without a discriminator that token reaches
+# our route, and its uniquifier hits an ObjectIdField as a 500. Tagging the
+# payload keeps the two apart by shape as well as by content.
+MIGRATION_LINK_TOKEN_TAG = "migration-link"
+
 # How long a validation link stays usable. Deliberately far shorter than the
 # five days flask-security allows its own confirmation links, because this one
 # both opens a session and binds an identity permanently. The deadline is kept
@@ -1142,7 +1151,7 @@ def _issue_migration_link(user, nic_hash, first_name, last_name):
     # either of which would silently void a link the owner had not opened yet.
     # The id is not the secret here — the nonce is.
     serializer = current_app.extensions["security"].confirm_serializer
-    return serializer.dumps([str(user.id), hash_data(nonce)])
+    return serializer.dumps([MIGRATION_LINK_TOKEN_TAG, str(user.id), hash_data(nonce)])
 
 
 def _link_identity_and_login(user, nic_hash, first_name, last_name):
@@ -1167,8 +1176,11 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name):
         user.confirmed_at = datetime.utcnow()
 
     # However the link was proved, any validation link still outstanding for
-    # this account was issued against the state that has just changed.
+    # this account was issued against the state that has just changed. The
+    # send tally goes with it: it exists to pace mails towards an unlinked
+    # account, and this account is now linked.
     user.extras.pop(MIGRATION_LINK_PENDING, None)
+    user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
     user.save()
 
     login_user(user)
@@ -1199,11 +1211,21 @@ def _migration_link_token_status(token):
     signature_expired, invalid, token_data = check_and_get_token_status(
         token, "confirm", MIGRATION_LINK_TTL
     )
-    if invalid or not token_data or len(token_data) != 2:
+    if (
+        invalid
+        or not token_data
+        or len(token_data) != 3
+        or token_data[0] != MIGRATION_LINK_TOKEN_TAG
+    ):
         return None, None, "invalid"
 
-    user_id, nonce_hash = token_data
-    user = User.objects(id=user_id).first() if user_id else None
+    _tag, user_id, nonce_hash = token_data
+    # A well-signed token from elsewhere can still carry something that is not
+    # an ObjectId, and handing that to the field raises rather than not-found.
+    if not ObjectId.is_valid(user_id):
+        return None, None, "invalid"
+
+    user = User.objects(id=user_id).first()
     if not user or user.deleted:
         return None, None, "invalid"
 
@@ -1227,9 +1249,23 @@ def _migration_link_token_status(token):
     if _has_linked_nic(user) and current_nic != record.get("nic_hash"):
         return user, None, "invalid"
 
+    # The record cannot see what happened to OTHER accounts while it sat in a
+    # mailbox. The password branch links whichever account proved its password,
+    # which by design may not be this one, and migration_skip creates a fresh
+    # account carrying the NIC — neither touches this record. Linking anyway
+    # would leave one identity on two accounts, and the login lookup resolves
+    # by auth_nic ordered by -created_at, so the newer one silently wins.
+    # migration_skip already refuses a NIC that is taken; so must this.
+    if User.objects(extras__auth_nic=record.get("nic_hash"), id__ne=user.id).first():
+        return user, None, "invalid"
+
     expires = _parse_isoformat(record.get("expires"))
-    # A record with no readable deadline fails closed.
-    if signature_expired or expires is None or datetime.utcnow() > expires:
+    # A record with no readable deadline is not a link whose age we can vouch
+    # for, so it is refused outright rather than treated as merely expired.
+    if expires is None:
+        return user, None, "invalid"
+
+    if signature_expired or datetime.utcnow() > expires:
         return user, record, "expired"
 
     return user, record, "ok"
@@ -2526,25 +2562,12 @@ def migration_confirm_link(token):
         return redirect(f"{wizard_url}?flash=migration_link_invalid")
 
     if state == "expired":
-        # Reissue on expiry, as the change-email confirmation does, so the
-        # user's way out is a fresh mail rather than starting over. The window
-        # cap still applies: it is the same mail as any other send.
-        allowed, tally = _migration_link_send_allowed(user)
-        if not allowed:
-            return redirect(f"{wizard_url}?flash=migration_link_too_many_sends")
-
-        # Reissue against the identity the expired record already holds: the
-        # hashed NIC is all that was kept, and re-hashing is neither possible
-        # nor needed.
-        new_token = _issue_migration_link(
-            user,
-            record.get("nic_hash"),
-            record.get("first_name"),
-            record.get("last_name"),
-        )
-        user.extras[MIGRATION_LINK_SEND_COUNT] = tally
-        user.save()
-        _send_migration_link(user, record.get("first_name"), record.get("last_name"), new_token)
+        # Deliberately no reissue here, unlike the change-email confirmation
+        # this route otherwise follows. Mail scanners open links in inboxes
+        # before their owners do: reissuing from an unauthenticated GET would
+        # let a scanner keep an old mail alive indefinitely, each pass minting
+        # a fresh link with a fresh deadline. The user re-authenticates
+        # instead — a few seconds of CMD, and something only they can trigger.
         return redirect(f"{wizard_url}?flash=migration_link_expired")
 
     _link_identity_and_login(
@@ -2561,7 +2584,11 @@ def migration_confirm_link(token):
 @autenticacao_gov.route("/saml/migration/confirm", methods=["POST"])
 @csrf.exempt
 def migration_confirm():
-    """Confirm migration via verification code or old password."""
+    """Confirm migration with the legacy account's password.
+
+    Ownership by email is proved by following the validation link instead,
+    which migration_confirm_link consumes on its own route.
+    """
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
@@ -2601,6 +2628,14 @@ def migration_confirm():
 
     else:
         return jsonify({"error": "Invalid method"}), 400
+
+    # This branch links the account whose password was proved, which by design
+    # may not be the candidate that was pointed (the homonym case). Any link
+    # mailed to that other candidate is now stale, and _link_identity_and_login
+    # only clears the account it is linking.
+    candidate_id = pending.get("legacy_user_id")
+    if candidate_id and candidate_id != str(user.id):
+        _drop_migration_link(candidate_id)
 
     saml_nic = pending.get("saml_nic")
     _link_identity_and_login(
@@ -2734,6 +2769,13 @@ def migration_skip():
     send_confirmation_instructions(user)
     user.extras[CONFIRMATION_SEND_COUNT] = send_count + 1
     user.save()
+
+    # The wizard walked away from whatever candidate it had pointed at, and
+    # the new account now carries the NIC. A link still sitting in the old
+    # candidate's mailbox would put that same NIC on a second account.
+    candidate_id = pending.get("legacy_user_id")
+    if candidate_id and candidate_id != str(user.id):
+        _drop_migration_link(candidate_id)
 
     # No login_user: the account has no session until the email is confirmed.
     # The wizard state is done, but a resend handle must survive it — this key

@@ -13,8 +13,23 @@
     session. That is what lets the click work with no session — the owner may
     open the mail in another browser — and it is the only way to invalidate a
     mailed token, which is stateless: re-pointing the wizard at another
-    account, linking by password, or consuming the link all destroy the record,
-    and each of those kills any link still in the wild.
+    account, linking by password, creating a new account instead, or consuming
+    the link all destroy the record, and each of those kills any link still in
+    the wild. Consumption additionally refuses outright if the NIC has since
+    landed on another account, so one identity can never sit on two: the login
+    lookup resolves by `auth_nic` ordered by `-created_at`, and the newer
+    account would silently win it.
+  - The token payload is tagged. The confirm serializer and its salt are shared
+    with flask-security's own confirmation token, whose payload is also a
+    two-element list of strings and which anyone gets in their inbox by
+    registering; untagged, that token reached this route and its uuid
+    uniquifier hit an `ObjectIdField` as an unauthenticated 500.
+  - An expired link is refused rather than reissued, departing from the
+    change-email confirmation this route otherwise follows. Mail scanners open
+    links in inboxes before their owners do, and reissuing from an
+    unauthenticated GET would let a scanner keep an old mail alive
+    indefinitely, each pass minting a link with a fresh deadline. Recovering
+    means authenticating again.
   - The token carries the account id and a hash of the record's nonce, not the
     `fs_uniquifier`: `/logout` and a password reset both rotate that to kill
     outstanding sessions, either of which would silently void a link the owner
@@ -37,8 +52,12 @@
     but unused would have left that reachable by direct POST.
   - `POST /saml/migration/send-code` is gone and `POST /saml/migration/confirm`
     no longer accepts `method="code"`; the `method="password"` proof is
-    untouched. A frontend still offering the code step must be deployed after
-    this.
+    untouched. **Deploy this before the frontend change** — the new wizard
+    screen calls `send-link`, which does not exist until this lands. Between
+    the two, the old wizard's "Enviar código" button hits a removed endpoint
+    and reports a generic error; that window is accepted deliberately, because
+    the path it breaks is the account-takeover vector above and the password
+    branch keeps working throughout.
 
 - **chore(tests): stop the suite from loading the deployment config by default**
   - `udata.cfg` is tracked in this repo and `create_app` loads it over

@@ -3754,11 +3754,18 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert not (legacy.extras or {}).get("auth_nic")
 
         # A brand-new client: no wizard session, no cookies at all.
+        # login_user is asserted directly rather than through /api/1/me/: once
+        # anything in the process calls it, current_user stays set for the rest
+        # of the test and every later client reads as authenticated, so a 200
+        # there would pass even if no session cookie were ever issued. This is
+        # the same way SAMLLoginFlowTest pins the login it cares about.
         with self.app.test_client() as fresh:
-            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == legacy.id
             assert response.status_code == 302
             assert response.headers["Location"] == "http://localhost:3000"
-            assert fresh.get("/api/1/me/").status_code == 200
 
         legacy.reload()
         assert legacy.extras["auth_nic"] == _hash_nic("10203040")
@@ -3792,17 +3799,18 @@ class SAMLMigrationLinkClickTest(APITestCase):
             # test and every later client reads as authenticated. The 401 that
             # proves criterion 2 is asserted in the test above, before any
             # login has happened. What matters here is that the second click
-            # changed nothing.
-            assert "flash=" in response.headers["Location"]
+            # changed nothing, asserted on the account below.
 
         legacy.reload()
         assert legacy.extras["auth_nic"] == _hash_nic("50607080")
         assert legacy.first_name == "Bruno"
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_expired_link_reissues_a_fresh_one(self, mock_client_for):
-        """Criterion 6: an expired link is a recoverable state — the user gets
-        a new mail rather than having to start the wizard again."""
+    def test_expired_link_is_refused_without_mailing_anything(self, mock_client_for):
+        """Criterion 6: an expired link says so and points at re-authentication.
+        It deliberately does NOT reissue: this is an unauthenticated GET, and
+        mail scanners open links before their owners do, so reissuing here
+        would let a scanner keep an old mail alive indefinitely."""
         from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
 
         legacy = UserFactory(
@@ -3827,17 +3835,19 @@ class SAMLMigrationLinkClickTest(APITestCase):
                 response = fresh.get(f"/saml/migration/confirm-link/{token}")
             assert response.status_code == 302
             assert "flash=migration_link_expired" in response.headers["Location"]
-            assert mock_send.call_count == 1
-            # No session was granted by an expired link.
+            # Nothing was mailed: a scanner cannot use an old link to mint a
+            # fresh one with a fresh deadline.
+            assert mock_send.call_count == 0
             assert fresh.get("/api/1/me/").status_code == 401
 
         legacy.reload()
         assert not (legacy.extras or {}).get("auth_nic")
-        # A new nonce replaced the old one, so the expired token stays dead.
-        assert legacy.extras[MIGRATION_LINK_PENDING]["nonce"] != record["nonce"]
+        # Repeating the click stays inert rather than escalating.
         with self.app.test_client() as again:
-            response = again.get(f"/saml/migration/confirm-link/{token}")
-            assert "flash=migration_link_invalid" in response.headers["Location"]
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+                response = again.get(f"/saml/migration/confirm-link/{token}")
+            assert "flash=migration_link_expired" in response.headers["Location"]
+            assert mock_send.call_count == 0
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_link_cannot_overwrite_an_identity_linked_meanwhile(self, mock_client_for):
@@ -3910,6 +3920,111 @@ class SAMLMigrationLinkClickTest(APITestCase):
             assert response.status_code in (302, 404)
             if response.status_code == 302:
                 assert "flash=migration_link_invalid" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_link_cannot_put_one_identity_on_two_accounts(self, mock_client_for):
+        """Takeover regression. The password branch links whichever account
+        proved its password, which by design may not be the pointed candidate.
+        A link mailed to that candidate stays in their inbox; if clicking it
+        also linked, one NIC would sit on two accounts — and the login lookup
+        resolves by auth_nic ordered by -created_at, so the account created
+        later silently wins the identity."""
+        victim = UserFactory(
+            email="victim2@example.pt",
+            password="VictimPass1!",
+            first_name="Sara",
+            last_name="Brito",
+        )
+        attacker = UserFactory(
+            email="attacker2@example.pt",
+            password="AttackerPass1!",
+            first_name="Sara",
+            last_name="Brito",
+        )
+
+        # Point the victim (search proves nothing — LEDG-2355 #6) and mail a
+        # link to their address.
+        self._sso_with(mock_client_for, nic="45454545", first_name="Sara", last_name="Brito")
+        assert (
+            self.client.post("/saml/migration/search", json={"email": victim.email}).json["found"]
+            is True
+        )
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
+
+        # Now link a DIFFERENT account by password.
+        assert (
+            self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": attacker.email,
+                    "password": "AttackerPass1!",
+                },
+            ).status_code
+            == 200
+        )
+        attacker.reload()
+        assert attacker.extras["auth_nic"] == _hash_nic("45454545")
+
+        # The victim opens the link that is still in their inbox.
+        with self.app.test_client() as fresh:
+            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            assert "flash=migration_link_invalid" in response.headers["Location"]
+
+        victim.reload()
+        assert not (victim.extras or {}).get("auth_nic"), "one NIC landed on two accounts"
+
+        from udata.core.user.models import User
+
+        holders = User.objects(extras__auth_nic=_hash_nic("45454545"))
+        assert holders.count() == 1
+        assert holders.first().id == attacker.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_creating_a_new_account_kills_the_candidate_link(self, mock_client_for):
+        """Same hazard through the skip: the new account carries the NIC, so a
+        link left in the abandoned candidate's inbox must not still work."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        candidate = UserFactory(
+            email="cand@example.pt",
+            password="S3cretPass!",
+            first_name="Nadia",
+            last_name="Rocha",
+        )
+
+        self._sso_with(mock_client_for, nic="64646464", first_name="Nadia", last_name="Rocha")
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+        candidate.reload()
+        assert MIGRATION_LINK_PENDING in candidate.extras
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"):
+            response = self.client.post(
+                "/saml/migration/skip", json={"email": "nadia.nova@example.pt"}
+            )
+        assert response.status_code == 200
+
+        candidate.reload()
+        assert MIGRATION_LINK_PENDING not in (candidate.extras or {})
+
+    def test_a_stock_confirmation_token_is_refused_not_a_500(self):
+        """The confirm serializer and its salt are shared with flask-security's
+        own confirmation token, whose payload is also a two-element list of
+        strings — and anyone who registers gets one in their inbox. Untagged,
+        it reached this route and its uuid uniquifier hit an ObjectIdField as
+        an unauthenticated 500."""
+        from flask_security.confirmable import generate_confirmation_token
+
+        user = UserFactory(email="stock@example.pt", password="S3cretPass!")
+        foreign = generate_confirmation_token(user)
+
+        response = self.client.get(f"/saml/migration/confirm-link/{foreign}")
+        assert response.status_code == 302
+        assert "flash=migration_link_invalid" in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_re_pointing_the_candidate_kills_the_link_already_sent(self, mock_client_for):
@@ -3985,9 +4100,11 @@ class SAMLMigrationLinkClickTest(APITestCase):
         )
 
         with self.app.test_client() as fresh:
-            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == legacy.id
             assert response.status_code == 302
-            assert fresh.get("/api/1/me/").status_code == 200
 
         legacy.reload()
         assert legacy.extras["auth_nic"] == _hash_nic(person_id)
