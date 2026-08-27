@@ -35,6 +35,11 @@
     ownership proof for a *correct* password and reported it through the
     deliberately generic "invalid credentials", making it indistinguishable
     from a wrong one.
+  - The pending endpoint no longer offers an address another casing already
+    holds. It pre-fills the creation field precisely so nobody is handed an
+    address that can only be rejected, and checking it exactly defeated that
+    for the commonest case there is: a CMD carrying "Rui@Example.pt" against an
+    account at "rui@example.pt".
   - The search endpoint now coerces its payload to strings before querying.
     A JSON body can carry a dict, and a dict reaching a MongoEngine query is
     how a field lookup becomes an operator lookup: `{"$regex": "^adm"}` made

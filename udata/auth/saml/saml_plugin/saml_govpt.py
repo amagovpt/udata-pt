@@ -2145,9 +2145,7 @@ def migration_pending():
     # the wizard pre-fills the account-creation field with it, and offering an
     # address that is already taken would only produce a guaranteed rejection.
     saml_email = pending.get("saml_email")
-    suggested_email = (
-        saml_email if saml_email and not datastore.find_user(email=saml_email) else None
-    )
+    suggested_email = saml_email if saml_email and not _find_user_by_email_ci(saml_email) else None
 
     # True only when the identity matched no account at all (as opposed to
     # matching several homonyms) AND carries a NIC. Both cases reach the

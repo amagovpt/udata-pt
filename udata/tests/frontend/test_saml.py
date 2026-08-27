@@ -2878,6 +2878,34 @@ class SAMLMigrationWizardTest(APITestCase):
         assert "/migrate-account" not in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_pending_does_not_suggest_an_address_taken_in_another_casing(self, mock_client_for):
+        """suggested_email exists so the creation step is never pre-filled with
+        an address that would only produce a guaranteed rejection. Checking it
+        exactly missed the case the skip's own uniqueness check catches: with
+        the CMD carrying Rui@Example.pt and the account at rui@example.pt, the
+        wizard offered the address and the submit then bounced it."""
+        UserFactory(
+            email="rui@example.pt",
+            password="S3cretPass!",
+            first_name="Rui",
+            last_name="Tavares",
+        )
+
+        # The name deliberately misses, so the identity reaches the creation
+        # step rather than being offered the account as a candidate.
+        self._sso_with(
+            mock_client_for,
+            email="Rui@Example.pt",
+            nic="60606060",
+            first_name="Rui Alexandre",
+            last_name="Tavares Pinho",
+        )
+
+        data = self.client.get("/saml/migration/pending").json
+        assert data["suggested_email"] is None
+        assert data["has_email"] is True
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_search_refuses_a_query_operator_instead_of_answering_it(self, mock_client_for):
         """A JSON body can carry a dict, and a dict reaching a MongoEngine
         query turns a field lookup into an operator lookup: {"$regex": "^adm"}
