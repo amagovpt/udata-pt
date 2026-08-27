@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+- **fix(harvest): authorize the config preview, and give it a rate limit of its own**
+  - `POST /harvest/source/preview/` tested `organization.permissions["harvest"]`
+    only when the payload named an organization, so a payload that named none
+    passed no authorization test at all beyond being logged in. It now requires a
+    sysadmin in that case. The decision, for the record: this is the one route
+    that makes the server run a whole harvest backend against a URL the caller
+    supplies, which is why it gets a gate that creating a source does not need —
+    a created source lands `VALIDATION_PENDING`, validating it is
+    `admin_permission`, and a manual run refuses anything not accepted. With no
+    organization in the payload there is nothing else to weigh the request
+    against, so a sysadmin is the only defensible answer.
+  - Two alternatives were considered and rejected. Requiring harvest permission
+    on *any* organization the caller belongs to would authorize fetching an
+    arbitrary URL because they happen to administer something unrelated, and has
+    no precedent in the codebase; leaving the behaviour as intentional and only
+    documenting it would leave the endpoint executing remote harvests for any
+    account that can log in. The alternative that mattered was on the client:
+    an organization's editors and the owner of an owner-only source may preview
+    and may not edit, so the backoffice now previews a *saved* source through
+    `GET /harvest/source/<id>/preview/`, whose per-source permission admits them,
+    and reserves the config route for a config that is not stored yet.
+  - Added `HARVEST_PREVIEW_LIMIT` (20/min, 120/h, 400/day), keyed by `user_or_ip`
+    and declared in the resource's `decorators` rather than on the verb, so the
+    limiter runs outside `@api.secure` and a flood of unauthorized attempts is
+    counted too. What this rations is not writes but outbound cost: every request
+    walks a remote catalogue and produces traffic in the portal's name. Both
+    preview routes carry it, including `GET /harvest/source/<id>/preview/`, which
+    had no limit of its own and so fell under the IP-keyed `RATELIMIT_DEFAULT` —
+    one shared bucket for every visitor behind the F5, where a single caller
+    previewing in a loop answers 429 to everyone else. It matters more now that
+    the backoffice sends every read-only preview there.
+
+- **fix(harvest): stop the INE harvester from writing to the database in preview**
+  - Previewing a harvest source with the `ine` backend created public datasets. That
+    backend never calls `BaseBackend.process_dataset`, so the dryrun guard around
+    `dataset.save()` never applied to it: `inner_harvest` writes the datasets itself, in
+    raw pymongo. An authenticated account with no organization membership could point the
+    preview endpoint at a URL of its own and have every indicator in it upserted as a
+    public dataset. Both writes the backend performs funnel through `_flush_bulk`, so one
+    guard there closes the per-chunk flush and the final one at once. The same bug class
+    was fixed in the ckanpt, odspt and ogc backends; this one was missed because those
+    searches looked for `.save()` and friends, and this backend writes with `bulk_write`.
+  - `max_items` was never read, so a single preview parsed and processed the whole remote
+    catalog rather than the twenty items `HARVEST_PREVIEW_MAX_ITEMS` allows. The cut now
+    happens while parsing. It cannot use the `has_reached_max_items()` convention of the
+    other backends: that reads `len(job.items)`, and this backend only pushes into that
+    list every thousand items, so for a twenty-item preview it would never be true. A
+    truncated real harvest now records a HarvestError, mirroring dcat — today none can,
+    since `HARVEST_MAX_ITEMS` defaults to unset, but if it were ever set then everything
+    below the cut would look like it had vanished remotely and autoarchive would take it.
+  - Titles and descriptions are now sanitized. `Dataset.pre_save` does this for every
+    other write in the portal, but it is a mongoengine signal and this backend hands
+    `to_mongo()` dicts to pymongo, so remote HTML was stored verbatim — a stored-XSS write
+    primitive through preview, and unsanitized remote markup every night on the real
+    harvest. The sanitization runs at extraction, not at apply, and the placement is
+    load-bearing: change detection compares the stored values against the extracted ones
+    and runs first, so sanitizing later would compare a sanitized title against a raw one
+    and rewrite every indicator carrying markup on every single harvest. **Expect the
+    first real harvest after this to rewrite the whole catalog**, not just the entries
+    carrying markup: bleach escapes what it does not strip, and the description always
+    ends with INE's `?xpid=INE&xpgid=…` link, so every description changes by at least
+    that `&`. It is a one-off — the transformation is idempotent — and the raw-pymongo
+    path fires no `post_save`, so it triggers no reindexing storm. Slugs are built from
+    the unescaped title, so the escaping does not reach new permalinks.
+  - Capping the parse had a second-order effect worth naming: `autoarchive` treats every
+    remote_id absent from the job as gone from the remote platform, and it runs in dryrun
+    too, so a truncated run would have reported everything past the cut as archived. It is
+    now skipped when the catalog was truncated.
+  - Previews download to their own file. `LOCAL_FILE_PATH` is a class attribute, so every
+    run in the process shared `/tmp/ine.xml`: a preview could overwrite the catalog a
+    running harvest was reading, and its cleanup deleted the cached file that harvest
+    falls back on when the connection drops. The real harvest keeps the shared path on
+    purpose, for exactly that cache. Cleanup of the preview file moved into a `finally`,
+    since the existing one only ran when processing completed.
+  - Both XML parse sites use defusedxml, which refuses entity definitions and external
+    references by default. The catalog body is remote and, through preview, caller-chosen;
+    the stdlib parser expands internal general entities, so the same request was also a
+    memory DoS against the API worker. No new dependency — defusedxml was already declared
+    and locked, just never imported.
+  - The backend had no coverage of any of this. It now has tests for the preview writes,
+    the item cap, sanitization, the file isolation and a hostile catalog body.
+  - Left alone deliberately: the `dcat` backend recomputes organization metrics in preview
+    without a guard. It is upstream code, so a local patch would diverge and conflict on
+    the next sync, and the effect does not cross an ownership boundary — the only
+    organization reachable in a preview is the source's own, which the caller was already
+    authorized against. It should be proposed upstream instead.
+
 - **fix(discussions): stop leaving orphaned notifications behind a deleted discussion**
   - Deleting a discussion, or a single comment, through the API left every notification
     that referenced it in place, pointing at a document that no longer exists. Both
