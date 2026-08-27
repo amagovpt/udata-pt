@@ -997,6 +997,23 @@ def _mask_email(email):
     return f"{masked}@{domain}"
 
 
+def _point_migration_candidate(pending, user):
+    """Point the pending migration at ``user`` as the account to link.
+
+    The single place that mutates the candidate reference. Any code already
+    emailed was issued for a different target, so it has to die with the
+    re-point — copying that invariant to a second call site is how
+    target-confusion gets reintroduced.
+    """
+    # Store only the candidate reference — saml_email must keep holding
+    # the email coming from the CMD identity (or None), never the
+    # legacy account's email.
+    pending["legacy_user_id"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.pop("migration_code", None)
+    session.modified = True
+
+
 def _send_migration_code(user, code):
     """Send a verification code email for account migration."""
     msg = MailMessage(
@@ -2165,15 +2182,7 @@ def migration_search():
     if not user:
         return jsonify({"found": False})
 
-    # Store only the candidate reference — saml_email must keep holding
-    # the email coming from the CMD identity (or None), never the
-    # legacy account's email.
-    pending["legacy_user_id"] = str(user.id)
-    session["saml_migration_pending"] = pending
-    # Any code previously emailed was issued for a different target —
-    # invalidate it so it cannot be replayed against the new candidate.
-    session.pop("migration_code", None)
-    session.modified = True
+    _point_migration_candidate(pending, user)
 
     return jsonify(
         {
@@ -2404,6 +2413,25 @@ def migration_skip():
     linked = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
 
     if existing and (not linked or existing.id != linked.id):
+        # The address is taken — but by whom? If it is a legacy account this
+        # identity could legitimately claim, refusing is the wrong answer:
+        # linking it is exactly what the wizard exists for, and the machinery
+        # is one step away. Point the candidate and say so, instead of
+        # sending the user back to retype an address the server has already
+        # resolved. Nothing is linked here: ownership still has to be proven
+        # at migration_confirm, by password or by a code mailed to that same
+        # account. Guarded on `not linked` so a replayed session cannot point
+        # a second account at an identity that already has one.
+        candidate = _find_legacy_user(email=email) if not linked else None
+        if candidate:
+            _point_migration_candidate(pending, candidate)
+            return jsonify(
+                {
+                    "error": "email_taken",
+                    "candidate_found": True,
+                    "email": _mask_email(candidate.email),
+                }
+            ), 409
         return jsonify({"error": "email_taken"}), 409
 
     if linked:

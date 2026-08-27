@@ -2736,6 +2736,58 @@ class SAMLMigrationWizardTest(APITestCase):
         assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_with_own_legacy_email_points_the_candidate(self, mock_client_for):
+        """The dead end this ticket exists for. A CMD whose email and name both
+        miss lands on the account-creation step; the address the person then
+        types is their own portal account. Refusing it sends them back to retype
+        an address the server has already resolved. Point the candidate instead
+        — still linking nothing, still 409, ownership still unproven."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="teresa@example.pt",
+            password="S3cretPass!",
+            first_name="Teresa",
+            last_name="Matos",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="teresa.matos@servico.gov.pt",
+            nic="53535353",
+            first_name="Teresa Alexandra",
+            last_name="Matos Ribeiro",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["no_match"] is True
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        users_before = User.objects.count()
+
+        # Typed in a different casing, which only resolves because the search
+        # lookup is case-insensitive.
+        response = self.client.post("/saml/migration/skip", json={"email": "Teresa@Example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+        assert response.json["candidate_found"] is True
+        assert response.json["email"] == "t***@example.pt"
+
+        # Nothing was created and nothing was linked: this only points.
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
+
+        with self.client.session_transaction() as sess:
+            pending = sess.get("saml_migration_pending")
+            # The wizard did not end — it moved to the linking branch.
+            assert pending is not None
+            assert pending["legacy_user_id"] == str(existing.id)
+            # Re-pointing kills any code issued for the previous target.
+            assert "migration_code" not in sess
+
+        # And the linking branch now works from here.
+        assert self.client.get("/saml/migration/pending").json["candidate"] is True
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_email_match_is_case_insensitive_for_the_wizard_candidate(self, mock_client_for):
         """Rule 2 is what decides migration_candidate. Exact-matching there sent
         the owner of maria@ whose CMD carries Maria@ down the no_match branch —

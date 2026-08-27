@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **fix(saml): the wizard no longer refuses the one address the person is sure of**
+  - `POST /saml/migration/skip` rejected any email already held by an account.
+    Correct for someone else's address; wrong for the caller's *own* legacy
+    account, which is precisely what the wizard exists to migrate. When the CMD
+    brings an address that differs from the portal one — institutional against
+    personal, the common case — and the name does not match either, the identity
+    is classed `no_match` and lands on the account-creation step; typing the real
+    address then got "email already registered". The skip now resolves that
+    address and, when it belongs to a legacy account this identity could
+    legitimately claim, points it as the candidate and reports
+    `candidate_found` alongside the existing `email_taken`, so the wizard
+    continues into the linking branch instead of asking for a retype.
+  - **Nothing is linked by this, and no new mechanism was added.** The response
+    only points the candidate; ownership is still proven at
+    `POST /saml/migration/confirm`, by password or by a code mailed to that same
+    account. The session mutation the search endpoint already performed —
+    including killing any code issued for a previous target — moved into a
+    single shared helper, so that invariant lives in one place rather than
+    being copied to a second call site. Accounts already linked to another CMD
+    identity, or without a password, are still refused, as is a replayed
+    session whose identity already holds an account.
+  - The status code and error key are unchanged, so the field is purely
+    additive: an older frontend keeps its current behaviour, and a newer one
+    against an older backend simply never sees the field. **The two releases
+    are independent — this needs no deploy ordering.**
+  - Three lookups in the same flow still resolved addresses case-sensitively
+    while every login and recovery lookup does not: the wizard's own search,
+    the email rule that decides whether an identity is a linking candidate at
+    all, and the confirm endpoint's password branch. The last one failed the
+    ownership proof for a *correct* password and reported it through the
+    deliberately generic "invalid credentials", making it indistinguishable
+    from a wrong one.
+
 - **feat(saml): a CMD account now needs a confirmed email before it has a session**
   - Creating an account through the account-linking wizard used to mint one from
     whatever the IdP happened to send: auto-confirmed, logged in on the spot, and
