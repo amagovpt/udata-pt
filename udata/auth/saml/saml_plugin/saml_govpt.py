@@ -728,13 +728,14 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
 # clearing: once confirmed_at is set the gate opens and the marker is inert.
 PENDING_EMAIL_CONFIRMATION = "pending_email_confirmation"
 
-# How many confirmation mails one pending account may trigger, and where that
-# tally lives. It is kept on the account rather than in the session because the
+# How many confirmation mails one pending account may ever trigger, and where
+# that tally lives. It is monotonic — correcting the address does not reset it —
+# so the ceiling is per CMD identity, not per address typed. It is kept on the account rather than in the session because the
 # recipient is an address the wizard user typed: a session-held counter is
 # reset by replaying an older copy of the signed cookie, which would leave the
 # resend endpoint able to mail an arbitrary victim without limit.
 CONFIRMATION_SEND_COUNT = "confirmation_send_count"
-MAX_CONFIRMATION_SENDS = 3
+MAX_CONFIRMATION_SENDS = 5
 
 
 def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
@@ -907,6 +908,13 @@ def _handle_saml_user_login(user, new_account=False):
         )
         # Identifies the user to the resend endpoint without authenticating
         # them — the wizard shows the pending-confirmation screen from it.
+        # Any wizard state still lying around belongs to an earlier, abandoned
+        # assertion; left in place, migration_pending would answer with that
+        # stale wizard instead of this screen.
+        session.pop("saml_migration_pending", None)
+        session.pop("migration_code", None)
+        session.pop("migration_send_count", None)
+        session.pop("migration_password_attempts", None)
         session["saml_confirmation_pending"] = {"user_id": str(user.id)}
         return redirect(f"{frontend_url}/migrate-account")
 
@@ -919,6 +927,11 @@ def _handle_saml_user_login(user, new_account=False):
 
     login_user(user)
     session["saml_login"] = True
+    # Whoever is logging in now owns this session. A confirmation handle left
+    # by someone else on a shared browser would otherwise disclose their masked
+    # address through migration_pending and let this user spend their send
+    # budget.
+    session.pop("saml_confirmation_pending", None)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts
     # created without a usable CMD email, or older ones from before this
@@ -1557,6 +1570,9 @@ def _terminate_local_session():
     session.pop("saml_login", None)
     session.pop("saml_name_id", None)
     session.pop("saml_name_id_format", None)
+    # Ends with the session like the rest: it is a handle onto someone's
+    # pending account, and the next person on this browser must not inherit it.
+    session.pop("saml_confirmation_pending", None)
     logout_user()
 
 
@@ -2354,34 +2370,62 @@ def migration_skip():
             "check_deliverability": False,
             **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS") or {}),
         }
-        validate_email(email, **validator_args)
+        # Store the normalised form, as the registration path does — not the
+        # raw string, whose casing would otherwise decide which of two rows
+        # the unique index accepts.
+        email = validate_email(email, **validator_args).normalized
     except EmailNotValidError:
         return jsonify({"error": "invalid_email"}), 400
 
-    if datastore.find_user(email=email):
-        return jsonify({"error": "email_taken"}), 409
-
-    # This identity already has an account. Normally unreachable — rule 1 of
-    # _find_or_create_saml_user would have resolved it long before the wizard
-    # — but the Flask session is a client-held signed cookie, so replaying a
-    # copy taken before the first skip re-enters here with the pending state
-    # intact. Without this check that replay mints an unbounded number of
-    # accounts against one NIC, each mailing a confirmation to an address the
-    # caller chooses. The session pops are not a defence: they only rewrite a
-    # response cookie the caller is free to discard.
+    # case_insensitive matters and is not cosmetic. The unique index on
+    # User.email is case-SENSITIVE, while every login and recovery lookup goes
+    # through SECURITY_USER_IDENTITY_ATTRIBUTES, which is case-INSENSITIVE. An
+    # exact-match check here therefore accepts "MARIA@x.pt" alongside an
+    # existing "maria@x.pt", and the victim's own login then resolves to the
+    # newer, password-less shadow row (User._meta ordering is -created_at) —
+    # locking them out of both login and password recovery, permanently.
     from udata.core.user.models import User
 
-    if User.objects(extras__auth_nic=_hash_nic(user_nic)).first():
-        return jsonify({"error": "identity_already_registered"}), 409
+    existing = datastore.find_user(case_insensitive=True, email=email)
+    linked = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
 
-    user = _create_pending_saml_user(
-        email,
-        user_nic,
-        pending.get("saml_first_name"),
-        pending.get("saml_last_name"),
-    )
+    if existing and (not linked or existing.id != linked.id):
+        return jsonify({"error": "email_taken"}), 409
+
+    if linked:
+        # This identity already has an account. Normally unreachable — rule 1
+        # of _find_or_create_saml_user resolves it long before the wizard — but
+        # the Flask session is a client-held signed cookie, so replaying a copy
+        # taken before the first skip re-enters here with the pending state
+        # intact; the session pops are no defence, they only rewrite a response
+        # cookie the caller may discard. Creating a second account per replay
+        # would mint them without bound, each mailing a chosen address.
+        #
+        # Refusing outright is not right either: it would brick the identity on
+        # a typo, and on an SMTP failure mid-request, with no way back — the
+        # account has no password, so neither login nor recovery is available,
+        # and the address can never be changed. So the pending account's
+        # address stays correctable until it is confirmed, while the send tally
+        # below stays monotonic, which is what keeps the mailer bounded.
+        if linked.confirmed_at is not None:
+            return jsonify({"error": "identity_already_registered"}), 409
+        user = linked
+        user.email = email
+        user.save()
+    else:
+        user = _create_pending_saml_user(
+            email,
+            user_nic,
+            pending.get("saml_first_name"),
+            pending.get("saml_last_name"),
+        )
+
+    send_count = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0)
+    if send_count >= MAX_CONFIRMATION_SENDS:
+        return jsonify({"error": "too_many_sends"}), 429
+
     send_confirmation_instructions(user)
-    user.extras[CONFIRMATION_SEND_COUNT] = 1
+    user.extras[CONFIRMATION_SEND_COUNT] = send_count + 1
     user.save()
 
     # No login_user: the account has no session until the email is confirmed.

@@ -2688,20 +2688,81 @@ class SAMLMigrationWizardTest(APITestCase):
             "udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"
         ) as mock_confirm:
             # The mail sent when the account was created already counts as one
-            # of the three, so two resends remain.
-            for _ in range(2):
+            # of the five, so four resends remain.
+            for _ in range(4):
                 response = self.client.post("/saml/migration/resend-confirmation")
                 assert response.status_code == 200
                 assert response.json == {"sent": True}
 
-            # The third resend would be the fourth mail overall: refused.
+            # The next resend would be the sixth mail overall: refused.
             response = self.client.post("/saml/migration/resend-confirmation")
             assert response.status_code == 429
 
-        assert mock_confirm.call_count == 2
+        assert mock_confirm.call_count == 4
         # Always the account's own address — never an arbitrary one.
         for call in mock_confirm.call_args_list:
             assert call[0][0].id == created.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_rejects_a_taken_email_whatever_its_casing(self, mock_client_for):
+        """The unique index on User.email is case-sensitive, but every login and
+        recovery lookup is case-INSENSITIVE. An exact-match check here would
+        accept MARIA@ alongside an existing maria@, and the victim's own login
+        would then resolve to the newer password-less row — locking them out of
+        both login and recovery, permanently."""
+        from udata.core.user.models import User
+
+        victim = UserFactory(
+            email="maria@example.pt",
+            password="S3cretPass!",
+            first_name="Maria",
+            last_name="Sousa",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="atacante.cmd@example.pt",
+            nic="37373737",
+            first_name="Maria",
+            last_name="Sousa",
+        )
+        users_before = User.objects.count()
+
+        response = self.client.post("/saml/migration/skip", json={"email": "MARIA@example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+        assert User.objects.count() == users_before
+        # Exactly one account still answers to that address.
+        assert User.objects(email__iexact="maria@example.pt").count() == 1
+        assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_stores_the_normalised_address(self, mock_client_for):
+        """The stored address is the normalised one, as on the registration
+        path — not the raw string, whose casing would otherwise decide which of
+        two rows the case-sensitive unique index accepts."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="rui.old@example.pt",
+            password="S3cretPass!",
+            first_name="Rui",
+            last_name="Pinto",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="rui.cmd@example.pt",
+            nic="38383838",
+            first_name="Rui",
+            last_name="Pinto",
+        )
+
+        response = self.client.post(
+            "/saml/migration/skip", json={"email": "  Rui.Novo@Example.PT  "}
+        )
+        assert response.status_code == 200
+        created = User.objects(extras__auth_nic=_hash_nic("38383838")).first()
+        assert created.email == "Rui.Novo@example.pt"  # domain lowercased, local part kept
+        assert response.json["email"] == created.email
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_refuses_a_second_account_for_the_same_identity(self, mock_client_for):
@@ -2744,10 +2805,17 @@ class SAMLMigrationWizardTest(APITestCase):
             sess["saml_migration_pending"] = replayed
 
         response = self.client.post("/saml/migration/skip", json={"email": "vera.b@example.pt"})
-        assert response.status_code == 409
-        assert response.json["error"] == "identity_already_registered"
+        assert response.status_code == 200
+        # No second account: the pending one had its address corrected, which
+        # is what keeps a typo (or an SMTP failure mid-request) from bricking
+        # the identity for good.
         assert User.objects.count() == users_after_first
-        assert User.objects(email="vera.b@example.pt").first() is None
+        assert User.objects(email="vera.a@example.pt").first() is None
+        corrected = User.objects(email="vera.b@example.pt").first()
+        assert corrected is not None
+        assert corrected.extras["auth_nic"] == _hash_nic("35353535")
+        # The tally is monotonic, so correcting does not buy more mail.
+        assert corrected.extras["confirmation_send_count"] == 2
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_resend_confirmation_cap_survives_a_replayed_session(self, mock_client_for):
@@ -2777,8 +2845,8 @@ class SAMLMigrationWizardTest(APITestCase):
             pristine = dict(sess.get("saml_confirmation_pending"))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"):
-            # The creation mail already counts as one, so two more are allowed.
-            for _ in range(2):
+            # The creation mail already counts as one, so four more are allowed.
+            for _ in range(4):
                 assert self.client.post("/saml/migration/resend-confirmation").status_code == 200
 
             # Replaying a session captured before any resend must not reset it.
@@ -2790,7 +2858,7 @@ class SAMLMigrationWizardTest(APITestCase):
                 assert response.status_code == 429, response.json
 
         created.reload()
-        assert created.extras["confirmation_send_count"] == 3
+        assert created.extras["confirmation_send_count"] == 5
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_resend_confirmation_reports_an_already_confirmed_account(self, mock_client_for):
