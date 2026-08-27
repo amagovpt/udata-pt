@@ -452,10 +452,16 @@ class SAMLOutstandingRelayTest(APITestCase):
 class SAMLAutoRegistrationTest(APITestCase):
     """Test the _find_or_create_saml_user helper function."""
 
-    def test_creates_new_user_from_saml_data(self):
+    def test_unmatched_identity_creates_nothing(self):
+        """The resolver is pure: an identity that matches no account yields
+        no_match and creates nothing. Whether an account is created — and on
+        what terms — is the caller's decision, because with the wizard on the
+        user must supply a confirmed email first."""
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+        from udata.core.user.models import User
 
         with self.app.app_context():
+            users_before = User.objects.count()
             user, status = _find_or_create_saml_user(
                 user_email="saml_new@example.com",
                 user_nic="12345678",
@@ -463,12 +469,9 @@ class SAMLAutoRegistrationTest(APITestCase):
                 last_name="Silva",
             )
 
-            assert status == "new"
-            assert user is not None
-            assert user.email == "saml_new@example.com"
-            assert user.first_name == "João"
-            assert user.last_name == "Silva"
-            assert user.extras.get("auth_nic") == _hash_nic("12345678")
+            assert status == "no_match"
+            assert user is None
+            assert User.objects.count() == users_before
 
     def test_finds_existing_user_by_email(self):
         """An email match never logs in nor auto-links — the existing
@@ -517,24 +520,18 @@ class SAMLAutoRegistrationTest(APITestCase):
                 last_name="Santos",
             )
 
-            assert status == "new"
-            assert user is not None
-            assert user.email == "no_nic@example.com"
-            assert not user.extras.get("auth_nic")
+            assert status == "no_match"
+            assert user is None
 
-    def test_handles_missing_email_generates_placeholder(self):
-        """When IdP provides NIC but no email, a placeholder email is generated."""
-        from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
+    def test_placeholder_is_minted_when_creating_without_an_email(self):
+        """The placeholder path still exists for the wizard-disabled fallback,
+        which creates the account outright. Asserted on _create_saml_user
+        directly now that the resolver no longer creates anything."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _create_saml_user
 
         with self.app.app_context():
-            user, status = _find_or_create_saml_user(
-                user_email=None,
-                user_nic="77777777",
-                first_name="Carlos",
-                last_name="Ferreira",
-            )
+            user = _create_saml_user(None, "77777777", "Carlos", "Ferreira")
 
-            assert status == "new"
             assert user is not None
             # Email must be the random-uuid placeholder, NOT a NIC-derived value.
             assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
@@ -698,8 +695,14 @@ class SAMLSSOCallbackTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_sso_callback_creates_user_and_logs_in(self, mock_client_for, mock_requires_conf):
-        """After autenticacao.gov success, udata must create user and login."""
+    def test_sso_callback_sends_an_unmatched_identity_to_the_wizard(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """An identity matching no account no longer gets one created behind
+        its back: it goes through the wizard, which asks for an email and
+        confirms it before any account or session exists."""
+        from udata.core.user.models import User
+
         mock_saml_client = MagicMock()
         mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
             email="cidadao@example.pt",
@@ -716,19 +719,23 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="Silva",
         )
 
+        users_before = User.objects.count()
+
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
-
-            # login_user must have been called exactly once
-            assert mock_login.call_count == 1
-            logged_in_user = mock_login.call_args[0][0]
-            assert logged_in_user.email == "cidadao@example.pt"
-            # auth_nic is stored as HMAC-SHA256 hex, never the raw NIC.
-            assert logged_in_user.extras.get("auth_nic") == _hash_nic("12345678")
-            assert logged_in_user.first_name == "João"
-            assert logged_in_user.last_name == "Silva"
+            assert mock_login.call_count == 0
 
         assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        assert User.objects.count() == users_before
+
+        # The identity travels in the session for the wizard to use, flagged
+        # as matching nothing so it opens straight on the email step.
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            assert pending["no_match"] is True
+            assert pending["saml_email"] == "cidadao@example.pt"
+            assert pending["saml_nic"] == "12345678"
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_email_match_requires_ownership_confirmation(self, mock_client_for):
@@ -819,6 +826,10 @@ class SAMLSSOCallbackTest(APITestCase):
         SAML response from autenticacao.gov is successfully processed and
         the user attributes (email, NIC, name) are extracted.
         """
+        # This test is about attribute plumbing, not creation policy: run it
+        # on the wizard-disabled path, where the account is still created
+        # and logged in outright.
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
         call_order = []
 
         mock_saml_client = MagicMock()
@@ -936,7 +947,10 @@ class SAMLSSOCallbackTest(APITestCase):
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_with_only_email(self, mock_client_for, mock_requires_conf):
-        """autenticacao.gov may return only email (NIC is optional)."""
+        """autenticacao.gov may return only email (NIC is optional). Without a
+        match the identity goes to the wizard; no_match stays false because
+        there is no NIC, so the wizard offers the search branch rather than
+        account creation (an account with no auth_nic could confirm itself)."""
         mock_saml_client = MagicMock()
         mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
             email="email_only@example.pt"
@@ -946,18 +960,20 @@ class SAMLSSOCallbackTest(APITestCase):
         xml = _build_saml_response_xml(email="email_only@example.pt")
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
-            self._post_saml_response(xml)
+            response = self._post_saml_response(xml)
+            assert mock_login.call_count == 0
 
-            assert mock_login.call_count == 1
-            logged_in_user = mock_login.call_args[0][0]
-            assert logged_in_user.email == "email_only@example.pt"
+        assert "/migrate-account" in response.headers["Location"]
+        assert self.client.get("/saml/migration/pending").json["no_match"] is False
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_sso_callback_with_only_nic_generates_placeholder_email(
+    def test_sso_callback_with_only_nic_goes_to_the_wizard(
         self, mock_client_for, mock_requires_conf
     ):
-        """autenticacao.gov may return NIC but no email; placeholder generated."""
+        """autenticacao.gov may return NIC but no email. Rather than minting a
+        placeholder and dropping the user on /complete-registration with a
+        session, the wizard now collects a real email up front."""
         mock_saml_client = MagicMock()
         mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
             nic="88888888", first_name="Pedro", last_name="Nunes"
@@ -968,18 +984,17 @@ class SAMLSSOCallbackTest(APITestCase):
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
+            assert mock_login.call_count == 0
 
-            assert mock_login.call_count == 1
-            logged_in_user = mock_login.call_args[0][0]
-            # Placeholder email must be a random uuid hex, NOT NIC-derived.
-            assert _SAML_PLACEHOLDER_EMAIL_RE.match(logged_in_user.email), logged_in_user.email
-            assert "88888888" not in logged_in_user.email  # NIC must not leak
-            assert logged_in_user.extras.get("auth_nic") == _hash_nic("88888888")
-
-        # Registration is not complete without a real email: the user is
-        # sent to the complete-registration page, not the homepage.
         assert response.status_code == 302
-        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+        # ?no_email=true is the pre-existing marker for "the IdP brought no
+        # email address"; the wizard base URL is what matters here.
+        assert response.headers["Location"].startswith("http://localhost:3000/migrate-account")
+
+        # A NIC is present, so the wizard can open straight on the email step.
+        data = self.client.get("/saml/migration/pending").json
+        assert data["no_match"] is True
+        assert data["suggested_email"] is None  # the CMD brought no email
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
@@ -1336,10 +1351,12 @@ class SAMLEidasSSOTest(APITestCase):
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_eidas_creates_account_from_eidas_attributes(self, mock_client_for, mock_requires_conf):
-        """eIDAS-only attributes create an account with the same shape as
-        CMD: names mapped, PersonIdentifier hashed into auth_nic, and a
-        placeholder email that forces the complete-registration page."""
+        """eIDAS shares the resolver with CMD, so an unmatched eIDAS identity
+        also goes through the wizard instead of getting a placeholder account
+        and a session. The attributes travel in the session for it to use."""
         from udata.core.user.models import User
+
+        users_before = User.objects.count()
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
@@ -1348,21 +1365,22 @@ class SAMLEidasSSOTest(APITestCase):
                 given_name="Carmen",
                 family_name="García",
             )
-
-            assert mock_login.call_count == 1
-            user = mock_login.call_args[0][0]
-            # CurrentGivenName → first_name, CurrentFamilyName → last_name
-            assert user.first_name == "Carmen"
-            assert user.last_name == "García"
-            # PersonIdentifier → auth_nic (HMAC), never stored raw
-            assert user.extras.get("auth_nic") == _hash_nic(self.PERSON_ID)
-            assert self.PERSON_ID not in (user.extras.get("auth_nic") or "")
-            # eIDAS has no email attribute → placeholder, not NIC-derived
-            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
+            assert mock_login.call_count == 0
 
         assert response.status_code == 302
-        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
-        assert User.objects(extras__auth_nic=_hash_nic(self.PERSON_ID)).count() == 1
+        # ?no_email=true is the pre-existing marker for "the IdP brought no
+        # email address"; the wizard base URL is what matters here.
+        assert response.headers["Location"].startswith("http://localhost:3000/migrate-account")
+        assert User.objects.count() == users_before
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            assert pending["no_match"] is True
+            # CurrentGivenName → first_name, CurrentFamilyName → last_name
+            assert pending["saml_first_name"] == "Carmen"
+            assert pending["saml_last_name"] == "García"
+            # The raw PersonIdentifier is only hashed once an account exists.
+            assert pending["saml_nic"] == self.PERSON_ID
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
@@ -1447,6 +1465,10 @@ class SAMLEidasSSOTest(APITestCase):
         TST: every eIDAS login was rejected with subject_nic_mismatch).
         Same rule as CMD: the binding check is skipped for pseudonym
         NameIDs and the login proceeds."""
+        # This test is about attribute plumbing, not creation policy: run it
+        # on the wizard-disabled path, where the account is still created
+        # and logged in outright.
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
                 mock_client_for,
@@ -1472,6 +1494,10 @@ class SAMLEidasSSOTest(APITestCase):
     def test_eidas_still_accepts_mdc_attributes(self, mock_client_for, mock_requires_conf):
         """If the PT node translates eIDAS attributes into the MDC/Cidadao
         namespace, the postback keeps working (MDC is read first)."""
+        # This test is about attribute plumbing, not creation policy: run it
+        # on the wizard-disabled path, where the account is still created
+        # and logged in outright.
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             self._sso_with(
                 mock_client_for,
@@ -1495,6 +1521,10 @@ class SAMLEidasSSOTest(APITestCase):
         the eIDAS URIs into friendly names (PersonIdentifier, FirstName,
         FamilyName), so get_identity() keys them that way — the extraction
         must find them (this was the DEV `missing_attributes` failure)."""
+        # This test is about attribute plumbing, not creation policy: run it
+        # on the wizard-disabled path, where the account is still created
+        # and logged in outright.
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
                 mock_client_for,
@@ -1839,7 +1869,8 @@ class SAMLAccountLinkingTest(APITestCase):
 
     def test_name_match_ignores_accounts_already_linked_to_cmd(self):
         """Accounts that already have a CMD identity are not name-match
-        candidates — a homonym with CMD gets a new account instead."""
+        candidates — the homonym with CMD is left alone and the incoming
+        identity matches nothing."""
         from udata.auth.saml.saml_plugin.saml_govpt import _find_or_create_saml_user
 
         with self.app.app_context():
@@ -1856,8 +1887,12 @@ class SAMLAccountLinkingTest(APITestCase):
                 last_name="Matos",
             )
 
-            assert status == "new"
-            assert user.id != linked.id
+            assert status == "no_match"
+            assert user is None
+            # The invariant that matters: the account linked to another CMD
+            # identity was neither matched nor touched.
+            linked.reload()
+            assert linked.extras["auth_nic"] == _hash_nic("00001111")
 
     def test_linked_nic_takes_precedence_over_email_match(self):
         """Entry rule: a CMD identity already linked logs straight into
@@ -1970,8 +2005,8 @@ class SAMLStaleNicRelinkTest(APITestCase):
                 last_name="Isidro",
             )
 
-            assert status == "new"
-            assert user.id != other.id
+            assert status == "no_match"
+            assert user is None
             other.reload()
             assert other.extras["auth_nic"] == "99990000"
 
@@ -2018,8 +2053,8 @@ class SAMLStaleNicRelinkTest(APITestCase):
                 last_name="Matos",
             )
 
-            assert status == "new"
-            assert user.id != linked.id
+            assert status == "no_match"
+            assert user is None
             linked.reload()
             assert linked.extras["auth_nic"] == _hash_nic("00001111")
 
@@ -2446,9 +2481,11 @@ class SAMLMigrationWizardTest(APITestCase):
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_new_account_redirect_informs_user(self, mock_client_for, mock_requires_conf):
-        """Scenario 4 (direct): no match at all — the account is created
-        and the redirect carries cmd_new_account=1 so the frontend can
-        inform the user."""
+        """Scenario 4 (direct): with the wizard disabled, no match at all
+        still creates the account outright and the redirect carries
+        cmd_new_account=1 so the frontend can inform the user. With the
+        wizard enabled this population goes through it instead."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
         response = self._sso_with(
             mock_client_for,
             email="novo@example.pt",

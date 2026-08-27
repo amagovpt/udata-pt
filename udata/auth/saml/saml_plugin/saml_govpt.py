@@ -777,17 +777,22 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     2. Email match → suspected existing account; the user must confirm
        ownership through the migration wizard before linking
     3. Name-only match → same, suspected existing account
-    4. No match → create a new account
+    4. No match → no account; the caller decides what to do
 
     Accounts whose ``auth_nic`` holds a stale non-hashed value (plain NIC of
     a different identity, legacy ciphertext, junk) are NOT treated as linked:
     they remain wizard candidates in rules 2 and 3.
 
+    This is a pure resolver: it never creates an account. Creating one is the
+    caller's decision, because it depends on whether the migration wizard is
+    enabled — with the wizard on, an unmatched identity goes through it and
+    must supply a confirmed email before any account exists.
+
     Returns a tuple (user, status) where status is one of:
     - "existing_saml" — NIC already linked, normal login
     - "migration_candidate" — email or name match; user is the single
       candidate account, or None when several homonyms exist
-    - "new" — newly created user
+    - "no_match" — nothing matched; user is always None
     - "error" — neither email nor NIC available
     """
     from udata.core.user.models import User
@@ -850,7 +855,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         current_app.logger.error("SAML: Cannot create user without email or NIC")
         return None, "error"
 
-    return _create_saml_user(user_email, user_nic, first_name, last_name), "new"
+    return None, "no_match"
 
 
 def _handle_saml_user_login(user, new_account=False):
@@ -927,7 +932,7 @@ def _handle_saml_user_login(user, new_account=False):
     return redirect(destination)
 
 
-def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name):
+def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name, no_match=False):
     """Store SAML data in session and redirect to migration page.
 
     ``user`` is the single candidate account matched by name, or None
@@ -935,9 +940,15 @@ def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name
     the user to identify the account (login or search).
     ``saml_email`` is always the email coming from the CMD identity,
     never the candidate account's email.
+
+    ``no_match`` says the identity matched nothing at all, as opposed to
+    matching several homonyms. Both cases arrive with ``user`` unset, so the
+    wizard cannot tell them apart otherwise — and they need different first
+    steps: create an account, versus help me find mine.
     """
     session["saml_migration_pending"] = {
         "legacy_user_id": str(user.id) if user else None,
+        "no_match": no_match,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
@@ -1443,7 +1454,7 @@ def idp_initiated():
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
-    if status == "migration_candidate":
+    if status in ("migration_candidate", "no_match"):
         if _migration_enabled():
             _audit_saml(
                 "migration_pending",
@@ -1452,9 +1463,17 @@ def idp_initiated():
                 name_id=name_id_value,
                 reason=status,
             )
-            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
-        # Migration wizard disabled: never log into an unproven account —
-        # fall back to creating a new one (scenario 4).
+            return _handle_migration_redirect(
+                user,
+                user_email,
+                user_nic,
+                first_name,
+                last_name,
+                no_match=(status == "no_match"),
+            )
+        # Migration wizard disabled: never log into an unproven account, and
+        # nobody is around to ask for a confirmed email — fall back to
+        # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(user_email, user_nic, first_name, last_name)
         status = "new"
 
@@ -1874,7 +1893,7 @@ def idp_eidas_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate":
+    if status in ("migration_candidate", "no_match"):
         if _migration_enabled():
             _audit_saml(
                 "migration_pending",
@@ -1883,9 +1902,17 @@ def idp_eidas_initiated():
                 name_id=name_id_value,
                 reason=status,
             )
-            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
-        # Migration wizard disabled: never log into an unproven account —
-        # fall back to creating a new one (scenario 4).
+            return _handle_migration_redirect(
+                user,
+                user_email,
+                user_nic,
+                first_name,
+                last_name,
+                no_match=(status == "no_match"),
+            )
+        # Migration wizard disabled: never log into an unproven account, and
+        # nobody is around to ask for a confirmed email — fall back to
+        # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(user_email, user_nic, first_name, last_name)
         status = "new"
 
