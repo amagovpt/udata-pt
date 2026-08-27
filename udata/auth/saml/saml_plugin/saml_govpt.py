@@ -1014,7 +1014,13 @@ def _find_legacy_user(email=None, first_name=None, last_name=None):
     """Find a legacy user (has password, no NIC, not deleted) by email or name."""
     user = None
     if email:
-        user = datastore.find_user(email=email)
+        # case_insensitive, for the same reason the skip uniqueness check
+        # uses it: every login and recovery lookup goes through
+        # SECURITY_USER_IDENTITY_ATTRIBUTES, which is case-INSENSITIVE. An
+        # exact match here would leave the owner of "maria@x.pt" unable to
+        # find their own account by typing "Maria@x.pt" — the one address
+        # they are sure of.
+        user = datastore.find_user(case_insensitive=True, email=email)
     elif first_name and last_name:
         from udata.core.user.models import User
 

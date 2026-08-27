@@ -2736,6 +2736,39 @@ class SAMLMigrationWizardTest(APITestCase):
         assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_search_finds_the_legacy_account_whatever_the_email_casing(self, mock_client_for):
+        """The search lookup was the last exact-match one in the wizard. Login
+        and recovery are case-INSENSITIVE, so the owner of maria@ who types
+        Maria@ — the one address they are sure of — must still find their own
+        account here, not be told none exists."""
+        existing = UserFactory(
+            email="maria@example.pt",
+            password="S3cretPass!",
+            first_name="Maria",
+            last_name="Sousa",
+        )
+
+        # Neither the CMD email nor the CMD name matches the account, so the
+        # wizard opens with no candidate pointed at all.
+        self._sso_with(
+            mock_client_for,
+            email="maria.sousa@servico.gov.pt",
+            nic="48484848",
+            first_name="Maria Isabel",
+            last_name="Sousa Pereira",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+
+        response = self.client.post("/saml/migration/search", json={"email": "MARIA@example.pt"})
+        assert response.status_code == 200
+        assert response.json["found"] is True
+        assert response.json["email"] == "m***@example.pt"
+
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(existing.id)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_stores_the_normalised_address(self, mock_client_for):
         """The stored address is the normalised one, as on the registration
         path — not the raw string, whose casing would otherwise decide which of
