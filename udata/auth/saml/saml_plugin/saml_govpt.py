@@ -31,10 +31,12 @@ from flask_login import login_user, logout_user
 from flask_security.confirmable import requires_confirmation, send_confirmation_instructions
 from flask_security.decorators import anonymous_user_required
 from flask_security.utils import (
+    check_and_get_token_status,
     do_flash,
     get_message,
     hash_data,
     verify_and_update_password,
+    verify_hash,
 )
 from saml2 import (
     BINDING_HTTP_POST,
@@ -1120,13 +1122,14 @@ def _migration_link_send_allowed(user):
     return True, {"count": count + 1, "window_start": tally["window_start"]}
 
 
-def _issue_migration_link(user, pending):
+def _issue_migration_link(user, nic_hash, first_name, last_name):
     """Record a pending link request on ``user`` and return its token.
 
     The record carries everything the click needs — the hashed NIC and the
     names from the assertion — so the consuming route never has to read the
     session. A fresh nonce is minted on every call, which is what makes a
-    resend invalidate the link that preceded it.
+    resend invalidate the link that preceded it. Takes the NIC already hashed
+    so a reissue can work from a record, where the raw value is long gone.
     """
     nonce = secrets.token_urlsafe(32)
 
@@ -1134,9 +1137,9 @@ def _issue_migration_link(user, pending):
         user.extras = {}
     user.extras[MIGRATION_LINK_PENDING] = {
         "nonce": nonce,
-        "nic_hash": _hash_nic(pending["saml_nic"]),
-        "first_name": pending.get("saml_first_name"),
-        "last_name": pending.get("saml_last_name"),
+        "nic_hash": nic_hash,
+        "first_name": first_name,
+        "last_name": last_name,
         "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
     }
 
@@ -1186,7 +1189,61 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name):
     current_app.logger.info(f"Account migration completed for user {user.id}")
 
 
-def _send_migration_link(user, pending, token):
+def _migration_link_token_status(token):
+    """Resolve a validation-link token to ``(user, record, state)``.
+
+    ``state`` is one of "ok", "invalid" or "expired". Validity is settled
+    BEFORE expiry, unlike the change-email precedent this otherwise follows:
+    there a stale token merely triggers a fresh mail, but here a resend mints
+    a new nonce, so letting a superseded token reach the expiry branch would
+    have it reissue and thereby kill the newer link the user is holding.
+    """
+    from udata.core.user.models import User
+
+    # The signature carries the same deadline as the record, so the TTL is
+    # enforced cryptographically too. An expired signature still yields its
+    # payload (loads_unsafe), which is what lets the caller identify the
+    # account and mail a fresh link rather than dead-ending the user.
+    signature_expired, invalid, token_data = check_and_get_token_status(
+        token, "confirm", MIGRATION_LINK_TTL
+    )
+    if invalid or not token_data or len(token_data) != 2:
+        return None, None, "invalid"
+
+    user_id, nonce_hash = token_data
+    user = User.objects(id=user_id).first() if user_id else None
+    if not user or user.deleted:
+        return None, None, "invalid"
+
+    record = (user.extras or {}).get(MIGRATION_LINK_PENDING)
+    if not record or not record.get("nonce"):
+        # No record: the link was consumed, the wizard was re-pointed at
+        # another account, or another branch linked this one. Where the
+        # account did end up linked, saying so is more use than "invalid" —
+        # it is what a second click, or a mail scanner pre-opening the link,
+        # actually ran into, and the answer is to sign in with CMD.
+        if _has_linked_nic(user):
+            return user, None, "already_done"
+        return user, None, "invalid"
+
+    if not verify_hash(nonce_hash, record["nonce"]):
+        return user, None, "invalid"
+
+    # The account gained a linked identity since the link went out, and it is
+    # not this one: refuse rather than overwrite somebody else's link.
+    current_nic = (user.extras or {}).get("auth_nic")
+    if _has_linked_nic(user) and current_nic != record.get("nic_hash"):
+        return user, None, "invalid"
+
+    expires = _parse_isoformat(record.get("expires"))
+    # A record with no readable deadline fails closed.
+    if signature_expired or expires is None or datetime.utcnow() > expires:
+        return user, record, "expired"
+
+    return user, record, "ok"
+
+
+def _send_migration_link(user, first_name, last_name, token):
     """Email the validation link that completes a legacy-account link.
 
     The body is a security control, not decoration. The wizard reaches this
@@ -1199,11 +1256,7 @@ def _send_migration_link(user, pending, token):
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     link = f"{frontend_url}/saml/migration/confirm-link/{token}"
 
-    requester = " ".join(
-        part.title()
-        for part in (pending.get("saml_first_name"), pending.get("saml_last_name"))
-        if part
-    )
+    requester = " ".join(part.title() for part in (first_name, last_name) if part)
 
     msg = MailMessage(
         subject=_("Confirm linking a digital identity to your account"),
@@ -2437,14 +2490,80 @@ def migration_send_link():
         # exact string onto its "too many sends" copy.
         return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
 
-    token = _issue_migration_link(user, pending)
+    token = _issue_migration_link(
+        user,
+        _hash_nic(pending["saml_nic"]),
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+    )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
 
-    _send_migration_link(user, pending, token)
+    _send_migration_link(user, pending.get("saml_first_name"), pending.get("saml_last_name"), token)
     current_app.logger.info(f"Migration validation link sent to user {legacy_user_id}")
 
     return jsonify({"sent": True})
+
+
+@autenticacao_gov.route("/saml/migration/confirm-link/<token>", methods=["GET"])
+@csrf.exempt
+def migration_confirm_link(token):
+    """Complete a legacy-account link from the emailed validation link.
+
+    This is the click, so it must work with no session: everything it needs
+    was recorded on the account when the link was issued. It logs the user in
+    directly rather than deferring to flask-security's /confirm/<token>, whose
+    AUTO_LOGIN_AFTER_CONFIRM defaults to False.
+
+    Every outcome is a redirect carrying a ?flash= the wizard screen renders.
+    A 500 here is a dead end for the user — the link is single-use, so they
+    cannot retry it.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    wizard_url = f"{frontend_url}/migrate-account"
+
+    if not _migration_enabled():
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
+
+    user, record, state = _migration_link_token_status(token)
+
+    if state == "already_done":
+        return redirect(f"{wizard_url}?flash=migration_link_already_done")
+
+    if state == "invalid":
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
+
+    if state == "expired":
+        # Reissue on expiry, as the change-email confirmation does, so the
+        # user's way out is a fresh mail rather than starting over. The window
+        # cap still applies: it is the same mail as any other send.
+        allowed, tally = _migration_link_send_allowed(user)
+        if not allowed:
+            return redirect(f"{wizard_url}?flash=migration_link_too_many_sends")
+
+        # Reissue against the identity the expired record already holds: the
+        # hashed NIC is all that was kept, and re-hashing is neither possible
+        # nor needed.
+        new_token = _issue_migration_link(
+            user,
+            record.get("nic_hash"),
+            record.get("first_name"),
+            record.get("last_name"),
+        )
+        user.extras[MIGRATION_LINK_SEND_COUNT] = tally
+        user.save()
+        _send_migration_link(user, record.get("first_name"), record.get("last_name"), new_token)
+        return redirect(f"{wizard_url}?flash=migration_link_expired")
+
+    _link_identity_and_login(
+        user,
+        record.get("nic_hash"),
+        record.get("first_name"),
+        record.get("last_name"),
+    )
+    current_app.logger.info(f"Migration completed by validation link for user {user.id}")
+
+    return redirect(frontend_url or "/")
 
 
 @autenticacao_gov.route("/saml/migration/send-code", methods=["POST"])
