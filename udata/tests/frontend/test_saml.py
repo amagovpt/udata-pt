@@ -2281,10 +2281,10 @@ class SAMLMigrationWizardTest(APITestCase):
         assert taken.extras.get("auth_nic") == _hash_nic("99990000")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_skip_creates_new_account_with_cmd_email(self, mock_client_for):
-        """'Criar nova conta' (scenario 4 via wizard): the new account
-        uses the CMD email when it exists, and the candidate account is
-        never touched."""
+    def test_skip_creates_unconfirmed_account_with_submitted_email(self, mock_client_for):
+        """'Criar nova conta': the account is created with the email the
+        user submitted, left unconfirmed, mailed a confirmation link, and
+        given NO session. The candidate account is never touched."""
         from udata.core.user.models import User
 
         homonym = UserFactory(
@@ -2302,16 +2302,75 @@ class SAMLMigrationWizardTest(APITestCase):
             last_name="Gomes",
         )
 
-        response = self.client.post("/saml/migration/skip")
-        assert response.status_code == 200
-        # The CMD email was usable — registration is complete.
-        assert response.json["pending_registration"] is False
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            # Criterion 8: assert we drive the STOCK Flask-Security
+            # confirmable — no new token, template or mechanism. Counting
+            # mails cannot show this: under test SEND_MAIL is False, so
+            # security mails go through NoopMailUtil and never reach the
+            # mail_sent signal that capture_mails listens on.
+            with patch(
+                "udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"
+            ) as mock_confirm:
+                response = self.client.post(
+                    "/saml/migration/skip",
+                    json={"email": "rita.chosen@example.pt"},
+                )
+            # Criterion 10: no session is started by this endpoint.
+            assert mock_login.call_count == 0
 
-        new_user = User.objects(email="rita.cmd@example.pt").first()
+        assert response.status_code == 200
+        assert response.json == {"success": True, "email": "rita.chosen@example.pt"}
+
+        new_user = User.objects(email="rita.chosen@example.pt").first()
+        assert mock_confirm.call_count == 1
+        assert mock_confirm.call_args[0][0].id == new_user.id
         assert new_user is not None
         assert new_user.extras.get("auth_nic") == _hash_nic("44556677")
+        # Criterion 9: unconfirmed until the owner follows the link.
+        assert new_user.confirmed_at is None
+        assert new_user.extras.get("pending_email_confirmation") is True
         homonym.reload()
         assert not (homonym.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_rejects_missing_invalid_and_taken_emails(self, mock_client_for):
+        """Criterion 5: each rejection is distinguishable and leaves the
+        pending migration intact, so the user can correct and resubmit."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="taken@example.pt",
+            password="S3cretPass!",
+            first_name="Rita",
+            last_name="Gomes",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="rita.cmd@example.pt",
+            nic="44556677",
+            first_name="Rita",
+            last_name="Gomes",
+        )
+        users_before = User.objects.count()
+
+        for payload, status, error in (
+            ({}, 400, "email_required"),
+            ({"email": "   "}, 400, "email_required"),
+            ({"email": "not-an-email"}, 400, "invalid_email"),
+            ({"email": "taken@example.pt"}, 409, "email_taken"),
+        ):
+            response = self.client.post("/saml/migration/skip", json=payload)
+            assert response.status_code == status, payload
+            assert response.json["error"] == error, payload
+            # The wizard session survives, and nothing was created.
+            with self.client.session_transaction() as sess:
+                assert sess.get("saml_migration_pending") is not None
+            assert User.objects.count() == users_before
+
+        # Correcting the address still works after the rejections.
+        response = self.client.post("/saml/migration/skip", json={"email": "rita.fixed@example.pt"})
+        assert response.status_code == 200
+        assert User.objects(email="rita.fixed@example.pt").first() is not None
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_pending_exposes_candidate_account_details(self, mock_client_for):
@@ -2450,10 +2509,10 @@ class SAMLMigrationWizardTest(APITestCase):
         assert existing.password == original_password_hash
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_skip_after_email_match_uses_placeholder_email(self, mock_client_for):
-        """When the CMD email is already taken by the matched account
-        and the user chooses 'create new account', the new account gets
-        a placeholder email instead of a duplicate."""
+    def test_skip_after_email_match_never_mints_a_placeholder(self, mock_client_for):
+        """When the CMD email is already taken by the matched account and the
+        user chooses 'create new account', they must supply a different
+        address. Criterion 6: this flow never mints a saml-* placeholder."""
         from udata.core.user.models import User
 
         existing = UserFactory(
@@ -2471,18 +2530,49 @@ class SAMLMigrationWizardTest(APITestCase):
             last_name="Pereira",
         )
 
-        response = self.client.post("/saml/migration/skip")
+        # Reusing the taken CMD address is refused, not silently worked
+        # around with a placeholder as it was before.
+        response = self.client.post("/saml/migration/skip", json={"email": "default@example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+
+        response = self.client.post("/saml/migration/skip", json={"email": "ana.nova@example.pt"})
         assert response.status_code == 200
-        # A placeholder was minted — the frontend must route the user to
-        # /complete-registration to provide a real email.
-        assert response.json["pending_registration"] is True
 
         new_user = User.objects(extras__auth_nic=_hash_nic("12121212")).first()
         assert new_user is not None
         assert new_user.id != existing.id
-        assert _SAML_PLACEHOLDER_EMAIL_RE.match(new_user.email), new_user.email
-        existing.reload()
-        assert not (existing.extras or {}).get("auth_nic")
+        assert new_user.email == "ana.nova@example.pt"
+        assert not _SAML_PLACEHOLDER_EMAIL_RE.match(new_user.email)
+        assert new_user.confirmed_at is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_refuses_an_identity_without_a_nic(self, mock_client_for):
+        """An account with no auth_nic would not be excluded by
+        _has_linked_nic, so on the next CMD login it would match itself as a
+        wizard candidate — letting the user mail a code to the very address
+        awaiting confirmation and log in without ever following the link.
+        Those identities belong in the search branch."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="bruno@example.pt",
+            password="S3cretPass!",
+            first_name="Bruno",
+            last_name="Silva",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="bruno@example.pt",
+            first_name="Bruno",
+            last_name="Silva",
+        )
+        users_before = User.objects.count()
+
+        response = self.client.post("/saml/migration/skip", json={"email": "bruno.novo@example.pt"})
+        assert response.status_code == 400
+        assert response.json["error"] == "nic_required"
+        assert User.objects.count() == users_before
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
