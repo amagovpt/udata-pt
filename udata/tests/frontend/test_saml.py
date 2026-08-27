@@ -2781,8 +2781,6 @@ class SAMLMigrationWizardTest(APITestCase):
             # The wizard did not end — it moved to the linking branch.
             assert pending is not None
             assert pending["legacy_user_id"] == str(existing.id)
-            # Re-pointing kills any code issued for the previous target.
-            assert "migration_code" not in sess
 
         # And the linking branch now works from here.
         assert self.client.get("/saml/migration/pending").json["candidate"] is True
@@ -2792,8 +2790,9 @@ class SAMLMigrationWizardTest(APITestCase):
         self, mock_client_for
     ):
         """The whole path the divert opens, end to end: no_match -> own address
-        on the creation step -> candidate pointed -> code mailed to that same
-        account -> linked -> the next CMD login walks straight in.
+        on the creation step -> candidate pointed -> validation link mailed to
+        that same account -> clicked -> linked -> the next CMD login walks
+        straight in.
 
         The negative assertion is the point of the test as much as the positive
         one: between the divert and the confirm, nothing is linked. The divert
@@ -2830,33 +2829,24 @@ class SAMLMigrationWizardTest(APITestCase):
         assert not (existing.extras or {}).get("auth_nic")
         assert User.objects.count() == users_before
 
-        # 3. The code goes to the candidate account's own address — the one
+        # 3. The link goes to the candidate account's own address — the one
         #    thing that makes this a proof of ownership rather than a claim.
-        captured = {}
-
-        def _capture(user, code):
-            captured["user"] = user
-            captured["code"] = code
-
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
-            side_effect=_capture,
-        ):
-            response = self.client.post("/saml/migration/send-code")
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post("/saml/migration/send-link")
             assert response.status_code == 200
-        assert captured["user"].id == existing.id
-        assert captured["user"].email == "joana@example.pt"
+        assert mock_send.call_args[0][0].id == existing.id
+        assert mock_send.call_args[0][0].email == "joana@example.pt"
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
 
-        # Ownership is still unproven right up to the confirm.
+        # Ownership is still unproven right up to the click.
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
 
-        # 4. Proving it links the identity to the existing account.
-        response = self.client.post(
-            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
-        )
-        assert response.status_code == 200
-        assert response.json["success"] is True
+        # 4. Clicking it links the identity to the existing account.
+        response = self.client.get(f"/saml/migration/confirm-link/{token}")
+        assert response.status_code == 302
+        assert "flash=" not in response.headers["Location"]
 
         assert User.objects.count() == users_before
         existing.reload()
@@ -3042,10 +3032,10 @@ class SAMLMigrationWizardTest(APITestCase):
         assert not (legacy.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_skip_divert_invalidates_a_code_issued_for_the_previous_target(self, mock_client_for):
+    def test_skip_divert_invalidates_a_link_issued_for_the_previous_target(self, mock_client_for):
         """The same target-confusion hole the search endpoint had, reached
-        through the skip instead. A code emailed for candidate A must not be
-        accepted once the divert has re-pointed the session at B."""
+        through the skip instead. A validation link emailed for candidate A
+        must not still work once the divert has re-pointed the session at B."""
         first = UserFactory(
             email="alice@example.pt",
             password="S3cretPass!",
@@ -3067,28 +3057,27 @@ class SAMLMigrationWizardTest(APITestCase):
             last_name="Lopes Dias",
         )
 
-        # Point A and get a code issued for it.
+        # Point A and get a link issued for it.
         response = self.client.post("/saml/migration/search", json={"email": first.email})
         assert response.json["found"] is True
-        captured = {}
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
-            side_effect=lambda user, code: captured.update(code=code),
-        ):
-            assert self.client.post("/saml/migration/send-code").status_code == 200
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
 
         # Now the divert re-points at B.
         response = self.client.post("/saml/migration/skip", json={"email": second.email})
         assert response.status_code == 409
         assert response.json["candidate_found"] is True
 
-        # The old code is gone, not merely mismatched.
-        with self.client.session_transaction() as sess:
-            assert "migration_code" not in sess
-        response = self.client.post(
-            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
-        )
-        assert response.status_code != 200
+        # The record backing the old link is destroyed, not merely mismatched.
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        first.reload()
+        assert MIGRATION_LINK_PENDING not in (first.extras or {})
+
+        response = self.client.get(f"/saml/migration/confirm-link/{token}")
+        assert "flash=migration_link_invalid" in response.headers["Location"]
         for account in (first, second):
             account.reload()
             assert not (account.extras or {}).get("auth_nic")
@@ -3878,6 +3867,42 @@ class SAMLMigrationLinkClickTest(APITestCase):
         legacy.reload()
         assert legacy.extras["auth_nic"] == _hash_nic("00001111")
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_code_branch_is_gone(self, mock_client_for):
+        """LEDG-2357 removes the 6-digit code outright rather than leaving it
+        unreachable from the UI: while the endpoint answered, the takeover
+        chain of LEDG-2355 stayed reachable by direct POST. The password
+        branch is untouched."""
+        UserFactory(
+            email="paulo.old@example.pt",
+            password="S3cretPass!",
+            first_name="Paulo",
+            last_name="Faria",
+        )
+        self._sso_with(mock_client_for, nic="31313131", first_name="Paulo", last_name="Faria")
+
+        # 405, not 404: the endpoint is gone from the blueprint, and a
+        # GET-only catch-all further down the map is what the path now hits.
+        assert self.client.post("/saml/migration/send-code").status_code in (404, 405)
+        assert not any("send-code" in str(rule) for rule in self.app.url_map.iter_rules())
+
+        response = self.client.post(
+            "/saml/migration/confirm", json={"method": "code", "code": "123456"}
+        )
+        assert response.status_code == 400
+        assert response.json["error"] == "Invalid method"
+
+        # The surviving proof of ownership still works.
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={
+                "method": "password",
+                "email": "paulo.old@example.pt",
+                "password": "S3cretPass!",
+            },
+        )
+        assert response.status_code == 200
+
     def test_a_forged_or_unknown_token_never_500s(self):
         """Criterion 6: garbage in the URL is an answer, not a stack trace."""
         for token in ("", "not-a-token", "a.b.c", "x" * 400):
@@ -3993,11 +4018,13 @@ class SAMLMigrationSecurityTest(APITestCase):
         return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_emailed_code_cannot_link_a_re_targeted_account(self, mock_client_for):
-        """Target-confusion / account takeover: a code emailed to the
-        attacker's own account must not be accepted to link the CMD
-        identity to a DIFFERENT account after migration/search re-points
-        the candidate to a victim."""
+    def test_emailed_link_cannot_link_a_re_targeted_account(self, mock_client_for):
+        """Target-confusion / account takeover: a validation link emailed to
+        the attacker's own account must not link the CMD identity to a
+        DIFFERENT account after migration/search re-points the candidate to a
+        victim. The code this replaced died with a session pop; the link is
+        stateless, so it dies with the record on the account it was issued
+        against."""
         # Victim: legacy account (password, no NIC). The attacker cannot
         # read the victim's mailbox nor knows its password.
         victim = UserFactory(
@@ -4021,31 +4048,24 @@ class SAMLMigrationSecurityTest(APITestCase):
         )
         assert "/migrate-account" in resp.headers["Location"]
 
-        # 2. Attacker requests a code — emailed to their OWN address. We
-        #    capture it as the attacker would read it from their inbox.
-        captured = {}
-
-        def _capture(user, code):
-            captured["code"] = code
-
-        with patch(
-            "udata.auth.saml.saml_plugin.saml_govpt._send_migration_code",
-            side_effect=_capture,
-        ):
-            r = self.client.post("/saml/migration/send-code")
+        # 2. Attacker requests a link — emailed to their OWN address. We take
+        #    the token as the attacker would read it from their inbox.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            r = self.client.post("/saml/migration/send-link")
             assert r.status_code == 200
-        assert "code" in captured
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
 
         # 3. Attacker re-targets the candidate to the victim via search.
         r = self.client.post("/saml/migration/search", json={"email": "victim@gov.pt"})
         assert r.status_code == 200 and r.json["found"] is True
 
-        # 4. Attacker submits the code they received. It must NOT link the
-        #    NIC to the victim, nor log the attacker in as the victim.
-        r = self.client.post(
-            "/saml/migration/confirm", json={"method": "code", "code": captured["code"]}
+        # 4. Attacker opens the link they received. It must NOT link the NIC
+        #    to the victim, nor log the attacker in as the victim.
+        r = self.client.get(f"/saml/migration/confirm-link/{token}")
+        assert "flash=migration_link_invalid" in r.headers["Location"], (
+            "Account takeover: re-targeted link was accepted"
         )
-        assert r.status_code != 200, "Account takeover: re-targeted code was accepted"
 
         victim.reload()
         assert not (victim.extras or {}).get("auth_nic"), "Victim account was taken over"

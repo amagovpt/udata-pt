@@ -6,7 +6,6 @@ import binascii
 import hashlib
 import logging
 import os
-import random
 import re
 import secrets
 import tempfile
@@ -973,8 +972,6 @@ def _handle_saml_user_login(user, new_account=False):
         # assertion; left in place, migration_pending would answer with that
         # stale wizard instead of this screen.
         session.pop("saml_migration_pending", None)
-        session.pop("migration_code", None)
-        session.pop("migration_send_count", None)
         session.pop("migration_password_attempts", None)
         session["saml_confirmation_pending"] = {"user_id": str(user.id)}
         return redirect(f"{frontend_url}/migrate-account")
@@ -1057,15 +1054,12 @@ def _mask_email(email):
 def _point_migration_candidate(pending, user):
     """Point the pending migration at ``user`` as the account to link.
 
-    The single place that mutates the candidate reference. Any code already
-    emailed was issued for a different target, so it has to die with the
-    re-point — copying that invariant to a second call site is how
-    target-confusion gets reintroduced.
-
-    A validation link needs the same treatment, but cannot get it the same
-    way: the code lived in the session, so popping it was enough, whereas a
-    mailed token is stateless and outlives any session. Destroying the record
-    on the account it was issued against is what kills it.
+    The single place that mutates the candidate reference. Any validation
+    link already emailed was issued for a different target, so it has to die
+    with the re-point — copying that invariant to a second call site is how
+    target-confusion gets reintroduced. The link is stateless and outlives
+    any session, so destroying the record on the account it was issued
+    against is what kills it.
     """
     previous_id = pending.get("legacy_user_id")
     if previous_id and previous_id != str(user.id):
@@ -1076,7 +1070,6 @@ def _point_migration_candidate(pending, user):
     # legacy account's email.
     pending["legacy_user_id"] = str(user.id)
     session["saml_migration_pending"] = pending
-    session.pop("migration_code", None)
     session.modified = True
 
 
@@ -1087,23 +1080,6 @@ def _drop_migration_link(user_id):
     previous = User.objects(id=user_id).first()
     if previous and (previous.extras or {}).pop(MIGRATION_LINK_PENDING, None):
         previous.save()
-
-
-def _send_migration_code(user, code):
-    """Send a verification code email for account migration."""
-    msg = MailMessage(
-        subject=_("Account migration verification code"),
-        paragraphs=[
-            _(
-                "Someone is linking a CMD identity to your %(site)s account.",
-                site=current_app.config.get("SITE_TITLE", "dados.gov.pt"),
-            ),
-            _("Your verification code is: %(code)s", code=code),
-            _("This code expires in 10 minutes."),
-            _("If you did not request this, ignore this email."),
-        ],
-    )
-    send_mail(user, msg)
 
 
 def _parse_isoformat(value):
@@ -1200,8 +1176,6 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name):
 
     # Clean up migration session data
     session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
     session.pop("migration_password_attempts", None)
 
     current_app.logger.info(f"Account migration completed for user {user.id}")
@@ -2584,50 +2558,6 @@ def migration_confirm_link(token):
     return redirect(frontend_url or "/")
 
 
-@autenticacao_gov.route("/saml/migration/send-code", methods=["POST"])
-@csrf.exempt
-def migration_send_code():
-    """Generate and send a 6-digit verification code to the legacy user's email."""
-    if not _migration_enabled():
-        return jsonify({"error": "Migration mode is not enabled"}), 403
-
-    pending = session.get("saml_migration_pending")
-    if not pending:
-        return jsonify({"error": "No pending migration"}), 400
-
-    # Rate limit: max 3 sends per session
-    send_count = session.get("migration_send_count", 0)
-    if send_count >= 3:
-        return jsonify({"error": "Maximum code sends exceeded"}), 429
-
-    legacy_user_id = pending.get("legacy_user_id")
-    if not legacy_user_id:
-        return jsonify({"error": "No legacy user found"}), 400
-
-    from udata.core.user.models import User
-
-    user = User.objects(id=legacy_user_id).first()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    code = str(random.randint(100000, 999999))
-    session["migration_code"] = {
-        "code": code,
-        # Bind the code to the account it was emailed to, so it cannot be
-        # replayed against a different candidate re-pointed via search.
-        "legacy_user_id": legacy_user_id,
-        "expires": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
-        "attempts": 0,
-    }
-    session["migration_send_count"] = send_count + 1
-    session.modified = True
-
-    _send_migration_code(user, code)
-    current_app.logger.info(f"Migration code sent to user {legacy_user_id}")
-
-    return jsonify({"sent": True})
-
-
 @autenticacao_gov.route("/saml/migration/confirm", methods=["POST"])
 @csrf.exempt
 def migration_confirm():
@@ -2642,45 +2572,7 @@ def migration_confirm():
     data = request.get_json(silent=True) or {}
     method = data.get("method")
 
-    from udata.core.user.models import User
-
-    if method == "code":
-        # Code verification targets the candidate account found by
-        # name/search — a code was emailed to that account's address.
-        legacy_user_id = pending.get("legacy_user_id")
-        if not legacy_user_id:
-            return jsonify({"error": "No legacy user found"}), 400
-
-        user = User.objects(id=legacy_user_id).first()
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-
-        code_data = session.get("migration_code")
-        if not code_data:
-            return jsonify({"error": "No code sent"}), 400
-
-        # The code is only valid for the account it was emailed to. If the
-        # candidate was re-pointed (via search) after the code was issued,
-        # refuse it — otherwise a code sent to an attacker-controlled
-        # mailbox could link the NIC to a victim account.
-        if code_data.get("legacy_user_id") != legacy_user_id:
-            return jsonify({"error": "No code sent"}), 400
-
-        if code_data["attempts"] >= 5:
-            return jsonify({"error": "Maximum attempts exceeded"}), 429
-
-        code_data["attempts"] += 1
-        session["migration_code"] = code_data
-        session.modified = True
-
-        expires = datetime.fromisoformat(code_data["expires"])
-        if datetime.utcnow() > expires:
-            return jsonify({"error": "Code expired"}), 400
-
-        if data.get("code") != code_data["code"]:
-            return jsonify({"error": "Invalid code"}), 400
-
-    elif method == "password":
+    if method == "password":
         # Full default login (email + password): the linked account is
         # the one whose credentials are proven, which may differ from
         # the name-matched candidate (homonym case).
@@ -2847,8 +2739,6 @@ def migration_skip():
     # The wizard state is done, but a resend handle must survive it — this key
     # identifies the user to the resend endpoint without authenticating them.
     session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
     session.pop("migration_password_attempts", None)
     session["saml_confirmation_pending"] = {"user_id": str(user.id)}
 
@@ -2885,12 +2775,11 @@ def migration_resend_confirmation():
         # send the user to the login instead of waiting for another mail.
         return jsonify({"sent": False, "confirmed": True})
 
-    # The cap is counted ON THE ACCOUNT, not in the session. migration_send_code
-    # keeps its counter in the session, but it can only ever mail the candidate
-    # account's own address; here the recipient was chosen by whoever ran the
-    # wizard, so a session-only counter would be no cap at all — the Flask
-    # session is a client-held signed cookie, and replaying a copy taken before
-    # the first send resets it to zero on every request.
+    # The cap is counted ON THE ACCOUNT, not in the session: here the recipient
+    # was chosen by whoever ran the wizard, so a session-only counter would be
+    # no cap at all — the Flask session is a client-held signed cookie, and
+    # replaying a copy taken before the first send resets it to zero on every
+    # request.
     send_count = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0)
     if send_count >= MAX_CONFIRMATION_SENDS:
         return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
