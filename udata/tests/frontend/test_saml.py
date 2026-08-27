@@ -3575,6 +3575,42 @@ class SAMLMigrationWizardTest(APITestCase):
         assert User.objects(id=legacy.id).first().confirmed_at is None
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_linking_by_password_clears_an_outstanding_validation_link(self, mock_client_for):
+        """LEDG-2357: proving ownership by password must kill a validation link
+        already in the wild. Otherwise that link stays clickable and would
+        overwrite the identity the password branch just bound."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy = UserFactory(
+            email="nuno.old@example.pt",
+            password="S3cretPass!",
+            first_name="Nuno",
+            last_name="Reis",
+        )
+
+        self._sso_with(mock_client_for, nic="65432198", first_name="Nuno", last_name="Reis")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+
+        legacy.reload()
+        assert MIGRATION_LINK_PENDING in legacy.extras
+
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={
+                "method": "password",
+                "email": "nuno.old@example.pt",
+                "password": "S3cretPass!",
+            },
+        )
+        assert response.status_code == 200
+
+        legacy.reload()
+        assert legacy.extras.get("auth_nic") == _hash_nic("65432198")
+        assert MIGRATION_LINK_PENDING not in legacy.extras
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_send_link_caps_sends_per_window_without_locking_the_account_out(self, mock_client_for):
         """LEDG-2357: the cap stops a mail flood, but it is a window and not a
         lifetime ceiling — otherwise five anonymous requests would deny the

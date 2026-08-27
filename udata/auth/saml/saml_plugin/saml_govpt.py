@@ -1148,6 +1148,44 @@ def _issue_migration_link(user, pending):
     return serializer.dumps([str(user.id), hash_data(nonce)])
 
 
+def _link_identity_and_login(user, nic_hash, first_name, last_name):
+    """Bind the authenticated identity to ``user`` and start its session.
+
+    The single place that completes a link, shared by every branch that can:
+    the password proof and the emailed validation link. Keeping it in one
+    place is not tidiness — clearing the pending link record is one of its
+    responsibilities, and a branch that linked an account without clearing it
+    would leave a live link able to overwrite the identity it just bound. The
+    password is left untouched so the account stays reachable both ways.
+    """
+    if not user.extras:
+        user.extras = {}
+    if nic_hash:
+        user.extras["auth_nic"] = nic_hash
+    if first_name:
+        user.first_name = first_name.title()
+    if last_name:
+        user.last_name = last_name.title()
+    if not user.confirmed_at:
+        user.confirmed_at = datetime.utcnow()
+
+    # However the link was proved, any validation link still outstanding for
+    # this account was issued against the state that has just changed.
+    user.extras.pop(MIGRATION_LINK_PENDING, None)
+    user.save()
+
+    login_user(user)
+    session["saml_login"] = True
+
+    # Clean up migration session data
+    session.pop("saml_migration_pending", None)
+    session.pop("migration_code", None)
+    session.pop("migration_send_count", None)
+    session.pop("migration_password_attempts", None)
+
+    current_app.logger.info(f"Account migration completed for user {user.id}")
+
+
 def _send_migration_link(user, pending, token):
     """Email the validation link that completes a legacy-account link.
 
@@ -2535,34 +2573,13 @@ def migration_confirm():
     else:
         return jsonify({"error": "Invalid method"}), 400
 
-    # Link: add NIC and update names. The password is kept so the
-    # account remains accessible through both login methods.
     saml_nic = pending.get("saml_nic")
-    saml_first_name = pending.get("saml_first_name")
-    saml_last_name = pending.get("saml_last_name")
-
-    if not user.extras:
-        user.extras = {}
-    if saml_nic:
-        user.extras["auth_nic"] = _hash_nic(saml_nic)
-    if saml_first_name:
-        user.first_name = saml_first_name.title()
-    if saml_last_name:
-        user.last_name = saml_last_name.title()
-    if not user.confirmed_at:
-        user.confirmed_at = datetime.utcnow()
-    user.save()
-
-    login_user(user)
-    session["saml_login"] = True
-
-    # Clean up migration session data
-    session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
-    session.pop("migration_password_attempts", None)
-
-    current_app.logger.info(f"Account migration completed for user {user.id}")
+    _link_identity_and_login(
+        user,
+        _hash_nic(saml_nic) if saml_nic else None,
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+    )
 
     return jsonify({"success": True})
 
