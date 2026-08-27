@@ -829,7 +829,11 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     #    (password or email code) via the migration wizard. Accounts
     #    already linked to another CMD identity are not candidates.
     if user_email:
-        user = datastore.find_user(email=user_email)
+        # case_insensitive, as everywhere else the wizard resolves an
+        # address: an exact match here sends the owner of "maria@x.pt" whose
+        # CMD carries "Maria@x.pt" down the no_match branch, making them ask
+        # for an account they already have.
+        user = datastore.find_user(case_insensitive=True, email=user_email)
         if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
@@ -2287,7 +2291,11 @@ def migration_confirm():
 
         email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        user = datastore.find_user(email=email) if email else None
+        # case_insensitive, to match the login form this branch stands in
+        # for. Exact-matching here failed the ownership proof for a correct
+        # password, and the generic error below made that indistinguishable
+        # from a wrong one.
+        user = datastore.find_user(case_insensitive=True, email=email) if email else None
         # Generic error on any failure to avoid account enumeration.
         if (
             not user

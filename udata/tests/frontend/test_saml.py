@@ -2736,6 +2736,74 @@ class SAMLMigrationWizardTest(APITestCase):
         assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_email_match_is_case_insensitive_for_the_wizard_candidate(self, mock_client_for):
+        """Rule 2 is what decides migration_candidate. Exact-matching there sent
+        the owner of maria@ whose CMD carries Maria@ down the no_match branch —
+        asked to create an account they already have. The name deliberately does
+        not match, so only the email rule can produce the candidate."""
+        existing = UserFactory(
+            email="beatriz@example.pt",
+            password="S3cretPass!",
+            first_name="Beatriz",
+            last_name="Lima",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="Beatriz@Example.pt",
+            nic="51515151",
+            first_name="Beatriz Maria",
+            last_name="Lima Correia",
+        )
+
+        data = self.client.get("/saml/migration/pending").json
+        assert data["candidate"] is True
+        assert data["no_match"] is False
+        assert data["email"] == "b***@example.pt"
+
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(existing.id)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_confirm_with_password_accepts_a_differently_cased_email(self, mock_client_for):
+        """This branch stands in for the login form, which is case-insensitive.
+        Exact-matching failed the ownership proof for a *correct* password, and
+        the deliberately generic error made that indistinguishable from a wrong
+        one — a dead end with no way to tell what went wrong."""
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            email="claudia@example.pt",
+            password="S3cretPass!",
+            first_name="Claudia",
+            last_name="Faria",
+        )
+        users_before = User.objects.count()
+
+        self._sso_with(
+            mock_client_for,
+            email="claudia.cmd@example.pt",
+            nic="52525252",
+            first_name="Claudia",
+            last_name="Faria",
+        )
+
+        response = self.client.post(
+            "/saml/migration/confirm",
+            json={
+                "method": "password",
+                "email": "CLAUDIA@example.pt",
+                "password": "S3cretPass!",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json["success"] is True
+
+        assert User.objects.count() == users_before
+        existing.reload()
+        assert existing.extras.get("auth_nic") == _hash_nic("52525252")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_search_finds_the_legacy_account_whatever_the_email_casing(self, mock_client_for):
         """The search lookup was the last exact-match one in the wizard. Login
         and recovery are case-INSENSITIVE, so the owner of maria@ who types
