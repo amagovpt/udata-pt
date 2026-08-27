@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **feat(saml)!: prove the legacy account by an emailed link instead of a 6-digit code**
+  - Linking a legacy account to a CMD/eIDAS identity proved ownership with a
+    code the user copied off their mail into the wizard. It is now a validation
+    link sent to the address already on that account, matching what the portal
+    already does everywhere else it asks someone to check their inbox. Clicking
+    it links the identity and starts the session; before the click there is no
+    authenticated session at all.
+  - The pending request is recorded on the account document, not in the
+    session. That is what lets the click work with no session — the owner may
+    open the mail in another browser — and it is the only way to invalidate a
+    mailed token, which is stateless: re-pointing the wizard at another
+    account, linking by password, or consuming the link all destroy the record,
+    and each of those kills any link still in the wild.
+  - The token carries the account id and a hash of the record's nonce, not the
+    `fs_uniquifier`: `/logout` and a password reset both rotate that to kill
+    outstanding sessions, either of which would silently void a link the owner
+    had not opened yet. Validity is checked before expiry, inverting the
+    change-email precedent, because a resend mints a new nonce and a superseded
+    token reaching the expiry branch would reissue and kill the newer link.
+  - Sends are capped per hour on the account rather than for its lifetime. The
+    account-creation cap is monotonic because the recipient there is an address
+    the wizard user typed; here it is always the account's own address, so a
+    lifetime ceiling would only let five anonymous requests permanently deny
+    the owner the email route.
+  - The mail body is part of the boundary rather than decoration. A code was
+    inert to a click — an attacker needed the owner to transcribe it — whereas
+    a link is not, so the mail names the identity that asked for the link and
+    says plainly not to open it otherwise.
+  - Removing the code path also removes the takeover chain it carried: the code
+    was written in cleartext into the requester's own signed-but-readable
+    session cookie, already bound to the account they had pointed at, so the
+    target-confusion guard passed by construction. Leaving the endpoint alive
+    but unused would have left that reachable by direct POST.
+  - `POST /saml/migration/send-code` is gone and `POST /saml/migration/confirm`
+    no longer accepts `method="code"`; the `method="password"` proof is
+    untouched. A frontend still offering the code step must be deployed after
+    this.
+
 - **chore(tests): stop the suite from loading the deployment config by default**
   - `udata.cfg` is tracked in this repo and `create_app` loads it over
     `settings.Testing`, so a plain `pytest` tested the deployment rather than the
