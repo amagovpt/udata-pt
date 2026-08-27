@@ -35,6 +35,11 @@
     ownership proof for a *correct* password and reported it through the
     deliberately generic "invalid credentials", making it indistinguishable
     from a wrong one.
+  - The search endpoint now coerces its payload to strings before querying.
+    A JSON body can carry a dict, and a dict reaching a MongoEngine query is
+    how a field lookup becomes an operator lookup: `{"$regex": "^adm"}` made
+    the endpoint's `found` flag a per-character oracle over every registered
+    address, returning the domain and first character of whatever matched.
   - Those three now go through one helper that prefers an **exact** match.
     Matching case-insensitively is not enough on its own: the unique index on
     `User.email` is case-sensitive, so a row differing only in case can exist

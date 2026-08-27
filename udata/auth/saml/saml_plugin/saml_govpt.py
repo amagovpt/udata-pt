@@ -2197,10 +2197,17 @@ def migration_search():
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
 
+    # Coerce to strings at the boundary, as confirm and skip already do. A
+    # JSON body can carry a dict, and a dict reaching a MongoEngine query is
+    # how a field lookup becomes an operator lookup: `{"$regex": "^adm"}`
+    # turned this endpoint's `found` flag into a per-character oracle over
+    # every registered address. The case-insensitive lookup happens to reject
+    # it now — re.escape raises on a dict — but that is an accident of the
+    # query type, and it comes back as a 500 rather than an answer.
     data = request.get_json(silent=True) or {}
-    email = data.get("email")
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
+    email = str(data.get("email") or "").strip()
+    first_name = str(data.get("first_name") or "").strip()
+    last_name = str(data.get("last_name") or "").strip()
 
     user = _find_legacy_user(email=email, first_name=first_name, last_name=last_name)
     if not user:

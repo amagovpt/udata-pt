@@ -2878,6 +2878,40 @@ class SAMLMigrationWizardTest(APITestCase):
         assert "/migrate-account" not in response.headers["Location"]
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_search_refuses_a_query_operator_instead_of_answering_it(self, mock_client_for):
+        """A JSON body can carry a dict, and a dict reaching a MongoEngine
+        query turns a field lookup into an operator lookup: {"$regex": "^adm"}
+        made `found` a per-character oracle over every registered address, and
+        handed back the domain plus the first character of the match."""
+        UserFactory(
+            email="admin.geral@example.pt",
+            password="S3cretPass!",
+            first_name="Admin",
+            last_name="Geral",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="tiago.cmd@servico.gov.pt",
+            nic="59595959",
+            first_name="Tiago Manuel",
+            last_name="Brito Faria",
+        )
+
+        for payload in (
+            {"email": {"$regex": "^adm"}},
+            {"email": {"$gt": ""}},
+            {"first_name": {"$ne": None}, "last_name": {"$ne": None}},
+        ):
+            response = self.client.post("/saml/migration/search", json=payload)
+            # Answered, not crashed, and nothing disclosed.
+            assert response.status_code == 200, payload
+            assert response.json["found"] is False, payload
+            assert "email" not in response.json, payload
+            with self.client.session_transaction() as sess:
+                assert sess["saml_migration_pending"]["legacy_user_id"] is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_case_insensitive_lookups_prefer_the_exactly_matching_row(self, mock_client_for):
         """The unique index on User.email is case-sensitive, so a shadow row
         differing only in case can exist — the email-change form and
