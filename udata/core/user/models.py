@@ -39,7 +39,12 @@ from udata.mongo.url_field import URLField
 from udata.uris import cdata_url
 
 from . import mails
-from .constants import AVATAR_SIZES, BIGGEST_AVATAR_SIZE
+from .constants import (
+    AVATAR_SIZES,
+    BIGGEST_AVATAR_SIZE,
+    SAML_PLACEHOLDER_EMAIL_DOMAIN,
+    SAML_PLACEHOLDER_EMAIL_PREFIX,
+)
 
 __all__ = ("User", "Role", "datastore")
 
@@ -172,6 +177,19 @@ class User(WithMetrics, UserMixin, Linkable, Document):
     @property
     def sysadmin(self):
         return self.has_role("admin")
+
+    @property
+    def has_placeholder_email(self):
+        """True while the account still holds a minted saml-* placeholder email.
+
+        Such accounts were created from a CMD/SAML identity without a usable
+        email; registration is only complete once the user sets a real one.
+        """
+        return bool(
+            self.email
+            and self.email.startswith(SAML_PLACEHOLDER_EMAIL_PREFIX)
+            and self.email.endswith(f"@{SAML_PLACEHOLDER_EMAIL_DOMAIN}")
+        )
 
     def self_web_url(self, **kwargs):
         return cdata_url(f"/users/{self._link_id(**kwargs)}", **kwargs)

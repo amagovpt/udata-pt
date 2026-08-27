@@ -3,6 +3,8 @@ from flask_login import current_user
 from werkzeug.exceptions import BadRequest
 
 from udata.api import API, api, fields
+from udata.api.limits import HARVEST_PREVIEW_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api_fields import dataset_fields, dataset_ref_fields
@@ -488,14 +490,60 @@ class ScheduleSourceAPI(API):
         return actions.unschedule(source), 204
 
 
+def _names_an_organization() -> bool:
+    """Whether the raw request body carries a non-empty `organization`.
+
+    Read before the form is validated, so it cannot rely on the resolved field.
+    A body that is not JSON at all answers False and falls through to the
+    permission test, then to `api.validate`, which is what turns it into the 400
+    it has always been — the alternative, letting `request.get_json` raise here,
+    would answer 400 to an unauthorized caller and leak that the payload parsed.
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("organization"))
+
+
 @ns.route("/source/preview/", endpoint="preview_harvest_source_config")
 class PreviewSourceConfigAPI(API):
+    # Every request here walks a remote catalogue on the caller's behalf, so the
+    # cost is outbound rather than stored. Declared at class level, not on the
+    # verb: `decorators` run outside `@api.secure`, which is what keeps the limit
+    # counting a flood of unauthorized attempts instead of only the ones that get
+    # past authentication.
+    decorators = [
+        limiter.limit(
+            HARVEST_PREVIEW_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.expect(source_fields)
     @api.doc("preview_harvest_source_config")
     @api.marshal_with(preview_job_fields)
     def post(self):
         """Preview an harvesting from a source created with the given payload"""
+        # Authorized BEFORE `api.validate`, which is the order every other route
+        # in this file uses. Validating the form resolves the submitted hostname
+        # (`HarvestURLField` -> `URLField.pre_validate` -> `uris.resolve_hostname`,
+        # with URLS_RESOLVE_HOSTNAME on), so authorizing afterwards still let any
+        # authenticated account fire an out-of-band DNS lookup at any hostname
+        # outside HARVEST_URL_HOST_DENYLIST — which is the probe VULN-2084 was
+        # about. This closes it for a payload that names no organization; a caller
+        # naming an organization they administer still validates first, because
+        # resolving the organization needs the form, and that is a smaller and
+        # accountable population.
+        if not _names_an_organization():
+            # No organization to weigh the request against, and this is the one
+            # route that makes the server run a harvest backend against a URL the
+            # caller chose. Creating a source is inert by comparison: it lands
+            # VALIDATION_PENDING, validating is admin_permission, and
+            # RunSourceAPI refuses anything not accepted.
+            admin_permission.test()
+
         form = api.validate(HarvestSourceForm)
         if form.organization.data:
             form.organization.data.permissions["harvest"].test()
@@ -504,6 +552,22 @@ class PreviewSourceConfigAPI(API):
 
 @ns.route("/source/<harvest_source:source>/preview/", endpoint="preview_harvest_source")
 class PreviewSourceAPI(API):
+    # Same cost as the config route — `actions.preview` walks the same remote
+    # catalogue under the same HARVEST_PREVIEW_MAX_ITEMS — so the same ceiling,
+    # and the same `user_or_ip` key. Without this it fell under
+    # RATELIMIT_DEFAULT, which is keyed on the remote address: behind the F5
+    # every visitor arrives from one origin IP, so that ceiling is shared
+    # site-wide and one caller previewing in a loop answers 429 to everybody
+    # else. That matters more now that the backoffice sends every read-only
+    # preview here.
+    decorators = [
+        limiter.limit(
+            HARVEST_PREVIEW_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("preview_harvest_source")
     @api.marshal_with(preview_job_fields)

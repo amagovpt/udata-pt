@@ -83,7 +83,7 @@ def notify_membership_response(org_id, request_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create membership accepted notification for user {request.user}: {e}"
             )
     else:
@@ -97,7 +97,7 @@ def notify_membership_response(org_id, request_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create membership refused notification for user {request.user}: {e}"
             )
 
@@ -178,7 +178,7 @@ def notify_badge_certified(org_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create new badge notification for kind {CERTIFIED} and user {member.user}: {e}"
             )
 
@@ -203,7 +203,7 @@ def notify_badge_public_service(org_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create new badge notification for kind {PUBLIC_SERVICE} and user {member.user}: {e}"
             )
 
@@ -226,7 +226,7 @@ def notify_badge_company(org_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create new badge notification for kind {COMPANY} and user {member.user}: {e}"
             )
 
@@ -249,7 +249,7 @@ def notify_badge_association(org_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create new badge notification for kind {ASSOCIATION} and user {member.user}: {e}"
             )
 
@@ -272,6 +272,6 @@ def notify_badge_local_authority(org_id):
             )
             notification.save()
         except Exception as e:
-            log.error(
+            log.exception(
                 f"Failed to create new badge notification for kind {LOCAL_AUTHORITY} and user {member.user}: {e}"
             )

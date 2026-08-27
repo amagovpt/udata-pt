@@ -4,7 +4,6 @@ from __future__ import unicode_literals
 import base64
 import binascii
 import hashlib
-import hmac
 import logging
 import os
 import random
@@ -13,6 +12,7 @@ import secrets
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
@@ -83,6 +83,8 @@ ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
 from udata.app import csrf
+from udata.core.user.nic import hash_nic as _hash_nic
+from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
 from udata.mail import MailMessage, send_mail
 from udata.models import datastore
@@ -403,6 +405,33 @@ _OUTSTANDING_RELAY_KEY = "saml_outstanding_relay:{token}"
 _OUTSTANDING_RELAY_TTL = 600  # 10 minutes — enough for the user to complete CMD
 _OUTSTANDING_RELAY_TOKEN_BYTES = 32
 
+# CMD (autenticacao.gov MDC) attribute URIs — used both in the AuthnRequest
+# RequestedAttributes and in the SSO postback extraction.
+MDC_ATTR_EMAIL = "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+MDC_ATTR_NIC = "http://interop.gov.pt/MDC/Cidadao/NIC"
+MDC_ATTR_FIRST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
+MDC_ATTR_LAST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+
+# eIDAS natural-person attribute URIs. Field mapping to the CMD equivalents:
+# PersonIdentifier → NIC slot (extras.auth_nic, HMAC-hashed),
+# CurrentGivenName → first_name (NomeProprio), CurrentFamilyName → last_name
+# (NomeApelido). eIDAS has no email attribute, so eIDAS accounts always get
+# a placeholder email and must complete registration on the frontend.
+EIDAS_ATTR_PERSON_IDENTIFIER = "http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier"
+EIDAS_ATTR_GIVEN_NAME = "http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName"
+EIDAS_ATTR_FAMILY_NAME = "http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName"
+
+# pysaml2 ships built-in attribute maps (saml2/attributemaps/saml_uri.py) that
+# translate the KNOWN eIDAS natural-person URIs above into friendly names when
+# NameFormat is urn:oasis:names:tc:SAML:2.0:attrname-format:uri — so
+# get_identity() keys eIDAS attributes by these names, NOT by the full URIs.
+# The MDC/Cidadao URIs are in no map, which is why they stay as raw URIs
+# (allow_unknown_attributes) and the CMD lookups match while URI-based eIDAS
+# lookups do not. Extraction must therefore try both forms.
+EIDAS_FRIENDLY_PERSON_IDENTIFIER = "PersonIdentifier"
+EIDAS_FRIENDLY_GIVEN_NAME = "FirstName"
+EIDAS_FRIENDLY_FAMILY_NAME = "FamilyName"
+
 
 def _remember_outstanding(reqid, kind):
     """Record an AuthnRequest id in the user's session.
@@ -584,6 +613,7 @@ def _reject_saml_login(
     issuer=None,
     name_id=None,
     reason=None,
+    detail=None,
 ):
     """Reject a SAML SSO request: log + audit + flash + redirect.
 
@@ -597,102 +627,80 @@ def _reject_saml_login(
     _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason=reason or log_message)
     do_flash(flash_message, "error")
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-    return redirect(f"{frontend_url}/login")
+    # Surface the rejection code in the redirect so the failure is visible
+    # in a browser network trace (environments where operators cannot reach
+    # the backend logs). Short internal codes only — never log text.
+    # ``detail`` may carry non-sensitive schema information (e.g. the
+    # attribute URIs the IdP returned) — never identity values.
+    error_code = quote(reason or "rejected", safe="")
+    destination = f"{frontend_url}/login?saml_error={error_code}"
+    if detail:
+        destination += f"&saml_detail={quote(detail, safe='')}"
+    return redirect(destination)
 
 
-def _hash_nic(nic):
-    """Hash a NIC value using HMAC-SHA256 with the app SECRET_KEY.
+def _idp_status_rejection(raw_saml_response, kind):
+    """Pre-check the raw SAMLResponse for an IdP-side rejection.
 
-    Returns a hex digest that is deterministic (same NIC → same hash)
-    but not reversible. Used for storing and matching NIC values
-    without exposing the raw personal identifier in the database.
+    When the IdP returns a non-Success ``samlp:StatusCode`` (e.g. the user
+    cancelled, or the request was denied upstream), pysaml2 raises
+    ``StatusError`` during parsing — which would surface as a 500. Detect it
+    first and return a clean redirect with the human-readable reason; return
+    ``None`` when the status is Success (or unreadable, in which case the
+    normal fail-closed parsing decides).
     """
-    secret = current_app.config["SECRET_KEY"]
-    if isinstance(secret, str):
-        secret = secret.encode("utf-8")
-    return hmac.new(secret, nic.encode("utf-8"), hashlib.sha256).hexdigest()
+    try:
+        decoded_xml = base64.b64decode(raw_saml_response)
+        xml_str = None
+        for codec in ["utf-8", "ISO-8859-1"]:
+            try:
+                xml_str = decoded_xml.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+        if xml_str:
+            status_root = ET.fromstring(xml_str)
+            ns = {"samlp": "urn:oasis:names:tc:SAML:2.0:protocol"}
+            status_code = status_root.find(".//samlp:StatusCode", ns)
+            status_msg = status_root.find(".//samlp:StatusMessage", ns)
+            if status_code is not None:
+                status_value = status_code.attrib.get("Value", "")
+                if "Success" not in status_value:
+                    # Extract human-readable message; fall back to status URI
+                    msg_text = status_msg.text if status_msg is not None else None
+                    # Also check for a nested sub-status code (e.g. RequestDenied)
+                    sub_code = status_code.find("samlp:StatusCode", ns)
+                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
+                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
+                    current_app.logger.error(
+                        f"SAML ({kind}): IdP rejeitou o pedido: "
+                        f"status={status_value}, sub={sub_value}, msg={msg_text}"
+                    )
+                    _audit_saml("rejected", kind, reason="idp_denied")
+                    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+                    do_flash(f"Autenticação rejeitada: {display_msg}", "error")
+                    return redirect(f"{frontend_url}/login?saml_error=idp_denied")
+    except Exception as e:
+        current_app.logger.warning(f"SAML ({kind}): Falha ao verificar status da resposta: {e}")
+    return None
 
 
-def _is_nic_hashed(nic_value):
-    """Check if a stored NIC value is already an HMAC-SHA256 hex digest (64 hex chars)."""
-    return bool(
-        nic_value and len(nic_value) == 64 and all(c in "0123456789abcdef" for c in nic_value)
-    )
-
-
-def _merge_nic_into_user(user, user_nic):
-    """Add the hashed SAML NIC to an existing user account (auto-merge)."""
-    if not user_nic:
-        return
-    if not user.extras:
-        user.extras = {}
-    user.extras["auth_nic"] = _hash_nic(user_nic)
-    user.save()
-    current_app.logger.info(f"SAML: NIC merged into existing account {user.email} (id={user.id})")
-
-
-def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
-    """Find an existing user by email/NIC/name or auto-create from SAML data.
-
-    Lookup order:
-    1. By email (exact match)
-    2. By NIC (already linked via previous SAML login)
-    3. By first_name + last_name (fallback for legacy accounts)
-
-    When a legacy account (password, no NIC) is found, the NIC is
-    automatically merged so future CMD logins resolve instantly.
-
-    Returns a tuple (user, status) where status is one of:
-    - "existing_saml" — user already has NIC, normal login
-    - "merged" — legacy account found and NIC auto-merged
-    - "new" — newly created user
-    """
-    from udata.core.user.models import User
-
-    user = None
-
-    # 1. Match by email
-    if user_email:
-        user = datastore.find_user(email=user_email)
-
-    # 2. Match by hashed NIC (use MongoEngine nested dict syntax, not find_user,
-    #    because find_user(extras={...}) matches the entire dict exactly)
-    if not user and user_nic:
-        hashed_nic = _hash_nic(user_nic)
-        user = User.objects(extras__auth_nic=hashed_nic).first()
-
-    # 3. Match by name (fallback for legacy accounts without NIC)
-    if not user and first_name and last_name:
-        candidates = User.objects(
-            first_name__iexact=first_name,
-            last_name__iexact=last_name,
-            deleted=None,
-        )
-        # Only auto-merge when the name matches exactly one account
-        if candidates.count() == 1:
-            user = candidates.first()
-            current_app.logger.info(
-                f"SAML: matched legacy account by name: {first_name} {last_name} → {user.email}"
-            )
-
-    if user:
-        stored_nic = user.extras.get("auth_nic") if user.extras else None
-        hashed_nic = _hash_nic(user_nic) if user_nic else None
-        if stored_nic and stored_nic == hashed_nic:
-            return user, "existing_saml"
-        # No NIC, legacy encrypted NIC, or unhashed NIC — update with hashed value.
-        _merge_nic_into_user(user, user_nic)
-        return user, "merged"
-
-    if not user_email and not user_nic:
-        current_app.logger.error("SAML: Cannot create user without email or NIC")
-        return None, "error"
-
-    # Generate a placeholder email when the IdP does not provide one.
-    if not user_email:
+def _create_saml_user(user_email, user_nic, first_name, last_name):
+    """Create a new account from SAML attributes (scenario 4)."""
+    # Generate a placeholder email when the IdP does not provide one, or
+    # when the CMD email is already taken by an existing account (the
+    # user explicitly chose to create a new one in the wizard).
+    if not user_email or datastore.find_user(email=user_email):
         import uuid
 
-        user_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
+        from udata.core.user.constants import (
+            SAML_PLACEHOLDER_EMAIL_DOMAIN,
+            SAML_PLACEHOLDER_EMAIL_PREFIX,
+        )
+
+        user_email = (
+            f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
+        )
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -708,11 +716,120 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     user.confirmed_at = datetime.utcnow()
     datastore.commit()
 
-    return user, "new"
+    return user
 
 
-def _handle_saml_user_login(user):
-    """Handle login/redirect after SAML authentication."""
+def _has_linked_nic(user):
+    """True when the account holds a properly linked (hashed) CMD identity.
+
+    Plain, legacy-encrypted or junk ``auth_nic`` values left behind by older
+    portal versions do not count as a link: they can never match a login
+    lookup, so the account must stay eligible for the migration wizard to
+    re-link it (the wizard overwrites the stale value with a fresh hash).
+    """
+    return _is_nic_hashed((user.extras or {}).get("auth_nic"))
+
+
+def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
+    """Resolve the CMD/SAML identity to an account.
+
+    ``user_nic`` carries the unique identifier of the authenticated identity:
+    the NIC for CMD logins, or the eIDAS PersonIdentifier (e.g. "ES/PT/...")
+    for eIDAS logins. Both are HMAC-hashed into ``extras.auth_nic`` — the
+    formats cannot collide, and every lookup/linking rule below applies to
+    either provider identically.
+
+    Decision order:
+    1. NIC already linked (hashed, or stored in plain form by an old plugin
+       version — upgraded to the hash on the spot) → direct login (entry
+       rule). This is the ONLY path that logs the user in without ownership
+       confirmation.
+    2. Email match → suspected existing account; the user must confirm
+       ownership through the migration wizard before linking
+    3. Name-only match → same, suspected existing account
+    4. No match → create a new account
+
+    Accounts whose ``auth_nic`` holds a stale non-hashed value (plain NIC of
+    a different identity, legacy ciphertext, junk) are NOT treated as linked:
+    they remain wizard candidates in rules 2 and 3.
+
+    Returns a tuple (user, status) where status is one of:
+    - "existing_saml" — NIC already linked, normal login
+    - "migration_candidate" — email or name match; user is the single
+      candidate account, or None when several homonyms exist
+    - "new" — newly created user
+    - "error" — neither email nor NIC available
+    """
+    from udata.core.user.models import User
+
+    # 1. CMD identity already linked: direct login, nothing else to check.
+    #    (Use MongoEngine nested dict syntax, not find_user, because
+    #    find_user(extras={...}) matches the entire dict exactly.)
+    if user_nic:
+        user = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
+        if user:
+            return user, "existing_saml"
+
+        # 1b. Same identity stored in plain form by an old plugin version:
+        #     the incoming NIC comes from a signed autenticacao.gov
+        #     assertion, so an exact match proves the link — upgrade the
+        #     stored value to the hashed format and log the user in.
+        user = User.objects(extras__auth_nic=user_nic).first()
+        if user:
+            user.extras["auth_nic"] = _hash_nic(user_nic)
+            user.save()
+            current_app.logger.info(f"SAML: upgraded plain stored NIC to hash for user {user.id}")
+            return user, "existing_saml"
+
+    # 2. Match by email: never auto-link — ownership must be proven
+    #    (password or email code) via the migration wizard. Accounts
+    #    already linked to another CMD identity are not candidates.
+    if user_email:
+        user = datastore.find_user(email=user_email)
+        if user and not _has_linked_nic(user):
+            current_app.logger.info(
+                f"SAML: email match for an existing account "
+                f"(id={user.id}) — ownership confirmation required"
+            )
+            return user, "migration_candidate"
+
+    # 3. Name-only match against accounts without a linked CMD identity:
+    #    never auto-merge — ownership must be proven (password or email
+    #    code) via the migration wizard before linking. The non-hashed
+    #    filter cannot be expressed in the query, so filter in Python.
+    if first_name and last_name:
+        candidates = [
+            candidate
+            for candidate in User.objects(
+                first_name__iexact=first_name,
+                last_name__iexact=last_name,
+                deleted=None,
+            )
+            if not _has_linked_nic(candidate)
+        ]
+        count = len(candidates)
+        if count:
+            candidate = candidates[0] if count == 1 else None
+            current_app.logger.info(
+                f"SAML: name-only match for {first_name} {last_name} "
+                f"({count} candidate(s)) — ownership confirmation required"
+            )
+            return candidate, "migration_candidate"
+
+    if not user_email and not user_nic:
+        current_app.logger.error("SAML: Cannot create user without email or NIC")
+        return None, "error"
+
+    return _create_saml_user(user_email, user_nic, first_name, last_name), "new"
+
+
+def _handle_saml_user_login(user, new_account=False):
+    """Handle login/redirect after SAML authentication.
+
+    When ``new_account`` is True the redirect carries ``cmd_new_account=1``
+    so the frontend can inform the user that a new account was created
+    (scenario 4).
+    """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
 
@@ -722,7 +839,10 @@ def _handle_saml_user_login(user):
             f"(frontend_url={frontend_url!r})"
         )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
-        return redirect(f"{frontend_url}/login")
+        # user is None only when the IdP response carried neither an email
+        # nor a NIC/PersonIdentifier — expose it in the redirect for
+        # browser-trace diagnosis (see _reject_saml_login).
+        return redirect(f"{frontend_url}/login?saml_error=missing_attributes")
 
     if requires_confirmation(user):
         # Auto-confirm on SAML login — autenticação.gov already verified the user.
@@ -738,7 +858,20 @@ def _handle_saml_user_login(user):
 
     login_user(user)
     session["saml_login"] = True
+
+    # Accounts still holding a minted saml-* placeholder email (new accounts
+    # created without a usable CMD email, or older ones from before this
+    # check) must provide a real email before using the portal. The original
+    # destination is dropped on purpose: completing registration is a hard
+    # precondition, and the page explains the situation itself (no
+    # cmd_new_account banner needed).
+    if user.has_placeholder_email:
+        return redirect(f"{frontend_url}/complete-registration")
+
     destination = f"{frontend_url}{next_path}" if next_path else (frontend_url or "/")
+    if new_account:
+        separator = "&" if "?" in destination else "?"
+        destination = f"{destination}{separator}cmd_new_account=1"
     current_app.logger.warning(
         f"[DEBUG] _handle_saml_user_login: login_user OK, email={user.email!r}, "
         f"redirect destination={destination!r}, next_path={next_path!r}"
@@ -747,9 +880,16 @@ def _handle_saml_user_login(user):
 
 
 def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name):
-    """Store SAML data in session and redirect to migration page."""
+    """Store SAML data in session and redirect to migration page.
+
+    ``user`` is the single candidate account matched by name, or None
+    when several homonym accounts exist — in that case the wizard asks
+    the user to identify the account (login or search).
+    ``saml_email`` is always the email coming from the CMD identity,
+    never the candidate account's email.
+    """
     session["saml_migration_pending"] = {
-        "legacy_user_id": str(user.id),
+        "legacy_user_id": str(user.id) if user else None,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
@@ -804,7 +944,7 @@ def _find_legacy_user(email=None, first_name=None, last_name=None):
             deleted=None,
         ).first()
 
-    if user and user.password and not (user.extras and user.extras.get("auth_nic")):
+    if user and user.password and not _has_linked_nic(user):
         if not user.deleted:
             return user
     return None
@@ -947,22 +1087,22 @@ def sp_initiated():
     spcertenc = RequestedAttributes(
         [
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/CorreioElectronico",
+                name=MDC_ATTR_EMAIL,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/NIC",
+                name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/NomeProprio",
+                name=MDC_ATTR_FIRST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
             RequestedAttribute(
-                name="http://interop.gov.pt/MDC/Cidadao/NomeApelido",
+                name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="False",
             ),
@@ -1040,38 +1180,9 @@ def idp_initiated():
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
 
     # 0. Verificar se o IdP rejeitou o pedido (antes de tentar pysaml2)
-    try:
-        decoded_xml = base64.b64decode(raw_saml_response)
-        xml_str = None
-        for codec in ["utf-8", "ISO-8859-1"]:
-            try:
-                xml_str = decoded_xml.decode(codec)
-                break
-            except UnicodeDecodeError:
-                continue
-        if xml_str:
-            status_root = ET.fromstring(xml_str)
-            ns = {"samlp": "urn:oasis:names:tc:SAML:2.0:protocol"}
-            status_code = status_root.find(".//samlp:StatusCode", ns)
-            status_msg = status_root.find(".//samlp:StatusMessage", ns)
-            if status_code is not None:
-                status_value = status_code.attrib.get("Value", "")
-                if "Success" not in status_value:
-                    # Extract human-readable message; fall back to status URI
-                    msg_text = status_msg.text if status_msg is not None else None
-                    # Also check for a nested sub-status code (e.g. RequestDenied)
-                    sub_code = status_code.find("samlp:StatusCode", ns)
-                    sub_value = sub_code.attrib.get("Value", "") if sub_code is not None else ""
-                    display_msg = msg_text or sub_value.rsplit(":", 1)[-1] or status_value
-                    current_app.logger.error(
-                        f"SAML: IdP rejeitou o pedido: "
-                        f"status={status_value}, sub={sub_value}, msg={msg_text}"
-                    )
-                    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
-                    do_flash(f"Autenticação rejeitada: {display_msg}", "error")
-                    return redirect(f"{frontend_url}/login")
-    except Exception as e:
-        current_app.logger.warning(f"SAML: Falha ao verificar status da resposta: {e}")
+    denied = _idp_status_rejection(raw_saml_response, kind="cmd")
+    if denied is not None:
+        return denied
 
     # 1. Validar a resposta SAML com pysaml2 (verifica assinatura + desencripta).
     # Política fail-closed (VULN-2077 / TICKET-58):
@@ -1098,7 +1209,8 @@ def idp_initiated():
         _diag_form_keys = []
     _diag_inresponse_to = None
     try:
-        _m = re.search(r'\bInResponseTo="([^"]+)"', decoded_xml.decode("utf-8", "replace"))
+        _decoded_diag = base64.b64decode(raw_saml_response)
+        _m = re.search(r'\bInResponseTo="([^"]+)"', _decoded_diag.decode("utf-8", "replace"))
         if _m:
             _diag_inresponse_to = _m.group(1)
     except Exception:
@@ -1222,12 +1334,10 @@ def idp_initiated():
                 pass
 
         if identity:
-            user_email = _first_value(
-                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
-            )
-            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            user_email = _first_value(identity, MDC_ATTR_EMAIL)
+            user_nic = _first_value(identity, MDC_ATTR_NIC)
+            first_name = _first_value(identity, MDC_ATTR_FIRST_NAME)
+            last_name = _first_value(identity, MDC_ATTR_LAST_NAME)
             current_app.logger.warning(
                 f"[DEBUG] SAML atributos extraídos: email={user_email!r}, "
                 f"nic_present={bool(user_nic)}, nome={first_name!r} {last_name!r}, "
@@ -1285,15 +1395,20 @@ def idp_initiated():
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
-    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
-        _audit_saml(
-            "migration_pending",
-            "cmd",
-            issuer=issuer,
-            name_id=name_id_value,
-            reason=status,
-        )
-        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+    if status == "migration_candidate":
+        if _migration_enabled():
+            _audit_saml(
+                "migration_pending",
+                "cmd",
+                issuer=issuer,
+                name_id=name_id_value,
+                reason=status,
+            )
+            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+        # Migration wizard disabled: never log into an unproven account —
+        # fall back to creating a new one (scenario 4).
+        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+        status = "new"
 
     _audit_saml(
         "success" if user else "user_not_found",
@@ -1302,7 +1417,13 @@ def idp_initiated():
         name_id=name_id_value,
         reason=status,
     )
-    return _handle_saml_user_login(user)
+    # Remember the authenticated Subject so SP-initiated logout can send the
+    # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    session["saml_name_id"] = name_id_value
+    # Only ever store plain strings in the session (the format may be a
+    # non-string sentinel in edge cases; production values are str or None).
+    session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
+    return _handle_saml_user_login(user, new_account=(status == "new"))
 
 
 #################################################################
@@ -1330,9 +1451,38 @@ def saml_logout_postback():
             else:
                 break
 
-    session.pop("saml_login", None)
-    logout_user()
+    _terminate_local_session()
     return redirect(frontend_url or "/")
+
+
+def _saml_session_name_id():
+    """Build the NameID for a LogoutRequest from the session, if stored.
+
+    The SSO postbacks record the Subject NameID the IdP authenticated
+    (``saml_name_id``/``saml_name_id_format``); using it lets the IdP tie
+    the LogoutRequest to the right session. Falls back to the historical
+    dummy value when nothing was recorded (e.g. sessions from before this
+    was stored, or wizard-created logins).
+    """
+    text = session.get("saml_name_id") or "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"
+    fmt = session.get("saml_name_id_format") or NAMEID_FORMAT_UNSPECIFIED
+    return NameID(format=fmt, text=text)
+
+
+def _terminate_local_session():
+    """End the dados.gov.pt session immediately.
+
+    Called by the SP-initiated logout routes BEFORE handing the user to the
+    IdP single-logout dance: if any step of that round-trip fails (IdP
+    error, unreachable postback, dummy NameID the IdP cannot resolve), the
+    local session must already be dead — clicking "Sair" always logs the
+    user out of the portal. The SLO postback clears the same keys again,
+    which is harmless.
+    """
+    session.pop("saml_login", None)
+    session.pop("saml_name_id", None)
+    session.pop("saml_name_id_format", None)
+    logout_user()
 
 
 #################################################################
@@ -1343,10 +1493,7 @@ def saml_logout():
     saml_client = saml_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
     )
-    nid = NameID(
-        format=NAMEID_FORMAT_UNSPECIFIED,
-        text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
-    )
+    nid = _saml_session_name_id()
 
     logout_url = LogoutUrl(text=_saml_endpoint_url("saml.saml_logout_postback"))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
@@ -1361,6 +1508,10 @@ def saml_logout():
         consent="urn:oasis:names:tc:SAML:2.0:logout:user",
         extensions=extensions,
     )
+
+    # Local session first, IdP dance second (best effort) — see
+    # _terminate_local_session.
+    _terminate_local_session()
 
     post_message = http_form_post_message(message=logout_request, location=destination)
     return _saml_form_response(post_message["data"])
@@ -1400,42 +1551,37 @@ def sp_eidas_initiated():
 
     faa = FAAALevel(text=str(current_app.config.get("SECURITY_SAML_FAAALEVEL")))
 
+    # eIDAS natural-person Minimum Data Set (MDS): PersonIdentifier,
+    # CurrentFamilyName, CurrentGivenName and DateOfBirth are guaranteed by
+    # every member state and must be requested as required per the eIDAS
+    # spec (the PT node was already forwarding them as Optional="false"
+    # downstream). The optional attributes (CurrentAddress, Gender,
+    # PlaceOfBirth) are no longer requested: they were never read nor
+    # stored, and requesting them showed up on the citizen's consent
+    # screen without any use (data minimisation). DateOfBirth still
+    # arrives (MDS) but is intentionally not stored — the User model has
+    # no birth-date field.
     spcertenc = RequestedAttributes(
         [
             RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/PersonIdentifier",
+                name=EIDAS_ATTR_PERSON_IDENTIFIER,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
             RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentFamilyName",
+                name=EIDAS_ATTR_FAMILY_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentGivenName",
+                name=EIDAS_ATTR_GIVEN_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name="http://eidas.europa.eu/attributes/naturalperson/DateOfBirth",
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/CurrentAddress",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/Gender",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
-            ),
-            RequestedAttribute(
-                name="http://eidas.europa.eu/attributes/naturalperson/PlaceOfBirth",
-                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
         ]
     )
@@ -1484,6 +1630,13 @@ def idp_eidas_initiated():
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
+
+    # 0. Verificar se o IdP rejeitou o pedido (antes de tentar pysaml2) —
+    # sem este pre-check um StatusCode non-Success faria o pysaml2 levantar
+    # StatusError e o pedido terminaria em 500 em vez de redirect limpo.
+    denied = _idp_status_rejection(raw_saml_response, kind="eidas")
+    if denied is not None:
+        return denied
 
     # 1. Validar a resposta eIDAS com pysaml2 (verifica assinatura + desencripta).
     # Política fail-closed (VULN-2077 / TICKET-58): MissingKey/SignatureError
@@ -1567,6 +1720,7 @@ def idp_eidas_initiated():
             reason="subject_unreadable",
         )
     name_id_value = (getattr(subject, "text", None) or "").strip() if subject else ""
+    name_id_format = (getattr(subject, "format", None) or "").strip() if subject else ""
     if not name_id_value:
         return _reject_saml_login(
             "eIDAS SSO rejeitado: Subject/NameID em falta",
@@ -1577,33 +1731,90 @@ def idp_eidas_initiated():
         )
 
     # 2. Extrair atributos a partir do objecto validado pelo pysaml2.
-    # Não existe fallback: atributos só são lidos depois da assinatura
-    # ter sido verificada por pysaml2 (VULN-2077 / TICKET-58).
+    # Atributos só são lidos depois da assinatura ter sido verificada
+    # por pysaml2 (VULN-2077 / TICKET-58).
+    identity_keys_csv = ""
     try:
         identity = authn_response.get_identity()
+
         if identity:
-            user_email = _first_value(
-                identity, "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
+            identity_keys_csv = ",".join(sorted(identity.keys())[:12])
+            # MDC (CMD) URIs first — the PT node may translate eIDAS
+            # attributes into them — then the eIDAS natural-person URIs the
+            # AuthnRequest asks for, and finally the FRIENDLY NAMES pysaml2's
+            # built-in attribute maps translate those URIs into (this is how
+            # they actually arrive from get_identity(); see the
+            # EIDAS_FRIENDLY_* constants). Mapping: PersonIdentifier →
+            # NIC slot, CurrentGivenName → first_name, CurrentFamilyName →
+            # last_name. eIDAS carries no email attribute: the account is
+            # created with a placeholder email and the user completes
+            # registration on the frontend.
+            user_email = _first_value(identity, MDC_ATTR_EMAIL)
+            user_nic = (
+                _first_value(identity, MDC_ATTR_NIC)
+                or _first_value(identity, EIDAS_ATTR_PERSON_IDENTIFIER)
+                or _first_value(identity, EIDAS_FRIENDLY_PERSON_IDENTIFIER)
             )
-            user_nic = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NIC")
-            first_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeProprio")
-            last_name = _first_value(identity, "http://interop.gov.pt/MDC/Cidadao/NomeApelido")
+            first_name = (
+                _first_value(identity, MDC_ATTR_FIRST_NAME)
+                or _first_value(identity, EIDAS_ATTR_GIVEN_NAME)
+                or _first_value(identity, EIDAS_FRIENDLY_GIVEN_NAME)
+            )
+            last_name = (
+                _first_value(identity, MDC_ATTR_LAST_NAME)
+                or _first_value(identity, EIDAS_ATTR_FAMILY_NAME)
+                or _first_value(identity, EIDAS_FRIENDLY_FAMILY_NAME)
+            )
+            if _first_value(identity, MDC_ATTR_NIC):
+                id_source = "mdc"
+            elif _first_value(identity, EIDAS_ATTR_PERSON_IDENTIFIER):
+                id_source = "eidas-uri"
+            elif user_nic:
+                id_source = "eidas-friendly"
+            else:
+                id_source = None
             current_app.logger.info(
-                f"eIDAS atributos via pysaml2: email={user_email}, nic={'***' if user_nic else None}, "
-                f"nome={first_name} {last_name}"
+                f"eIDAS atributos via pysaml2: email={user_email}, "
+                f"id={'***' if user_nic else None} (source={id_source}), "
+                f"nome={first_name} {last_name}, "
+                f"identity_keys={list(identity.keys())}, "
+                f"name_id_format={name_id_format!r}"
+            )
+        else:
+            # Mesmo log de diagnóstico do postback CMD.
+            current_app.logger.warning(
+                f"eIDAS pysaml2: identity vazio. "
+                f"response type={type(authn_response).__name__}, "
+                f"assertions={getattr(authn_response, 'assertions', 'N/A')}, "
+                f"encrypted_assertions="
+                f"{bool(getattr(authn_response, 'encrypted_assertions', None))}"
             )
     except Exception as e:
         current_app.logger.warning(f"Falha ao extrair identity do pysaml2 (eIDAS): {e}")
 
     if not user_email and not user_nic:
         current_app.logger.error(
-            "eIDAS SSO: nenhum atributo extraído (email/NIC). "
+            "eIDAS SSO: nenhum atributo extraído (email/NIC/PersonIdentifier). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
-            "tem acesso à chave privada para desencriptar."
+            "tem acesso à chave privada para desencriptar. "
+            f"identity_keys={identity_keys_csv!r}"
         )
 
-    # 2b. NameID ↔ NIC binding (VULN-2077 / TICKET-58).
-    if user_nic and not _name_id_binds_nic(name_id_value, user_nic):
+    # 2b. NameID ↔ identifier binding (VULN-2077 / TICKET-58).
+    # Same rule as the CMD postback: autenticacao.gov emits NameID as an
+    # opaque pseudonym with Format=unspecified — it is unrelated to the
+    # NIC/PersonIdentifier attribute, so the equality check would always
+    # fail (observed in TST: every eIDAS login was rejected with
+    # subject_nic_mismatch once PersonIdentifier extraction landed). XSW
+    # protection still comes from the Response signature (xmlsec1), the
+    # Issuer whitelist, the replay cache and allow_unsolicited=False; the
+    # binding only adds value for IdPs that emit the identifier as Subject.
+    # Skip it when the format is unspecified (or absent).
+    nameid_is_pseudonym = name_id_format in (
+        "",
+        "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+    )
+    if user_nic and not nameid_is_pseudonym and not _name_id_binds_nic(name_id_value, user_nic):
         return _reject_saml_login(
             "eIDAS SSO rejeitado: Subject/NIC binding mismatch (possível XSW)",
             _("Autenticação rejeitada: identidade SAML inconsistente."),
@@ -1615,24 +1826,50 @@ def idp_eidas_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate" and current_app.config.get("MIGRATION_MODE_ENABLED", False):
-        _audit_saml(
-            "migration_pending",
-            "eidas",
+    if status == "migration_candidate":
+        if _migration_enabled():
+            _audit_saml(
+                "migration_pending",
+                "eidas",
+                issuer=issuer,
+                name_id=name_id_value,
+                reason=status,
+            )
+            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
+        # Migration wizard disabled: never log into an unproven account —
+        # fall back to creating a new one (scenario 4).
+        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+        status = "new"
+
+    if user is None:
+        # Neither email nor NIC/PersonIdentifier came through: nothing to
+        # authenticate against. Surface the attribute URIs that DID arrive
+        # (schema names only, never values) so a browser network trace is
+        # enough to diagnose what the IdP actually returned.
+        return _reject_saml_login(
+            f"eIDAS SSO rejeitado: sem atributos utilizáveis (identity_keys={identity_keys_csv!r})",
+            _("Autenticação rejeitada: resposta sem atributos de identidade."),
+            kind="eidas",
             issuer=issuer,
             name_id=name_id_value,
-            reason=status,
+            reason="missing_attributes",
+            detail=identity_keys_csv,
         )
-        return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
 
     _audit_saml(
-        "success" if user else "user_not_found",
+        "success",
         "eidas",
         issuer=issuer,
         name_id=name_id_value,
         reason=status,
     )
-    return _handle_saml_user_login(user)
+    # Remember the authenticated Subject so SP-initiated logout can send the
+    # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    session["saml_name_id"] = name_id_value
+    # Only ever store plain strings in the session (the format may be a
+    # non-string sentinel in edge cases; production values are str or None).
+    session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
+    return _handle_saml_user_login(user, new_account=(status == "new"))
 
 
 #################################################################
@@ -1659,8 +1896,7 @@ def eidas_logout_postback():
             else:
                 break
 
-    session.pop("saml_login", None)
-    logout_user()
+    _terminate_local_session()
     frontend_url = current_app.config.get("CDATA_BASE_URL") or "/"
     return redirect(frontend_url)
 
@@ -1673,10 +1909,7 @@ def eidas_logout():
     saml_client = eidas_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
     )
-    nid = NameID(
-        format=NAMEID_FORMAT_UNSPECIFIED,
-        text="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
-    )
+    nid = _saml_session_name_id()
 
     logout_url = LogoutUrl(text=_saml_endpoint_url("saml.eidas_logout_postback"))
     destination = current_app.config.get("SECURITY_SAML_FA_URL")
@@ -1691,6 +1924,10 @@ def eidas_logout():
         consent="urn:oasis:names:tc:SAML:2.0:logout:user",
         extensions=extensions,
     )
+
+    # Local session first, IdP dance second (best effort) — see
+    # _terminate_local_session.
+    _terminate_local_session()
 
     post_message = http_form_post_message(message=logout_request, location=destination)
     return _saml_form_response(post_message["data"])
@@ -1718,7 +1955,7 @@ def migration_check():
     if not current_user.is_authenticated:
         return jsonify({"needs_migration": False})
 
-    has_nic = current_user.extras and current_user.extras.get("auth_nic")
+    has_nic = _has_linked_nic(current_user)
     needs = bool(not has_nic and current_user.password)
     return jsonify({"needs_migration": needs})
 
@@ -1734,13 +1971,14 @@ def migration_pending():
     if not pending:
         return jsonify({"pending": False})
 
-    user_email = pending.get("saml_email")
-    has_email = bool(user_email)
+    # Whether the CMD identity itself carries an email address.
+    has_email = bool(pending.get("saml_email"))
 
-    # Fetch legacy account details for user confirmation
+    # Fetch candidate (legacy) account details for user confirmation.
     legacy_user_id = pending.get("legacy_user_id")
     first_name = None
     last_name = None
+    legacy_email = None
     if legacy_user_id:
         from udata.core.user.models import User
 
@@ -1748,12 +1986,14 @@ def migration_pending():
         if user:
             first_name = user.first_name
             last_name = user.last_name
+            legacy_email = user.email
 
     return jsonify(
         {
             "pending": True,
-            "email": _mask_email(user_email) if user_email else None,
+            "email": _mask_email(legacy_email) if legacy_email else None,
             "has_email": has_email,
+            "candidate": bool(legacy_user_id),
             "first_name": first_name,
             "last_name": last_name,
         }
@@ -1780,9 +2020,14 @@ def migration_search():
     if not user:
         return jsonify({"found": False})
 
+    # Store only the candidate reference — saml_email must keep holding
+    # the email coming from the CMD identity (or None), never the
+    # legacy account's email.
     pending["legacy_user_id"] = str(user.id)
-    pending["saml_email"] = user.email
     session["saml_migration_pending"] = pending
+    # Any code previously emailed was issued for a different target —
+    # invalidate it so it cannot be replayed against the new candidate.
+    session.pop("migration_code", None)
     session.modified = True
 
     return jsonify(
@@ -1822,6 +2067,9 @@ def migration_send_code():
     code = str(random.randint(100000, 999999))
     session["migration_code"] = {
         "code": code,
+        # Bind the code to the account it was emailed to, so it cannot be
+        # replayed against a different candidate re-pointed via search.
+        "legacy_user_id": legacy_user_id,
         "expires": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
         "attempts": 0,
     }
@@ -1848,19 +2096,28 @@ def migration_confirm():
     data = request.get_json(silent=True) or {}
     method = data.get("method")
 
-    legacy_user_id = pending.get("legacy_user_id")
-    if not legacy_user_id:
-        return jsonify({"error": "No legacy user found"}), 400
-
     from udata.core.user.models import User
 
-    user = User.objects(id=legacy_user_id).first()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
     if method == "code":
+        # Code verification targets the candidate account found by
+        # name/search — a code was emailed to that account's address.
+        legacy_user_id = pending.get("legacy_user_id")
+        if not legacy_user_id:
+            return jsonify({"error": "No legacy user found"}), 400
+
+        user = User.objects(id=legacy_user_id).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
         code_data = session.get("migration_code")
         if not code_data:
+            return jsonify({"error": "No code sent"}), 400
+
+        # The code is only valid for the account it was emailed to. If the
+        # candidate was re-pointed (via search) after the code was issued,
+        # refuse it — otherwise a code sent to an attacker-controlled
+        # mailbox could link the NIC to a victim account.
+        if code_data.get("legacy_user_id") != legacy_user_id:
             return jsonify({"error": "No code sent"}), 400
 
         if code_data["attempts"] >= 5:
@@ -1878,14 +2135,33 @@ def migration_confirm():
             return jsonify({"error": "Invalid code"}), 400
 
     elif method == "password":
+        # Full default login (email + password): the linked account is
+        # the one whose credentials are proven, which may differ from
+        # the name-matched candidate (homonym case).
+        attempts = session.get("migration_password_attempts", 0)
+        if attempts >= 5:
+            return jsonify({"error": "Maximum attempts exceeded"}), 429
+        session["migration_password_attempts"] = attempts + 1
+        session.modified = True
+
+        email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        if not verify_and_update_password(password, user):
-            return jsonify({"error": "Invalid password"}), 400
+        user = datastore.find_user(email=email) if email else None
+        # Generic error on any failure to avoid account enumeration.
+        if (
+            not user
+            or user.deleted
+            or not user.password
+            or _has_linked_nic(user)
+            or not verify_and_update_password(password, user)
+        ):
+            return jsonify({"error": "Invalid credentials"}), 400
 
     else:
         return jsonify({"error": "Invalid method"}), 400
 
-    # Merge: add NIC, clear password, update names
+    # Link: add NIC and update names. The password is kept so the
+    # account remains accessible through both login methods.
     saml_nic = pending.get("saml_nic")
     saml_first_name = pending.get("saml_first_name")
     saml_last_name = pending.get("saml_last_name")
@@ -1894,7 +2170,6 @@ def migration_confirm():
         user.extras = {}
     if saml_nic:
         user.extras["auth_nic"] = _hash_nic(saml_nic)
-    user.password = None
     if saml_first_name:
         user.first_name = saml_first_name.title()
     if saml_last_name:
@@ -1910,6 +2185,7 @@ def migration_confirm():
     session.pop("saml_migration_pending", None)
     session.pop("migration_code", None)
     session.pop("migration_send_count", None)
+    session.pop("migration_password_attempts", None)
 
     current_app.logger.info(f"Account migration completed for user {user.id}")
 
@@ -1927,26 +2203,15 @@ def migration_skip():
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
 
-    saml_nic = pending.get("saml_nic")
-    saml_first_name = pending.get("saml_first_name")
-    saml_last_name = pending.get("saml_last_name")
-
-    # Generate a unique email to avoid conflicts with the legacy account
-    import uuid
-
-    saml_email = f"saml-{uuid.uuid4().hex[:8]}@autenticacao.gov.pt"
-
-    user_data = {
-        "first_name": (saml_first_name or "").title(),
-        "last_name": (saml_last_name or "").title(),
-        "email": saml_email,
-    }
-    if saml_nic:
-        user_data["extras"] = {"auth_nic": _hash_nic(saml_nic)}
-
-    user = datastore.create_user(**user_data)
-    user.confirmed_at = datetime.utcnow()
-    datastore.commit()
+    # Use the CMD email when available (no account holds it, otherwise
+    # the email lookup would have auto-linked); a placeholder is
+    # generated by _create_saml_user when the CMD brought no email.
+    user = _create_saml_user(
+        pending.get("saml_email"),
+        pending.get("saml_nic"),
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+    )
 
     login_user(user)
     session["saml_login"] = True
@@ -1955,5 +2220,9 @@ def migration_skip():
     session.pop("saml_migration_pending", None)
     session.pop("migration_code", None)
     session.pop("migration_send_count", None)
+    session.pop("migration_password_attempts", None)
 
-    return jsonify({"success": True})
+    # A placeholder email means registration is not complete yet: the
+    # frontend must send the user to /complete-registration instead of
+    # the homepage.
+    return jsonify({"success": True, "pending_registration": user.has_placeholder_email})

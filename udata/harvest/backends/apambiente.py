@@ -20,12 +20,13 @@ from owslib.csw import CatalogueServiceWeb
 
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
-from udata.models import License, Resource
+from udata.models import License
 
 from .tools.harvester_utils import (
     collapse_duplicated_path,
     guess_url_format,
     normalize_url_slashes,
+    sync_resources,
     with_http_retry,
 )
 
@@ -122,9 +123,6 @@ class PortalAmbienteBackend(BaseBackend):
 
         dataset.description = item.get("description")
 
-        # Force recreation of all resources
-        dataset.resources = []
-
         url = item.get("url")
 
         # Determine resource format/type. `liveData` records describe a map
@@ -135,10 +133,19 @@ class PortalAmbienteBackend(BaseBackend):
         else:
             resource_format = guess_url_format(url)
 
-        # Create and append the resource
-        new_resource = Resource(
-            title=dataset.title, url=url, filetype="remote", format=resource_format
+        # Refresh the resource in place rather than recreating it: a new
+        # `Resource` would mean a new id, i.e. a dead download permalink for
+        # everyone who had copied the previous one (LEDG-2251).
+        sync_resources(
+            dataset,
+            [
+                {
+                    "title": dataset.title,
+                    "url": url,
+                    "filetype": "remote",
+                    "format": resource_format,
+                }
+            ],
         )
-        dataset.resources.append(new_resource)
 
         return dataset

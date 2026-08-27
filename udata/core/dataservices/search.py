@@ -50,7 +50,9 @@ class DataserviceApiParser(ModelApiParser):
             # every word in it with quotes before rebuild it.
             # This allows the search_text method to tokenise with an AND
             # between tokens whereas an OR is used without it.
-            phrase_query = " ".join([f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")])
+            phrase_query = " ".join(
+                [f'"{elem}"' for elem in normalize_search_query(args["q"]).split(" ")]
+            )
             dataservices = dataservices.search_text(phrase_query)
         if args.get("tag"):
             dataservices = dataservices.filter(tags=args["tag"])

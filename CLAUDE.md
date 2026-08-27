@@ -104,7 +104,7 @@ This backend repo (`github.com/amagovpt/udata-pt`) has long-lived environment br
 4. Then a PR **into `ppr`**; test in ppr.
 5. Then a PR **into `main`** (production).
 
-> The PR base is always the **next environment up**, not always `main`. Apply this flow only when the change touches this repo. GitHub CLI (`gh`) is not installed here — open PRs via the compare URL `https://github.com/amagovpt/udata-pt/compare/<base>...<head>?expand=1`. See the monorepo `CLAUDE.md` for the cross-repo rule.
+> The PR base is always the **next environment up**, not always `main`. Apply this flow only when the change touches this repo. Check `gh auth status` first — the GitHub CLI is available on some team machines and not on others. When it is authenticated, open the PR with `gh pr create --repo amagovpt/udata-pt --base <base> --head <branch>` and follow CI with `gh pr checks`; otherwise open it via the compare URL `https://github.com/amagovpt/udata-pt/compare/<base>...<head>?expand=1`. See the monorepo `CLAUDE.md` for the cross-repo rule.
 
 ### Commits — Conventional Commits 1.0.0
 

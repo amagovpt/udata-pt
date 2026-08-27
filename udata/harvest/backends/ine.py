@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import html
+import os
 import random
 import re
+import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from uuid import uuid4
 
+import defusedxml.ElementTree as DET
 import requests
 from flask import current_app
 from slugify import slugify
 
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
-from udata.harvest.models import HarvestItem, HarvestJob
-from udata.models import Dataset, License, Resource
+from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
+from udata.models import Dataset, License
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import normalize_url_slashes, sync_resources
 
 
 class INEDownloadIncomplete(Exception):
@@ -72,6 +78,23 @@ class INEBackend(BaseBackend):
         super().__init__(*args, **kwargs)
 
         self._cc_by_license = None
+        self._catalog_truncated = False
+
+        if self.dryrun and not self.IS_TEST_MODE:
+            # Previews must not share the download path with the real harvest.
+            # `LOCAL_FILE_PATH` is a class attribute, so every INE run in the
+            # process reads and writes the same file: a preview could overwrite
+            # the catalog a running harvest was reading, and its cleanup deletes
+            # the cached file that harvest falls back on. The real harvest keeps
+            # the shared path deliberately — that cache is what saves it when the
+            # slow INE endpoint drops the connection on every attempt. The cost
+            # of the split is disk: the body is downloaded before any `max_items`
+            # cut, so N concurrent previews now hold N bodies instead of one.
+            # `IS_TEST_MODE` is excluded because there the file is placed at the
+            # class path by hand, and overriding it would make every run fail.
+            self.LOCAL_FILE_PATH = os.path.join(
+                tempfile.gettempdir(), f"ine-preview-{uuid4().hex}.xml"
+            )
 
         try:
             self._log = current_app.logger
@@ -236,7 +259,7 @@ class INEBackend(BaseBackend):
             # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
             resp = self.get(url, timeout=30)
             resp.raise_for_status()
-            root = ET.fromstring(resp.content)
+            root = DET.fromstring(resp.content)
             ids = {ind.attrib["id"] for ind in root.findall(".//indicator") if "id" in ind.attrib}
             self._log.info("[INE] HVD IDs carregados: %s", len(ids))
             return ids
@@ -248,11 +271,23 @@ class INEBackend(BaseBackend):
     # Extrai metadados do indicator (já normalizados)
     # --------------------------
     def _extract_metadata(self, elem: ET.Element) -> dict:
+        """Read one `<indicator>` into a metadata dict, sanitized.
+
+        Title and description are sanitized *here*, at extraction, and not in
+        `_apply_metadata_to_dataset`. This backend writes `dataset.to_mongo()`
+        straight to pymongo, so the `Dataset.pre_save` signal that sanitizes
+        every other write in the portal never fires for it; the sanitization has
+        to be reproduced by hand. It cannot happen in the apply step, though,
+        because `_has_changed` compares the *stored* values against this dict
+        and runs before it: sanitizing later would compare a sanitized title
+        against a raw one, so any indicator carrying markup would report as
+        changed on every nightly harvest and be rewritten forever.
+        """
         md = {}
 
         node = elem.find("title")
         if node is not None and node.text:
-            md["title"] = node.text
+            md["title"] = sanitize_strict(node.text)
 
         desc = ""
         remote_url = None
@@ -268,8 +303,10 @@ class INEBackend(BaseBackend):
                 desc = (desc + "\n" + bdd_url.text) if desc else bdd_url.text
 
         if desc:
-            md["description"] = desc
+            md["description"] = sanitize_markdown_html(desc)
         if remote_url:
+            # Not sanitized on purpose: this is a URL, not markup, and it is
+            # stored in `harvest.remote_url` rather than rendered as content.
             md["remote_url"] = remote_url
 
         resources = []
@@ -435,10 +472,10 @@ class INEBackend(BaseBackend):
         if "description" in md:
             dataset.description = md["description"]
 
-        dataset.resources = []
-        for res_data in md.get("resources") or []:
-            r = Resource(**res_data)
-            dataset.resources.append(r)
+        # Reconciled, not rebuilt: `_has_changed` lets any single metadata edit
+        # reach this point, and recreating the resources there would hand every
+        # one of them a new id — a new, broken download permalink (LEDG-2251).
+        sync_resources(dataset, md.get("resources") or [])
 
         if not dataset.harvest:
             dataset.harvest = Dataset.harvest.document_type_obj()
@@ -473,7 +510,11 @@ class INEBackend(BaseBackend):
         # Adiciona remote_id ao final para garantir unicidade
         if not getattr(dataset, "id", None):
             if not getattr(dataset, "slug", None) and dataset.title:
-                base_slug = slugify(dataset.title, to_lower=True)
+                # Unescaped first: the title is sanitized, and bleach escapes
+                # what it does not strip, so slugifying it directly turns
+                # "Investigação e Desenvolvimento (I&D)" into a permalink
+                # carrying a spurious "-amp-" segment.
+                base_slug = slugify(html.unescape(dataset.title), to_lower=True)
                 dataset.slug = f"{base_slug}-{remote_id}" if base_slug else f"ine-{remote_id}"
 
         return dataset
@@ -491,6 +532,21 @@ class INEBackend(BaseBackend):
 
         if not ops:
             return 0, 0, 0  # matched, modified, upserted
+
+        if self.dryrun:
+            # A preview must never touch the database. This backend does not go
+            # through `BaseBackend.process_dataset`, so the dryrun guard around
+            # `dataset.save()` in `base.py` never applies here: `inner_harvest`
+            # writes the datasets itself, and every one of those writes — the
+            # `ReplaceOne` of a changed dataset and the upserting `UpdateOne` of a
+            # new one — funnels through this method. Guarding here therefore
+            # closes both call sites (the per-chunk flush and the final one) at
+            # once. Logged at WARNING because suppressed writes are an
+            # operationally meaningful event; note that, unlike the LEDG-2320
+            # backends, nothing on this path installs a `LogCatcher`, so this
+            # does not reach the preview response.
+            self._log.warning("[INE] Dryrun: discarding %s pending write(s)", len(ops))
+            return 0, 0, 0
 
         t0 = time.time()
         try:
@@ -550,6 +606,54 @@ class INEBackend(BaseBackend):
     # inner_harvest (2 fases)
     # --------------------------
     def inner_harvest(self):
+        try:
+            self._inner_harvest()
+        finally:
+            if self.dryrun and not self.IS_TEST_MODE:
+                # The success-path cleanup at the end of `_inner_harvest` does not
+                # run when phase 2 raises, and the phase 1 handler keeps the file
+                # on purpose, for debugging. Both are fine for the real harvest,
+                # which reuses one shared path; a preview owns a unique file per
+                # instance and would leave it behind for good.
+                self._cleanup_local_file()
+
+    def autoarchive(self):
+        """Skip archiving when the catalog was only partly read.
+
+        `BaseBackend.autoarchive` treats every remote_id missing from
+        `job.items` as gone from the remote platform. That is sound for a run
+        that read the whole catalog and false for one that stopped at
+        `max_items` — which is every preview, since `actions.preview` always
+        passes `HARVEST_PREVIEW_MAX_ITEMS`. Without this, a preview of a source
+        whose real harvest has been failing for longer than the grace period
+        would report the entire rest of the catalog as archived.
+        """
+        if self._catalog_truncated:
+            self._log.warning(
+                "[INE] Autoarchive ignorado: o catálogo foi truncado em max_items=%s",
+                self.max_items,
+            )
+            return
+        super().autoarchive()
+
+    def _cleanup_local_file(self):
+        if not self.USE_LOCAL_FILE:
+            return
+        try:
+            if os.path.exists(self.LOCAL_FILE_PATH):
+                os.remove(self.LOCAL_FILE_PATH)
+                self._log.info(
+                    "[INE] Ficheiro descarregado removido após processamento: %s",
+                    self.LOCAL_FILE_PATH,
+                )
+        except Exception as e:
+            self._log.warning(
+                "[INE] Falha ao remover ficheiro %s: %s",
+                self.LOCAL_FILE_PATH,
+                e,
+            )
+
+    def _inner_harvest(self):
         self._log.info("[INE] Iniciando harvester de %s", self.source.url)
         self._log.info(
             "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s, TestMode=%s",
@@ -604,15 +708,36 @@ class INEBackend(BaseBackend):
 
             # Fase 1: Criação do iterador sobre o XML
             # source_context pode ser file path ou file-like object (BytesIO)
-            context = ET.iterparse(source_context, events=("start", "end"))
+            # Hardened parser: the catalog body is remote and, through the
+            # preview endpoint, caller-supplied. defusedxml refuses DTD entity
+            # definitions and external references by default, which is what
+            # turns a billion-laughs body from a worker-memory DoS into a clean
+            # harvest failure. The elements it yields are ordinary stdlib ones,
+            # so `elem.clear()` and the `ET.Element` type hints still hold — the
+            # stdlib import stays because defusedxml does not re-export Element.
+            context = DET.iterparse(source_context, events=("start", "end"))
             context = iter(context)
             event, root = next(context)  # Pega o elemento raiz
 
             metadata_map = {}  # {remote_id: metadata_dict}
             total_parsed = 0
+            # `max_items` has to be honoured here, not in phase 2. The convention
+            # elsewhere is to call `has_reached_max_items()` per item, but that
+            # reads `len(self.job.items)` and this backend only pushes into that
+            # list every `BULK_SIZE * 2` items (or at the very end), so for a
+            # 20-item preview it would never be true. Cutting the parse in
+            # document order is what the dcat backend does too.
+            truncated = False
 
             for event, elem in context:
                 if event == "end" and elem.tag == "indicator":
+                    # Checked before processing, not after: deciding on the way in
+                    # means a catalog holding exactly `max_items` indicators ends
+                    # the loop naturally and is not reported as truncated.
+                    if self.max_items and len(metadata_map) >= self.max_items:
+                        truncated = True
+                        break
+
                     total_parsed += 1
                     md = self._extract_metadata(elem)
                     remote_id = elem.get("id")
@@ -630,6 +755,24 @@ class INEBackend(BaseBackend):
                 "[INE] Parsing XML concluído. Total items: %s. Iniciando processamento...",
                 total_parsed,
             )
+
+            self._catalog_truncated = truncated
+
+            if truncated and not self.dryrun:
+                # Expected in a preview, worth an error on a real harvest: with
+                # `source.autoarchive` on, everything below the cut would be
+                # archived as if it had disappeared from the remote catalog.
+                self._log.warning(
+                    "[INE] max_items=%s atingido: nem todos os indicadores foram retirados",
+                    self.max_items,
+                )
+                self.job.errors.append(
+                    HarvestError(
+                        message=(
+                            f"{self.max_items} max items reached, not all datasets were retrieved"
+                        )
+                    )
+                )
 
         except Exception as e:
             self._log.error("[INE] Erro no download/parsing do XML: %s", e)
@@ -863,19 +1006,5 @@ class INEBackend(BaseBackend):
 
         # Remover ficheiro descarregado após processamento bem-sucedido
         # (não remover em modo teste)
-        if not self.IS_TEST_MODE and self.USE_LOCAL_FILE:
-            try:
-                import os
-
-                if os.path.exists(self.LOCAL_FILE_PATH):
-                    os.remove(self.LOCAL_FILE_PATH)
-                    self._log.info(
-                        "[INE] Ficheiro descarregado removido após processamento: %s",
-                        self.LOCAL_FILE_PATH,
-                    )
-            except Exception as e:
-                self._log.warning(
-                    "[INE] Falha ao remover ficheiro %s: %s",
-                    self.LOCAL_FILE_PATH,
-                    e,
-                )
+        if not self.IS_TEST_MODE:
+            self._cleanup_local_file()

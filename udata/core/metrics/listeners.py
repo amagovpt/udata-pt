@@ -14,9 +14,7 @@ _SLUG_OR_OID = r"(?:[a-z0-9]+-[a-z0-9-]*[a-z0-9]|[0-9a-f]{24})"
 # Patterns to extract object_type and object_id from API URL paths.
 # Only match direct object access (the identifier must be the last path segment),
 # so sub-endpoints like /organizations/<slug>/datasets/ are NOT counted as views.
-_RESOURCE_DL = re.compile(
-    rf"/api/[12]/datasets/r/({_SLUG_OR_OID})/?$"
-)
+_RESOURCE_DL = re.compile(rf"/api/[12]/datasets/r/({_SLUG_OR_OID})/?$")
 
 URL_PATTERNS = [
     (re.compile(rf"/api/[12]/datasets/({_SLUG_OR_OID})/?$"), "dataset"),
