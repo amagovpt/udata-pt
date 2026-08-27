@@ -2788,6 +2788,73 @@ class SAMLMigrationWizardTest(APITestCase):
         assert self.client.get("/saml/migration/pending").json["candidate"] is True
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_still_refuses_emails_of_non_candidate_accounts(self, mock_client_for):
+        """The divert must not become a way in. It fires only where
+        _find_legacy_user returns an account, so an address held by one this
+        identity cannot claim is still refused — and refused *without*
+        candidate_found, which is what tells the wizard to say so rather than
+        offer a confirmation screen.
+
+        The 'deleted' case is asserted defensively, not as a scenario from
+        production: User.mark_as_deleted rewrites the address to <id>@deleted
+        and clears password and extras, so the original email is free again and
+        the skip creates a new account instead of reaching this branch.
+        """
+        from udata.core.user.models import User
+
+        # Already linked to a different CMD identity: linking it would
+        # overwrite that link and lock the other person out of CMD login.
+        other_cmd = UserFactory(
+            email="ines@example.pt",
+            password="S3cretPass!",
+            first_name="Ines",
+            last_name="Duarte",
+            extras={"auth_nic": _hash_nic("99999999")},
+        )
+        # No password: not a legacy account with portal credentials to
+        # migrate. The argument is omitted, not passed as None — the factory
+        # hashes whatever it is given, and hash_password(None) yields a
+        # perfectly truthy hash.
+        no_password = UserFactory(
+            email="rita@example.pt",
+            first_name="Rita",
+            last_name="Gomes",
+        )
+        deleted = UserFactory(
+            email="hugo@example.pt",
+            password="S3cretPass!",
+            first_name="Hugo",
+            last_name="Silva",
+            deleted=datetime(2025, 1, 1),
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="nuno.cmd@servico.gov.pt",
+            nic="54545454",
+            first_name="Nuno Miguel",
+            last_name="Ferreira Lopes",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        users_before = User.objects.count()
+
+        for account in (other_cmd, no_password, deleted):
+            response = self.client.post("/saml/migration/skip", json={"email": account.email})
+            assert response.status_code == 409, account.email
+            assert response.json["error"] == "email_taken", account.email
+            assert "candidate_found" not in response.json, account.email
+
+            # No account created, and no candidate pointed to confirm against.
+            assert User.objects.count() == users_before, account.email
+            with self.client.session_transaction() as sess:
+                assert sess["saml_migration_pending"]["legacy_user_id"] is None
+
+        # The other person's CMD link is untouched.
+        other_cmd.reload()
+        assert other_cmd.extras.get("auth_nic") == _hash_nic("99999999")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_email_match_is_case_insensitive_for_the_wizard_candidate(self, mock_client_for):
         """Rule 2 is what decides migration_candidate. Exact-matching there sent
         the owner of maria@ whose CMD carries Maria@ down the no_match branch —
