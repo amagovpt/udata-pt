@@ -2335,6 +2335,55 @@ class SAMLMigrationWizardTest(APITestCase):
         assert data["first_name"] == "Pedro"
         assert data["email"] == "p***@example.pt"  # candidate account email, masked
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_pending_exposes_suggested_email(self, mock_client_for):
+        """The account-creation step pre-fills the CMD email, but only when
+        no account holds it — offering a taken address would guarantee a
+        rejection. no_match stays false here: these identities matched a
+        homonym, so they are not the 'no account at all' case."""
+        UserFactory(
+            email="marta@example.pt",
+            password="S3cretPass!",
+            first_name="Marta",
+            last_name="Bento",
+        )
+
+        # CMD carries an email no account holds -> offered as a suggestion.
+        self._sso_with(
+            mock_client_for,
+            email="marta.cmd@example.pt",
+            nic="66778899",
+            first_name="Marta",
+            last_name="Bento",
+        )
+        data = self.client.get("/saml/migration/pending").json
+        assert data["suggested_email"] == "marta.cmd@example.pt"
+        assert data["no_match"] is False
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_pending_omits_suggested_email_when_already_taken(self, mock_client_for):
+        """An email that already belongs to an account is never suggested."""
+        UserFactory(
+            email="sofia@example.pt",
+            password="S3cretPass!",
+            first_name="Sofia",
+            last_name="Cardoso",
+        )
+
+        # The CMD email is the candidate account's own address: match by
+        # email, and nothing to suggest.
+        self._sso_with(
+            mock_client_for,
+            email="sofia@example.pt",
+            nic="77889900",
+            first_name="Sofia",
+            last_name="Cardoso",
+        )
+        data = self.client.get("/saml/migration/pending").json
+        assert data["candidate"] is True
+        assert data["suggested_email"] is None
+        assert data["no_match"] is False
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_new_account_redirect_informs_user(self, mock_client_for, mock_requires_conf):

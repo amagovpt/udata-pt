@@ -1974,6 +1974,23 @@ def migration_pending():
     # Whether the CMD identity itself carries an email address.
     has_email = bool(pending.get("saml_email"))
 
+    # The email the CMD identity carried, but only when no account holds it:
+    # the wizard pre-fills the account-creation field with it, and offering an
+    # address that is already taken would only produce a guaranteed rejection.
+    saml_email = pending.get("saml_email")
+    suggested_email = (
+        saml_email if saml_email and not datastore.find_user(email=saml_email) else None
+    )
+
+    # True only when the identity matched no account at all (as opposed to
+    # matching several homonyms) AND carries a NIC. Both cases reach the
+    # wizard with legacy_user_id unset, so `candidate` alone cannot tell them
+    # apart. The NIC is required because an identity without one cannot create
+    # an account through this flow (see migration_skip): without auth_nic the
+    # pending account would match itself as a wizard candidate on the next
+    # login and could be confirmed without ever following the emailed link.
+    no_match = bool(pending.get("no_match")) and bool(pending.get("saml_nic"))
+
     # Fetch candidate (legacy) account details for user confirmation.
     legacy_user_id = pending.get("legacy_user_id")
     first_name = None
@@ -1993,7 +2010,9 @@ def migration_pending():
             "pending": True,
             "email": _mask_email(legacy_email) if legacy_email else None,
             "has_email": has_email,
+            "suggested_email": suggested_email,
             "candidate": bool(legacy_user_id),
+            "no_match": no_match,
             "first_name": first_name,
             "last_name": last_name,
         }
