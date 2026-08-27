@@ -2687,19 +2687,110 @@ class SAMLMigrationWizardTest(APITestCase):
         with patch(
             "udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"
         ) as mock_confirm:
-            for _ in range(3):
+            # The mail sent when the account was created already counts as one
+            # of the three, so two resends remain.
+            for _ in range(2):
                 response = self.client.post("/saml/migration/resend-confirmation")
                 assert response.status_code == 200
                 assert response.json == {"sent": True}
 
-            # Fourth send in the same session is refused.
+            # The third resend would be the fourth mail overall: refused.
             response = self.client.post("/saml/migration/resend-confirmation")
             assert response.status_code == 429
 
-        assert mock_confirm.call_count == 3
+        assert mock_confirm.call_count == 2
         # Always the account's own address — never an arbitrary one.
         for call in mock_confirm.call_args_list:
             assert call[0][0].id == created.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_refuses_a_second_account_for_the_same_identity(self, mock_client_for):
+        """The Flask session is a client-held signed cookie, so a caller can
+        replay a copy taken before the first skip and re-enter with the pending
+        state intact — the session pops only rewrite a response cookie they are
+        free to discard. Without a server-side check that replay mints an
+        unbounded number of accounts against one NIC, each mailing a
+        confirmation to an address the caller chooses."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="vera.old@example.pt",
+            password="S3cretPass!",
+            first_name="Vera",
+            last_name="Lima",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="vera.cmd@example.pt",
+            nic="35353535",
+            first_name="Vera",
+            last_name="Lima",
+        )
+
+        # Capture the wizard cookie, exactly as a replaying caller would.
+        with self.client.session_transaction() as sess:
+            replayed = dict(sess.get("saml_migration_pending"))
+
+        assert (
+            self.client.post(
+                "/saml/migration/skip", json={"email": "vera.a@example.pt"}
+            ).status_code
+            == 200
+        )
+        users_after_first = User.objects.count()
+
+        # Replay: put the pre-skip state back and try another address.
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = replayed
+
+        response = self.client.post("/saml/migration/skip", json={"email": "vera.b@example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "identity_already_registered"
+        assert User.objects.count() == users_after_first
+        assert User.objects(email="vera.b@example.pt").first() is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_resend_confirmation_cap_survives_a_replayed_session(self, mock_client_for):
+        """The cap is counted on the account, not in the session: the recipient
+        was chosen by whoever ran the wizard, so a session-only counter would be
+        reset by replaying an older cookie and the endpoint could mail an
+        arbitrary victim without limit."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="nuno.old@example.pt",
+            password="S3cretPass!",
+            first_name="Nuno",
+            last_name="Faria",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="nuno.cmd@example.pt",
+            nic="36363636",
+            first_name="Nuno",
+            last_name="Faria",
+        )
+        self.client.post("/saml/migration/skip", json={"email": "nuno.novo@example.pt"})
+        created = User.objects(email="nuno.novo@example.pt").first()
+
+        with self.client.session_transaction() as sess:
+            pristine = dict(sess.get("saml_confirmation_pending"))
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"):
+            # The creation mail already counts as one, so two more are allowed.
+            for _ in range(2):
+                assert self.client.post("/saml/migration/resend-confirmation").status_code == 200
+
+            # Replaying a session captured before any resend must not reset it.
+            for _ in range(3):
+                with self.client.session_transaction() as sess:
+                    sess["saml_confirmation_pending"] = pristine
+                    sess.pop("migration_confirmation_send_count", None)
+                response = self.client.post("/saml/migration/resend-confirmation")
+                assert response.status_code == 429, response.json
+
+        created.reload()
+        assert created.extras["confirmation_send_count"] == 3
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_resend_confirmation_reports_an_already_confirmed_account(self, mock_client_for):

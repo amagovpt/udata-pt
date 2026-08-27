@@ -728,6 +728,14 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
 # clearing: once confirmed_at is set the gate opens and the marker is inert.
 PENDING_EMAIL_CONFIRMATION = "pending_email_confirmation"
 
+# How many confirmation mails one pending account may trigger, and where that
+# tally lives. It is kept on the account rather than in the session because the
+# recipient is an address the wizard user typed: a session-held counter is
+# reset by replaying an older copy of the signed cookie, which would leave the
+# resend endpoint able to mail an arbitrary victim without limit.
+CONFIRMATION_SEND_COUNT = "confirmation_send_count"
+MAX_CONFIRMATION_SENDS = 3
+
 
 def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
     """Create an account from a user-declared email, left unconfirmed.
@@ -2336,16 +2344,35 @@ def migration_skip():
         return jsonify({"error": "email_required"}), 400
 
     try:
-        # Same validator arguments as the rest of the codebase (see
-        # udata.core.contact_point.models.check_is_email): deliverability
-        # checks are disabled under test, and a transient DNS failure must
-        # never tell a user their valid address is invalid.
-        validate_email(email, **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS", {}) or {}))
+        # Shape only, never deliverability. email_validator defaults
+        # check_deliverability to True, and SECURITY_EMAIL_VALIDATOR_ARGS is
+        # defined only in settings.Testing — so relying on the config alone
+        # would run a live MX lookup, for an attacker-chosen domain, inside
+        # the request. That both hands out an outbound DNS primitive and lets
+        # a resolver blip tell a user their valid address is invalid.
+        validator_args = {
+            "check_deliverability": False,
+            **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS") or {}),
+        }
+        validate_email(email, **validator_args)
     except EmailNotValidError:
         return jsonify({"error": "invalid_email"}), 400
 
     if datastore.find_user(email=email):
         return jsonify({"error": "email_taken"}), 409
+
+    # This identity already has an account. Normally unreachable — rule 1 of
+    # _find_or_create_saml_user would have resolved it long before the wizard
+    # — but the Flask session is a client-held signed cookie, so replaying a
+    # copy taken before the first skip re-enters here with the pending state
+    # intact. Without this check that replay mints an unbounded number of
+    # accounts against one NIC, each mailing a confirmation to an address the
+    # caller chooses. The session pops are not a defence: they only rewrite a
+    # response cookie the caller is free to discard.
+    from udata.core.user.models import User
+
+    if User.objects(extras__auth_nic=_hash_nic(user_nic)).first():
+        return jsonify({"error": "identity_already_registered"}), 409
 
     user = _create_pending_saml_user(
         email,
@@ -2354,6 +2381,8 @@ def migration_skip():
         pending.get("saml_last_name"),
     )
     send_confirmation_instructions(user)
+    user.extras[CONFIRMATION_SEND_COUNT] = 1
+    user.save()
 
     # No login_user: the account has no session until the email is confirmed.
     # The wizard state is done, but a resend handle must survive it — this key
@@ -2386,11 +2415,6 @@ def migration_resend_confirmation():
     if not awaiting:
         return jsonify({"error": "No pending confirmation"}), 400
 
-    # Rate limit: max 3 sends per session, mirroring migration_send_code.
-    send_count = session.get("migration_confirmation_send_count", 0)
-    if send_count >= 3:
-        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
-
     from udata.core.user.models import User
 
     user = User.objects(id=awaiting.get("user_id")).first()
@@ -2402,7 +2426,18 @@ def migration_resend_confirmation():
         # send the user to the login instead of waiting for another mail.
         return jsonify({"sent": False, "confirmed": True})
 
+    # The cap is counted ON THE ACCOUNT, not in the session. migration_send_code
+    # keeps its counter in the session, but it can only ever mail the candidate
+    # account's own address; here the recipient was chosen by whoever ran the
+    # wizard, so a session-only counter would be no cap at all — the Flask
+    # session is a client-held signed cookie, and replaying a copy taken before
+    # the first send resets it to zero on every request.
+    send_count = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0)
+    if send_count >= MAX_CONFIRMATION_SENDS:
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
     send_confirmation_instructions(user)
-    session["migration_confirmation_send_count"] = send_count + 1
+    user.extras[CONFIRMATION_SEND_COUNT] = send_count + 1
+    user.save()
 
     return jsonify({"sent": True})
