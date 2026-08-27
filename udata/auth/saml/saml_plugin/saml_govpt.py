@@ -2338,3 +2338,44 @@ def migration_skip():
     session["saml_confirmation_pending"] = {"user_id": str(user.id)}
 
     return jsonify({"success": True, "email": user.email})
+
+
+@autenticacao_gov.route("/saml/migration/resend-confirmation", methods=["POST"])
+@csrf.exempt
+def migration_resend_confirmation():
+    """Resend the confirmation link for the account awaiting confirmation.
+
+    At this point there is no session to authenticate: the account exists but
+    is deliberately not logged in. The pending-confirmation key left in the
+    session identifies the user without authenticating them, which is why this
+    endpoint takes no email argument — it would otherwise be an open relay,
+    and the stock ``security.send_confirmation`` view carries no rate limit of
+    its own to fall back on.
+    """
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
+    awaiting = session.get("saml_confirmation_pending")
+    if not awaiting:
+        return jsonify({"error": "No pending confirmation"}), 400
+
+    # Rate limit: max 3 sends per session, mirroring migration_send_code.
+    send_count = session.get("migration_confirmation_send_count", 0)
+    if send_count >= 3:
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    from udata.core.user.models import User
+
+    user = User.objects(id=awaiting.get("user_id")).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    if user.confirmed_at is not None:
+        # Already done — nothing to resend, and saying so lets the frontend
+        # send the user to the login instead of waiting for another mail.
+        return jsonify({"sent": False, "confirmed": True})
+
+    send_confirmation_instructions(user)
+    session["migration_confirmation_send_count"] = send_count + 1
+
+    return jsonify({"sent": True})

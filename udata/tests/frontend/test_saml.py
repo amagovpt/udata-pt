@@ -2593,6 +2593,79 @@ class SAMLMigrationWizardTest(APITestCase):
         assert data["email"] == "t***@example.pt"
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_resend_confirmation_requires_pending_session_and_rate_limits(self, mock_client_for):
+        """Criterion 15: the resend works without an authenticated session —
+        the pending-confirmation key identifies the user — but only for the
+        account's own address, and no more than three times per session."""
+        from udata.core.user.models import User
+
+        # No pending confirmation in session: refused, not an open relay.
+        response = self.client.post("/saml/migration/resend-confirmation")
+        assert response.status_code == 400
+
+        UserFactory(
+            email="ines.old@example.pt",
+            password="S3cretPass!",
+            first_name="Ines",
+            last_name="Duarte",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="ines.cmd@example.pt",
+            nic="33333333",
+            first_name="Ines",
+            last_name="Duarte",
+        )
+        self.client.post("/saml/migration/skip", json={"email": "ines.nova@example.pt"})
+        created = User.objects(email="ines.nova@example.pt").first()
+
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt.send_confirmation_instructions"
+        ) as mock_confirm:
+            for _ in range(3):
+                response = self.client.post("/saml/migration/resend-confirmation")
+                assert response.status_code == 200
+                assert response.json == {"sent": True}
+
+            # Fourth send in the same session is refused.
+            response = self.client.post("/saml/migration/resend-confirmation")
+            assert response.status_code == 429
+
+        assert mock_confirm.call_count == 3
+        # Always the account's own address — never an arbitrary one.
+        for call in mock_confirm.call_args_list:
+            assert call[0][0].id == created.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_resend_confirmation_reports_an_already_confirmed_account(self, mock_client_for):
+        """Nothing to resend once the link was followed — say so, so the
+        frontend can point the user at the login instead of a new mail."""
+        from udata.core.user.models import User
+
+        UserFactory(
+            email="hugo.old@example.pt",
+            password="S3cretPass!",
+            first_name="Hugo",
+            last_name="Reis",
+        )
+        self._sso_with(
+            mock_client_for,
+            email="hugo.cmd@example.pt",
+            nic="34343434",
+            first_name="Hugo",
+            last_name="Reis",
+        )
+        self.client.post("/saml/migration/skip", json={"email": "hugo.novo@example.pt"})
+
+        created = User.objects(email="hugo.novo@example.pt").first()
+        created.confirmed_at = datetime.utcnow()
+        created.save()
+
+        response = self.client.post("/saml/migration/resend-confirmation")
+        assert response.status_code == 200
+        assert response.json == {"sent": False, "confirmed": True}
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_cmd_login_after_confirmation_enters_directly(self, mock_client_for):
         """Criteria 12/13: once the link is followed, confirmed_at is set, the
         gate stops matching and the NIC takes the user straight in — no
