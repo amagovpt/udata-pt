@@ -1061,7 +1061,16 @@ def _point_migration_candidate(pending, user):
     emailed was issued for a different target, so it has to die with the
     re-point — copying that invariant to a second call site is how
     target-confusion gets reintroduced.
+
+    A validation link needs the same treatment, but cannot get it the same
+    way: the code lived in the session, so popping it was enough, whereas a
+    mailed token is stateless and outlives any session. Destroying the record
+    on the account it was issued against is what kills it.
     """
+    previous_id = pending.get("legacy_user_id")
+    if previous_id and previous_id != str(user.id):
+        _drop_migration_link(previous_id)
+
     # Store only the candidate reference — saml_email must keep holding
     # the email coming from the CMD identity (or None), never the
     # legacy account's email.
@@ -1069,6 +1078,15 @@ def _point_migration_candidate(pending, user):
     session["saml_migration_pending"] = pending
     session.pop("migration_code", None)
     session.modified = True
+
+
+def _drop_migration_link(user_id):
+    """Destroy any validation link outstanding for ``user_id``."""
+    from udata.core.user.models import User
+
+    previous = User.objects(id=user_id).first()
+    if previous and (previous.extras or {}).pop(MIGRATION_LINK_PENDING, None):
+        previous.save()
 
 
 def _send_migration_code(user, code):

@@ -3886,6 +3886,57 @@ class SAMLMigrationLinkClickTest(APITestCase):
             if response.status_code == 302:
                 assert "flash=migration_link_invalid" in response.headers["Location"]
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_re_pointing_the_candidate_kills_the_link_already_sent(self, mock_client_for):
+        """LEDG-2357, the link-flow equivalent of the target-confusion guard:
+        a link issued for one account must not survive the wizard being
+        pointed at another. The code died with a session pop; a mailed token
+        can only be killed by destroying the record it was issued against."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        first = UserFactory(
+            email="first.old@example.pt",
+            password="S3cretPass!",
+            first_name="Marta",
+            last_name="Costa",
+        )
+        second = UserFactory(
+            email="second.old@example.pt",
+            password="S3cretPass!",
+            first_name="Marta",
+            last_name="Costa",
+        )
+
+        # Two homonyms means no automatic candidate: the wizard asks, the user
+        # names one, takes a link for it — and then names the other.
+        self._sso_with(mock_client_for, nic="77778888", first_name="Marta", last_name="Costa")
+        found = self.client.post("/saml/migration/search", json={"email": first.email})
+        assert found.json["found"] is True
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
+
+        first.reload()
+        assert MIGRATION_LINK_PENDING in first.extras
+
+        repointed = self.client.post("/saml/migration/search", json={"email": second.email})
+        assert repointed.json["found"] is True
+
+        # The record on the account the link was issued for is gone.
+        first.reload()
+        assert MIGRATION_LINK_PENDING not in (first.extras or {})
+
+        with self.app.test_client() as fresh:
+            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            assert response.status_code == 302
+            assert "flash=migration_link_invalid" in response.headers["Location"]
+
+        for account in (first, second):
+            account.reload()
+            assert not (account.extras or {}).get("auth_nic")
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_the_same_flow_works_from_eidas(self, mock_client_for, mock_requires_conf):
