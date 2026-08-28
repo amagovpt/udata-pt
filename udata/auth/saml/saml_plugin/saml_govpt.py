@@ -1081,7 +1081,7 @@ def _point_migration_candidate(pending, user):
     """
     previous_id = pending.get("legacy_user_id")
     if previous_id and previous_id != str(user.id):
-        _drop_migration_link(previous_id)
+        _drop_migration_link(previous_id, pending)
 
     # Store only the candidate reference — saml_email must keep holding
     # the email coming from the CMD identity (or None), never the
@@ -1091,13 +1091,35 @@ def _point_migration_candidate(pending, user):
     session.modified = True
 
 
-def _drop_migration_link(user_id):
-    """Destroy any validation link outstanding for ``user_id``."""
+def _drop_migration_link(user_id, pending):
+    """Destroy the validation link THIS session issued for ``user_id``.
+
+    Scoped to the issuing session, and that scope is the whole point. The
+    record lives on the User document, so it is global to the account and
+    outlives whoever wrote it — while pointing at an account takes no proof
+    at all on one path that remains: the SSO points a candidate by itself,
+    by email match or by a unique name match. Unscoped, this function let
+    such a session delete a link somebody else had legitimately asked for,
+    which is a denial of the whole flow for the account's owner.
+
+    The invariant being protected is narrower than the record, which is why
+    scoping costs nothing: a link still live in the old candidate's mailbox
+    would put this session's NIC on a second account, and only a link this
+    session issued can be in that position. A link issued by another session
+    is already bound to that session's own target.
+    """
+    if not user_id or str(user_id) != pending.get("link_issued_for"):
+        return
+
     from udata.core.user.models import User
 
     previous = User.objects(id=user_id).first()
     if previous and (previous.extras or {}).pop(MIGRATION_LINK_PENDING, None):
         previous.save()
+
+    pending.pop("link_issued_for", None)
+    session["saml_migration_pending"] = pending
+    session.modified = True
 
 
 def _parse_isoformat(value):
@@ -1362,6 +1384,13 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
+
+    # Remember that it was THIS session that put the record there. Only a
+    # link this session issued may later be destroyed by it — see
+    # _drop_migration_link.
+    pending["link_issued_for"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.modified = True
 
     _send_migration_link(user, pending.get("saml_first_name"), pending.get("saml_last_name"), token)
     current_app.logger.info(f"Migration validation link sent to user {user.id}")
@@ -2835,7 +2864,7 @@ def migration_skip():
     # candidate's mailbox would put that same NIC on a second account.
     candidate_id = pending.get("legacy_user_id")
     if candidate_id and candidate_id != str(user.id):
-        _drop_migration_link(candidate_id)
+        _drop_migration_link(candidate_id, pending)
 
     # No login_user: the account has no session until the email is confirmed.
     # The wizard state is done, but a resend handle must survive it — this key

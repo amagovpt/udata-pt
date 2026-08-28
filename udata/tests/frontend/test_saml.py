@@ -3361,6 +3361,75 @@ class SAMLMigrationWizardTest(APITestCase):
         assert not (decoy.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_sso_name_match_cannot_destroy_a_link_it_did_not_issue(self, mock_client_for):
+        """The candidate can still be pointed with no proof at all -- not by a
+        request, but by the SSO itself, which matches by email and then by a
+        unique name match. A homonym therefore arrives at the wizard already
+        pointed at somebody else's account.
+
+        That is tolerable on its own; what is not is the tail of the account
+        creation branch, which destroys the link outstanding for the candidate
+        it walks away from. The homonym never asked for that link, so it is not
+        theirs to invalidate: the record is on the User document and the owner
+        may have just requested it by proving their password.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        victim = UserFactory(
+            email="vera@example.pt",
+            password="S3cretPass!",
+            first_name="Vera",
+            last_name="Nunes",
+        )
+
+        # 1. The owner's own run: the CMD carries their address, the SSO points
+        #    the account, and the link is mailed to it.
+        self._sso_with(
+            mock_client_for,
+            email="vera@example.pt",
+            nic="31313131",
+            first_name="Vera",
+            last_name="Nunes",
+        )
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
+        victim.reload()
+        issued = dict((victim.extras or {})[MIGRATION_LINK_PENDING])
+
+        # 2. A homonym with a different NIC and an address of their own. The
+        #    SSO cannot match the address, so it falls through to the unique
+        #    name match and hands them the victim as candidate.
+        with self.client.session_transaction() as sess:
+            sess.clear()
+        self._sso_with(
+            mock_client_for,
+            email="vera.nunes@servico.gov.pt",
+            nic="32323232",
+            first_name="Vera",
+            last_name="Nunes",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(victim.id)
+
+        # 3. They walk away and create their own account. The tail drops the
+        #    candidate's link -- but this session never issued one.
+        response = self.client.post("/saml/migration/skip", json={"email": "nova@example.pt"})
+        assert response.status_code == 200
+
+        victim.reload()
+        assert (victim.extras or {})[MIGRATION_LINK_PENDING] == issued
+        assert not (victim.extras or {}).get("auth_nic")
+
+        # 4. And the owner's link still works.
+        response = self.client.get(f"/saml/migration/confirm-link/{token}")
+        assert response.status_code == 302
+        assert "flash=migration_link_invalid" not in response.headers["Location"]
+        victim.reload()
+        assert victim.extras.get("auth_nic") == _hash_nic("31313131")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_still_refuses_emails_of_non_candidate_accounts(self, mock_client_for):
         """The divert must not become a way in. It fires only where
         _find_legacy_user returns an account, so an address held by one this
