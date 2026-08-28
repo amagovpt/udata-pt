@@ -1307,6 +1307,44 @@ def _send_migration_link(user, first_name, last_name, token):
     send_mail(user, msg)
 
 
+def _mail_validation_link(pending, user):
+    """Issue and email the validation link that completes ``user``'s link.
+
+    Shared by the two branches that reach this point: the wizard asking for a
+    link outright, and the password branch proving which account to link.
+    Returns None once the mail is out, or the ``(payload, status)`` its caller
+    should return.
+
+    The NIC guard comes first, before the send cap and before anything is
+    written: the assertion is the only source of the NIC, and without it the
+    token would be consumed with ``nic_hash=None`` — a link that starts a
+    session and binds no identity at all.
+    """
+    if not pending.get("saml_nic"):
+        # Nothing to link; a broken wizard session rather than a user error.
+        # migration_send_link checks this earlier too, to keep its own
+        # response ordering; this is the check every caller is covered by.
+        return {"error": "No pending migration"}, 400
+
+    allowed, tally = _migration_link_send_allowed(user)
+    if not allowed:
+        # The frontend maps this exact string onto its "too many sends" copy.
+        return {"error": "Maximum confirmation sends exceeded"}, 429
+
+    token = _issue_migration_link(
+        user,
+        _hash_nic(pending["saml_nic"]),
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+    )
+    user.extras[MIGRATION_LINK_SEND_COUNT] = tally
+    user.save()
+
+    _send_migration_link(user, pending.get("saml_first_name"), pending.get("saml_last_name"), token)
+    current_app.logger.info(f"Migration validation link sent to user {user.id}")
+    return None
+
+
 def _find_legacy_user(email=None, first_name=None, last_name=None):
     """Find a legacy user (has password, no NIC, not deleted) by email or name."""
     user = None
@@ -2512,23 +2550,10 @@ def migration_send_link():
         # then reject. Same generic wording as the password branch.
         return jsonify({"error": "Invalid credentials"}), 400
 
-    allowed, tally = _migration_link_send_allowed(user)
-    if not allowed:
-        # Same message as the resend endpoint: the frontend already maps this
-        # exact string onto its "too many sends" copy.
-        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
-
-    token = _issue_migration_link(
-        user,
-        _hash_nic(pending["saml_nic"]),
-        pending.get("saml_first_name"),
-        pending.get("saml_last_name"),
-    )
-    user.extras[MIGRATION_LINK_SEND_COUNT] = tally
-    user.save()
-
-    _send_migration_link(user, pending.get("saml_first_name"), pending.get("saml_last_name"), token)
-    current_app.logger.info(f"Migration validation link sent to user {legacy_user_id}")
+    error = _mail_validation_link(pending, user)
+    if error:
+        payload, status = error
+        return jsonify(payload), status
 
     return jsonify({"sent": True})
 
@@ -2584,10 +2609,12 @@ def migration_confirm_link(token):
 @autenticacao_gov.route("/saml/migration/confirm", methods=["POST"])
 @csrf.exempt
 def migration_confirm():
-    """Confirm migration with the legacy account's password.
+    """Identify the legacy account by its password, then mail the link.
 
-    Ownership by email is proved by following the validation link instead,
-    which migration_confirm_link consumes on its own route.
+    The password says *which* account to link, not that its email is
+    reachable, so it no longer completes anything on its own: this route
+    mails the validation link and migration_confirm_link — the single place
+    that binds the identity and starts a session — consumes the click.
     """
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
@@ -2626,26 +2653,32 @@ def migration_confirm():
         ):
             return jsonify({"error": "Invalid credentials"}), 400
 
+        # The password proved ownership, so it must not count against the
+        # brute-force cap. The tally is incremented before the check above,
+        # so without this reset the send cap below would burn attempts that
+        # were all correct, until five of them locked the session out of the
+        # only branch that can identify the account.
+        session["migration_password_attempts"] = 0
+        session.modified = True
+
     else:
         return jsonify({"error": "Invalid method"}), 400
 
-    # This branch links the account whose password was proved, which by design
-    # may not be the candidate that was pointed (the homonym case). Any link
-    # mailed to that other candidate is now stale, and _link_identity_and_login
-    # only clears the account it is linking.
-    candidate_id = pending.get("legacy_user_id")
-    if candidate_id and candidate_id != str(user.id):
-        _drop_migration_link(candidate_id)
+    # The account whose password was proved is the one to link, and by design
+    # it may not be the candidate the assertion matched by name. Re-pointing
+    # is also what makes the resend endpoint — which reads no body, on
+    # purpose — mail that account rather than the homonym; and it kills any
+    # link already issued for the previous target.
+    _point_migration_candidate(pending, user)
 
-    saml_nic = pending.get("saml_nic")
-    _link_identity_and_login(
-        user,
-        _hash_nic(saml_nic) if saml_nic else None,
-        pending.get("saml_first_name"),
-        pending.get("saml_last_name"),
-    )
+    # The session is deliberately left pending: the resend and a second
+    # attempt both need it, and the click is what clears it.
+    error = _mail_validation_link(pending, user)
+    if error:
+        payload, status = error
+        return jsonify(payload), status
 
-    return jsonify({"success": True})
+    return jsonify({"sent": True})
 
 
 @autenticacao_gov.route("/saml/migration/skip", methods=["POST"])
