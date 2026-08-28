@@ -1027,7 +1027,7 @@ def _handle_migration_redirect(
 
     ``user`` is the single candidate account matched by name, or None
     when several homonym accounts exist — in that case the wizard asks
-    the user to identify the account (login or search).
+    the user to identify the account by proving a password.
     ``saml_email`` is always the email coming from the CMD identity,
     never the candidate account's email.
 
@@ -1397,8 +1397,12 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
     return None
 
 
-def _find_legacy_user(email=None, first_name=None, last_name=None):
-    """Find a legacy user (has password, no NIC, not deleted) by email or name."""
+def _find_legacy_user(email=None):
+    """Find a legacy user (has password, no NIC, not deleted) by email.
+
+    Name lookup went with POST /saml/migration/search: that route was the
+    only caller that ever passed a name, and it is gone.
+    """
     user = None
     if email:
         # Case-insensitive, for the same reason the skip uniqueness check
@@ -1408,14 +1412,6 @@ def _find_legacy_user(email=None, first_name=None, last_name=None):
         # find their own account by typing "Maria@x.pt" — the one address
         # they are sure of.
         user = _find_user_by_email_ci(email)
-    elif first_name and last_name:
-        from udata.core.user.models import User
-
-        user = User.objects(
-            first_name__iexact=first_name,
-            last_name__iexact=last_name,
-            deleted=None,
-        ).first()
 
     if user and user.password and not _has_linked_nic(user):
         if not user.deleted:
@@ -2531,43 +2527,6 @@ def migration_pending():
     )
 
 
-@autenticacao_gov.route("/saml/migration/search", methods=["POST"])
-@csrf.exempt
-def migration_search():
-    """Search for a legacy account when SAML did not return an email."""
-    if not _migration_enabled():
-        return jsonify({"error": "Migration mode is not enabled"}), 403
-
-    pending = session.get("saml_migration_pending")
-    if not pending:
-        return jsonify({"error": "No pending migration"}), 400
-
-    # Coerce to strings at the boundary, as confirm and skip already do. A
-    # JSON body can carry a dict, and a dict reaching a MongoEngine query is
-    # how a field lookup becomes an operator lookup: `{"$regex": "^adm"}`
-    # turned this endpoint's `found` flag into a per-character oracle over
-    # every registered address. The case-insensitive lookup happens to reject
-    # it now — re.escape raises on a dict — but that is an accident of the
-    # query type, and it comes back as a 500 rather than an answer.
-    data = request.get_json(silent=True) or {}
-    email = str(data.get("email") or "").strip()
-    first_name = str(data.get("first_name") or "").strip()
-    last_name = str(data.get("last_name") or "").strip()
-
-    user = _find_legacy_user(email=email, first_name=first_name, last_name=last_name)
-    if not user:
-        return jsonify({"found": False})
-
-    _point_migration_candidate(pending, user)
-
-    return jsonify(
-        {
-            "found": True,
-            "email": _mask_email(user.email),
-        }
-    )
-
-
 @autenticacao_gov.route("/saml/migration/send-link", methods=["POST"])
 @csrf.exempt
 def migration_send_link():
@@ -2761,13 +2720,16 @@ def migration_skip():
     # would match itself as a wizard candidate, letting the user mail a code
     # to the very address awaiting confirmation and log in through
     # migration_confirm — confirming the email without ever following the
-    # link. These identities belong in the search branch, not here.
+    # link. These identities cannot use this branch at all.
     user_nic = pending.get("saml_nic")
     if not user_nic:
         return jsonify({"error": "nic_required"}), 400
 
-    email = (request.get_json(silent=True) or {}).get("email") or ""
-    email = email.strip()
+    # Coerce to a string at the boundary. A JSON body can carry a dict, and a
+    # dict reaching .strip() is an AttributeError, i.e. a 500 where a 400
+    # belongs. migration_search did this and was the only route that did; the
+    # coercion outlives it because the reason does.
+    email = str((request.get_json(silent=True) or {}).get("email") or "").strip()
     if not email:
         return jsonify({"error": "email_required"}), 400
 

@@ -3148,11 +3148,13 @@ class SAMLMigrationWizardTest(APITestCase):
         assert data["has_email"] is True
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_search_refuses_a_query_operator_instead_of_answering_it(self, mock_client_for):
+    def test_skip_refuses_a_query_operator_instead_of_answering_it(self, mock_client_for):
         """A JSON body can carry a dict, and a dict reaching a MongoEngine
         query turns a field lookup into an operator lookup: {"$regex": "^adm"}
-        made `found` a per-character oracle over every registered address, and
-        handed back the domain plus the first character of the match."""
+        made the removed search endpoint's `found` flag a per-character oracle
+        over every registered address. The skip is the address-taking route
+        that outlived it, so the coercion at its boundary is what keeps that
+        shape from coming back — as a 400, not a 500 from .strip()."""
         UserFactory(
             email="admin.geral@example.pt",
             password="S3cretPass!",
@@ -3171,13 +3173,13 @@ class SAMLMigrationWizardTest(APITestCase):
         for payload in (
             {"email": {"$regex": "^adm"}},
             {"email": {"$gt": ""}},
-            {"first_name": {"$ne": None}, "last_name": {"$ne": None}},
+            {"email": ["admin.geral@example.pt"]},
         ):
-            response = self.client.post("/saml/migration/search", json=payload)
+            response = self.client.post("/saml/migration/skip", json=payload)
             # Answered, not crashed, and nothing disclosed.
-            assert response.status_code == 200, payload
-            assert response.json["found"] is False, payload
-            assert "email" not in response.json, payload
+            assert response.status_code == 400, payload
+            assert response.json["error"] == "invalid_email", payload
+            assert "candidate_found" not in response.json, payload
             with self.client.session_transaction() as sess:
                 assert sess["saml_migration_pending"]["legacy_user_id"] is None
 
@@ -3217,17 +3219,17 @@ class SAMLMigrationWizardTest(APITestCase):
             last_name="Mendes Rocha",
         )
 
-        # The search resolves the row the user typed, not the newest one.
-        response = self.client.post("/saml/migration/search", json={"email": "sara@example.pt"})
-        assert response.status_code == 200
-        assert response.json["found"] is True
-        with self.client.session_transaction() as sess:
-            assert sess["saml_migration_pending"]["legacy_user_id"] == str(real.id)
-
-        # And the ownership proof accepts the real account's own password,
-        # which is the path the shadow would otherwise have blocked.
+        # The ownership proof resolves the row the user typed, not the newest
+        # one: it accepts the real account's own password, and links that row.
+        # This is the whole lookup now that the search endpoint is gone.
         response = self._confirm_by_password("sara@example.pt", "S3cretPass!")
         assert response.status_code == 200
+        with self.client.session_transaction() as sess:
+            assert sess.get("saml_migration_pending") is None
+        real.reload()
+        shadow.reload()
+        assert real.extras.get("auth_nic") == _hash_nic("56565656")
+        assert not (shadow.extras or {}).get("auth_nic")
         real.reload()
         assert real.extras.get("auth_nic") == _hash_nic("56565656")
         shadow.reload()
@@ -3558,11 +3560,12 @@ class SAMLMigrationWizardTest(APITestCase):
         assert existing.extras.get("auth_nic") == _hash_nic("52525252")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_search_finds_the_legacy_account_whatever_the_email_casing(self, mock_client_for):
-        """The search lookup was the last exact-match one in the wizard. Login
-        and recovery are case-INSENSITIVE, so the owner of maria@ who types
-        Maria@ — the one address they are sure of — must still find their own
-        account here, not be told none exists."""
+    def test_skip_divert_finds_the_legacy_account_whatever_the_email_casing(self, mock_client_for):
+        """Login and recovery are case-INSENSITIVE, so the owner of maria@ who
+        types Maria@ — the one address they are sure of — must still be sent to
+        their own account, not told none exists. The journey moved from the
+        removed search endpoint to the skip's divert, which is where the user
+        now types an address."""
         existing = UserFactory(
             email="maria@example.pt",
             password="S3cretPass!",
@@ -3582,13 +3585,19 @@ class SAMLMigrationWizardTest(APITestCase):
         with self.client.session_transaction() as sess:
             assert sess["saml_migration_pending"]["legacy_user_id"] is None
 
-        response = self.client.post("/saml/migration/search", json={"email": "MARIA@example.pt"})
-        assert response.status_code == 200
-        assert response.json["found"] is True
-        assert response.json["email"] == "m***@example.pt"
+        response = self.client.post("/saml/migration/skip", json={"email": "MARIA@example.pt"})
+        assert response.status_code == 409
+        assert response.json["error"] == "email_taken"
+        assert response.json["candidate_found"] is True
 
+        # Signposted, not pointed, and nothing created for the shadow casing.
         with self.client.session_transaction() as sess:
-            assert sess["saml_migration_pending"]["legacy_user_id"] == str(existing.id)
+            assert sess["saml_migration_pending"]["legacy_user_id"] is None
+        from udata.core.user.models import User
+
+        assert User.objects(email__iexact="maria@example.pt").count() == 1
+        existing.reload()
+        assert not (existing.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_stores_the_normalised_address(self, mock_client_for):
@@ -4236,6 +4245,25 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert legacy.extras["auth_nic"] == _hash_nic("00001111")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_search_route_is_gone(self, mock_client_for):
+        """LEDG-2361 removes the account search outright rather than leaving it
+        unreachable from the UI. While the endpoint answered, it pointed the
+        migration candidate at any legacy account by address with no proof at
+        all -- which both disclosed whether an address has an account and, via
+        the drop that re-pointing performs, destroyed whatever validation link
+        that account was holding."""
+        UserFactory(
+            email="paula.old@example.pt",
+            password="S3cretPass!",
+            first_name="Paula",
+            last_name="Faria",
+        )
+        self._sso_with(mock_client_for, nic="34343434", first_name="Paula", last_name="Faria")
+
+        assert self.client.post("/saml/migration/search").status_code in (404, 405)
+        assert not any("migration/search" in str(rule) for rule in self.app.url_map.iter_rules())
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_the_code_branch_is_gone(self, mock_client_for):
         """LEDG-2357 removes the 6-digit code outright rather than leaving it
         unreachable from the UI: while the endpoint answered, the takeover
@@ -4301,13 +4329,15 @@ class SAMLMigrationLinkClickTest(APITestCase):
             last_name="Brito",
         )
 
-        # Point the victim (search proves nothing — LEDG-2355 #6) and mail a
-        # link to their address.
+        # Point the victim and mail a link to their address. Two homonyms
+        # exist, so the SSO points nothing; the candidate is set directly on
+        # the session, the way the rest of this file seeds wizard state now
+        # that no route points an arbitrary account.
         self._sso_with(mock_client_for, nic="45454545", first_name="Sara", last_name="Brito")
-        assert (
-            self.client.post("/saml/migration/search", json={"email": victim.email}).json["found"]
-            is True
-        )
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            pending["legacy_user_id"] = str(victim.id)
+            sess["saml_migration_pending"] = pending
         with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
             assert self.client.post("/saml/migration/send-link").status_code == 200
         ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
@@ -4415,11 +4445,14 @@ class SAMLMigrationLinkClickTest(APITestCase):
             last_name="Costa",
         )
 
-        # Two homonyms means no automatic candidate: the wizard asks, the user
-        # names one, takes a link for it — and then names the other.
+        # Two homonyms means no automatic candidate. The candidate is seeded
+        # on the session, and the re-point is the only one left that a request
+        # can cause: proving the OTHER account's password.
         self._sso_with(mock_client_for, nic="77778888", first_name="Marta", last_name="Costa")
-        found = self.client.post("/saml/migration/search", json={"email": first.email})
-        assert found.json["found"] is True
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            pending["legacy_user_id"] = str(first.id)
+            sess["saml_migration_pending"] = pending
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
             assert self.client.post("/saml/migration/send-link").status_code == 200
@@ -4429,8 +4462,16 @@ class SAMLMigrationLinkClickTest(APITestCase):
         first.reload()
         assert MIGRATION_LINK_PENDING in first.extras
 
-        repointed = self.client.post("/saml/migration/search", json={"email": second.email})
-        assert repointed.json["found"] is True
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            repointed = self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": second.email,
+                    "password": "S3cretPass!",
+                },
+            )
+        assert repointed.status_code == 200
 
         # The record on the account the link was issued for is gone.
         first.reload()
@@ -4708,10 +4749,15 @@ class SAMLMigrationSecurityTest(APITestCase):
     def test_emailed_link_cannot_link_a_re_targeted_account(self, mock_client_for):
         """Target-confusion / account takeover: a validation link emailed to
         the attacker's own account must not link the CMD identity to a
-        DIFFERENT account after migration/search re-points the candidate to a
-        victim. The code this replaced died with a session pop; the link is
-        stateless, so it dies with the record on the account it was issued
-        against."""
+        DIFFERENT account, however the candidate is moved afterwards.
+
+        No route re-points an arbitrary account any more, so the re-target is
+        modelled the only way it can still happen — a hostile client editing
+        its own wizard session. That is the stronger statement anyway: the
+        click is settled entirely by the record on the account the link was
+        issued against (migration_confirm_link reads no session at all), so
+        the session can say whatever it likes and the victim stays untouched.
+        """
         # Victim: legacy account (password, no NIC). The attacker cannot
         # read the victim's mailbox nor knows its password.
         victim = UserFactory(
@@ -4743,19 +4789,29 @@ class SAMLMigrationSecurityTest(APITestCase):
         ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
         token = ctas[0].link.rsplit("/", 1)[1]
 
-        # 3. Attacker re-targets the candidate to the victim via search.
-        r = self.client.post("/saml/migration/search", json={"email": "victim@gov.pt"})
-        assert r.status_code == 200 and r.json["found"] is True
+        # 3. Attacker re-targets the candidate to the victim by rewriting
+        #    their own session cookie — no endpoint will do it for them.
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            pending["legacy_user_id"] = str(victim.id)
+            sess["saml_migration_pending"] = pending
 
-        # 4. Attacker opens the link they received. It must NOT link the NIC
-        #    to the victim, nor log the attacker in as the victim.
+        # 4. Attacker opens the link they received. It binds the account the
+        #    link was issued for — their own — and never the victim.
         r = self.client.get(f"/saml/migration/confirm-link/{token}")
-        assert "flash=migration_link_invalid" in r.headers["Location"], (
-            "Account takeover: re-targeted link was accepted"
-        )
+        assert r.status_code == 302
+        assert "flash=migration_link_invalid" not in r.headers["Location"]
 
         victim.reload()
         assert not (victim.extras or {}).get("auth_nic"), "Victim account was taken over"
+
+        from udata.core.user.models import User
+
+        assert User.objects(extras__auth_nic=_hash_nic("66667777")).count() == 1
+        assert (
+            User.objects(extras__auth_nic=_hash_nic("66667777")).first().email
+            == "attacker@evil.com"
+        )
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_password_brute_force_is_capped_per_session(self, mock_client_for):
