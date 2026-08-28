@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 from flask import session
 
+from udata.app import limiter
 from udata.auth.saml.saml_plugin.saml_govpt import (
     _consume_outstanding_relay,
     _hash_nic,
@@ -2112,6 +2113,20 @@ class SAMLStaleNicRelinkTest(APITestCase):
             assert existing.extras["auth_nic"] == "johndoe"
 
 
+@pytest.fixture(autouse=True)
+def _reset_migration_limiter():
+    """Clear the migration rate-limit window around every test in this module.
+
+    Same pattern as test_auth_ratelimit_ip_collapse.py: the limiter is live
+    under pytest (RATELIMIT_ENABLED is switched off in settings.Debug, not in
+    settings.Testing), and the wizard's routes share one scope, so without
+    this the requests one test makes leak 429s into the next.
+    """
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
 class SAMLMigrationWizardTest(APITestCase):
     """End-to-end coverage of the account-linking wizard: an email or
     name match redirects to /migrate-account, where the user
@@ -3437,6 +3452,61 @@ class SAMLMigrationWizardTest(APITestCase):
         assert "flash=migration_link_invalid" not in response.headers["Location"]
         victim.reload()
         assert victim.extras.get("auth_nic") == _hash_nic("31313131")
+
+    @pytest.mark.options(RATELIMIT_ENABLED=True)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_migration_submissions_are_capped_per_identity(self, mock_client_for):
+        """The generic answer makes the skip mail an address chosen in the
+        request, so something has to bound it. The bound is per government
+        identity, not per IP: behind the F5/WAF every anonymous visitor shares
+        one origin address, so an IP key would be a single national bucket
+        that separates the attacker from nobody.
+
+        Both halves matter, and the second is the one an IP key gets wrong: a
+        budget spent by one identity must leave the next identity untouched.
+        """
+        UserFactory(
+            email="tecto@example.pt",
+            password="S3cretPass!",
+            first_name="Teresa",
+            last_name="Tecto",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            email="primeira.cmd@servico.gov.pt",
+            nic="81818181",
+            first_name="Primeira",
+            last_name="Identidade",
+        )
+        with self.client.session_transaction() as sess:
+            replayed = dict(sess["saml_migration_pending"])
+
+        statuses = []
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            for _attempt in range(40):
+                with self.client.session_transaction() as sess:
+                    sess["saml_migration_pending"] = dict(replayed)
+                statuses.append(
+                    self.client.post(
+                        "/saml/migration/skip", json={"email": "tecto@example.pt"}
+                    ).status_code
+                )
+        assert 429 in statuses, "the ceiling never fired"
+
+        # A second identity is unaffected: the budget is theirs, not the IP's.
+        with self.client.session_transaction() as sess:
+            sess.clear()
+        self._sso_with(
+            mock_client_for,
+            email="segunda.cmd@servico.gov.pt",
+            nic="82828282",
+            first_name="Segunda",
+            last_name="Identidade",
+        )
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            response = self.client.post("/saml/migration/skip", json={"email": "tecto@example.pt"})
+        assert response.status_code == 200
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_answers_identically_for_a_taken_and_a_free_address(self, mock_client_for):

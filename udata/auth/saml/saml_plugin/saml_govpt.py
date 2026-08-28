@@ -93,6 +93,7 @@ ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
 from limits import parse
 
+from udata.api.limits import MIGRATION_SUBMIT_LIMIT
 from udata.app import csrf
 from udata.core.user.nic import hash_nic as _hash_nic
 from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
@@ -1358,6 +1359,34 @@ def _migration_identity(state):
     return f"ip:{get_remote_address()}"
 
 
+def _migration_identity_key():
+    """Rate-limit key for the migration routes: the identity, not the IP.
+
+    Reads the wizard session while it lasts and the confirmation handle
+    afterwards -- the skip ends the wizard on every exit, and the resend runs
+    after that, so a key that only knew the wizard would fall back to the IP
+    exactly where it is needed most. Behind the F5/WAF that fallback is a
+    single national bucket (see MIGRATION_SUBMIT_LIMIT), so it is left only
+    for requests carrying neither handle, which answer 400 anyway.
+    """
+    return _migration_identity(
+        session.get("saml_migration_pending") or session.get("saml_confirmation_pending")
+    )
+
+
+def _migration_rate_limit(view):
+    """Apply the migration ceiling to a view.
+
+    Its own scope, deliberately not the ``auth-ip`` one that auth_rate_limit
+    shares: the wizard must not spend the login's budget, nor the reverse.
+    """
+    from udata.app import limiter
+
+    return limiter.shared_limit(
+        MIGRATION_SUBMIT_LIMIT, scope="saml-migration", key_func=_migration_identity_key
+    )(view)
+
+
 def _migration_notice_send_allowed(state, *, consume=True):
     """Whether this identity may send one more migration mail right now.
 
@@ -2601,6 +2630,7 @@ def migration_pending():
 
 @autenticacao_gov.route("/saml/migration/send-link", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_send_link():
     """Email a validation link to the candidate account's own address.
 
@@ -2696,6 +2726,7 @@ def migration_confirm_link(token):
 
 @autenticacao_gov.route("/saml/migration/confirm", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_confirm():
     """Identify the legacy account by its password, then mail the link.
 
@@ -2772,6 +2803,7 @@ def migration_confirm():
 
 @autenticacao_gov.route("/saml/migration/skip", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_skip():
     """Create a new account from a user-declared, confirmation-pending email.
 
@@ -2950,6 +2982,7 @@ def migration_skip():
 
 @autenticacao_gov.route("/saml/migration/resend-confirmation", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_resend_confirmation():
     """Resend the confirmation link for the account awaiting confirmation.
 
