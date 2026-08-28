@@ -3385,6 +3385,69 @@ class SAMLMigrationWizardTest(APITestCase):
         assert not (decoy.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_send_link_cannot_reissue_over_a_link_it_did_not_issue(self, mock_client_for):
+        """Scoping the drop is not enough on its own: issuing is destructive
+        too. _issue_migration_link mints a fresh nonce over the account's
+        record, so a reissue kills whatever link was already there -- the same
+        denial, reached through send-link instead of through the drop.
+
+        And it is reachable with no proof, because the SSO points a candidate
+        by itself: a homonym arrives at the wizard aimed at an account they
+        have proved nothing about, and send-link reads no body, so there is
+        nothing else standing between them and the victim's record."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        victim = UserFactory(
+            email="olga@example.pt",
+            password="S3cretPass!",
+            first_name="Olga",
+            last_name="Neves",
+        )
+
+        # The owner proves their password and holds a live link.
+        self._sso_with(
+            mock_client_for,
+            email="olga@example.pt",
+            nic="41414141",
+            first_name="Olga",
+            last_name="Neves",
+        )
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+        ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+        token = ctas[0].link.rsplit("/", 1)[1]
+        victim.reload()
+        issued = dict((victim.extras or {})[MIGRATION_LINK_PENDING])
+
+        # A homonym with their own NIC: the SSO hands them the same candidate.
+        with self.client.session_transaction() as sess:
+            sess.clear()
+        self._sso_with(
+            mock_client_for,
+            email="olga.neves@servico.gov.pt",
+            nic="42424242",
+            first_name="Olga",
+            last_name="Neves",
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["legacy_user_id"] == str(victim.id)
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post("/saml/migration/send-link")
+        assert response.status_code == 400
+        assert mock_send.call_count == 0
+
+        # The record is byte for byte what the owner was issued, and their
+        # link still confirms -- to their own identity, not the homonym's.
+        victim.reload()
+        assert (victim.extras or {})[MIGRATION_LINK_PENDING] == issued
+        response = self.client.get(f"/saml/migration/confirm-link/{token}")
+        assert response.status_code == 302
+        assert "flash=migration_link_invalid" not in response.headers["Location"]
+        victim.reload()
+        assert victim.extras.get("auth_nic") == _hash_nic("41414141")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_the_sso_name_match_cannot_destroy_a_link_it_did_not_issue(self, mock_client_for):
         """The candidate can still be pointed with no proof at all -- not by a
         request, but by the SSO itself, which matches by email and then by a
@@ -3452,6 +3515,30 @@ class SAMLMigrationWizardTest(APITestCase):
         assert "flash=migration_link_invalid" not in response.headers["Location"]
         victim.reload()
         assert victim.extras.get("auth_nic") == _hash_nic("31313131")
+
+    @pytest.mark.options(RATELIMIT_ENABLED=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_wizard_still_works_with_rate_limiting_switched_off(self, mock_client_for):
+        """settings.Debug switches RATELIMIT_ENABLED off, so this is every
+        development run -- and an incident response that turns limiting off in
+        production. flask_limiter returns from init_app before building a
+        strategy in that case, and the property exposing it asserts, so
+        reaching for it unguarded turns "rate limiting is off" into a 500 on
+        account creation."""
+        from udata.core.user.models import User
+
+        self._sso_with(
+            mock_client_for,
+            email="sem.tecto@servico.gov.pt",
+            nic="83838383",
+            first_name="Sem",
+            last_name="Tecto",
+        )
+        response = self.client.post("/saml/migration/skip", json={"email": "sem@example.pt"})
+        assert response.status_code == 200
+        assert User.objects(extras__auth_nic=_hash_nic("83838383")).first() is not None
+
+        assert self.client.post("/saml/migration/resend-confirmation").status_code == 200
 
     @pytest.mark.options(RATELIMIT_ENABLED=True)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")

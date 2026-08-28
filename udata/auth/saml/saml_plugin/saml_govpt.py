@@ -1231,6 +1231,19 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name):
     current_app.logger.info(f"Account migration completed for user {user.id}")
 
 
+def _migration_link_token_status_from_record(record):
+    """Whether a stored link record is still live, without a token to check.
+
+    Only the deadline can be read from the record alone -- the nonce is stored
+    hashed and the token is the other half -- which is all the caller needs:
+    an expired record protects nobody, so overwriting it destroys nothing.
+    """
+    expires = _parse_isoformat((record or {}).get("expires"))
+    if expires is None or expires <= datetime.utcnow():
+        return None, record, "expired"
+    return None, record, "live"
+
+
 def _migration_link_token_status(token):
     """Resolve a validation-link token to ``(user, record, state)``.
 
@@ -1420,7 +1433,7 @@ def _migration_rate_limit(view):
     )(view)
 
 
-def _migration_notice_send_allowed(state, *, consume=True):
+def _migration_notice_send_allowed(state):
     """Whether this identity may send one more migration mail right now.
 
     The budget lives in the limiter's storage, keyed on the identity the SSO
@@ -1437,14 +1450,17 @@ def _migration_notice_send_allowed(state, *, consume=True):
     # object itself.
     from udata.app import limiter
 
+    if not limiter.enabled:
+        # init_app returns before building a strategy when RATELIMIT_ENABLED is
+        # false -- which settings.Debug sets, i.e. every development run -- and
+        # the property that exposes it asserts. Reaching for it unguarded turns
+        # "rate limiting is off" into a 500 on account creation.
+        return True
+
     item = parse(
         f"{MAX_CONFIRMATION_SENDS} per {int(MIGRATION_LINK_SEND_WINDOW.total_seconds())} seconds"
     )
-    key = _migration_identity(state)
-    strategy = limiter.limiter
-    if consume:
-        return strategy.hit(item, "saml-migration-mail", key)
-    return strategy.test(item, "saml-migration-mail", key)
+    return limiter.limiter.hit(item, "saml-migration-mail", _migration_identity(state))
 
 
 def _send_migration_address_taken_notice(user):
@@ -1473,6 +1489,14 @@ def _send_migration_address_taken_notice(user):
             _(
                 "If it was you, sign in to that account the way you normally "
                 "do, or use the account recovery if you cannot."
+            ),
+            # The commonest recipient is the owner of a legacy account who
+            # just typed their own address into the wizard. The wizard session
+            # is over by the time this arrives, so without this line they are
+            # told what went wrong and not what they came to do.
+            _(
+                "To link that account to your digital identity, start the "
+                "sign-in again and follow the account association steps."
             ),
             _("If it was not you, no action is needed. Your account is untouched."),
         ],
@@ -2691,6 +2715,26 @@ def migration_send_link():
         # then reject. Same generic wording as the password branch.
         return jsonify({"error": "Invalid credentials"}), 400
 
+    # Issuing is destructive too, and destroying a link is reserved to the
+    # session that issued it. _issue_migration_link mints a fresh nonce over
+    # the account's record, so a reissue kills whatever link was there --
+    # which makes an unproved session's send-link the same denial as the drop
+    # that was already scoped. It is reachable unproved: the SSO points a
+    # candidate by itself, by email match or by a unique name match, so a
+    # homonym arrives here aimed at an account they have proved nothing about.
+    #
+    # A session may therefore issue only when the account holds no live link,
+    # or when the live one is its own. The wizard loses nothing: the frontend
+    # reaches this route only to resend after a password proof, which is
+    # always the second case.
+    outstanding = (user.extras or {}).get(MIGRATION_LINK_PENDING)
+    if outstanding and pending.get("link_issued_for") != str(user.id):
+        _, _, state = _migration_link_token_status_from_record(outstanding)
+        if state == "live":
+            # Same generic wording as above: whether a stranger's link is
+            # outstanding is not this caller's business either.
+            return jsonify({"error": "Invalid credentials"}), 400
+
     error = _mail_validation_link(pending, user)
     if error:
         payload, status = error
@@ -2944,12 +2988,13 @@ def migration_skip():
         # lost: the credentials screen never needed a pointed candidate,
         # because migration_confirm resolves the account from the password it
         # proves and re-points from there.
-        # A deleted row still answers to the address here, and mailing it
-        # would be mailing nobody. The response does not change: the caller
-        # must not learn which of the two it was.
-        recipient = existing if (not linked or existing.id != linked.id) else None
-        if recipient and not recipient.deleted:
-            _send_migration_address_taken_notice(recipient)
+        # mark_as_deleted rewrites the address to <id>@deleted, so a row
+        # deleted through the product cannot be found by a submitted address
+        # at all; the guard is for rows deleted by any other means, and
+        # mailing one would be mailing nobody. The response does not change
+        # either way -- the caller must not learn which case it was.
+        if not existing.deleted:
+            _send_migration_address_taken_notice(existing)
 
         # Same shape as the creation branch, down to the normalised address --
         # which is the one the caller submitted, so echoing it discloses
