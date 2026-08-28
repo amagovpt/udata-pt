@@ -1020,7 +1020,9 @@ def _handle_saml_user_login(user, new_account=False):
     return redirect(destination)
 
 
-def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name, no_match=False):
+def _handle_migration_redirect(
+    user, user_email, user_nic, first_name, last_name, no_match=False, provider="cmd"
+):
     """Store SAML data in session and redirect to migration page.
 
     ``user`` is the single candidate account matched by name, or None
@@ -1033,6 +1035,12 @@ def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name
     matching several homonyms. Both cases arrive with ``user`` unset, so the
     wizard cannot tell them apart otherwise — and they need different first
     steps: create an account, versus help me find mine.
+
+    ``provider`` is "cmd" or "eidas". The wizard names the provider on every
+    screen it renders, and nothing downstream of here can infer which one
+    started the flow — the two ACS routes converge on this function and the
+    assertion attributes look the same afterwards. Same reason as no_match:
+    give the wizard the distinction it cannot derive.
     """
     session["saml_migration_pending"] = {
         "legacy_user_id": str(user.id) if user else None,
@@ -1041,6 +1049,7 @@ def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name
         "saml_nic": user_nic,
         "saml_first_name": first_name,
         "saml_last_name": last_name,
+        "saml_provider": provider,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -1832,6 +1841,7 @@ def idp_initiated():
                 first_name,
                 last_name,
                 no_match=(status == "no_match"),
+                provider="cmd",
             )
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
@@ -2274,6 +2284,7 @@ def idp_eidas_initiated():
                 first_name,
                 last_name,
                 no_match=(status == "no_match"),
+                provider="eidas",
             )
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
@@ -2470,6 +2481,9 @@ def migration_pending():
             "no_match": no_match,
             "first_name": first_name,
             "last_name": last_name,
+            # Defaults to CMD so a session opened before this field existed
+            # still names a provider, rather than rendering "Associar conta a".
+            "provider": pending.get("saml_provider") or "cmd",
         }
     )
 

@@ -4213,6 +4213,51 @@ class SAMLMigrationLinkClickTest(APITestCase):
             account.reload()
             assert not (account.extras or {}).get("auth_nic")
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_pending_reports_which_provider_started_the_migration(self, mock_client_for):
+        """The wizard names the provider on every screen it renders, and it
+        cannot infer which one started the flow: both ACS routes converge on
+        the same redirect. So the pending state carries it."""
+        UserFactory(
+            email="hugo.old@example.pt",
+            password="S3cretPass!",
+            first_name="Hugo",
+            last_name="Freitas",
+        )
+
+        self._sso_with(mock_client_for, nic="72727272", first_name="Hugo", last_name="Freitas")
+
+        response = self.client.get("/saml/migration/pending")
+        assert response.status_code == 200
+        assert response.json["provider"] == "cmd"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_pending_reports_eidas_when_eidas_started_the_migration(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Same field, the other provider — otherwise every eIDAS user would
+        read "Chave Movel Digital" on the screen that asks for their
+        credentials."""
+        UserFactory(
+            email="ines.old@example.pt",
+            password="S3cretPass!",
+            first_name="Ines",
+            last_name="Bravo",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            endpoint="/saml/eidas/sso",
+            person_identifier="ES/PT/1231231230",
+            given_name="Ines",
+            family_name="Bravo",
+        )
+
+        response = self.client.get("/saml/migration/pending")
+        assert response.status_code == 200
+        assert response.json["provider"] == "eidas"
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_the_same_flow_works_from_eidas(self, mock_client_for, mock_requires_conf):
