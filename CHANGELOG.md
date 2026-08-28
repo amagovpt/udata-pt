@@ -33,10 +33,16 @@
     demand, which is the very thing being fixed.
   - Indistinguishable also means one request later. The refusals that depend
     only on the identity are settled before the address is looked up; the
-    wizard ends on both branches; `saml_confirmation_pending` gains a notice
-    shape so `/saml/migration/pending` and `/saml/migration/resend-confirmation`
-    answer alike, the resend spending the same budget and returning the same
-    429 body in both. What this does not buy is stated rather than implied:
+    wizard ends on both branches; and `saml_confirmation_pending` keeps ONE
+    shape — the caller's own address and the hash of the NIC they
+    authenticated with — with the branch recomputed server-side, because the
+    Flask session cookie is signed but not encrypted and a handle shaped
+    differently per branch hands the answer over to a base64 decode. That one
+    shape is also what keys the mailer budget on the identity in both cases:
+    keyed on the identity for one branch and on the IP for the other, the 429
+    would itself have been the answer — and, behind the F5/WAF, every
+    legitimate resend in the country would have shared one bucket of five
+    mails an hour. What this does not buy is stated rather than implied:
     repetition still distinguishes, because the creation branch consumes an
     allowance on the account it creates while the notice deliberately consumes
     nothing on the target — so the guarantee is one probe per CMD

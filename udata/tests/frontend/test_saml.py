@@ -3544,6 +3544,8 @@ class SAMLMigrationWizardTest(APITestCase):
             with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
                 response = self.client.post("/saml/migration/skip", json={"email": address})
             follow = self.client.get("/saml/migration/pending")
+            with self.client.session_transaction() as sess:
+                handle = sess.get("saml_confirmation_pending") or {}
             seen[label] = (
                 response.status_code,
                 sorted(response.json),
@@ -3552,6 +3554,14 @@ class SAMLMigrationWizardTest(APITestCase):
                 follow.status_code,
                 sorted(follow.json),
                 follow.json.get("awaiting_confirmation"),
+                # The session cookie is signed but NOT encrypted, so its
+                # payload is a base64 decode away from the client. A handle
+                # shaped one way for a taken address and another way for a
+                # free one is the answer, handed over without a second
+                # request -- which is why the shape is compared, not just the
+                # response the browser was given.
+                sorted(handle),
+                handle.get("email") == address,
             )
 
         assert seen["taken"] == seen["free"], seen

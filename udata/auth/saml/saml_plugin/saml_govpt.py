@@ -986,7 +986,10 @@ def _handle_saml_user_login(user, new_account=False):
         # stale wizard instead of this screen.
         session.pop("saml_migration_pending", None)
         session.pop("migration_password_attempts", None)
-        session["saml_confirmation_pending"] = {"user_id": str(user.id)}
+        session["saml_confirmation_pending"] = {
+            "email": user.email,
+            "nic_hash": (user.extras or {}).get("auth_nic"),
+        }
         return redirect(f"{frontend_url}/migrate-account")
 
     if requires_confirmation(user):
@@ -1356,7 +1359,37 @@ def _migration_identity(state):
         return f"saml-nic:{_hash_nic(nic)}"
     if state.get("nic_hash"):
         return f"saml-nic:{state['nic_hash']}"
+    # Only requests carrying neither handle land here, and they answer 400
+    # before sending anything. Behind the F5/WAF this key is one national
+    # bucket, so anything that legitimately sends mail must never reach it.
     return f"ip:{get_remote_address()}"
+
+
+def _resolve_confirmation_handle(awaiting):
+    """Resolve a confirmation handle to ``(own_account, address)``.
+
+    The handle has ONE shape whichever branch of the skip wrote it -- the
+    address the caller submitted and the hash of the NIC they authenticated
+    with -- and both are things the caller already knows. That is not tidiness.
+    The Flask session cookie is signed but NOT encrypted, so its payload is a
+    base64 decode away from the client: a handle shaped one way for a taken
+    address and another way for a free one hands over the very bit the generic
+    answer exists to withhold, without the attacker making a second request.
+
+    Which branch ran is therefore recomputed here instead of being recorded.
+    An account answering to the address AND carrying this identity's NIC is
+    the account this wizard created; anything else means the address belongs
+    to somebody else, and the caller is told nothing either way.
+    """
+    address = (awaiting or {}).get("email")
+    if not address:
+        return None, None
+
+    nic_hash = (awaiting or {}).get("nic_hash")
+    account = datastore.find_user(case_insensitive=True, email=address)
+    if account and nic_hash and (account.extras or {}).get("auth_nic") == nic_hash:
+        return account, address
+    return None, address
 
 
 def _migration_identity_key():
@@ -2552,29 +2585,19 @@ def migration_pending():
         # the user to /login with no explanation.
         awaiting = session.get("saml_confirmation_pending")
         if awaiting:
-            from udata.core.user.models import User
-
-            # The skip declined to create an account because the address
-            # already had one. Answered exactly as the creation case, from the
-            # address the caller submitted -- masking their own input tells
-            # them nothing, and any other shape here would undo the generic
-            # answer the skip just gave.
-            if awaiting.get("notice_email"):
+            own, address = _resolve_confirmation_handle(awaiting)
+            # Answered from the address the caller submitted, whichever branch
+            # of the skip put it there -- masking their own input tells them
+            # nothing, and any other answer would undo the generic one the
+            # skip just gave. Only the owner acting on their own account
+            # (confirming it) ever changes this, which is a state the caller
+            # cannot reach for somebody else's address.
+            if address and (own is None or own.confirmed_at is None):
                 return jsonify(
                     {
                         "pending": False,
                         "awaiting_confirmation": True,
-                        "email": _mask_email(awaiting["notice_email"]),
-                    }
-                )
-
-            user = User.objects(id=awaiting.get("user_id")).first()
-            if user and user.confirmed_at is None:
-                return jsonify(
-                    {
-                        "pending": False,
-                        "awaiting_confirmation": True,
-                        "email": _mask_email(user.email),
+                        "email": _mask_email(address),
                     }
                 )
         return jsonify({"pending": False})
@@ -2935,7 +2958,7 @@ def migration_skip():
         session.pop("saml_migration_pending", None)
         session.pop("migration_password_attempts", None)
         session["saml_confirmation_pending"] = {
-            "notice_email": email,
+            "email": email,
             "nic_hash": _hash_nic(user_nic),
         }
         return jsonify({"success": True, "email": email})
@@ -2975,7 +2998,10 @@ def migration_skip():
     # identifies the user to the resend endpoint without authenticating them.
     session.pop("saml_migration_pending", None)
     session.pop("migration_password_attempts", None)
-    session["saml_confirmation_pending"] = {"user_id": str(user.id)}
+    session["saml_confirmation_pending"] = {
+        "email": user.email,
+        "nic_hash": _hash_nic(user_nic),
+    }
 
     return jsonify({"success": True, "email": user.email})
 
@@ -3000,27 +3026,23 @@ def migration_resend_confirmation():
     if not awaiting:
         return jsonify({"error": "No pending confirmation"}), 400
 
-    from udata.core.user.models import User
-
-    # The handle comes in two shapes, and they must be indistinguishable from
-    # outside: an account this wizard created, or an address it declined to
-    # create because one already existed. Same budget, same 429, same body.
-    if awaiting.get("notice_email"):
-        if not _migration_notice_send_allowed(awaiting):
-            return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
-        recipient = datastore.find_user(case_insensitive=True, email=awaiting["notice_email"])
-        if recipient:
-            _send_migration_address_taken_notice(recipient)
-        # Answered the same whether or not the account is still there: the
-        # caller supplied the address and learns nothing either way.
-        return jsonify({"sent": True})
-
-    user = User.objects(id=awaiting.get("user_id")).first()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
+    # The handle has one shape and the branch is recomputed, so nothing the
+    # caller can read says which one it is. The mailer budget is spent first
+    # and identically by both, because it is keyed on the identity carried in
+    # that same handle -- keying one branch on the identity and the other on
+    # the IP would make the 429 itself the answer.
     if not _migration_notice_send_allowed(awaiting):
         return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    user, address = _resolve_confirmation_handle(awaiting)
+    if user is None:
+        # The address is somebody else's. Re-send them the same notice, write
+        # nothing on their account, and answer as the other branch does --
+        # including when nobody holds it any more.
+        recipient = datastore.find_user(case_insensitive=True, email=address) if address else None
+        if recipient and not recipient.deleted:
+            _send_migration_address_taken_notice(recipient)
+        return jsonify({"sent": True})
 
     if user.confirmed_at is not None:
         # Already done — nothing to resend, and saying so lets the frontend
