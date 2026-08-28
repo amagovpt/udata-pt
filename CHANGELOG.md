@@ -2,6 +2,273 @@
 
 ## Unreleased
 
+- **fix(saml)!: no unproven session may destroy a validation link, and the skip stops saying whether an address is taken**
+  - The `migration_link_pending` record lives on the User document, so it is
+    global to the account and outlives the session that asked for it. Two
+    routes could point the migration candidate at an arbitrary account by
+    address, with no proof of anything, and pointing destroys the link
+    outstanding for the previous target: `POST /saml/migration/search`, and the
+    `email_taken` branch of the skip. Either was a destructor for any account's
+    link, and the pending session now surviving `migration_confirm` made it a
+    loop. Neither points any more, and `search` is removed outright rather than
+    hardened a second time — it has had no consumer since the wizard stopped
+    calling it. Its boundary coercion moves to the skip, and `_find_legacy_user`
+    loses the name branch it was the only caller of.
+  - One unproven pointer remains and is not a request: the SSO points a
+    candidate by itself, by email match and then by unique name match, so a
+    homonym reaches the wizard aimed at somebody else's account and the
+    account-creation tail would destroy the link that account was holding.
+    Destroying a link is now scoped to the session that issued it, which costs
+    nothing: the invariant the drop protects is that a live link in the old
+    candidate's mailbox would put this session's NIC on a second account, and
+    only a link this session issued can be in that position.
+  - `POST /saml/migration/skip` answered 409 `email_taken` for a taken address
+    and 200 for a free one, so one wizard session was an oracle over every
+    address anyone cared to submit — against the portal's own
+    `SECURITY_RETURN_GENERIC_RESPONSES`, and useful mainly for picking targets.
+    A taken address now gets a notice mailed to it and the caller gets the
+    creation branch's answer. The notice carries no token and writes nothing at
+    all on the target: mailing the validation link instead would mint a fresh
+    nonce over the record and hand every session the power to destroy a link on
+    demand, which is the very thing being fixed.
+  - Indistinguishable also means one request later. The refusals that depend
+    only on the identity are settled before the address is looked up; the
+    wizard ends on both branches; and `saml_confirmation_pending` keeps ONE
+    shape — the caller's own address and the hash of the NIC they
+    authenticated with — with the branch recomputed server-side, because the
+    Flask session cookie is signed but not encrypted and a handle shaped
+    differently per branch hands the answer over to a base64 decode. That one
+    shape is also what keys the mailer budget on the identity in both cases:
+    keyed on the identity for one branch and on the IP for the other, the 429
+    would itself have been the answer — and, behind the F5/WAF, every
+    legitimate resend in the country would have shared one bucket of five
+    mails an hour. What this does not buy is stated rather than implied:
+    repetition still distinguishes, because the creation branch consumes an
+    allowance on the account it creates while the notice deliberately consumes
+    nothing on the target — so the guarantee is one probe per CMD
+    authentication, plus one per window per identity, not zero.
+  - The wizard's four mail-sending routes gain a ceiling keyed on the
+    government identity the SSO proved, not on the IP: behind the F5/WAF every
+    anonymous visitor collapses onto one origin address, so an IP key would be
+    a single national bucket. Its own limiter scope, so the wizard cannot spend
+    the login's budget or the reverse.
+  - Breaking: `POST /saml/migration/search` is gone, and the skip no longer
+    returns `email_taken` or `candidate_found`. The frontend that reads them
+    must be deployed first.
+
+- **feat(saml)!: mail the validation link after the password proof instead of logging in**
+  - The password on `POST /saml/migration/confirm` said which legacy account to
+    link and then linked it, session and all. It does not prove that the
+    account's email is reachable, so it no longer completes anything: the route
+    re-points the candidate at the account whose password was proved, mails the
+    validation link to that account's own address, and leaves
+    `migration_confirm_link` as the single place that binds the identity and
+    starts a session. The response is `{"sent": true}`; the session stays
+    pending, because the resend and a second attempt both need it and the click
+    is what clears it.
+  - Re-pointing goes through `_point_migration_candidate`, the only mutator of
+    the candidate reference. That is what makes the resend endpoint — which
+    reads no body, on purpose — mail the proven account rather than the homonym
+    the assertion matched by name, and it destroys any link already issued for
+    the previous target. Where the proven account *is* the candidate, the fresh
+    nonce written over the same record is what stops the earlier token
+    validating: the invariant the emailed link arrived with holds, by a
+    different mechanism.
+  - A correct password resets the attempt tally. The tally is incremented before
+    the password is checked, so without the reset the send cap would spend
+    attempts that were all correct, until five of them locked the session out of
+    the only branch that can identify the account.
+  - The emit-store-tally-send block is shared with `migration_send_link` through
+    `_mail_validation_link`, which runs the NIC guard first: without a NIC the
+    token would be consumed with `nic_hash=None`, which is a link that starts a
+    session and binds no identity at all.
+- **feat(saml): report the identity provider that started the migration**
+  - The wizard names the provider on every screen it renders and had no way to
+    tell which one started the flow — the CMD and eIDAS ACS routes converge on
+    `_handle_migration_redirect` and the assertion attributes are
+    indistinguishable afterwards, so an eIDAS user read "Chave Móvel Digital" on
+    the screen asking for their credentials. The pending state now carries
+    `saml_provider` and `GET /saml/migration/pending` returns it, defaulting to
+    `cmd` for sessions opened before the field existed.
+  - **Deploy this before the matching frontend change**: the wizard depends on
+    both the `{"sent": true}` contract and this field.
+
+- **feat(saml)!: prove the legacy account by an emailed link instead of a 6-digit code**
+  - Linking a legacy account to a CMD/eIDAS identity proved ownership with a
+    code the user copied off their mail into the wizard. It is now a validation
+    link sent to the address already on that account, matching what the portal
+    already does everywhere else it asks someone to check their inbox. Clicking
+    it links the identity and starts the session; before the click there is no
+    authenticated session at all.
+  - The pending request is recorded on the account document, not in the
+    session. That is what lets the click work with no session — the owner may
+    open the mail in another browser — and it is the only way to invalidate a
+    mailed token, which is stateless: re-pointing the wizard at another
+    account, linking by password, creating a new account instead, or consuming
+    the link all destroy the record, and each of those kills any link still in
+    the wild. Consumption additionally refuses outright if the NIC has since
+    landed on another account, so one identity can never sit on two: the login
+    lookup resolves by `auth_nic` ordered by `-created_at`, and the newer
+    account would silently win it.
+  - The token payload is tagged. The confirm serializer and its salt are shared
+    with flask-security's own confirmation token, whose payload is also a
+    two-element list of strings and which anyone gets in their inbox by
+    registering; untagged, that token reached this route and its uuid
+    uniquifier hit an `ObjectIdField` as an unauthenticated 500.
+  - An expired link is refused rather than reissued, departing from the
+    change-email confirmation this route otherwise follows. Mail scanners open
+    links in inboxes before their owners do, and reissuing from an
+    unauthenticated GET would let a scanner keep an old mail alive
+    indefinitely, each pass minting a link with a fresh deadline. Recovering
+    means authenticating again.
+  - The token carries the account id and a hash of the record's nonce, not the
+    `fs_uniquifier`: `/logout` and a password reset both rotate that to kill
+    outstanding sessions, either of which would silently void a link the owner
+    had not opened yet. Validity is checked before expiry, inverting the
+    change-email precedent, because a resend mints a new nonce and a superseded
+    token reaching the expiry branch would reissue and kill the newer link.
+  - Sends are capped per hour on the account rather than for its lifetime. The
+    account-creation cap is monotonic because the recipient there is an address
+    the wizard user typed; here it is always the account's own address, so a
+    lifetime ceiling would only let five anonymous requests permanently deny
+    the owner the email route.
+  - The mail body is part of the boundary rather than decoration. A code was
+    inert to a click — an attacker needed the owner to transcribe it — whereas
+    a link is not, so the mail names the identity that asked for the link and
+    says plainly not to open it otherwise.
+  - Removing the code path also removes the takeover chain it carried: the code
+    was written in cleartext into the requester's own signed-but-readable
+    session cookie, already bound to the account they had pointed at, so the
+    target-confusion guard passed by construction. Leaving the endpoint alive
+    but unused would have left that reachable by direct POST.
+  - `POST /saml/migration/send-code` is gone and `POST /saml/migration/confirm`
+    no longer accepts `method="code"`; the `method="password"` proof is
+    untouched. **Deploy this before the frontend change** — the new wizard
+    screen calls `send-link`, which does not exist until this lands. Between
+    the two, the old wizard's "Enviar código" button hits a removed endpoint
+    and reports a generic error; that window is accepted deliberately, because
+    the path it breaks is the account-takeover vector above and the password
+    branch keeps working throughout.
+
+- **chore(tests): stop the suite from loading the deployment config by default**
+  - `udata.cfg` is tracked in this repo and `create_app` loads it over
+    `settings.Testing`, so a plain `pytest` tested the deployment rather than the
+    defaults the suite is written against. Measured on `develop`, whole suite,
+    clean test databases: **617s and 10 failures with it loaded, against 236s and
+    green without it**. Every failure was a rate-limit test, which follows —
+    `udata.cfg` configures the limiter's storage, and `RATELIMIT_ENABLED=False`
+    lives in `settings.Debug`, not in `settings.Testing`.
+  - `pyproject.toml` now defaults `UDATA_SETTINGS` to a path that does not exist,
+    which is how `udata/tests/__init__.py` asks for the load to be skipped and
+    what the CI job already did on its own. The default now covers everyone:
+    local runs, IDE runs, and any new CI job that forgets the variable.
+  - The `D:` prefix is pytest-env for *only if not already set*, so a run that
+    deliberately loads the deployment config still wins — the CI step that
+    asserts the download-proxy timeouts against the real `udata.cfg` is
+    unaffected, and was re-run to confirm it.
+
+- **fix(saml): request every MDC attribute the CMD login actually needs as required**
+  - `sp_initiated()` asked Autenticação.gov for NIC, NomeProprio and NomeApelido
+    with `isRequired="False"` while only CorreioElectronico was required. All
+    four are consumed unconditionally on the ACS side: the NIC feeds the
+    NameID ↔ NIC binding that rejects an XSW-style wrapper assertion, and the
+    two names build or match the account. Declaring them optional described an
+    SP that can work without them, which is not this one, and left the login
+    depending on the PT node volunteering them.
+  - Mirrors the alignment already done for the eIDAS AuthnRequest, where the
+    Minimum Data Set attributes were promoted for the same reason: relying on
+    the node's downstream normalisation instead of stating the requirement was
+    fragile. The consent screen still lists exactly the same four attributes —
+    nothing new is requested, and nothing stops being requested.
+- **fix(saml): the wizard no longer refuses the one address the person is sure of**
+  - `POST /saml/migration/skip` rejected any email already held by an account.
+    Correct for someone else's address; wrong for the caller's *own* legacy
+    account, which is precisely what the wizard exists to migrate. When the CMD
+    brings an address that differs from the portal one — institutional against
+    personal, the common case — and the name does not match either, the identity
+    is classed `no_match` and lands on the account-creation step; typing the real
+    address then got "email already registered". The skip now resolves that
+    address and, when it belongs to a legacy account this identity could
+    legitimately claim, points it as the candidate and reports
+    `candidate_found` alongside the existing `email_taken`, so the wizard
+    continues into the linking branch instead of asking for a retype.
+  - **Nothing is linked by this, and no new mechanism was added.** The response
+    only points the candidate; ownership is still proven at
+    `POST /saml/migration/confirm`, by password or by a code mailed to that same
+    account. The session mutation the search endpoint already performed —
+    including killing any code issued for a previous target — moved into a
+    single shared helper, so that invariant lives in one place rather than
+    being copied to a second call site. Accounts already linked to another CMD
+    identity, or without a password, are still refused, as is a replayed
+    session whose identity already holds an account.
+  - The status code and error key are unchanged, so the field is purely
+    additive and an older frontend keeps its current behaviour. **Promote this
+    before the matching frontend release**: the frontend narrows the
+    already-registered message to "cannot be linked", which is false advice
+    while the backend still refuses a claimable address.
+  - Three lookups in the same flow still resolved addresses case-sensitively
+    while every login and recovery lookup does not: the wizard's own search,
+    the email rule that decides whether an identity is a linking candidate at
+    all, and the confirm endpoint's password branch. The last one failed the
+    ownership proof for a *correct* password and reported it through the
+    deliberately generic "invalid credentials", making it indistinguishable
+    from a wrong one.
+  - The pending endpoint no longer offers an address another casing already
+    holds. It pre-fills the creation field precisely so nobody is handed an
+    address that can only be rejected, and checking it exactly defeated that
+    for the commonest case there is: a CMD carrying "Rui@Example.pt" against an
+    account at "rui@example.pt".
+  - The search endpoint now coerces its payload to strings before querying.
+    A JSON body can carry a dict, and a dict reaching a MongoEngine query is
+    how a field lookup becomes an operator lookup: `{"$regex": "^adm"}` made
+    the endpoint's `found` flag a per-character oracle over every registered
+    address, returning the domain and first character of whatever matched.
+  - Those three now go through one helper that prefers an **exact** match.
+    Matching case-insensitively is not enough on its own: the unique index on
+    `User.email` is case-sensitive, so a row differing only in case can exist
+    (the email-change form and the SAML account creation both still check
+    exact), and accounts are ordered newest-first — so a plain
+    case-insensitive lookup hands back whichever row was created last. That
+    would have pointed the wizard at the shadow row and linked the identity to
+    an empty account, leaving the real one unreachable by CMD.
+
+- **feat(saml): a CMD account now needs a confirmed email before it has a session**
+  - Creating an account through the account-linking wizard used to mint one from
+    whatever the IdP happened to send: auto-confirmed, logged in on the spot, and
+    given a `saml-*` placeholder address whenever the CMD brought no email or the
+    one it brought was taken. autenticação.gov proves *who the person is*; it says
+    nothing about an address, and the address is the account's recovery and
+    notification channel. `POST /saml/migration/skip` now requires an email, checks
+    it is well-formed and unused, creates the account **unconfirmed**, mails the
+    stock Flask-Security confirmation link, and starts no session. No new token,
+    template or mechanism was introduced.
+  - The gate would have been trivially bypassable: the new account already carries
+    the NIC, so a repeat CMD login resolved straight to it and hit the auto-confirm
+    that ran on *every* SAML login — "try again" would have been enough to get in.
+    Accounts carrying the new `pending_email_confirmation` marker in `extras` are
+    now neither confirmed nor logged in until their owner follows the link; they
+    land back on the wizard, which explains why and offers a resend. Everything
+    without the marker keeps the previous behaviour, which is what the marker is
+    for. It never needs clearing: once `confirmed_at` is set the gate stops
+    matching.
+  - The requirement would also have missed the people it is most for. An identity
+    matching no account never reached the wizard at all — it was created and logged
+    in inside the SSO callback — so `_find_or_create_saml_user` is now a pure
+    resolver that returns `no_match` instead of creating. Both callbacks route that
+    through the wizard when it is enabled, and fall back to creating the account
+    outright when it is not, exactly as before. eIDAS follows, sharing the resolver.
+  - Resending the confirmation has to work with no session, since by design there
+    isn't one. A dedicated endpoint keyed on the pending-confirmation marker left in
+    the session identifies the user without authenticating them, so it takes no
+    email argument and can only ever mail the account's own address — an endpoint
+    accepting an arbitrary one would be an open relay. It carries its own limit of
+    three sends per session, because the stock `security.send_confirmation` view is
+    registered with no rate limit to lean on.
+  - **Requires `MIGRATION_MODE_ENABLED` to be on in the environment's `udata.cfg`.**
+    The flag has no value in `Defaults`, and with it off none of the above applies:
+    the fallback keeps creating auto-confirmed accounts with placeholder emails,
+    silently and without error.
+
 - **fix(harvest): authorize the config preview, and give it a rate limit of its own**
   - `POST /harvest/source/preview/` tested `organization.permissions["harvest"]`
     only when the payload named an organization, so a payload that named none

@@ -6,7 +6,6 @@ import binascii
 import hashlib
 import logging
 import os
-import random
 import re
 import secrets
 import tempfile
@@ -14,8 +13,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+from bson import ObjectId
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
+from email_validator import EmailNotValidError, validate_email
 from flask import (
     Blueprint,
     current_app,
@@ -26,10 +27,18 @@ from flask import (
     session,
     url_for,
 )
+from flask_limiter.util import get_remote_address
 from flask_login import login_user, logout_user
-from flask_security.confirmable import requires_confirmation
+from flask_security.confirmable import requires_confirmation, send_confirmation_instructions
 from flask_security.decorators import anonymous_user_required
-from flask_security.utils import do_flash, get_message, verify_and_update_password
+from flask_security.utils import (
+    check_and_get_token_status,
+    do_flash,
+    get_message,
+    hash_data,
+    verify_and_update_password,
+    verify_hash,
+)
 from saml2 import (
     BINDING_HTTP_POST,
     BINDING_HTTP_REDIRECT,
@@ -82,11 +91,14 @@ ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
+from limits import parse
+
+from udata.api.limits import MIGRATION_SUBMIT_LIMIT
 from udata.app import csrf
 from udata.core.user.nic import hash_nic as _hash_nic
 from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
-from udata.mail import MailMessage, send_mail
+from udata.mail import MailCTA, MailMessage, send_mail
 from udata.models import datastore
 
 from .faa_level import FAAALevel, LogoutUrl
@@ -719,6 +731,102 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
     return user
 
 
+# Marks an account whose email was typed by the user rather than vouched for
+# by the IdP. autenticação.gov proves the *identity*; it says nothing about an
+# address the user just declared, so that address must be confirmed by its
+# owner before the account gets a session. Every other SAML flow keeps today's
+# auto-confirm, which is exactly what this marker buys. It never needs
+# clearing: once confirmed_at is set the gate opens and the marker is inert.
+PENDING_EMAIL_CONFIRMATION = "pending_email_confirmation"
+
+# How many confirmation mails one pending account may ever trigger, and where
+# that tally lives. It is monotonic — correcting the address does not reset it —
+# so the ceiling is per CMD identity, not per address typed. It is kept on the account rather than in the session because the
+# recipient is an address the wizard user typed: a session-held counter is
+# reset by replaying an older copy of the signed cookie, which would leave the
+# resend endpoint able to mail an arbitrary victim without limit.
+CONFIRMATION_SEND_COUNT = "confirmation_send_count"
+MAX_CONFIRMATION_SENDS = 5
+
+# The pending validation link for a legacy-account link request, held on the
+# account it points at. It lives on the document rather than in the session
+# because the link must work with no session at all — its owner may well open
+# it in another browser — and because a mailed token is stateless: once sent,
+# only destroying this record can invalidate it. The nonce is the secret; the
+# URL carries nothing but its hash.
+MIGRATION_LINK_PENDING = "migration_link_pending"
+
+# First element of the token payload. The confirm serializer and its salt are
+# shared with flask-security's own confirmation token, whose payload is also a
+# two-element list of strings ([fs_uniquifier, hash_data(email)]) — anyone who
+# registers gets one in their inbox. Without a discriminator that token reaches
+# our route, and its uniquifier hits an ObjectIdField as a 500. Tagging the
+# payload keeps the two apart by shape as well as by content.
+MIGRATION_LINK_TOKEN_TAG = "migration-link"
+
+# How long a validation link stays usable. Deliberately far shorter than the
+# five days flask-security allows its own confirmation links, because this one
+# both opens a session and binds an identity permanently. The deadline is kept
+# on the record instead of in SECURITY_CONFIRM_EMAIL_WITHIN: that setting also
+# governs the account-creation link, which this flow does not own.
+MIGRATION_LINK_TTL = timedelta(minutes=30)
+
+# How many links one account may be sent, and over what window. Unlike
+# CONFIRMATION_SEND_COUNT this is NOT monotonic for life: there the recipient
+# is an address the wizard user typed, so the ceiling stops a stranger being
+# mailed at all; here the recipient is always the account's own address, so
+# the cap only has to stop a mail flood. A lifetime ceiling would let five
+# anonymous requests permanently deny an account's owner the email route,
+# leaving them only the password they came to the wizard without.
+MIGRATION_LINK_SEND_COUNT = "migration_link_send_count"
+MAX_MIGRATION_LINK_SENDS = 5
+MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
+
+
+def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
+    """Create an account from a user-declared email, left unconfirmed.
+
+    Unlike :func:`_create_saml_user` this never mints a placeholder address —
+    the caller has already validated that ``user_email`` is well-formed and
+    unused — and it deliberately does NOT set ``confirmed_at``: the account
+    stays unconfirmed, and without a session, until the owner follows the
+    emailed confirmation link.
+    """
+    user = datastore.create_user(
+        first_name=(first_name or "").title(),
+        last_name=(last_name or "").title(),
+        email=user_email,
+        extras={"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True},
+    )
+    datastore.commit()
+
+    return user
+
+
+def _find_user_by_email_ci(email):
+    """Resolve an address case-insensitively, preferring an exact match.
+
+    Every login and recovery lookup is case-insensitive, so the wizard has to
+    be too. But the unique index on ``User.email`` is case-SENSITIVE, so
+    "maria@x.pt" and "MARIA@x.pt" can coexist (the email-change form and
+    _create_saml_user both still check exact), and ``User`` orders by
+    ``-created_at`` — a bare ``__iexact`` lookup would hand back whichever row
+    was created last. Where two rows answer to one address, the one the caller
+    typed is the one they meant.
+    """
+    from udata.core.user.models import User
+
+    if not email:
+        return None
+    matches = list(User.objects(email__iexact=email))
+    if not matches:
+        return None
+    for user in matches:
+        if user.email == email:
+            return user
+    return matches[0]
+
+
 def _has_linked_nic(user):
     """True when the account holds a properly linked (hashed) CMD identity.
 
@@ -747,17 +855,22 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     2. Email match → suspected existing account; the user must confirm
        ownership through the migration wizard before linking
     3. Name-only match → same, suspected existing account
-    4. No match → create a new account
+    4. No match → no account; the caller decides what to do
 
     Accounts whose ``auth_nic`` holds a stale non-hashed value (plain NIC of
     a different identity, legacy ciphertext, junk) are NOT treated as linked:
     they remain wizard candidates in rules 2 and 3.
 
+    This is a pure resolver: it never creates an account. Creating one is the
+    caller's decision, because it depends on whether the migration wizard is
+    enabled — with the wizard on, an unmatched identity goes through it and
+    must supply a confirmed email before any account exists.
+
     Returns a tuple (user, status) where status is one of:
     - "existing_saml" — NIC already linked, normal login
     - "migration_candidate" — email or name match; user is the single
       candidate account, or None when several homonyms exist
-    - "new" — newly created user
+    - "no_match" — nothing matched; user is always None
     - "error" — neither email nor NIC available
     """
     from udata.core.user.models import User
@@ -785,7 +898,11 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     #    (password or email code) via the migration wizard. Accounts
     #    already linked to another CMD identity are not candidates.
     if user_email:
-        user = datastore.find_user(email=user_email)
+        # Case-insensitive, as everywhere else the wizard resolves an
+        # address: an exact match here sends the owner of "maria@x.pt" whose
+        # CMD carries "Maria@x.pt" down the no_match branch, making them ask
+        # for an account they already have.
+        user = _find_user_by_email_ci(user_email)
         if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
@@ -820,7 +937,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         current_app.logger.error("SAML: Cannot create user without email or NIC")
         return None, "error"
 
-    return _create_saml_user(user_email, user_nic, first_name, last_name), "new"
+    return None, "no_match"
 
 
 def _handle_saml_user_login(user, new_account=False):
@@ -844,11 +961,6 @@ def _handle_saml_user_login(user, new_account=False):
         # browser-trace diagnosis (see _reject_saml_login).
         return redirect(f"{frontend_url}/login?saml_error=missing_attributes")
 
-    if requires_confirmation(user):
-        # Auto-confirm on SAML login — autenticação.gov already verified the user.
-        user.confirmed_at = datetime.utcnow()
-        datastore.commit()
-
     if user.deleted:
         current_app.logger.warning(
             f"[DEBUG] _handle_saml_user_login: user.deleted=True, email={user.email!r}"
@@ -856,8 +968,44 @@ def _handle_saml_user_login(user, new_account=False):
         do_flash(*get_message("DISABLED_ACCOUNT"))
         return redirect(frontend_url or "/")
 
+    # An account created by the wizard from a self-declared email must not be
+    # let in — nor auto-confirmed — until its owner follows the emailed link.
+    # This gate has to sit BEFORE the auto-confirm below: the account already
+    # carries the NIC, so a repeat CMD login resolves straight to it, and the
+    # auto-confirm would otherwise turn the whole confirmation requirement
+    # into a "just try again". The gate needs no cleanup: once confirmed_at is
+    # set by the stock confirm flow, it stops matching and the marker is inert.
+    if user.confirmed_at is None and (user.extras or {}).get(PENDING_EMAIL_CONFIRMATION):
+        current_app.logger.info(
+            f"SAML: login blocked, email confirmation still pending for user {user.id}"
+        )
+        # Identifies the user to the resend endpoint without authenticating
+        # them — the wizard shows the pending-confirmation screen from it.
+        # Any wizard state still lying around belongs to an earlier, abandoned
+        # assertion; left in place, migration_pending would answer with that
+        # stale wizard instead of this screen.
+        session.pop("saml_migration_pending", None)
+        session.pop("migration_password_attempts", None)
+        session["saml_confirmation_pending"] = {
+            "email": user.email,
+            "nic_hash": (user.extras or {}).get("auth_nic"),
+        }
+        return redirect(f"{frontend_url}/migrate-account")
+
+    if requires_confirmation(user):
+        # Auto-confirm on SAML login — autenticação.gov already verified the
+        # user. This vouches for the IDENTITY, which is why it does not apply
+        # to the self-declared addresses gated above.
+        user.confirmed_at = datetime.utcnow()
+        datastore.commit()
+
     login_user(user)
     session["saml_login"] = True
+    # Whoever is logging in now owns this session. A confirmation handle left
+    # by someone else on a shared browser would otherwise disclose their masked
+    # address through migration_pending and let this user spend their send
+    # budget.
+    session.pop("saml_confirmation_pending", None)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts
     # created without a usable CMD email, or older ones from before this
@@ -879,21 +1027,36 @@ def _handle_saml_user_login(user, new_account=False):
     return redirect(destination)
 
 
-def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name):
+def _handle_migration_redirect(
+    user, user_email, user_nic, first_name, last_name, no_match=False, provider="cmd"
+):
     """Store SAML data in session and redirect to migration page.
 
     ``user`` is the single candidate account matched by name, or None
     when several homonym accounts exist — in that case the wizard asks
-    the user to identify the account (login or search).
+    the user to identify the account by proving a password.
     ``saml_email`` is always the email coming from the CMD identity,
     never the candidate account's email.
+
+    ``no_match`` says the identity matched nothing at all, as opposed to
+    matching several homonyms. Both cases arrive with ``user`` unset, so the
+    wizard cannot tell them apart otherwise — and they need different first
+    steps: create an account, versus help me find mine.
+
+    ``provider`` is "cmd" or "eidas". The wizard names the provider on every
+    screen it renders, and nothing downstream of here can infer which one
+    started the flow — the two ACS routes converge on this function and the
+    assertion attributes look the same afterwards. Same reason as no_match:
+    give the wizard the distinction it cannot derive.
     """
     session["saml_migration_pending"] = {
         "legacy_user_id": str(user.id) if user else None,
+        "no_match": no_match,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
         "saml_last_name": last_name,
+        "saml_provider": provider,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -913,40 +1076,490 @@ def _mask_email(email):
     return f"{masked}@{domain}"
 
 
-def _send_migration_code(user, code):
-    """Send a verification code email for account migration."""
+def _point_migration_candidate(pending, user):
+    """Point the pending migration at ``user`` as the account to link.
+
+    The single place that mutates the candidate reference. Any validation
+    link already emailed was issued for a different target, so it has to die
+    with the re-point — copying that invariant to a second call site is how
+    target-confusion gets reintroduced. The link is stateless and outlives
+    any session, so destroying the record on the account it was issued
+    against is what kills it.
+    """
+    previous_id = pending.get("legacy_user_id")
+    if previous_id and previous_id != str(user.id):
+        _drop_migration_link(previous_id, pending)
+
+    # Store only the candidate reference — saml_email must keep holding
+    # the email coming from the CMD identity (or None), never the
+    # legacy account's email.
+    pending["legacy_user_id"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.modified = True
+
+
+def _drop_migration_link(user_id, pending):
+    """Destroy the validation link THIS session issued for ``user_id``.
+
+    Scoped to the issuing session, and that scope is the whole point. The
+    record lives on the User document, so it is global to the account and
+    outlives whoever wrote it — while pointing at an account takes no proof
+    at all on one path that remains: the SSO points a candidate by itself,
+    by email match or by a unique name match. Unscoped, this function let
+    such a session delete a link somebody else had legitimately asked for,
+    which is a denial of the whole flow for the account's owner.
+
+    The invariant being protected is narrower than the record, which is why
+    scoping costs nothing: a link still live in the old candidate's mailbox
+    would put this session's NIC on a second account, and only a link this
+    session issued can be in that position. A link issued by another session
+    is already bound to that session's own target.
+    """
+    if not user_id or str(user_id) != pending.get("link_issued_for"):
+        return
+
+    from udata.core.user.models import User
+
+    previous = User.objects(id=user_id).first()
+    if previous and (previous.extras or {}).pop(MIGRATION_LINK_PENDING, None):
+        previous.save()
+
+    pending.pop("link_issued_for", None)
+    session["saml_migration_pending"] = pending
+    session.modified = True
+
+
+def _parse_isoformat(value):
+    """Parse an ISO-8601 stamp we wrote ourselves, tolerating a bad one.
+
+    These stamps live in ``extras`` on the account, so a document written by
+    an older build — or edited by hand — must degrade to "no deadline known"
+    rather than 500 on a click the user cannot retry.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _migration_link_send_allowed(user):
+    """Whether ``user`` may be sent another validation link right now.
+
+    Returns the tally to store alongside the answer, so the caller writes back
+    a window that has already been rolled over rather than recomputing it.
+    """
+    tally = (user.extras or {}).get(MIGRATION_LINK_SEND_COUNT) or {}
+    started = _parse_isoformat(tally.get("window_start"))
+    count = tally.get("count", 0)
+
+    if started is None or datetime.utcnow() - started >= MIGRATION_LINK_SEND_WINDOW:
+        return True, {"count": 1, "window_start": datetime.utcnow().isoformat()}
+
+    if count >= MAX_MIGRATION_LINK_SENDS:
+        return False, tally
+
+    return True, {"count": count + 1, "window_start": tally["window_start"]}
+
+
+def _issue_migration_link(user, nic_hash, first_name, last_name):
+    """Record a pending link request on ``user`` and return its token.
+
+    The record carries everything the click needs — the hashed NIC and the
+    names from the assertion — so the consuming route never has to read the
+    session. A fresh nonce is minted on every call, which is what makes a
+    resend invalidate the link that preceded it. Takes the NIC already hashed
+    so a reissue can work from a record, where the raw value is long gone.
+    """
+    nonce = secrets.token_urlsafe(32)
+
+    if not user.extras:
+        user.extras = {}
+    user.extras[MIGRATION_LINK_PENDING] = {
+        "nonce": nonce,
+        "nic_hash": nic_hash,
+        "first_name": first_name,
+        "last_name": last_name,
+        "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
+    }
+
+    # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
+    # outstanding sessions (LEDG-2134), and a password reset rotates it too,
+    # either of which would silently void a link the owner had not opened yet.
+    # The id is not the secret here — the nonce is.
+    serializer = current_app.extensions["security"].confirm_serializer
+    return serializer.dumps([MIGRATION_LINK_TOKEN_TAG, str(user.id), hash_data(nonce)])
+
+
+def _link_identity_and_login(user, nic_hash, first_name, last_name):
+    """Bind the authenticated identity to ``user`` and start its session.
+
+    The single place that completes a link, shared by every branch that can:
+    the password proof and the emailed validation link. Keeping it in one
+    place is not tidiness — clearing the pending link record is one of its
+    responsibilities, and a branch that linked an account without clearing it
+    would leave a live link able to overwrite the identity it just bound. The
+    password is left untouched so the account stays reachable both ways.
+    """
+    if not user.extras:
+        user.extras = {}
+    if nic_hash:
+        user.extras["auth_nic"] = nic_hash
+    if first_name:
+        user.first_name = first_name.title()
+    if last_name:
+        user.last_name = last_name.title()
+    if not user.confirmed_at:
+        user.confirmed_at = datetime.utcnow()
+
+    # However the link was proved, any validation link still outstanding for
+    # this account was issued against the state that has just changed. The
+    # send tally goes with it: it exists to pace mails towards an unlinked
+    # account, and this account is now linked.
+    user.extras.pop(MIGRATION_LINK_PENDING, None)
+    user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
+    user.save()
+
+    login_user(user)
+    session["saml_login"] = True
+
+    # Clean up migration session data
+    session.pop("saml_migration_pending", None)
+    session.pop("migration_password_attempts", None)
+
+    current_app.logger.info(f"Account migration completed for user {user.id}")
+
+
+def _migration_link_token_status_from_record(record):
+    """Whether a stored link record is still live, without a token to check.
+
+    Only the deadline can be read from the record alone -- the nonce is stored
+    hashed and the token is the other half -- which is all the caller needs:
+    an expired record protects nobody, so overwriting it destroys nothing.
+    """
+    expires = _parse_isoformat((record or {}).get("expires"))
+    if expires is None or expires <= datetime.utcnow():
+        return None, record, "expired"
+    return None, record, "live"
+
+
+def _migration_link_token_status(token):
+    """Resolve a validation-link token to ``(user, record, state)``.
+
+    ``state`` is one of "ok", "invalid" or "expired". Validity is settled
+    BEFORE expiry, unlike the change-email precedent this otherwise follows:
+    there a stale token merely triggers a fresh mail, but here a resend mints
+    a new nonce, so letting a superseded token reach the expiry branch would
+    have it reissue and thereby kill the newer link the user is holding.
+    """
+    from udata.core.user.models import User
+
+    # The signature carries the same deadline as the record, so the TTL is
+    # enforced cryptographically too. An expired signature still yields its
+    # payload (loads_unsafe), which is what lets the caller identify the
+    # account and mail a fresh link rather than dead-ending the user.
+    signature_expired, invalid, token_data = check_and_get_token_status(
+        token, "confirm", MIGRATION_LINK_TTL
+    )
+    if (
+        invalid
+        or not token_data
+        or len(token_data) != 3
+        or token_data[0] != MIGRATION_LINK_TOKEN_TAG
+    ):
+        return None, None, "invalid"
+
+    _tag, user_id, nonce_hash = token_data
+    # A well-signed token from elsewhere can still carry something that is not
+    # an ObjectId, and handing that to the field raises rather than not-found.
+    if not ObjectId.is_valid(user_id):
+        return None, None, "invalid"
+
+    user = User.objects(id=user_id).first()
+    if not user or user.deleted:
+        return None, None, "invalid"
+
+    record = (user.extras or {}).get(MIGRATION_LINK_PENDING)
+    if not record or not record.get("nonce"):
+        # No record: the link was consumed, the wizard was re-pointed at
+        # another account, or another branch linked this one. Where the
+        # account did end up linked, saying so is more use than "invalid" —
+        # it is what a second click, or a mail scanner pre-opening the link,
+        # actually ran into, and the answer is to sign in with CMD.
+        if _has_linked_nic(user):
+            return user, None, "already_done"
+        return user, None, "invalid"
+
+    if not verify_hash(nonce_hash, record["nonce"]):
+        return user, None, "invalid"
+
+    # The account gained a linked identity since the link went out, and it is
+    # not this one: refuse rather than overwrite somebody else's link.
+    current_nic = (user.extras or {}).get("auth_nic")
+    if _has_linked_nic(user) and current_nic != record.get("nic_hash"):
+        return user, None, "invalid"
+
+    # The record cannot see what happened to OTHER accounts while it sat in a
+    # mailbox. The password branch links whichever account proved its password,
+    # which by design may not be this one, and migration_skip creates a fresh
+    # account carrying the NIC — neither touches this record. Linking anyway
+    # would leave one identity on two accounts, and the login lookup resolves
+    # by auth_nic ordered by -created_at, so the newer one silently wins.
+    # migration_skip already refuses a NIC that is taken; so must this.
+    if User.objects(extras__auth_nic=record.get("nic_hash"), id__ne=user.id).first():
+        return user, None, "invalid"
+
+    expires = _parse_isoformat(record.get("expires"))
+    # A record with no readable deadline is not a link whose age we can vouch
+    # for, so it is refused outright rather than treated as merely expired.
+    if expires is None:
+        return user, None, "invalid"
+
+    if signature_expired or datetime.utcnow() > expires:
+        return user, record, "expired"
+
+    return user, record, "ok"
+
+
+def _send_migration_link(user, first_name, last_name, token):
+    """Email the validation link that completes a legacy-account link.
+
+    The body is a security control, not decoration. The wizard reaches this
+    account without proving anything about it, so this mail is what stands
+    between a request nobody made and an identity bound to someone else's
+    account. Where a code was inert to a click — the owner had to transcribe
+    it for an attacker to get anywhere — a link is not: so it names the
+    identity that asked, and says plainly not to open it otherwise.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    link = f"{frontend_url}/saml/migration/confirm-link/{token}"
+
+    requester = " ".join(part.title() for part in (first_name, last_name) if part)
+
     msg = MailMessage(
-        subject=_("Account migration verification code"),
+        subject=_("Confirm linking a digital identity to your account"),
         paragraphs=[
             _(
-                "Someone is linking a CMD identity to your %(site)s account.",
+                "Someone signed in with the digital identity of %(name)s and asked "
+                "to link it to your %(site)s account.",
+                name=requester or _("an unnamed identity"),
                 site=current_app.config.get("SITE_TITLE", "dados.gov.pt"),
             ),
-            _("Your verification code is: %(code)s", code=code),
-            _("This code expires in 10 minutes."),
-            _("If you did not request this, ignore this email."),
+            _("Open the link below to complete the linking and sign in."),
+            MailCTA(label=_("Confirm linking"), link=link),
+            _("The link is valid for 30 minutes and can only be used once."),
+            _(
+                "If it was not you who started this, do NOT open the link and "
+                "ignore this email. Your account will not be changed."
+            ),
         ],
     )
     send_mail(user, msg)
 
 
-def _find_legacy_user(email=None, first_name=None, last_name=None):
-    """Find a legacy user (has password, no NIC, not deleted) by email or name."""
-    user = None
-    if email:
-        user = datastore.find_user(email=email)
-    elif first_name and last_name:
-        from udata.core.user.models import User
+def _migration_identity(state):
+    """The identity a migration request belongs to, as a rate-limit subject.
 
-        user = User.objects(
-            first_name__iexact=first_name,
-            last_name__iexact=last_name,
-            deleted=None,
-        ).first()
+    Read from the wizard session while it lasts and from the confirmation
+    handle afterwards, because the skip ends the wizard on every exit and the
+    resend runs after that. Falls back to the caller's address only for
+    requests that carry neither -- which are the ones that answer 400 anyway.
+    """
+    state = state or {}
+    nic = state.get("saml_nic")
+    if nic:
+        return f"saml-nic:{_hash_nic(nic)}"
+    if state.get("nic_hash"):
+        return f"saml-nic:{state['nic_hash']}"
+    # Only requests carrying neither handle land here, and they answer 400
+    # before sending anything. Behind the F5/WAF this key is one national
+    # bucket, so anything that legitimately sends mail must never reach it.
+    return f"ip:{get_remote_address()}"
 
-    if user and user.password and not _has_linked_nic(user):
-        if not user.deleted:
-            return user
+
+def _resolve_confirmation_handle(awaiting):
+    """Resolve a confirmation handle to ``(own_account, address)``.
+
+    The handle has ONE shape whichever branch of the skip wrote it -- the
+    address the caller submitted and the hash of the NIC they authenticated
+    with -- and both are things the caller already knows. That is not tidiness.
+    The Flask session cookie is signed but NOT encrypted, so its payload is a
+    base64 decode away from the client: a handle shaped one way for a taken
+    address and another way for a free one hands over the very bit the generic
+    answer exists to withhold, without the attacker making a second request.
+
+    Which branch ran is therefore recomputed here instead of being recorded.
+    An account answering to the address AND carrying this identity's NIC is
+    the account this wizard created; anything else means the address belongs
+    to somebody else, and the caller is told nothing either way.
+    """
+    address = (awaiting or {}).get("email")
+    if not address:
+        return None, None
+
+    nic_hash = (awaiting or {}).get("nic_hash")
+    account = datastore.find_user(case_insensitive=True, email=address)
+    if account and nic_hash and (account.extras or {}).get("auth_nic") == nic_hash:
+        return account, address
+    return None, address
+
+
+def _migration_identity_key():
+    """Rate-limit key for the migration routes: the identity, not the IP.
+
+    Reads the wizard session while it lasts and the confirmation handle
+    afterwards -- the skip ends the wizard on every exit, and the resend runs
+    after that, so a key that only knew the wizard would fall back to the IP
+    exactly where it is needed most. Behind the F5/WAF that fallback is a
+    single national bucket (see MIGRATION_SUBMIT_LIMIT), so it is left only
+    for requests carrying neither handle, which answer 400 anyway.
+    """
+    return _migration_identity(
+        session.get("saml_migration_pending") or session.get("saml_confirmation_pending")
+    )
+
+
+def _migration_rate_limit(view):
+    """Apply the migration ceiling to a view.
+
+    Its own scope, deliberately not the ``auth-ip`` one that auth_rate_limit
+    shares: the wizard must not spend the login's budget, nor the reverse.
+    """
+    from udata.app import limiter
+
+    return limiter.shared_limit(
+        MIGRATION_SUBMIT_LIMIT, scope="saml-migration", key_func=_migration_identity_key
+    )(view)
+
+
+def _migration_notice_send_allowed(state):
+    """Whether this identity may send one more migration mail right now.
+
+    The budget lives in the limiter's storage, keyed on the identity the SSO
+    proved -- not on the recipient's document, which is the whole point. A
+    tally written on the target would hand a stranger the power to spend the
+    owner's allowance, and that is half of what LEDG-2361 is about; a tally in
+    the session would be no tally at all, the cookie being the client's.
+
+    It is checked BEFORE anything looks at whether the submitted address
+    exists, so that running out says nothing about the address.
+    """
+    # udata.app, not current_app.extensions["limiter"]: flask-limiter 3.x
+    # stores a *set* under that key, and the strategy lives on the extension
+    # object itself.
+    from udata.app import limiter
+
+    if not limiter.enabled:
+        # init_app returns before building a strategy when RATELIMIT_ENABLED is
+        # false -- which settings.Debug sets, i.e. every development run -- and
+        # the property that exposes it asserts. Reaching for it unguarded turns
+        # "rate limiting is off" into a 500 on account creation.
+        return True
+
+    item = parse(
+        f"{MAX_CONFIRMATION_SENDS} per {int(MIGRATION_LINK_SEND_WINDOW.total_seconds())} seconds"
+    )
+    return limiter.limiter.hit(item, "saml-migration-mail", _migration_identity(state))
+
+
+def _send_migration_address_taken_notice(user):
+    """Tell the owner of an address that it already has an account.
+
+    The counterpart of the generic answer the skip now gives: the browser
+    learns nothing, and the only party told anything is whoever can read that
+    mailbox. Deliberately carries no token and no linking CTA -- issuing a
+    validation link here would overwrite the record on an account this session
+    has proved nothing about, which is exactly the destruction the flow is
+    being fixed to prevent. It also prescribes no particular next step: the
+    account may have been created through SAML and have no usable password, or
+    already be linked to another identity, and "use your password" would be
+    impossible advice for both.
+    """
+    site = current_app.config.get("SITE_TITLE", "dados.gov.pt")
+    msg = MailMessage(
+        subject=_("Your %(site)s account already exists", site=site),
+        paragraphs=[
+            _(
+                "Someone signing in with a digital identity tried to use this "
+                "address to create a new %(site)s account. It already belongs "
+                "to an account, so nothing was created and nothing changed.",
+                site=site,
+            ),
+            _(
+                "If it was you, sign in to that account the way you normally "
+                "do, or use the account recovery if you cannot."
+            ),
+            # The commonest recipient is the owner of a legacy account who
+            # just typed their own address into the wizard. The wizard session
+            # is over by the time this arrives, so without this line they are
+            # told what went wrong and not what they came to do.
+            _(
+                "To link that account to your digital identity, start the "
+                "sign-in again and follow the account association steps."
+            ),
+            _("If it was not you, no action is needed. Your account is untouched."),
+        ],
+    )
+    send_mail(user, msg)
+
+
+def _mail_validation_link(pending, user, *, enforce_cap=True):
+    """Issue and email the validation link that completes ``user``'s link.
+
+    Shared by the two branches that reach this point: the wizard asking for a
+    link outright, and the password branch proving which account to link.
+    Returns None once the mail is out, or the ``(payload, status)`` its caller
+    should return.
+
+    The NIC guard comes first, before the cap and before anything is written:
+    the assertion is the only source of the NIC, and without it the token would
+    be consumed with ``nic_hash=None`` -- a link that starts a session and
+    binds no identity at all.
+
+    ``enforce_cap`` is False for the password branch, which also clears the
+    tally. The cap exists to stop an address being mailed by a stranger, and a
+    proven password is the owner asking: counting it against an allowance
+    strangers can fill would let five anonymous sends deny the owner the whole
+    flow, which is the very thing MAX_MIGRATION_LINK_SENDS was made a window
+    rather than a lifetime ceiling to avoid -- and the password used to be the
+    way out of it. The recipient is still only ever that same proven address,
+    so lifting the cap mails nobody who did not ask for it.
+    """
+    if not pending.get("saml_nic"):
+        # The assertion carried no NIC, so there is nothing to bind. Neither a
+        # broken session nor a user error: this identity cannot use this flow
+        # at all, and saying "session expired" would send the user round to
+        # authenticate again into an identical dead end.
+        return {"error": "nic_required"}, 400
+
+    if enforce_cap:
+        allowed, tally = _migration_link_send_allowed(user)
+        if not allowed:
+            # The frontend maps this exact string onto its "too many sends" copy.
+            return {"error": "Maximum confirmation sends exceeded"}, 429
+    else:
+        user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
+        _, tally = _migration_link_send_allowed(user)
+
+    token = _issue_migration_link(
+        user,
+        _hash_nic(pending["saml_nic"]),
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+    )
+    user.extras[MIGRATION_LINK_SEND_COUNT] = tally
+    user.save()
+
+    # Remember that it was THIS session that put the record there. Only a
+    # link this session issued may later be destroyed by it — see
+    # _drop_migration_link.
+    pending["link_issued_for"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.modified = True
+
+    _send_migration_link(user, pending.get("saml_first_name"), pending.get("saml_last_name"), token)
+    current_app.logger.info(f"Migration validation link sent to user {user.id}")
     return None
 
 
@@ -1094,17 +1707,17 @@ def sp_initiated():
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_FIRST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
         ]
     )
@@ -1395,7 +2008,7 @@ def idp_initiated():
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
-    if status == "migration_candidate":
+    if status in ("migration_candidate", "no_match"):
         if _migration_enabled():
             _audit_saml(
                 "migration_pending",
@@ -1404,9 +2017,18 @@ def idp_initiated():
                 name_id=name_id_value,
                 reason=status,
             )
-            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
-        # Migration wizard disabled: never log into an unproven account —
-        # fall back to creating a new one (scenario 4).
+            return _handle_migration_redirect(
+                user,
+                user_email,
+                user_nic,
+                first_name,
+                last_name,
+                no_match=(status == "no_match"),
+                provider="cmd",
+            )
+        # Migration wizard disabled: never log into an unproven account, and
+        # nobody is around to ask for a confirmed email — fall back to
+        # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(user_email, user_nic, first_name, last_name)
         status = "new"
 
@@ -1482,6 +2104,9 @@ def _terminate_local_session():
     session.pop("saml_login", None)
     session.pop("saml_name_id", None)
     session.pop("saml_name_id_format", None)
+    # Ends with the session like the rest: it is a handle onto someone's
+    # pending account, and the next person on this browser must not inherit it.
+    session.pop("saml_confirmation_pending", None)
     logout_user()
 
 
@@ -1826,7 +2451,7 @@ def idp_eidas_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate":
+    if status in ("migration_candidate", "no_match"):
         if _migration_enabled():
             _audit_saml(
                 "migration_pending",
@@ -1835,9 +2460,18 @@ def idp_eidas_initiated():
                 name_id=name_id_value,
                 reason=status,
             )
-            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
-        # Migration wizard disabled: never log into an unproven account —
-        # fall back to creating a new one (scenario 4).
+            return _handle_migration_redirect(
+                user,
+                user_email,
+                user_nic,
+                first_name,
+                last_name,
+                no_match=(status == "no_match"),
+                provider="eidas",
+            )
+        # Migration wizard disabled: never log into an unproven account, and
+        # nobody is around to ask for a confirmed email — fall back to
+        # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(user_email, user_nic, first_name, last_name)
         status = "new"
 
@@ -1969,10 +2603,46 @@ def migration_pending():
 
     pending = session.get("saml_migration_pending")
     if not pending:
+        # The wizard is over but the account it created is still waiting for
+        # its owner to follow the confirmation link. Tell the frontend so it
+        # can explain the situation and offer a resend, instead of bouncing
+        # the user to /login with no explanation.
+        awaiting = session.get("saml_confirmation_pending")
+        if awaiting:
+            own, address = _resolve_confirmation_handle(awaiting)
+            # Answered from the address the caller submitted, whichever branch
+            # of the skip put it there -- masking their own input tells them
+            # nothing, and any other answer would undo the generic one the
+            # skip just gave. Only the owner acting on their own account
+            # (confirming it) ever changes this, which is a state the caller
+            # cannot reach for somebody else's address.
+            if address and (own is None or own.confirmed_at is None):
+                return jsonify(
+                    {
+                        "pending": False,
+                        "awaiting_confirmation": True,
+                        "email": _mask_email(address),
+                    }
+                )
         return jsonify({"pending": False})
 
     # Whether the CMD identity itself carries an email address.
     has_email = bool(pending.get("saml_email"))
+
+    # The email the CMD identity carried, but only when no account holds it:
+    # the wizard pre-fills the account-creation field with it, and offering an
+    # address that is already taken would only produce a guaranteed rejection.
+    saml_email = pending.get("saml_email")
+    suggested_email = saml_email if saml_email and not _find_user_by_email_ci(saml_email) else None
+
+    # True only when the identity matched no account at all (as opposed to
+    # matching several homonyms) AND carries a NIC. Both cases reach the
+    # wizard with legacy_user_id unset, so `candidate` alone cannot tell them
+    # apart. The NIC is required because an identity without one cannot create
+    # an account through this flow (see migration_skip): without auth_nic the
+    # pending account would match itself as a wizard candidate on the next
+    # login and could be confirmed without ever following the emailed link.
+    no_match = bool(pending.get("no_match")) and bool(pending.get("saml_nic"))
 
     # Fetch candidate (legacy) account details for user confirmation.
     legacy_user_id = pending.get("legacy_user_id")
@@ -1993,70 +2663,45 @@ def migration_pending():
             "pending": True,
             "email": _mask_email(legacy_email) if legacy_email else None,
             "has_email": has_email,
+            "suggested_email": suggested_email,
             "candidate": bool(legacy_user_id),
+            "no_match": no_match,
             "first_name": first_name,
             "last_name": last_name,
+            # Defaults to CMD so a session opened before this field existed
+            # still names a provider, rather than rendering "Associar conta a".
+            "provider": pending.get("saml_provider") or "cmd",
         }
     )
 
 
-@autenticacao_gov.route("/saml/migration/search", methods=["POST"])
+@autenticacao_gov.route("/saml/migration/send-link", methods=["POST"])
 @csrf.exempt
-def migration_search():
-    """Search for a legacy account when SAML did not return an email."""
+@_migration_rate_limit
+def migration_send_link():
+    """Email a validation link to the candidate account's own address.
+
+    Proof of ownership of the legacy account is the click, so this endpoint
+    reads no body at all: the recipient is the address already on the account,
+    never one supplied with the request. It deliberately does not log anyone
+    in — the link is what grants the session, exactly as on the
+    account-creation branch (see migration_skip).
+    """
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
-
-    data = request.get_json(silent=True) or {}
-    email = data.get("email")
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
-
-    user = _find_legacy_user(email=email, first_name=first_name, last_name=last_name)
-    if not user:
-        return jsonify({"found": False})
-
-    # Store only the candidate reference — saml_email must keep holding
-    # the email coming from the CMD identity (or None), never the
-    # legacy account's email.
-    pending["legacy_user_id"] = str(user.id)
-    session["saml_migration_pending"] = pending
-    # Any code previously emailed was issued for a different target —
-    # invalidate it so it cannot be replayed against the new candidate.
-    session.pop("migration_code", None)
-    session.modified = True
-
-    return jsonify(
-        {
-            "found": True,
-            "email": _mask_email(user.email),
-        }
-    )
-
-
-@autenticacao_gov.route("/saml/migration/send-code", methods=["POST"])
-@csrf.exempt
-def migration_send_code():
-    """Generate and send a 6-digit verification code to the legacy user's email."""
-    if not _migration_enabled():
-        return jsonify({"error": "Migration mode is not enabled"}), 403
-
-    pending = session.get("saml_migration_pending")
-    if not pending:
-        return jsonify({"error": "No pending migration"}), 400
-
-    # Rate limit: max 3 sends per session
-    send_count = session.get("migration_send_count", 0)
-    if send_count >= 3:
-        return jsonify({"error": "Maximum code sends exceeded"}), 429
 
     legacy_user_id = pending.get("legacy_user_id")
     if not legacy_user_id:
         return jsonify({"error": "No legacy user found"}), 400
+
+    if not pending.get("saml_nic"):
+        # Nothing to link. The assertion is the only source of the NIC, so
+        # this is a broken wizard session rather than a user error.
+        return jsonify({"error": "No pending migration"}), 400
 
     from udata.core.user.models import User
 
@@ -2064,28 +2709,99 @@ def migration_send_code():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    code = str(random.randint(100000, 999999))
-    session["migration_code"] = {
-        "code": code,
-        # Bind the code to the account it was emailed to, so it cannot be
-        # replayed against a different candidate re-pointed via search.
-        "legacy_user_id": legacy_user_id,
-        "expires": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
-        "attempts": 0,
-    }
-    session["migration_send_count"] = send_count + 1
-    session.modified = True
+    if _has_linked_nic(user):
+        # Already linked to some identity. Refuse here as well as on the
+        # click, so the wizard never mails a link the consuming route would
+        # then reject. Same generic wording as the password branch.
+        return jsonify({"error": "Invalid credentials"}), 400
 
-    _send_migration_code(user, code)
-    current_app.logger.info(f"Migration code sent to user {legacy_user_id}")
+    # Issuing is destructive too, and destroying a link is reserved to the
+    # session that issued it. _issue_migration_link mints a fresh nonce over
+    # the account's record, so a reissue kills whatever link was there --
+    # which makes an unproved session's send-link the same denial as the drop
+    # that was already scoped. It is reachable unproved: the SSO points a
+    # candidate by itself, by email match or by a unique name match, so a
+    # homonym arrives here aimed at an account they have proved nothing about.
+    #
+    # A session may therefore issue only when the account holds no live link,
+    # or when the live one is its own. The wizard loses nothing: the frontend
+    # reaches this route only to resend after a password proof, which is
+    # always the second case.
+    outstanding = (user.extras or {}).get(MIGRATION_LINK_PENDING)
+    if outstanding and pending.get("link_issued_for") != str(user.id):
+        _, _, state = _migration_link_token_status_from_record(outstanding)
+        if state == "live":
+            # Same generic wording as above: whether a stranger's link is
+            # outstanding is not this caller's business either.
+            return jsonify({"error": "Invalid credentials"}), 400
+
+    error = _mail_validation_link(pending, user)
+    if error:
+        payload, status = error
+        return jsonify(payload), status
 
     return jsonify({"sent": True})
 
 
+@autenticacao_gov.route("/saml/migration/confirm-link/<token>", methods=["GET"])
+@csrf.exempt
+def migration_confirm_link(token):
+    """Complete a legacy-account link from the emailed validation link.
+
+    This is the click, so it must work with no session: everything it needs
+    was recorded on the account when the link was issued. It logs the user in
+    directly rather than deferring to flask-security's /confirm/<token>, whose
+    AUTO_LOGIN_AFTER_CONFIRM defaults to False.
+
+    Every outcome is a redirect carrying a ?flash= the wizard screen renders.
+    A 500 here is a dead end for the user — the link is single-use, so they
+    cannot retry it.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    wizard_url = f"{frontend_url}/migrate-account"
+
+    if not _migration_enabled():
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
+
+    user, record, state = _migration_link_token_status(token)
+
+    if state == "already_done":
+        return redirect(f"{wizard_url}?flash=migration_link_already_done")
+
+    if state == "invalid":
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
+
+    if state == "expired":
+        # Deliberately no reissue here, unlike the change-email confirmation
+        # this route otherwise follows. Mail scanners open links in inboxes
+        # before their owners do: reissuing from an unauthenticated GET would
+        # let a scanner keep an old mail alive indefinitely, each pass minting
+        # a fresh link with a fresh deadline. The user re-authenticates
+        # instead — a few seconds of CMD, and something only they can trigger.
+        return redirect(f"{wizard_url}?flash=migration_link_expired")
+
+    _link_identity_and_login(
+        user,
+        record.get("nic_hash"),
+        record.get("first_name"),
+        record.get("last_name"),
+    )
+    current_app.logger.info(f"Migration completed by validation link for user {user.id}")
+
+    return redirect(frontend_url or "/")
+
+
 @autenticacao_gov.route("/saml/migration/confirm", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_confirm():
-    """Confirm migration via verification code or old password."""
+    """Identify the legacy account by its password, then mail the link.
+
+    The password says *which* account to link, not that its email is
+    reachable, so it no longer completes anything on its own: this route
+    mails the validation link and migration_confirm_link — the single place
+    that binds the identity and starts a session — consumes the click.
+    """
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
@@ -2096,57 +2812,20 @@ def migration_confirm():
     data = request.get_json(silent=True) or {}
     method = data.get("method")
 
-    from udata.core.user.models import User
-
-    if method == "code":
-        # Code verification targets the candidate account found by
-        # name/search — a code was emailed to that account's address.
-        legacy_user_id = pending.get("legacy_user_id")
-        if not legacy_user_id:
-            return jsonify({"error": "No legacy user found"}), 400
-
-        user = User.objects(id=legacy_user_id).first()
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-
-        code_data = session.get("migration_code")
-        if not code_data:
-            return jsonify({"error": "No code sent"}), 400
-
-        # The code is only valid for the account it was emailed to. If the
-        # candidate was re-pointed (via search) after the code was issued,
-        # refuse it — otherwise a code sent to an attacker-controlled
-        # mailbox could link the NIC to a victim account.
-        if code_data.get("legacy_user_id") != legacy_user_id:
-            return jsonify({"error": "No code sent"}), 400
-
-        if code_data["attempts"] >= 5:
-            return jsonify({"error": "Maximum attempts exceeded"}), 429
-
-        code_data["attempts"] += 1
-        session["migration_code"] = code_data
-        session.modified = True
-
-        expires = datetime.fromisoformat(code_data["expires"])
-        if datetime.utcnow() > expires:
-            return jsonify({"error": "Code expired"}), 400
-
-        if data.get("code") != code_data["code"]:
-            return jsonify({"error": "Invalid code"}), 400
-
-    elif method == "password":
+    if method == "password":
         # Full default login (email + password): the linked account is
         # the one whose credentials are proven, which may differ from
         # the name-matched candidate (homonym case).
-        attempts = session.get("migration_password_attempts", 0)
-        if attempts >= 5:
+        if session.get("migration_password_attempts", 0) >= 5:
             return jsonify({"error": "Maximum attempts exceeded"}), 429
-        session["migration_password_attempts"] = attempts + 1
-        session.modified = True
 
         email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        user = datastore.find_user(email=email) if email else None
+        # Case-insensitive, to match the login form this branch stands in
+        # for. Exact-matching here failed the ownership proof for a correct
+        # password, and the generic error below made that indistinguishable
+        # from a wrong one.
+        user = _find_user_by_email_ci(email)
         # Generic error on any failure to avoid account enumeration.
         if (
             not user
@@ -2155,47 +2834,60 @@ def migration_confirm():
             or _has_linked_nic(user)
             or not verify_and_update_password(password, user)
         ):
+            # Only a WRONG guess is counted, and the cap is never reset. A
+            # correct password must not cost an attempt, because this branch
+            # can now end in a 429 from the send path and charging that to the
+            # brute-force tally would lock the owner out of the only branch
+            # that can identify their account. But resetting on success is not
+            # the way to arrange that: anyone holding one legacy account's
+            # password could then launder four guesses per reset against any
+            # other address, indefinitely -- this file has no Flask-Limiter
+            # backstop, and the WAF collapses every visitor onto one IP.
+            attempts = session.get("migration_password_attempts", 0)
+            session["migration_password_attempts"] = attempts + 1
+            session.modified = True
             return jsonify({"error": "Invalid credentials"}), 400
 
     else:
         return jsonify({"error": "Invalid method"}), 400
 
-    # Link: add NIC and update names. The password is kept so the
-    # account remains accessible through both login methods.
-    saml_nic = pending.get("saml_nic")
-    saml_first_name = pending.get("saml_first_name")
-    saml_last_name = pending.get("saml_last_name")
+    # The account whose password was proved is the one to link, and by design
+    # it may not be the candidate the assertion matched by name. Re-pointing
+    # is also what makes the resend endpoint — which reads no body, on
+    # purpose — mail that account rather than the homonym; and it kills any
+    # link already issued for the previous target.
+    _point_migration_candidate(pending, user)
 
-    if not user.extras:
-        user.extras = {}
-    if saml_nic:
-        user.extras["auth_nic"] = _hash_nic(saml_nic)
-    if saml_first_name:
-        user.first_name = saml_first_name.title()
-    if saml_last_name:
-        user.last_name = saml_last_name.title()
-    if not user.confirmed_at:
-        user.confirmed_at = datetime.utcnow()
-    user.save()
+    # The session is deliberately left pending: the resend and a second
+    # attempt both need it, and the click is what clears it.
+    error = _mail_validation_link(pending, user, enforce_cap=False)
+    if error:
+        payload, status = error
+        return jsonify(payload), status
 
-    login_user(user)
-    session["saml_login"] = True
-
-    # Clean up migration session data
-    session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
-    session.pop("migration_password_attempts", None)
-
-    current_app.logger.info(f"Account migration completed for user {user.id}")
-
-    return jsonify({"success": True})
+    return jsonify({"sent": True})
 
 
 @autenticacao_gov.route("/saml/migration/skip", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_skip():
-    """Skip migration and create a new account from SAML data."""
+    """Create a new account from a user-declared, confirmation-pending email.
+
+    The CMD proves who the person is; it does not prove that the address they
+    typed is theirs. So this endpoint validates the submitted email, creates
+    the account UNCONFIRMED, mails the standard confirmation link, and
+    deliberately starts NO session: authenticated access waits for the click.
+
+    And it answers the same way whether or not the address already has an
+    account. It used to reply 409 email_taken, which made it an oracle over
+    every registered address for anyone holding one wizard session -- against
+    the portal's own SECURITY_RETURN_GENERIC_RESPONSES, and useful precisely
+    for picking targets. A taken address now gets a notice mailed to it and
+    the caller gets the creation branch's answer; every refusal this route can
+    still return is settled before the address is looked at, so none of them
+    leaks the same bit by the back door.
+    """
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
@@ -2203,26 +2895,216 @@ def migration_skip():
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
 
-    # Use the CMD email when available (no account holds it, otherwise
-    # the email lookup would have auto-linked); a placeholder is
-    # generated by _create_saml_user when the CMD brought no email.
-    user = _create_saml_user(
-        pending.get("saml_email"),
-        pending.get("saml_nic"),
-        pending.get("saml_first_name"),
-        pending.get("saml_last_name"),
-    )
+    # Without a NIC the new account gets no auth_nic, and an account with no
+    # auth_nic is not excluded by _has_linked_nic: on the next CMD login it
+    # would match itself as a wizard candidate, letting the user mail a code
+    # to the very address awaiting confirmation and log in through
+    # migration_confirm — confirming the email without ever following the
+    # link. These identities cannot use this branch at all.
+    user_nic = pending.get("saml_nic")
+    if not user_nic:
+        return jsonify({"error": "nic_required"}), 400
 
-    login_user(user)
-    session["saml_login"] = True
+    # Coerce to a string at the boundary. A JSON body can carry a dict, and a
+    # dict reaching .strip() is an AttributeError, i.e. a 500 where a 400
+    # belongs. migration_search did this and was the only route that did; the
+    # coercion outlives it because the reason does.
+    email = str((request.get_json(silent=True) or {}).get("email") or "").strip()
+    if not email:
+        return jsonify({"error": "email_required"}), 400
 
-    # Clean up migration session data
+    try:
+        # Shape only, never deliverability. email_validator defaults
+        # check_deliverability to True, and SECURITY_EMAIL_VALIDATOR_ARGS is
+        # defined only in settings.Testing — so relying on the config alone
+        # would run a live MX lookup, for an attacker-chosen domain, inside
+        # the request. That both hands out an outbound DNS primitive and lets
+        # a resolver blip tell a user their valid address is invalid.
+        validator_args = {
+            "check_deliverability": False,
+            **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS") or {}),
+        }
+        # Store the normalised form, as the registration path does — not the
+        # raw string, whose casing would otherwise decide which of two rows
+        # the unique index accepts.
+        email = validate_email(email, **validator_args).normalized
+    except EmailNotValidError:
+        return jsonify({"error": "invalid_email"}), 400
+
+    # case_insensitive matters and is not cosmetic. The unique index on
+    # User.email is case-SENSITIVE, while every login and recovery lookup goes
+    # through SECURITY_USER_IDENTITY_ATTRIBUTES, which is case-INSENSITIVE. An
+    # exact-match check here therefore accepts "MARIA@x.pt" alongside an
+    # existing "maria@x.pt", and the victim's own login then resolves to the
+    # newer, password-less shadow row (User._meta ordering is -created_at) —
+    # locking them out of both login and password recovery, permanently.
+    from udata.core.user.models import User
+
+    existing = datastore.find_user(case_insensitive=True, email=email)
+    linked = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
+
+    # Everything that can refuse this request is settled BEFORE anything looks
+    # at whether the submitted address exists. Evaluated the other way round --
+    # as they were, behind the taken-address branch -- these refusals answer
+    # "does this address have an account?" by their presence or absence, which
+    # is the one question this route must not answer.
+    if linked is not None:
+        # This identity already has an account. Normally unreachable -- rule 1
+        # of _find_or_create_saml_user resolves it long before the wizard --
+        # but the Flask session is a client-held signed cookie, so replaying a
+        # copy taken before the first skip re-enters here with the pending
+        # state intact; the session pops are no defence, they only rewrite a
+        # response cookie the caller may discard.
+        if linked.confirmed_at is not None:
+            return jsonify({"error": "identity_already_registered"}), 409
+        # The account's own monotonic tally, hoisted for the same reason. It
+        # cannot fire on the branch that creates an account, which starts at
+        # zero, so hoisting loses no coverage and removes an oracle.
+        if (linked.extras or {}).get(CONFIRMATION_SEND_COUNT, 0) >= MAX_CONFIRMATION_SENDS:
+            return jsonify({"error": "too_many_sends"}), 429
+
+    # One mailer budget for this identity, spent by whichever branch mails.
+    # Split budgets would diverge, and a divergence is an oracle.
+    if not _migration_notice_send_allowed(pending):
+        return jsonify({"error": "too_many_sends"}), 429
+
+    if existing and (not linked or existing.id != linked.id):
+        # The address is taken — but by whom? If it is a legacy account this
+        # identity could legitimately claim, refusing outright is the wrong
+        # answer: linking it is exactly what the wizard exists for. So this
+        # branch says where to go next, and stops there.
+        #
+        # It says nothing about the address, and it writes nothing anywhere.
+        # The person who can act on this is whoever reads that mailbox, so
+        # that is who gets told -- the browser is answered exactly as it would
+        # be for a free address. Mailing the validation link here instead
+        # would be the obvious move and is forbidden: _issue_migration_link
+        # mints a fresh nonce over the account's record, so it would destroy
+        # whatever link the owner was holding, on demand, from any session.
+        #
+        # The candidate is not pointed either. The address arrives in the
+        # request body and nothing about it has been proved, while pointing
+        # drops the link outstanding for the previous candidate. Nothing is
+        # lost: the credentials screen never needed a pointed candidate,
+        # because migration_confirm resolves the account from the password it
+        # proves and re-points from there.
+        # mark_as_deleted rewrites the address to <id>@deleted, so a row
+        # deleted through the product cannot be found by a submitted address
+        # at all; the guard is for rows deleted by any other means, and
+        # mailing one would be mailing nobody. The response does not change
+        # either way -- the caller must not learn which case it was.
+        if not existing.deleted:
+            _send_migration_address_taken_notice(existing)
+
+        # Same shape as the creation branch, down to the normalised address --
+        # which is the one the caller submitted, so echoing it discloses
+        # nothing. The wizard ends here too, or the next GET of
+        # /saml/migration/pending would tell the caller which branch ran.
+        session.pop("saml_migration_pending", None)
+        session.pop("migration_password_attempts", None)
+        session["saml_confirmation_pending"] = {
+            "email": email,
+            "nic_hash": _hash_nic(user_nic),
+        }
+        return jsonify({"success": True, "email": email})
+
+    if linked:
+        # Refusing a linked-but-unconfirmed identity outright is not right: it
+        # would brick the identity on a typo, and on an SMTP failure
+        # mid-request, with no way back — the account has no password, so
+        # neither login nor recovery is available, and the address can never be
+        # changed. So the pending account's address stays correctable until it
+        # is confirmed, while the send tally stays monotonic, which is what
+        # keeps the mailer bounded.
+        user = linked
+        user.email = email
+        user.save()
+    else:
+        user = _create_pending_saml_user(
+            email,
+            user_nic,
+            pending.get("saml_first_name"),
+            pending.get("saml_last_name"),
+        )
+
+    send_confirmation_instructions(user)
+    user.extras[CONFIRMATION_SEND_COUNT] = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0) + 1
+    user.save()
+
+    # The wizard walked away from whatever candidate it had pointed at, and
+    # the new account now carries the NIC. A link still sitting in the old
+    # candidate's mailbox would put that same NIC on a second account.
+    candidate_id = pending.get("legacy_user_id")
+    if candidate_id and candidate_id != str(user.id):
+        _drop_migration_link(candidate_id, pending)
+
+    # No login_user: the account has no session until the email is confirmed.
+    # The wizard state is done, but a resend handle must survive it — this key
+    # identifies the user to the resend endpoint without authenticating them.
     session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
     session.pop("migration_password_attempts", None)
+    session["saml_confirmation_pending"] = {
+        "email": user.email,
+        "nic_hash": _hash_nic(user_nic),
+    }
 
-    # A placeholder email means registration is not complete yet: the
-    # frontend must send the user to /complete-registration instead of
-    # the homepage.
-    return jsonify({"success": True, "pending_registration": user.has_placeholder_email})
+    return jsonify({"success": True, "email": user.email})
+
+
+@autenticacao_gov.route("/saml/migration/resend-confirmation", methods=["POST"])
+@csrf.exempt
+@_migration_rate_limit
+def migration_resend_confirmation():
+    """Resend the confirmation link for the account awaiting confirmation.
+
+    At this point there is no session to authenticate: the account exists but
+    is deliberately not logged in. The pending-confirmation key left in the
+    session identifies the user without authenticating them, which is why this
+    endpoint takes no email argument — it would otherwise be an open relay,
+    and the stock ``security.send_confirmation`` view carries no rate limit of
+    its own to fall back on.
+    """
+    if not _migration_enabled():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
+    awaiting = session.get("saml_confirmation_pending")
+    if not awaiting:
+        return jsonify({"error": "No pending confirmation"}), 400
+
+    # The handle has one shape and the branch is recomputed, so nothing the
+    # caller can read says which one it is. The mailer budget is spent first
+    # and identically by both, because it is keyed on the identity carried in
+    # that same handle -- keying one branch on the identity and the other on
+    # the IP would make the 429 itself the answer.
+    if not _migration_notice_send_allowed(awaiting):
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    user, address = _resolve_confirmation_handle(awaiting)
+    if user is None:
+        # The address is somebody else's. Re-send them the same notice, write
+        # nothing on their account, and answer as the other branch does --
+        # including when nobody holds it any more.
+        recipient = datastore.find_user(case_insensitive=True, email=address) if address else None
+        if recipient and not recipient.deleted:
+            _send_migration_address_taken_notice(recipient)
+        return jsonify({"sent": True})
+
+    if user.confirmed_at is not None:
+        # Already done — nothing to resend, and saying so lets the frontend
+        # send the user to the login instead of waiting for another mail.
+        return jsonify({"sent": False, "confirmed": True})
+
+    # The cap is counted ON THE ACCOUNT, not in the session: here the recipient
+    # was chosen by whoever ran the wizard, so a session-only counter would be
+    # no cap at all — the Flask session is a client-held signed cookie, and
+    # replaying a copy taken before the first send resets it to zero on every
+    # request.
+    send_count = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0)
+    if send_count >= MAX_CONFIRMATION_SENDS:
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    send_confirmation_instructions(user)
+    user.extras[CONFIRMATION_SEND_COUNT] = send_count + 1
+    user.save()
+
+    return jsonify({"sent": True})
