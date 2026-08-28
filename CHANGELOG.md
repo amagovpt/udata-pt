@@ -18,7 +18,8 @@
     the assertion matched by name, and it destroys any link already issued for
     the previous target. Where the proven account *is* the candidate, the fresh
     nonce written over the same record is what stops the earlier token
-    validating: the LEDG-2357 invariant holds, by a different mechanism.
+    validating: the invariant the emailed link arrived with holds, by a
+    different mechanism.
   - A correct password resets the attempt tally. The tally is incremented before
     the password is checked, so without the reset the send cap would spend
     attempts that were all correct, until five of them locked the session out of
