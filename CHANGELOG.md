@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- **fix(saml)!: no unproven session may destroy a validation link, and the skip stops saying whether an address is taken**
+  - The `migration_link_pending` record lives on the User document, so it is
+    global to the account and outlives the session that asked for it. Two
+    routes could point the migration candidate at an arbitrary account by
+    address, with no proof of anything, and pointing destroys the link
+    outstanding for the previous target: `POST /saml/migration/search`, and the
+    `email_taken` branch of the skip. Either was a destructor for any account's
+    link, and the pending session now surviving `migration_confirm` made it a
+    loop. Neither points any more, and `search` is removed outright rather than
+    hardened a second time — it has had no consumer since the wizard stopped
+    calling it. Its boundary coercion moves to the skip, and `_find_legacy_user`
+    loses the name branch it was the only caller of.
+  - One unproven pointer remains and is not a request: the SSO points a
+    candidate by itself, by email match and then by unique name match, so a
+    homonym reaches the wizard aimed at somebody else's account and the
+    account-creation tail would destroy the link that account was holding.
+    Destroying a link is now scoped to the session that issued it, which costs
+    nothing: the invariant the drop protects is that a live link in the old
+    candidate's mailbox would put this session's NIC on a second account, and
+    only a link this session issued can be in that position.
+  - `POST /saml/migration/skip` answered 409 `email_taken` for a taken address
+    and 200 for a free one, so one wizard session was an oracle over every
+    address anyone cared to submit — against the portal's own
+    `SECURITY_RETURN_GENERIC_RESPONSES`, and useful mainly for picking targets.
+    A taken address now gets a notice mailed to it and the caller gets the
+    creation branch's answer. The notice carries no token and writes nothing at
+    all on the target: mailing the validation link instead would mint a fresh
+    nonce over the record and hand every session the power to destroy a link on
+    demand, which is the very thing being fixed.
+  - Indistinguishable also means one request later. The refusals that depend
+    only on the identity are settled before the address is looked up; the
+    wizard ends on both branches; and `saml_confirmation_pending` keeps ONE
+    shape — the caller's own address and the hash of the NIC they
+    authenticated with — with the branch recomputed server-side, because the
+    Flask session cookie is signed but not encrypted and a handle shaped
+    differently per branch hands the answer over to a base64 decode. That one
+    shape is also what keys the mailer budget on the identity in both cases:
+    keyed on the identity for one branch and on the IP for the other, the 429
+    would itself have been the answer — and, behind the F5/WAF, every
+    legitimate resend in the country would have shared one bucket of five
+    mails an hour. What this does not buy is stated rather than implied:
+    repetition still distinguishes, because the creation branch consumes an
+    allowance on the account it creates while the notice deliberately consumes
+    nothing on the target — so the guarantee is one probe per CMD
+    authentication, plus one per window per identity, not zero.
+  - The wizard's four mail-sending routes gain a ceiling keyed on the
+    government identity the SSO proved, not on the IP: behind the F5/WAF every
+    anonymous visitor collapses onto one origin address, so an IP key would be
+    a single national bucket. Its own limiter scope, so the wizard cannot spend
+    the login's budget or the reverse.
+  - Breaking: `POST /saml/migration/search` is gone, and the skip no longer
+    returns `email_taken` or `candidate_found`. The frontend that reads them
+    must be deployed first.
+
 - **feat(saml)!: mail the validation link after the password proof instead of logging in**
   - The password on `POST /saml/migration/confirm` said which legacy account to
     link and then linked it, session and all. It does not prove that the
