@@ -1316,7 +1316,7 @@ def _send_migration_link(user, first_name, last_name, token):
     send_mail(user, msg)
 
 
-def _mail_validation_link(pending, user):
+def _mail_validation_link(pending, user, *, enforce_cap=True):
     """Issue and email the validation link that completes ``user``'s link.
 
     Shared by the two branches that reach this point: the wizard asking for a
@@ -1324,21 +1324,35 @@ def _mail_validation_link(pending, user):
     Returns None once the mail is out, or the ``(payload, status)`` its caller
     should return.
 
-    The NIC guard comes first, before the send cap and before anything is
-    written: the assertion is the only source of the NIC, and without it the
-    token would be consumed with ``nic_hash=None`` — a link that starts a
-    session and binds no identity at all.
+    The NIC guard comes first, before the cap and before anything is written:
+    the assertion is the only source of the NIC, and without it the token would
+    be consumed with ``nic_hash=None`` -- a link that starts a session and
+    binds no identity at all.
+
+    ``enforce_cap`` is False for the password branch, which also clears the
+    tally. The cap exists to stop an address being mailed by a stranger, and a
+    proven password is the owner asking: counting it against an allowance
+    strangers can fill would let five anonymous sends deny the owner the whole
+    flow, which is the very thing MAX_MIGRATION_LINK_SENDS was made a window
+    rather than a lifetime ceiling to avoid -- and the password used to be the
+    way out of it. The recipient is still only ever that same proven address,
+    so lifting the cap mails nobody who did not ask for it.
     """
     if not pending.get("saml_nic"):
-        # Nothing to link; a broken wizard session rather than a user error.
-        # migration_send_link checks this earlier too, to keep its own
-        # response ordering; this is the check every caller is covered by.
-        return {"error": "No pending migration"}, 400
+        # The assertion carried no NIC, so there is nothing to bind. Neither a
+        # broken session nor a user error: this identity cannot use this flow
+        # at all, and saying "session expired" would send the user round to
+        # authenticate again into an identical dead end.
+        return {"error": "nic_required"}, 400
 
-    allowed, tally = _migration_link_send_allowed(user)
-    if not allowed:
-        # The frontend maps this exact string onto its "too many sends" copy.
-        return {"error": "Maximum confirmation sends exceeded"}, 429
+    if enforce_cap:
+        allowed, tally = _migration_link_send_allowed(user)
+        if not allowed:
+            # The frontend maps this exact string onto its "too many sends" copy.
+            return {"error": "Maximum confirmation sends exceeded"}, 429
+    else:
+        user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
+        _, tally = _migration_link_send_allowed(user)
 
     token = _issue_migration_link(
         user,
@@ -2644,11 +2658,8 @@ def migration_confirm():
         # Full default login (email + password): the linked account is
         # the one whose credentials are proven, which may differ from
         # the name-matched candidate (homonym case).
-        attempts = session.get("migration_password_attempts", 0)
-        if attempts >= 5:
+        if session.get("migration_password_attempts", 0) >= 5:
             return jsonify({"error": "Maximum attempts exceeded"}), 429
-        session["migration_password_attempts"] = attempts + 1
-        session.modified = True
 
         email = (data.get("email") or "").strip()
         password = data.get("password", "")
@@ -2665,15 +2676,19 @@ def migration_confirm():
             or _has_linked_nic(user)
             or not verify_and_update_password(password, user)
         ):
+            # Only a WRONG guess is counted, and the cap is never reset. A
+            # correct password must not cost an attempt, because this branch
+            # can now end in a 429 from the send path and charging that to the
+            # brute-force tally would lock the owner out of the only branch
+            # that can identify their account. But resetting on success is not
+            # the way to arrange that: anyone holding one legacy account's
+            # password could then launder four guesses per reset against any
+            # other address, indefinitely -- this file has no Flask-Limiter
+            # backstop, and the WAF collapses every visitor onto one IP.
+            attempts = session.get("migration_password_attempts", 0)
+            session["migration_password_attempts"] = attempts + 1
+            session.modified = True
             return jsonify({"error": "Invalid credentials"}), 400
-
-        # The password proved ownership, so it must not count against the
-        # brute-force cap. The tally is incremented before the check above,
-        # so without this reset the send cap below would burn attempts that
-        # were all correct, until five of them locked the session out of the
-        # only branch that can identify the account.
-        session["migration_password_attempts"] = 0
-        session.modified = True
 
     else:
         return jsonify({"error": "Invalid method"}), 400
@@ -2687,7 +2702,7 @@ def migration_confirm():
 
     # The session is deliberately left pending: the resend and a second
     # attempt both need it, and the click is what clears it.
-    error = _mail_validation_link(pending, user)
+    error = _mail_validation_link(pending, user, enforce_cap=False)
     if error:
         payload, status = error
         return jsonify(payload), status

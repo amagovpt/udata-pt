@@ -2335,11 +2335,17 @@ class SAMLMigrationWizardTest(APITestCase):
             assert pending["legacy_user_id"] == str(legacy.id)
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_confirm_send_cap_returns_429_without_burning_a_password_attempt(self, mock_client_for):
-        """A correct password must not count against the brute-force cap.
-        The tally is incremented before the password is checked, so without a
-        reset the send cap would spend attempts that were all correct and
-        lock the account out of the only branch that can identify it."""
+    def test_a_spent_send_allowance_does_not_deny_the_proven_owner(self, mock_client_for):
+        """MAX_MIGRATION_LINK_SENDS is a window and not a lifetime ceiling
+        precisely so five anonymous sends cannot deny an account's owner the
+        email route, "leaving them only the password they came to the wizard
+        without". Now that the password mails a link too, charging it to that
+        same allowance would take away the way out the cap was designed
+        around: search points a candidate at any address with no proof, five
+        send-links spend the hour, and the owner's own correct password would
+        be refused. The proof lifts the cap, and clears it -- the recipient is
+        only ever the proven account's own address, so nobody unasked is
+        mailed."""
         from udata.auth.saml.saml_plugin.saml_govpt import (
             MAX_MIGRATION_LINK_SENDS,
             MIGRATION_LINK_SEND_COUNT,
@@ -2361,24 +2367,134 @@ class SAMLMigrationWizardTest(APITestCase):
 
         self._sso_with(mock_client_for, nic="41414141", first_name="Rita", last_name="Gomes")
 
-        # Six correct passwords in a row: every one hits the send cap, and
-        # none of them is ever answered with the attempts cap.
-        for _ in range(6):
-            with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
-                response = self.client.post(
+        # The anonymous route is still capped.
+        assert self.client.post("/saml/migration/send-link").status_code == 429
+
+        # The owner's proof is not.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": "rita@example.pt",
+                    "password": "S3cretPass!",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json["sent"] is True
+            assert mock_send.call_args[0][0].id == legacy.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_correct_password_neither_costs_nor_clears_an_attempt(self, mock_client_for):
+        """The brute-force cap must count wrong guesses and nothing else.
+
+        Charging a correct password would let the send path's own refusals
+        lock the owner out; but resetting the tally on a correct one is worse,
+        and was the first thing tried here: anyone holding a single legacy
+        account's password could launder four guesses per reset against any
+        other address, indefinitely. Nothing else bounds it -- this module
+        registers no Flask-Limiter rule, and the WAF collapses every visitor
+        onto one IP.
+        """
+        UserFactory(
+            email="owner@example.pt",
+            password="OwnerPass1!",
+            first_name="Vera",
+            last_name="Antunes",
+        )
+        UserFactory(
+            email="target@example.pt",
+            password="TargetPass1!",
+            first_name="Vera",
+            last_name="Antunes",
+        )
+
+        self._sso_with(mock_client_for, nic="61616161", first_name="Vera", last_name="Antunes")
+
+        # Four wrong guesses at somebody else's account.
+        for _ in range(4):
+            assert (
+                self.client.post(
+                    "/saml/migration/confirm",
+                    json={"method": "password", "email": "target@example.pt", "password": "no"},
+                ).status_code
+                == 400
+            )
+
+        # A correct password of an account the caller does own: it goes
+        # through, and it does NOT hand back the four spent guesses.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail"):
+            assert (
+                self.client.post(
                     "/saml/migration/confirm",
                     json={
                         "method": "password",
-                        "email": "rita@example.pt",
-                        "password": "S3cretPass!",
+                        "email": "owner@example.pt",
+                        "password": "OwnerPass1!",
                     },
-                )
-            assert response.status_code == 429
-            assert response.json["error"] == "Maximum confirmation sends exceeded"
-            mock_send.assert_not_called()
-
+                ).status_code
+                == 200
+            )
         with self.client.session_transaction() as sess:
-            assert sess.get("migration_password_attempts") == 0
+            assert sess.get("migration_password_attempts") == 4
+
+        # The fifth wrong guess exhausts the cap and the sixth is refused,
+        # whatever it carries.
+        assert (
+            self.client.post(
+                "/saml/migration/confirm",
+                json={"method": "password", "email": "target@example.pt", "password": "no"},
+            ).status_code
+            == 400
+        )
+        assert (
+            self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": "owner@example.pt",
+                    "password": "OwnerPass1!",
+                },
+            ).status_code
+            == 429
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_assertion_without_a_nic_says_so_instead_of_blaming_the_session(
+        self, mock_client_for
+    ):
+        """An email match needs no NIC to reach the wizard, and the eIDAS ACS
+        tolerates a missing identifier, so a pending session can carry a
+        candidate and no NIC. There is nothing to bind, and the password branch
+        used to link such a session with nic_hash=None. Refusing it is right;
+        refusing it as "no pending migration" is not -- the frontend reads that
+        as an expired session and sends the user to authenticate again, into an
+        identical dead end."""
+        UserFactory(
+            email="sem.nic@example.pt",
+            password="S3cretPass!",
+            first_name="Paulo",
+            last_name="Aires",
+        )
+
+        self._sso_with(
+            mock_client_for, email="sem.nic@example.pt", first_name="Paulo", last_name="Aires"
+        )
+        with self.client.session_transaction() as sess:
+            assert sess["saml_migration_pending"]["saml_nic"] is None
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": "sem.nic@example.pt",
+                    "password": "S3cretPass!",
+                },
+            )
+            mock_send.assert_not_called()
+        assert response.status_code == 400
+        assert response.json["error"] == "nic_required"
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_confirm_with_wrong_password_blocks_linking(self, mock_client_for):
