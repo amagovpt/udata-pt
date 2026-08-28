@@ -2774,26 +2774,24 @@ def migration_skip():
 
     if existing and (not linked or existing.id != linked.id):
         # The address is taken — but by whom? If it is a legacy account this
-        # identity could legitimately claim, refusing is the wrong answer:
-        # linking it is exactly what the wizard exists for, and the machinery
-        # is one step away. Point the candidate and say so, instead of
-        # sending the user back to retype an address the server has already
-        # resolved. Nothing is linked here: ownership still has to be proven
-        # at migration_confirm, by password or by a code mailed to that same
-        # account. Guarded on `not linked` to keep the replay hardening below
-        # intact — note this only narrows the skip: migration_search already
-        # points an arbitrary candidate with no such guard, so the guard is
-        # local prudence, not a boundary the flow enforces.
+        # identity could legitimately claim, refusing outright is the wrong
+        # answer: linking it is exactly what the wizard exists for. So this
+        # branch says where to go next, and stops there.
+        #
+        # It deliberately does NOT point the candidate any more. The address
+        # arrives in the request body and nothing about it has been proved,
+        # while pointing destroys the validation link outstanding for the
+        # previous candidate — which made this branch a destructor for any
+        # account, drivable from any session. Nothing is lost by signposting
+        # alone: the credentials screen never needed a candidate, because
+        # migration_confirm resolves the account from the password it proves
+        # and re-points from there. The masked address goes for the same
+        # reason — it described an account this session has proved nothing
+        # about. Guarded on `not linked` to keep the replay hardening below
+        # intact.
         candidate = _find_legacy_user(email=email) if not linked else None
         if candidate:
-            _point_migration_candidate(pending, candidate)
-            return jsonify(
-                {
-                    "error": "email_taken",
-                    "candidate_found": True,
-                    "email": _mask_email(candidate.email),
-                }
-            ), 409
+            return jsonify({"error": "email_taken", "candidate_found": True}), 409
         return jsonify({"error": "email_taken"}), 409
 
     if linked:

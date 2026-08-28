@@ -2970,12 +2970,17 @@ class SAMLMigrationWizardTest(APITestCase):
         assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_skip_with_own_legacy_email_points_the_candidate(self, mock_client_for):
-        """The dead end this ticket exists for. A CMD whose email and name both
-        miss lands on the account-creation step; the address the person then
-        types is their own portal account. Refusing it sends them back to retype
-        an address the server has already resolved. Point the candidate instead
-        — still linking nothing, still 409, ownership still unproven."""
+    def test_skip_with_own_legacy_email_signposts_without_pointing(self, mock_client_for):
+        """The dead end LEDG-2351 exists for, answered without a side effect. A
+        CMD whose email and name both miss lands on the account-creation step;
+        the address the person then types is their own portal account. Refusing
+        it outright sends them back to retype an address the server has already
+        resolved, so the answer still says "go to the credentials screen".
+
+        What it must NOT do is point the candidate. The address came from the
+        request body and nothing about it is proved, and pointing destroys the
+        validation link outstanding for the previous candidate. Signposting is
+        enough: migration_confirm resolves the account from the password."""
         from udata.core.user.models import User
 
         existing = UserFactory(
@@ -2997,40 +3002,44 @@ class SAMLMigrationWizardTest(APITestCase):
             assert sess["saml_migration_pending"]["legacy_user_id"] is None
         users_before = User.objects.count()
 
-        # Typed in a different casing, which only resolves because the search
-        # lookup is case-insensitive.
+        # Typed in a different casing, which only resolves because the lookup
+        # is case-insensitive.
         response = self.client.post("/saml/migration/skip", json={"email": "Teresa@Example.pt"})
         assert response.status_code == 409
         assert response.json["error"] == "email_taken"
         assert response.json["candidate_found"] is True
-        assert response.json["email"] == "t***@example.pt"
+        # The masked address described an account this session has proved
+        # nothing about, so it does not come back at all.
+        assert "email" not in response.json
 
-        # Nothing was created and nothing was linked: this only points.
+        # Nothing was created and nothing was linked.
         assert User.objects.count() == users_before
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
 
         with self.client.session_transaction() as sess:
             pending = sess.get("saml_migration_pending")
-            # The wizard did not end — it moved to the linking branch.
+            # The wizard did not end, and it did not move the candidate either.
             assert pending is not None
-            assert pending["legacy_user_id"] == str(existing.id)
+            assert pending["legacy_user_id"] is None
 
-        # And the linking branch now works from here.
-        assert self.client.get("/saml/migration/pending").json["candidate"] is True
+        # The credentials screen does not need a pointed candidate: the
+        # password branch resolves the account itself.
+        assert self.client.get("/saml/migration/pending").json["candidate"] is False
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_link_via_skip_divert_keeps_ownership_proof_and_next_login_is_direct(
         self, mock_client_for
     ):
         """The whole path the divert opens, end to end: no_match -> own address
-        on the creation step -> candidate pointed -> validation link mailed to
-        that same account -> clicked -> linked -> the next CMD login walks
-        straight in.
+        on the creation step -> credentials screen -> password proves which
+        account -> validation link mailed to that same account -> clicked ->
+        linked -> the next CMD login walks straight in.
 
         The negative assertion is the point of the test as much as the positive
-        one: between the divert and the confirm, nothing is linked. The divert
-        is a signpost, not a grant.
+        one: between the divert and the click, nothing is linked. The divert is
+        a signpost, not a grant — it does not even point the candidate, which
+        is why the password branch has to resolve the account on its own.
         """
         from udata.core.user.models import User
 
@@ -3063,10 +3072,19 @@ class SAMLMigrationWizardTest(APITestCase):
         assert not (existing.extras or {}).get("auth_nic")
         assert User.objects.count() == users_before
 
-        # 3. The link goes to the candidate account's own address — the one
-        #    thing that makes this a proof of ownership rather than a claim.
+        # 3. The signpost led to the credentials screen. The password says
+        #    which account to link, and the link then goes to that account's
+        #    own address — the one thing that makes this a proof of ownership
+        #    rather than a claim.
         with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
-            response = self.client.post("/saml/migration/send-link")
+            response = self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": "joana@example.pt",
+                    "password": "S3cretPass!",
+                },
+            )
             assert response.status_code == 200
         assert mock_send.call_args[0][0].id == existing.id
         assert mock_send.call_args[0][0].email == "joana@example.pt"
@@ -3263,55 +3281,84 @@ class SAMLMigrationWizardTest(APITestCase):
         assert not (legacy.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_skip_divert_invalidates_a_link_issued_for_the_previous_target(self, mock_client_for):
-        """The same target-confusion hole the search endpoint had, reached
-        through the skip instead. A validation link emailed for candidate A
-        must not still work once the divert has re-pointed the session at B."""
-        first = UserFactory(
+    def test_skip_cannot_invalidate_a_link_issued_for_another_account(self, mock_client_for):
+        """The heart of LEDG-2361, and the inverse of what this test asserted
+        before: a session that has proved nothing about an account must not be
+        able to destroy the validation link that account is holding.
+
+        The link record lives on the User document, not in the session, so it
+        outlives whoever issued it — which is exactly why a request that can
+        point the candidate at an arbitrary address can also kill it. The
+        divert used to be such a request.
+
+        Each probe runs in its OWN wizard session, deliberately: the skip is
+        about to start ending the session on every exit, so two probes sharing
+        one session would fail on "No pending migration" for a reason that has
+        nothing to do with what is being asserted here.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        victim = UserFactory(
             email="alice@example.pt",
             password="S3cretPass!",
             first_name="Alice",
             last_name="Ramos",
         )
-        second = UserFactory(
+        decoy = UserFactory(
             email="bianca@example.pt",
             password="S3cretPass!",
             first_name="Bianca",
             last_name="Sousa",
         )
 
+        # 1. The victim's own wizard run: their CMD carries their address, so
+        #    the SSO matches the account and the link is mailed to it.
         self._sso_with(
             mock_client_for,
-            email="carla.cmd@servico.gov.pt",
-            nic="58585858",
-            first_name="Carla Sofia",
-            last_name="Lopes Dias",
+            email="alice@example.pt",
+            nic="11223344",
+            first_name="Alice",
+            last_name="Ramos",
         )
-
-        # Point A and get a link issued for it.
-        response = self.client.post("/saml/migration/search", json={"email": first.email})
-        assert response.json["found"] is True
         with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
             assert self.client.post("/saml/migration/send-link").status_code == 200
         ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
         token = ctas[0].link.rsplit("/", 1)[1]
 
-        # Now the divert re-points at B.
-        response = self.client.post("/saml/migration/skip", json={"email": second.email})
-        assert response.status_code == 409
-        assert response.json["candidate_found"] is True
+        victim.reload()
+        issued = dict((victim.extras or {})[MIGRATION_LINK_PENDING])
 
-        # The record backing the old link is destroyed, not merely mismatched.
-        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+        # 2. Two probes from a stranger's identity, one wizard session each.
+        for probe in range(2):
+            with self.client.session_transaction() as sess:
+                sess.clear()
+            self._sso_with(
+                mock_client_for,
+                email="mallory.cmd@servico.gov.pt",
+                nic="99999999",
+                first_name="Mallory",
+                last_name="Nunes",
+            )
+            response = self.client.post("/saml/migration/skip", json={"email": "alice@example.pt"})
+            assert response.status_code == 409, f"probe {probe}"
+            assert response.json["error"] == "email_taken"
 
-        first.reload()
-        assert MIGRATION_LINK_PENDING not in (first.extras or {})
+            # Nothing about the victim moved: not the candidate this session
+            # points at, and above all not the record backing their link.
+            with self.client.session_transaction() as sess:
+                assert sess["saml_migration_pending"]["legacy_user_id"] is None
+            victim.reload()
+            assert (victim.extras or {})[MIGRATION_LINK_PENDING] == issued, f"probe {probe}"
 
+        # 3. The victim's link still works, and binds their own identity.
         response = self.client.get(f"/saml/migration/confirm-link/{token}")
-        assert "flash=migration_link_invalid" in response.headers["Location"]
-        for account in (first, second):
-            account.reload()
-            assert not (account.extras or {}).get("auth_nic")
+        assert response.status_code == 302
+        assert "flash=migration_link_invalid" not in response.headers["Location"]
+
+        victim.reload()
+        assert victim.extras.get("auth_nic") == _hash_nic("11223344")
+        decoy.reload()
+        assert not (decoy.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_skip_still_refuses_emails_of_non_candidate_accounts(self, mock_client_for):
