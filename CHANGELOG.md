@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **feat(saml)!: mail the validation link after the password proof instead of logging in**
+  - The password on `POST /saml/migration/confirm` said which legacy account to
+    link and then linked it, session and all. It does not prove that the
+    account's email is reachable, so it no longer completes anything: the route
+    re-points the candidate at the account whose password was proved, mails the
+    validation link to that account's own address, and leaves
+    `migration_confirm_link` as the single place that binds the identity and
+    starts a session. The response is `{"sent": true}`; the session stays
+    pending, because the resend and a second attempt both need it and the click
+    is what clears it.
+  - Re-pointing goes through `_point_migration_candidate`, the only mutator of
+    the candidate reference. That is what makes the resend endpoint — which
+    reads no body, on purpose — mail the proven account rather than the homonym
+    the assertion matched by name, and it destroys any link already issued for
+    the previous target. Where the proven account *is* the candidate, the fresh
+    nonce written over the same record is what stops the earlier token
+    validating: the invariant the emailed link arrived with holds, by a
+    different mechanism.
+  - A correct password resets the attempt tally. The tally is incremented before
+    the password is checked, so without the reset the send cap would spend
+    attempts that were all correct, until five of them locked the session out of
+    the only branch that can identify the account.
+  - The emit-store-tally-send block is shared with `migration_send_link` through
+    `_mail_validation_link`, which runs the NIC guard first: without a NIC the
+    token would be consumed with `nic_hash=None`, which is a link that starts a
+    session and binds no identity at all.
+- **feat(saml): report the identity provider that started the migration**
+  - The wizard names the provider on every screen it renders and had no way to
+    tell which one started the flow — the CMD and eIDAS ACS routes converge on
+    `_handle_migration_redirect` and the assertion attributes are
+    indistinguishable afterwards, so an eIDAS user read "Chave Móvel Digital" on
+    the screen asking for their credentials. The pending state now carries
+    `saml_provider` and `GET /saml/migration/pending` returns it, defaulting to
+    `cmd` for sessions opened before the field existed.
+  - **Deploy this before the matching frontend change**: the wizard depends on
+    both the `{"sent": true}` contract and this field.
+
 - **feat(saml)!: prove the legacy account by an emailed link instead of a 6-digit code**
   - Linking a legacy account to a CMD/eIDAS identity proved ownership with a
     code the user copied off their mail into the wizard. It is now a validation
