@@ -4214,6 +4214,163 @@ class SAMLMigrationLinkClickTest(APITestCase):
             assert not (account.extras or {}).get("auth_nic")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_resend_after_password_proof_mails_the_proven_account(self, mock_client_for):
+        """The resend endpoint reads no body, on purpose: the recipient is the
+        address on the pointed candidate. So after a password proof named a
+        DIFFERENT account than the assertion matched by name, the candidate
+        has to be the proven one — or "Enviar novo email" would keep mailing
+        the homonym, and the link that arrives would link the wrong account.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        homonym = UserFactory(
+            email="tiago.homonym@example.pt",
+            password="0therPass!",
+            first_name="Tiago",
+            last_name="Ferreira",
+        )
+        real = UserFactory(
+            email="tiago.real@example.pt",
+            password="S3cretPass!",
+            first_name="Tiago Andre",
+            last_name="Ferreira",
+        )
+
+        self._sso_with(mock_client_for, nic="83838383", first_name="Tiago", last_name="Ferreira")
+
+        # The assertion pointed the homonym; the password names the real one.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.client.post(
+                    "/saml/migration/confirm",
+                    json={
+                        "method": "password",
+                        "email": "tiago.real@example.pt",
+                        "password": "S3cretPass!",
+                    },
+                ).status_code
+                == 200
+            )
+            assert mock_send.call_args[0][0].id == real.id
+
+        # "Enviar novo email" follows the proof, not the assertion.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert self.client.post("/saml/migration/send-link").status_code == 200
+            assert mock_send.call_args[0][0].id == real.id
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        # Nothing was ever issued against the homonym.
+        homonym.reload()
+        assert MIGRATION_LINK_PENDING not in (homonym.extras or {})
+
+        with self.app.test_client() as fresh:
+            assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+        real.reload()
+        assert real.extras["auth_nic"] == _hash_nic("83838383")
+        homonym.reload()
+        assert not (homonym.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_wrong_password_keeps_the_pending_migration_alive(self, mock_client_for):
+        """A wrong password must cost the identity nothing: the user is one
+        typo away from the only screen that can identify their account, and
+        losing the assertion would send them back through Autenticacao.gov.
+        True today only because the refusal returns before any mutation --
+        nothing pinned it, and the branch around it just changed."""
+        legacy = UserFactory(
+            email="marta@example.pt",
+            password="S3cretPass!",
+            first_name="Marta",
+            last_name="Vieira",
+        )
+
+        self._sso_with(mock_client_for, nic="94949494", first_name="Marta", last_name="Vieira")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post(
+                "/saml/migration/confirm",
+                json={"method": "password", "email": "marta@example.pt", "password": "wrong"},
+            )
+            assert response.status_code == 400
+            mock_send.assert_not_called()
+
+        with self.client.session_transaction() as sess:
+            pending = sess.get("saml_migration_pending")
+            assert pending is not None
+            assert pending["saml_nic"] == "94949494"
+            assert pending["saml_first_name"] == "Marta"
+
+        # And the retry still works, from the same session.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": "marta@example.pt",
+                    "password": "S3cretPass!",
+                },
+            )
+            assert response.status_code == 200
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        assert self.client.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+        legacy.reload()
+        assert legacy.extras["auth_nic"] == _hash_nic("94949494")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_the_password_branch_works_the_same_from_eidas(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """test_the_same_flow_works_from_eidas covers the send-link route; the
+        password branch is the one this ticket rewrote and the one the main
+        path now goes through, so eIDAS parity has to be proved there too."""
+        person_id = "ES/PT/5566778899"
+        legacy = UserFactory(
+            email="alvaro.old@example.pt",
+            password="S3cretPass!",
+            first_name="Alvaro",
+            last_name="Neves",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            endpoint="/saml/eidas/sso",
+            person_identifier=person_id,
+            given_name="Alvaro",
+            family_name="Neves",
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            response = self.client.post(
+                "/saml/migration/confirm",
+                json={
+                    "method": "password",
+                    "email": "alvaro.old@example.pt",
+                    "password": "S3cretPass!",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json["sent"] is True
+            assert mock_send.call_args[0][0].id == legacy.id
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        legacy.reload()
+        assert not (legacy.extras or {}).get("auth_nic")
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == legacy.id
+
+        legacy.reload()
+        assert legacy.extras["auth_nic"] == _hash_nic(person_id)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_pending_reports_which_provider_started_the_migration(self, mock_client_for):
         """The wizard names the provider on every screen it renders, and it
         cannot infer which one started the flow: both ACS routes converge on
