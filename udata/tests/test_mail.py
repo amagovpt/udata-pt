@@ -6,7 +6,9 @@ from unittest.mock import patch
 import pytest
 from flask_babel import LazyString
 
-from udata.core.legal.mails import _content_deleted  # noqa: F401 - see docstring
+from udata.core.dataset.factories import DatasetFactory
+from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
+from udata.core.discussions.mails import new_discussion
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.site.mails import support_contact
 from udata.core.user.factories import UserFactory
@@ -256,6 +258,27 @@ class MailDispatchAuditLogTest(APITestCase):
         assert "result=error" in self.caplog.text
         assert "ConnectionRefusedError" in self.caplog.text
 
+    def test_the_emitted_line_carries_the_mails_own_kind(self):
+        """The end-to-end shape of the fix, as an operator reads it.
+
+        Everything else asserts `mail_kind` in isolation. This one sends a real
+        mail through `send_mail` and asserts the line that lands in the log,
+        which is what the ticket is about: before the fix this same mail logged
+        `kind="[%(site)s] %(topic)s — %(subject)s"`.
+        """
+        self._enable_sending()
+
+        with self.caplog.at_level(logging.INFO, logger=self.AUDIT_LOGGER):
+            with mail.record_messages() as outbox:
+                send_mail(
+                    "jane.doe@example.org",
+                    support_contact("question", "a@b.pt", "Ajuda", "corpo"),
+                )
+
+        assert len(outbox) == 1
+        assert 'mail_dispatch kind="support_contact"' in self.caplog.text
+        assert "%(" not in self.caplog.text
+
     def test_recipient_without_an_at_sign_still_yields_a_parseable_field(self):
         """A misconfigured MAIL_DEFAULT_RECEIVER must not break the shape.
 
@@ -378,12 +401,17 @@ class MailKindTest(APITestCase):
         assert mail_kind(named) == "support_contact"
 
     def test_user_input_stays_out_of_the_kind(self):
-        """The support form's subject is a free text field on a public page.
+        """User input interpolated into a subject must not reach the log line.
 
         `lazy_gettext(msgid, **kwargs)` keeps the interpolated values in
-        `_kwargs`, so the kind is the msgid and the submitted text never
-        reaches the log line. This asserts that boundary rather than trusting
-        it, because the whole quoting scheme depends on it.
+        `_kwargs`, so the kind is the msgid and the submitted text stays out
+        of it. This asserts that boundary rather than trusting it, because the
+        whole quoting scheme depends on it.
+
+        The message here is synthetic: the real support mail now carries
+        `kind="support_contact"` and never derives from its subject at all, so
+        it is doubly safe. This covers the derivation itself, for any mail that
+        interpolates user input and carries no explicit kind.
         """
         message = MailMessage(
             _(
@@ -492,11 +520,17 @@ class ScrubAddressesTest:
 class MailKindOfRealMailsTest(APITestCase):
     """The kind of the actual mails in the tree, not of synthetic messages.
 
-    Only the three builders that can be instantiated in a test are covered.
-    `legal.mails._content_deleted` needs an authenticated admin in context
-    (`current_user`), and the SAML `_send_migration_address_taken_notice` is
-    not a builder at all -- it composes the message inline and sends it. In
-    both, the change is a single literal keyword argument.
+    Covers the four builders whose subject is a template and that can be
+    called with no more than a factory. Not covered, and this is a choice
+    rather than a limitation: `legal.mails._content_deleted`, which is
+    exercised end to end by `test_legal_mails.py` through the delete API for
+    all seven deletable types, and the SAML notice, which is not a builder at
+    all — it composes the message inline and sends it.
+
+    Note this list is hand-maintained and therefore does not notice a *new*
+    mail with a templated subject. That is exactly how `new_discussion` was
+    missed on the first pass, with this file green. Whoever adds a mail whose
+    subject carries placeholders has to add it here too.
     """
 
     def _cases(self):
@@ -504,15 +538,36 @@ class MailKindOfRealMailsTest(APITestCase):
             ("support_contact", support_contact("question", "a@b.pt", "Ajuda", "corpo")),
             ("inactive_account_deleted", inactive_account_deleted()),
             ("inactive_user", inactive_user(UserFactory(email="jane@example.org"))),
+            (
+                "new_discussion",
+                # The builder reads discussion.discussion[0], so the factory
+                # needs a message: an empty discussion raises IndexError.
+                new_discussion(
+                    DiscussionFactory(
+                        subject=DatasetFactory(),
+                        discussion=[MessageDiscussionFactory()],
+                    )
+                ),
+            ),
         ]
 
     def test_each_mail_reports_its_own_name(self):
         for expected, message in self._cases():
-            assert mail_kind(message) == expected
+            with self.subTest(mail=expected):
+                assert mail_kind(message) == expected
 
-    def test_no_kind_leaks_an_unfilled_placeholder(self):
-        """Guards the regression generically, not just the known five."""
-        for _expected, message in self._cases():
-            kind = mail_kind(message)
-            assert "%(" not in kind, kind
-            assert "{" not in kind, kind
+    def test_no_kind_is_a_subject_template(self):
+        """Every one of these subjects is a template; none may reach the log.
+
+        Weaker than `test_each_mail_reports_its_own_name`, and deliberately
+        kept alongside it: this is the shape of the defect rather than the
+        expected value, so it still fails if someone renames a kind to
+        something derived from the subject. It says nothing about the
+        `.format()` variant, whose broken kind was a translated sentence with
+        no placeholder left in it — that one only the test above catches.
+        """
+        for expected, message in self._cases():
+            with self.subTest(mail=expected):
+                kind = mail_kind(message)
+                assert "%(" not in kind, kind
+                assert "{" not in kind, kind

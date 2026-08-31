@@ -66,10 +66,10 @@ def send_legal_notice_on_deletion(obj: DeletableObject, args: dict):
         recipients = _get_recipients_for_owned_object(obj)
 
     if recipients:
-        _content_deleted(obj.verbose_name).send(recipients)
+        _content_deleted(obj.verbose_name, type(obj).__name__.lower()).send(recipients)
 
 
-def _content_deleted(content_type_label: LazyString) -> MailMessage:
+def _content_deleted(content_type_label: LazyString, content_type: str) -> MailMessage:
     admin = current_user._get_current_object()
     terms_of_use_url = current_app.config.get("TERMS_OF_USE_URL")
     terms_of_use_deletion_article = current_app.config.get("TERMS_OF_USE_DELETION_ARTICLE")
@@ -123,10 +123,12 @@ def _content_deleted(content_type_label: LazyString) -> MailMessage:
     ]
 
     return MailMessage(
-        # One name for all content types this builder serves (dataset, reuse,
-        # dataservice): the type is a translated label, so carrying it into the
-        # kind would make the kind language-dependent. It stays in the body.
-        kind="content_deleted",
+        # This builder serves every DeletableObject — seven of them, from a
+        # dataset to a user account — so a single name would make "we deleted
+        # your dataset" and "we deleted your account" indistinguishable in the
+        # log, on a legal notice where what was deleted is the whole point. The
+        # class name is used rather than the label, which is translated.
+        kind=f"content_deleted:{content_type}",
         subject=_("Deletion of your %(content_type)s", content_type=content_type_label),
         paragraphs=paragraphs,
     )

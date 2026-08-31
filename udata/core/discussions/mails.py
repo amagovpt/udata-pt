@@ -5,6 +5,7 @@ from udata.mail import LabelledContent, MailCTA, MailMessage, ParagraphWithLinks
 
 def new_discussion(discussion: Discussion) -> MailMessage:
     return MailMessage(
+        kind="new_discussion",
         subject=_(
             "A new discussion has been opened on your %(type)s",
             type=discussion.subject.verbose_name,

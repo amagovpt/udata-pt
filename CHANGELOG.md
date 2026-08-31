@@ -10,11 +10,13 @@
     `.format()` resolves eagerly and left the kind as the *translated* sentence,
     so the same mail logged differently per language — the opposite of a stable
     identifier.
-  - A `MailMessage` can now carry an explicit `kind`, and the five mails with a
+  - A `MailMessage` can now carry an explicit `kind`, and the six mails with a
     templated subject use it, named after the function that builds them so a
-    grep of the log leads straight to the code. The field is optional and the
-    remaining mails are untouched: deriving from the msgid is already right for
-    them.
+    grep of the log leads straight to the code. The legal deletion notice also
+    carries the type it deleted, since one builder serves all seven deletable
+    kinds and "we deleted your dataset" must not read the same as "we deleted
+    your account". The field is optional and the remaining mails are untouched:
+    deriving from the msgid is already right for them.
 
 - **feat(mail): log every outgoing email — type, masked recipient, outcome — including the Flask-Security ones**
   - A real send used to leave no trace at all. The `log.debug` calls and the
