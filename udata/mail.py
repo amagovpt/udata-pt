@@ -1,5 +1,6 @@
 import copy
 import logging
+import re
 from dataclasses import dataclass
 from html import escape
 
@@ -9,12 +10,86 @@ from flask_babel import LazyString
 from flask_mail import Mail, Message
 
 from udata import i18n
+from udata.utils import mask_email
 
 log = logging.getLogger(__name__)
+
+# Dedicated audit logger: one line per mail dispatch attempt, so "did this
+# user ever get the mail?" can be answered from the backoffice log page
+# instead of guessed. It lives under `udata.*` on purpose — the records
+# propagate to the handlers of the `udata` logger (`app.logger`), whose
+# stderr uwsgi writes to the file that page reads. Its level is pinned in
+# `init_app` because `udata` is set to WARNING in production, which a child
+# with no level of its own would inherit, silently dropping every line.
+audit_logger = logging.getLogger("udata.mail.audit")
 
 mail = Mail()
 
 mail_sent = signal("mail-sent")
+
+# Matches the addresses SMTP errors quote back at us. Deliberately loose:
+# scrubbing a false positive costs nothing, missing a real address writes
+# personal data to disk.
+ADDRESS_RE = re.compile(r"[^\s<>,:\"'()\[\]]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
+
+
+def scrub_addresses(text: str) -> str:
+    """Replace every email address in ``text`` by its masked form.
+
+    SMTP failures name the address they refused: ``str(SMTPRecipientsRefused)``
+    is the ``{address: (code, response)}`` dict itself, and SMTPSenderRefused
+    carries the sender. Logging such a message verbatim would write the very
+    address the audit line takes care to mask, so the message is scrubbed
+    before it reaches the log. The domain survives, which is what makes the
+    line diagnostic: a whole domain refusing mail is a real signal.
+    """
+    return ADDRESS_RE.sub(lambda match: mask_email(match.group(0)), text)
+
+
+def mail_kind(message: "MailMessage") -> str:
+    """Return a stable identifier for the kind of mail being sent.
+
+    The subject is a translated LazyString, which makes a poor identifier:
+    the same mail would log differently per recipient language. The msgid
+    behind it is stable, and lazy_gettext keeps it in ``_args[0]``. Reading
+    that internal is the same coupling `ParagraphWithLinks.html` already has
+    on ``_kwargs``; when it does not hold — a subject built with ``.format()``
+    resolves the LazyString eagerly and hands back a plain str — the
+    translated subject is still a usable per-mail identifier.
+    """
+    subject = message.subject
+    try:
+        if isinstance(subject, LazyString) and subject._args:
+            return str(subject._args[0])
+        return str(subject)
+    except Exception:  # noqa: BLE001 - an audit line must never break a send
+        return "?"
+
+
+def log_mail_dispatch(kind: str, recipient: str, result: str, error: Exception | None = None):
+    """Emit one key=value audit line per mail dispatch attempt.
+
+    Mirrors the shape of the SAML audit line (`_audit_saml`): a single line
+    per terminal outcome, never raising — an audit failure must not turn a
+    working send into a 500. ``kind`` is quoted because msgids contain
+    spaces and interpolation placeholders, which would otherwise break the
+    key=value shape.
+    """
+    try:
+        masked = mask_email(recipient) if recipient else "-"
+        detail = "-"
+        if error is not None:
+            detail = f"{type(error).__name__}: {scrub_addresses(str(error))}"
+        line = f'mail_dispatch kind="{kind}" recipient={masked} result={result} error={detail}'
+        if result == "sent":
+            audit_logger.info(line)
+        else:
+            # exc_info stays off: this is a one-line audit record, and the
+            # traceback (which quotes the raw address) is still logged by the
+            # normal error handling downstream, where it already was.
+            audit_logger.error(line)
+    except Exception:  # noqa: BLE001 - see docstring
+        log.exception("Failed to emit mail dispatch audit line")
 
 
 @dataclass
@@ -101,6 +176,10 @@ class MailMessage:
 
 def init_app(app):
     mail.init_app(app)
+    # See `audit_logger`: without its own level it would inherit the WARNING
+    # that `init_logging` sets on the `udata` logger in production, and every
+    # successful-dispatch line would be dropped before reaching the log file.
+    audit_logger.setLevel(logging.INFO)
 
 
 def send_mail(
@@ -131,8 +210,19 @@ def send_mail(
             )
 
         if send_mail:
-            with mail.connect() as conn:
-                conn.send(msg)
+            kind = mail_kind(message)
+            try:
+                with mail.connect() as conn:
+                    conn.send(msg)
+            except Exception as e:
+                # Restores the guard #2840 added upstream and a later refactor
+                # dropped: a failed send used to leave no trace at all. The
+                # exception is re-raised so callers keep the behaviour they
+                # have today — the point is the audit trail, not swallowing
+                # failures, which would make a failed send look successful.
+                log_mail_dispatch(kind, to, "error", error=e)
+                raise
+            log_mail_dispatch(kind, to, "sent")
         else:
             log.debug(f"Sending mail {message.subject} to {to}")
             log.debug(msg.body)
