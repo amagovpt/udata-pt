@@ -80,14 +80,21 @@ def scrub_addresses(text: str) -> str:
 def mail_kind(message: "MailMessage") -> str:
     """Return a stable identifier for the kind of mail being sent.
 
-    The subject is a translated LazyString, which makes a poor identifier:
-    the same mail would log differently per recipient language. The msgid
-    behind it is stable, and lazy_gettext keeps it in ``_args[0]``. Reading
-    that internal is the same coupling `ParagraphWithLinks.html` already has
-    on ``_kwargs``; when it does not hold — a subject built with ``.format()``
-    resolves the LazyString eagerly and hands back a plain str — the
-    translated subject is still a usable per-mail identifier.
+    An explicit ``kind`` on the message wins, and is how the mails whose
+    subject is a template say what they are: deriving from the subject gives
+    them the msgid with its placeholders unfilled — `[%(site)s] %(topic)s —
+    %(subject)s` tells a reader nothing — and, when the subject was built with
+    ``.format()``, gives a *translated* string, which is not stable at all.
+
+    Otherwise the msgid is used, which is the right identifier for the
+    subjects that are plain sentences: the translated subject would log
+    differently per recipient language, and lazy_gettext keeps the msgid in
+    ``_args[0]``. Reading that internal is the same coupling
+    `ParagraphWithLinks.html` already has on ``_kwargs``.
     """
+    if message.kind:
+        return message.kind
+
     subject = message.subject
     try:
         if isinstance(subject, LazyString) and subject._args:
@@ -190,6 +197,11 @@ class ParagraphWithLinks:
 class MailMessage:
     subject: LazyString
     paragraphs: list[LazyString | MailCTA | ParagraphWithLinks | LabelledContent | None]
+    # Short, stable name for the dispatch audit line, for the mails whose
+    # subject makes a poor label. Optional: derived from the subject's msgid
+    # when left unset, which is fine for the subjects that are plain
+    # sentences. Last, because the two fields above have no default.
+    kind: str | None = None
 
     def __post_init__(self):
         self.paragraphs = [p for p in self.paragraphs if p is not None]

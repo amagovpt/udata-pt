@@ -334,20 +334,45 @@ class MailKindTest(APITestCase):
     def test_eagerly_formatted_subject_falls_back_to_the_resolved_string(self):
         # `_("...").format(...)` resolves the LazyString through its
         # __getattr__ and hands back a plain str, so there is no msgid left to
-        # read. udata/core/user/mails.py builds one subject this way, and its
-        # kind is therefore the *translated* subject — asserted here without
-        # pinning a locale, since the resolved string is whatever the active
-        # language produces.
+        # read and the kind becomes the *translated* sentence — not stable
+        # across languages. The mails in the tree that build a subject this way
+        # now carry an explicit `kind` for that reason (see MailKindOfRealMails
+        # below); this covers what still happens to any subject that does not.
         subject = _("Inactivity of your {site} account").format(site="x")
         message = MailMessage(subject, paragraphs=[])
 
         assert not isinstance(subject, LazyString)
         # The interesting property is that the msgid is *gone* — the kind is
         # the interpolated, translated sentence, not the template.
-        assert not isinstance(subject, LazyString)
         assert mail_kind(message) != "Inactivity of your {site} account"
         assert "{site}" not in mail_kind(message)
         assert mail_kind(message).endswith(" account") or "x" in mail_kind(message)
+
+    def test_explicit_kind_wins_over_the_subject(self):
+        message = MailMessage(_("New membership request"), paragraphs=[], kind="membership_request")
+
+        assert mail_kind(message) == "membership_request"
+
+    def test_without_an_explicit_kind_the_msgid_is_still_used(self):
+        message = MailMessage(_("New membership request"), paragraphs=[])
+
+        assert message.kind is None
+        assert mail_kind(message) == "New membership request"
+
+    def test_an_explicit_kind_beats_a_templated_subject(self):
+        """The whole point of the field: the msgid here is unreadable."""
+        templated = MailMessage(
+            _("[%(site)s] %(topic)s — %(subject)s", site="s", topic="t", subject="u"),
+            paragraphs=[],
+        )
+        named = MailMessage(
+            _("[%(site)s] %(topic)s — %(subject)s", site="s", topic="t", subject="u"),
+            paragraphs=[],
+            kind="support_contact",
+        )
+
+        assert "%(" in mail_kind(templated)
+        assert mail_kind(named) == "support_contact"
 
     def test_user_input_stays_out_of_the_kind(self):
         """The support form's subject is a free text field on a public page.
