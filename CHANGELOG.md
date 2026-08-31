@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- **feat(mail): log every outgoing email — type, masked recipient, outcome — including the Flask-Security ones**
+  - A real send used to leave no trace at all. The `log.debug` calls and the
+    `mail_sent` signal in `send_mail` sit in the `else` branch, so they only
+    fire when `SEND_MAIL` is off; in every deployed environment a successful
+    send and a failed one were equally silent. "Did this user ever get the
+    confirmation mail?" was therefore unanswerable from the backoffice log
+    page, which is one of the most recurring operational questions.
+  - Each attempt now emits a single `key=value` audit line — kind, masked
+    recipient, outcome, and on failure the error class with a scrubbed message
+    — shaped after the SAML audit line. `conn.send` is wrapped again, restoring
+    a guard that came in upstream and a later refactor dropped; the exception
+    is still re-raised, so callers keep the behaviour they have and a failed
+    send never looks successful.
+  - The logger is `udata.mail.audit`, deliberately inside the `udata` tree so
+    its records reach the handlers of `app.logger`, whose stderr is written to
+    the file that page reads. Its level is pinned in `init_app`: `init_logging`
+    puts the `udata` logger at WARNING outside debug, and a child with no level
+    of its own inherits it, which would have dropped every line before it
+    reached a handler — the whole feature a silent no-op. A test guards that
+    specific failure.
+  - The error text is scrubbed rather than logged verbatim, because
+    `str(SMTPRecipientsRefused)` *is* the `{address: (code, response)}` dict:
+    writing it out would leak the very address the line takes care to mask, in
+    exactly the case that matters (a refused recipient). The domain survives —
+    a whole domain refusing mail is a real signal.
+  - Flask-Security dispatches confirmation, welcome and password-reset mails
+    itself, bypassing `send_mail` entirely, so `AuditMailUtil` now takes the
+    place of the bare `MailUtil` and emits the same line for them. Its `kind`
+    is the template name Flask-Security passes, which arrives bare
+    (`reset_instructions`, `welcome`) — the `security/email/` prefix exists
+    only while the template file is resolved.
+  - Address masking moved out of the SAML plugin into `udata.utils`, where the
+    mail code can reach it, instead of adding a third divergent copy.
+
 - **fix(saml)!: no unproven session may destroy a validation link, and the skip stops saying whether an address is taken**
   - The `migration_link_pending` record lives on the User document, so it is
     global to the account and outlives the session that asked for it. Two
