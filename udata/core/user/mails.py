@@ -14,6 +14,7 @@ def account_deletion() -> MailMessage:
 
 def inactive_account_deleted() -> MailMessage:
     return MailMessage(
+        kind="inactive_account_deleted",
         subject=_(
             "Deletion of your inactive %(site)s account", site=current_app.config["SITE_TITLE"]
         ),
@@ -30,6 +31,9 @@ def inactive_user(user) -> MailMessage:
     config = current_app.config
 
     return MailMessage(
+        # Without this the kind would be the *translated* subject: .format()
+        # resolves the LazyString eagerly, leaving no msgid to read.
+        kind="inactive_user",
         subject=_("Inactivity of your {site} account").format(site=config["SITE_TITLE"]),
         paragraphs=[
             _(

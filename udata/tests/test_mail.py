@@ -6,8 +6,11 @@ from unittest.mock import patch
 import pytest
 from flask_babel import LazyString
 
+from udata.core.legal.mails import _content_deleted  # noqa: F401 - see docstring
 from udata.core.organization.factories import OrganizationFactory
+from udata.core.site.mails import support_contact
 from udata.core.user.factories import UserFactory
+from udata.core.user.mails import inactive_account_deleted, inactive_user
 from udata.i18n import lazy_gettext as _
 from udata.mail import (
     LabelledContent,
@@ -484,3 +487,32 @@ class ScrubAddressesTest:
         long_text = "x" * 200_000
 
         assert len(scrub_addresses(long_text)) == 500
+
+
+class MailKindOfRealMailsTest(APITestCase):
+    """The kind of the actual mails in the tree, not of synthetic messages.
+
+    Only the three builders that can be instantiated in a test are covered.
+    `legal.mails._content_deleted` needs an authenticated admin in context
+    (`current_user`), and the SAML `_send_migration_address_taken_notice` is
+    not a builder at all -- it composes the message inline and sends it. In
+    both, the change is a single literal keyword argument.
+    """
+
+    def _cases(self):
+        return [
+            ("support_contact", support_contact("question", "a@b.pt", "Ajuda", "corpo")),
+            ("inactive_account_deleted", inactive_account_deleted()),
+            ("inactive_user", inactive_user(UserFactory(email="jane@example.org"))),
+        ]
+
+    def test_each_mail_reports_its_own_name(self):
+        for expected, message in self._cases():
+            assert mail_kind(message) == expected
+
+    def test_no_kind_leaks_an_unfilled_placeholder(self):
+        """Guards the regression generically, not just the known five."""
+        for _expected, message in self._cases():
+            kind = mail_kind(message)
+            assert "%(" not in kind, kind
+            assert "{" not in kind, kind

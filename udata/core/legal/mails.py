@@ -123,6 +123,10 @@ def _content_deleted(content_type_label: LazyString) -> MailMessage:
     ]
 
     return MailMessage(
+        # One name for all content types this builder serves (dataset, reuse,
+        # dataservice): the type is a translated label, so carrying it into the
+        # kind would make the kind language-dependent. It stays in the body.
+        kind="content_deleted",
         subject=_("Deletion of your %(content_type)s", content_type=content_type_label),
         paragraphs=paragraphs,
     )
