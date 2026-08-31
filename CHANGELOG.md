@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **feat(mail): log every outgoing email — type, masked recipient, outcome — including the Flask-Security ones**
+  - A real send used to leave no trace at all. The `log.debug` calls and the
+    `mail_sent` signal in `send_mail` sit in the `else` branch, so they only
+    fire when `SEND_MAIL` is off; in every deployed environment a successful
+    send and a failed one were equally silent. "Did this user ever get the
+    confirmation mail?" was therefore unanswerable from the backoffice log
+    page, which is one of the most recurring operational questions.
+  - Each attempt now emits a single `key=value` audit line — kind, masked
+    recipient, outcome, and on failure the error class with a scrubbed message
+    — shaped after the SAML audit line. `conn.send` is wrapped so a failure is
+    recorded instead of passing without a trace, and the exception is still
+    re-raised: a failed send must not look successful, and the multi-recipient
+    semantics (the loop stops) are left exactly as they were, since changing
+    who still receives a mail is a delivery decision rather than an audit one.
+    A test pins that behaviour so a future change to it is deliberate.
+  - The logger is `udata.mail.audit`, deliberately inside the `udata` tree so
+    its records reach the handlers of `app.logger`, whose stderr is written to
+    the file that page reads. Its level is pinned in `init_app`: `init_logging`
+    puts the `udata` logger at WARNING outside debug, and a child with no level
+    of its own inherits it, which would have dropped every line before it
+    reached a handler — the whole feature a silent no-op. A test guards that
+    specific failure.
+  - The error text is scrubbed rather than logged verbatim, because
+    `str(SMTPRecipientsRefused)` *is* the `{address: (code, response)}` dict:
+    writing it out would leak the very address the line takes care to mask, in
+    exactly the case that matters (a refused recipient). Only the local part is
+    masked, so the domain survives — a whole domain refusing mail is a real
+    signal. Matching the domain too, the obvious way to write that pattern,
+    failed open on every domain not starting with an ASCII alphanumeric (an
+    address literal, an IDN, a leading underscore), letting the whole address
+    through untouched. The scrubbed text is also capped: it comes from the
+    remote server, `smtplib` puts no ceiling on an accumulated multi-line
+    response, and the substitution is quadratic.
+  - The audit logger is excluded from Sentry. Its ERROR line accompanies an
+    exception that already reaches Sentry through the Flask and Celery
+    integrations, so the logging integration's defaults would have raised a
+    second issue for every refused recipient and made a breadcrumb of every
+    successful send.
+  - Flask-Security dispatches confirmation, welcome and password-reset mails
+    itself, bypassing `send_mail` entirely, so `AuditMailUtil` now takes the
+    place of the bare `MailUtil` and emits the same line for them. Its `kind`
+    is the template name Flask-Security passes, which arrives bare
+    (`reset_instructions`, `welcome`) — the `security/email/` prefix exists
+    only while the template file is resolved.
+  - Address masking moved out of the SAML plugin into `udata.utils`, where the
+    mail code can reach it, instead of adding a third divergent copy.
+
 - **fix(saml)!: no unproven session may destroy a validation link, and the skip stops saying whether an address is taken**
   - The `migration_link_pending` record lives on the User document, so it is
     global to the account and outlives the session that asked for it. Two

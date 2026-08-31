@@ -13,6 +13,8 @@ from flask_security import login_required as login_required
 from flask_security import login_user as login_user
 from flask_security import mail_util
 
+from udata.mail import log_mail_dispatch
+
 from . import mails
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,38 @@ class NoopMailUtil(mail_util.MailUtil):
         return None
 
 
+class AuditMailUtil(mail_util.MailUtil):
+    """Emit the mail dispatch audit line for Flask-Security's own mails.
+
+    Confirmation, password reset and welcome mails never pass through
+    `udata.mail.send_mail` — Flask-Security dispatches them itself — so the
+    audit line added there does not cover them, which is precisely the class
+    of mail operations gets asked about most. ``template`` is the stable,
+    untranslated identifier here: Flask-Security hands it over bare
+    (``reset_instructions``, ``welcome``, …), adding the ``security/email/``
+    prefix only when resolving the template file.
+    """
+
+    def send_mail(
+        self,
+        template: str,
+        subject: str,
+        recipient: str,
+        sender: t.Union[str, tuple],
+        body: str,
+        html: t.Optional[str],
+        **kwargs: t.Any,
+    ) -> None:
+        try:
+            super().send_mail(template, subject, recipient, sender, body, html, **kwargs)
+        except Exception as e:
+            log_mail_dispatch(template, recipient, "error", error=e)
+            raise
+        log_mail_dispatch(template, recipient, "sent")
+
+        return None
+
+
 def init_app(app):
     from udata.errors import ConfigError
     from udata.models import datastore
@@ -86,7 +120,7 @@ def init_app(app):
     # Same logic as in our own mail system :DisableMail
     debug = app.config.get("DEBUG", False)
     send_mail = app.config.get("SEND_MAIL", not debug)
-    mail_util_cls = mail_util.MailUtil if send_mail else NoopMailUtil
+    mail_util_cls = AuditMailUtil if send_mail else NoopMailUtil
 
     security = Security(
         datastore,

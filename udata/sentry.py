@@ -47,6 +47,7 @@ def init_app(app: UDataApp):
             import sentry_sdk
             from sentry_sdk.integrations.celery import CeleryIntegration
             from sentry_sdk.integrations.flask import FlaskIntegration
+            from sentry_sdk.integrations.logging import ignore_logger
         except ImportError:
             log.error("sentry-sdk is required to use Sentry")
             return
@@ -70,6 +71,14 @@ def init_app(app: UDataApp):
             traces_sample_rate=app.config.get("SENTRY_SAMPLE_RATE", None),
             profiles_sample_rate=app.config.get("SENTRY_SAMPLE_RATE", None),
         )
+
+        # The mail dispatch audit logger is a record of what happened, not an
+        # alerting channel. Its ERROR line accompanies an exception that is
+        # re-raised and reaches Sentry through the Flask/Celery integrations
+        # anyway, so leaving LoggingIntegration's defaults in place (event_level
+        # ERROR) would raise a second issue for every refused recipient, and
+        # turn every successful send into an INFO breadcrumb.
+        ignore_logger("udata.mail.audit")
 
         # Set log level
         log_level_name = app.config["SENTRY_LOGGING"]

@@ -1,5 +1,6 @@
 import copy
 import logging
+import re
 from dataclasses import dataclass
 from html import escape
 
@@ -9,12 +10,124 @@ from flask_babel import LazyString
 from flask_mail import Mail, Message
 
 from udata import i18n
+from udata.utils import mask_email
 
 log = logging.getLogger(__name__)
+
+# Dedicated audit logger: one line per mail dispatch attempt, so "did this
+# user ever get the mail?" can be answered from the backoffice log page
+# instead of guessed. It lives under `udata.*` on purpose — the records
+# propagate to the handlers of the `udata` logger (`app.logger`), whose
+# stderr uwsgi writes to the file that page reads. Its level is pinned in
+# `init_app` because `udata` is set to WARNING in production, which a child
+# with no level of its own would inherit, silently dropping every line.
+audit_logger = logging.getLogger("udata.mail.audit")
 
 mail = Mail()
 
 mail_sent = signal("mail-sent")
+
+# Matches the local part of anything shaped like an address, by looking ahead
+# for the `@` without consuming the domain. Matching the domain too — the
+# obvious way to write this — fails open on every domain whose first character
+# is not ASCII alphanumeric: an address literal (`jane@[192.168.1.10]`, which
+# MTAs do quote in bounces), an IDN (`jane@exemplo.pt` is fine, `jane@例え.jp`
+# is not) or a leading underscore would then match nothing at all and the
+# whole address, local part included, would reach the log in the clear.
+# Leaving the domain out also stops the match from eating the text around it:
+# consuming greedily across a separator turned `a@x.pt;b@y.pt` into a single
+# match, dropping the first address and the fact that two recipients failed.
+ADDRESS_LOCAL_RE = re.compile(r"[^\s<>,:;=\"'()\[\]]+(?=@)")
+
+# The error text comes from the remote SMTP server, and smtplib accumulates
+# multi-line responses with no overall ceiling. The substitution below is
+# quadratic in the length of the text, so an unbounded input is a way to burn
+# the worker's whole harakiri budget on a regex. No diagnostic survives past a
+# few hundred characters anyway.
+MAX_ERROR_CHARS = 500
+
+# Ceiling for the quoted `kind` field, which is a subject msgid.
+MAX_KIND_CHARS = 120
+
+
+def sanitize_field(value: str) -> str:
+    """Make ``value`` safe to sit inside a quoted key=value field.
+
+    Today every subject is `lazy_gettext(msgid, **kwargs)`, so `mail_kind`
+    returns a msgid and user input stays in the LazyString's `_kwargs`,
+    out of reach. That is an unwritten invariant, not a guarantee: one
+    subject in the tree is already built with `.format()`, and a future
+    subject interpolating user input the same way would carry newlines and
+    quotes straight into the line — enough to forge a second audit record.
+    Cheap to close here rather than to rely on nobody doing it.
+    """
+    return str(value).replace("\r", " ").replace("\n", " ").replace('"', "'")[:MAX_KIND_CHARS]
+
+
+def scrub_addresses(text: str) -> str:
+    """Mask the local part of every address in ``text``.
+
+    SMTP failures name the address they refused: ``str(SMTPRecipientsRefused)``
+    is the ``{address: (code, response)}`` dict itself, and SMTPSenderRefused
+    carries the sender. Logging such a message verbatim would write the very
+    address the audit line takes care to mask, so the message is scrubbed
+    before it reaches the log. The domain survives, which is what makes the
+    line diagnostic: a whole domain refusing mail is a real signal.
+    """
+    return ADDRESS_LOCAL_RE.sub(lambda match: f"{match.group(0)[0]}***", text[:MAX_ERROR_CHARS])
+
+
+def mail_kind(message: "MailMessage") -> str:
+    """Return a stable identifier for the kind of mail being sent.
+
+    The subject is a translated LazyString, which makes a poor identifier:
+    the same mail would log differently per recipient language. The msgid
+    behind it is stable, and lazy_gettext keeps it in ``_args[0]``. Reading
+    that internal is the same coupling `ParagraphWithLinks.html` already has
+    on ``_kwargs``; when it does not hold — a subject built with ``.format()``
+    resolves the LazyString eagerly and hands back a plain str — the
+    translated subject is still a usable per-mail identifier.
+    """
+    subject = message.subject
+    try:
+        if isinstance(subject, LazyString) and subject._args:
+            return str(subject._args[0])
+        return str(subject)
+    except Exception:  # noqa: BLE001 - an audit line must never break a send
+        return "?"
+
+
+def log_mail_dispatch(kind: str, recipient: str, result: str, error: Exception | None = None):
+    """Emit one key=value audit line per mail dispatch attempt.
+
+    Mirrors the shape of the SAML audit line (`_audit_saml`): a single line
+    per terminal outcome, never raising — an audit failure must not turn a
+    working send into a 500. ``kind`` is quoted because msgids contain
+    spaces and interpolation placeholders, which would otherwise break the
+    key=value shape.
+    """
+    try:
+        # `or "-"`, not `if recipient`: mask_email returns "" for anything
+        # without an `@`, and a misconfigured MAIL_DEFAULT_RECEIVER would
+        # then emit `recipient=` — breaking the key=value shape and losing
+        # the field silently rather than visibly.
+        masked = mask_email(recipient) or "-"
+        detail = "-"
+        if error is not None:
+            detail = f"{type(error).__name__}: {scrub_addresses(str(error))}"
+        line = (
+            f'mail_dispatch kind="{sanitize_field(kind)}" recipient={masked} '
+            f"result={result} error={detail}"
+        )
+        if result == "sent":
+            audit_logger.info(line)
+        else:
+            # exc_info stays off: this is a one-line audit record, and the
+            # traceback (which quotes the raw address) is still logged by the
+            # normal error handling downstream, where it already was.
+            audit_logger.error(line)
+    except Exception:  # noqa: BLE001 - see docstring
+        log.exception("Failed to emit mail dispatch audit line")
 
 
 @dataclass
@@ -101,6 +214,10 @@ class MailMessage:
 
 def init_app(app):
     mail.init_app(app)
+    # See `audit_logger`: without its own level it would inherit the WARNING
+    # that `init_logging` sets on the `udata` logger in production, and every
+    # successful-dispatch line would be dropped before reaching the log file.
+    audit_logger.setLevel(logging.INFO)
 
 
 def send_mail(
@@ -118,6 +235,9 @@ def send_mail(
     if not isinstance(recipients, list):
         recipients = [recipients]
 
+    # Derived once: the kind belongs to the message, not to the recipient.
+    kind = mail_kind(message)
+
     for recipient in recipients:
         lang = i18n._default_lang(recipient)
         to = recipient if isinstance(recipient, str) else recipient.email
@@ -131,8 +251,21 @@ def send_mail(
             )
 
         if send_mail:
-            with mail.connect() as conn:
-                conn.send(msg)
+            try:
+                with mail.connect() as conn:
+                    conn.send(msg)
+            except Exception as e:
+                # A failed send used to leave no trace at all. Upstream #2840
+                # once logged one here, but inside the loop and without
+                # re-raising, so a single refused recipient did not stop the
+                # rest; that guard is gone and this is NOT a restoration of it
+                # — the exception is re-raised, matching what this branch has
+                # done since. Swallowing it would make a failed send look
+                # successful, and changing the multi-recipient semantics is
+                # more than an audit trail should decide.
+                log_mail_dispatch(kind, to, "error", error=e)
+                raise
+            log_mail_dispatch(kind, to, "sent")
         else:
             log.debug(f"Sending mail {message.subject} to {to}")
             log.debug(msg.body)

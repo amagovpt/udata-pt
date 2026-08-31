@@ -100,6 +100,7 @@ from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
 from udata.mail import MailCTA, MailMessage, send_mail
 from udata.models import datastore
+from udata.utils import mask_email as _mask_email
 
 from .faa_level import FAAALevel, LogoutUrl
 from .requested_atributes import RequestedAttribute, RequestedAttributes
@@ -1062,18 +1063,6 @@ def _handle_migration_redirect(
     has_email = bool(user_email)
     no_email_param = "" if has_email else "?no_email=true"
     return redirect(f"{frontend_url}/migrate-account{no_email_param}")
-
-
-def _mask_email(email):
-    """Mask an email address for display (e.g. j***@example.com)."""
-    if not email or "@" not in email:
-        return ""
-    local, domain = email.rsplit("@", 1)
-    if len(local) <= 1:
-        masked = local + "***"
-    else:
-        masked = local[0] + "***"
-    return f"{masked}@{domain}"
 
 
 def _point_migration_candidate(pending, user):
