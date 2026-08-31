@@ -27,14 +27,45 @@ mail = Mail()
 
 mail_sent = signal("mail-sent")
 
-# Matches the addresses SMTP errors quote back at us. Deliberately loose:
-# scrubbing a false positive costs nothing, missing a real address writes
-# personal data to disk.
-ADDRESS_RE = re.compile(r"[^\s<>,:\"'()\[\]]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
+# Matches the local part of anything shaped like an address, by looking ahead
+# for the `@` without consuming the domain. Matching the domain too — the
+# obvious way to write this — fails open on every domain whose first character
+# is not ASCII alphanumeric: an address literal (`jane@[192.168.1.10]`, which
+# MTAs do quote in bounces), an IDN (`jane@exemplo.pt` is fine, `jane@例え.jp`
+# is not) or a leading underscore would then match nothing at all and the
+# whole address, local part included, would reach the log in the clear.
+# Leaving the domain out also stops the match from eating the text around it:
+# consuming greedily across a separator turned `a@x.pt;b@y.pt` into a single
+# match, dropping the first address and the fact that two recipients failed.
+ADDRESS_LOCAL_RE = re.compile(r"[^\s<>,:;=\"'()\[\]]+(?=@)")
+
+# The error text comes from the remote SMTP server, and smtplib accumulates
+# multi-line responses with no overall ceiling. The substitution below is
+# quadratic in the length of the text, so an unbounded input is a way to burn
+# the worker's whole harakiri budget on a regex. No diagnostic survives past a
+# few hundred characters anyway.
+MAX_ERROR_CHARS = 500
+
+# Ceiling for the quoted `kind` field, which is a subject msgid.
+MAX_KIND_CHARS = 120
+
+
+def sanitize_field(value: str) -> str:
+    """Make ``value`` safe to sit inside a quoted key=value field.
+
+    Today every subject is `lazy_gettext(msgid, **kwargs)`, so `mail_kind`
+    returns a msgid and user input stays in the LazyString's `_kwargs`,
+    out of reach. That is an unwritten invariant, not a guarantee: one
+    subject in the tree is already built with `.format()`, and a future
+    subject interpolating user input the same way would carry newlines and
+    quotes straight into the line — enough to forge a second audit record.
+    Cheap to close here rather than to rely on nobody doing it.
+    """
+    return str(value).replace("\r", " ").replace("\n", " ").replace('"', "'")[:MAX_KIND_CHARS]
 
 
 def scrub_addresses(text: str) -> str:
-    """Replace every email address in ``text`` by its masked form.
+    """Mask the local part of every address in ``text``.
 
     SMTP failures name the address they refused: ``str(SMTPRecipientsRefused)``
     is the ``{address: (code, response)}`` dict itself, and SMTPSenderRefused
@@ -43,7 +74,7 @@ def scrub_addresses(text: str) -> str:
     before it reaches the log. The domain survives, which is what makes the
     line diagnostic: a whole domain refusing mail is a real signal.
     """
-    return ADDRESS_RE.sub(lambda match: mask_email(match.group(0)), text)
+    return ADDRESS_LOCAL_RE.sub(lambda match: f"{match.group(0)[0]}***", text[:MAX_ERROR_CHARS])
 
 
 def mail_kind(message: "MailMessage") -> str:
@@ -76,11 +107,18 @@ def log_mail_dispatch(kind: str, recipient: str, result: str, error: Exception |
     key=value shape.
     """
     try:
-        masked = mask_email(recipient) if recipient else "-"
+        # `or "-"`, not `if recipient`: mask_email returns "" for anything
+        # without an `@`, and a misconfigured MAIL_DEFAULT_RECEIVER would
+        # then emit `recipient=` — breaking the key=value shape and losing
+        # the field silently rather than visibly.
+        masked = mask_email(recipient) or "-"
         detail = "-"
         if error is not None:
             detail = f"{type(error).__name__}: {scrub_addresses(str(error))}"
-        line = f'mail_dispatch kind="{kind}" recipient={masked} result={result} error={detail}'
+        line = (
+            f'mail_dispatch kind="{sanitize_field(kind)}" recipient={masked} '
+            f"result={result} error={detail}"
+        )
         if result == "sent":
             audit_logger.info(line)
         else:
@@ -197,6 +235,9 @@ def send_mail(
     if not isinstance(recipients, list):
         recipients = [recipients]
 
+    # Derived once: the kind belongs to the message, not to the recipient.
+    kind = mail_kind(message)
+
     for recipient in recipients:
         lang = i18n._default_lang(recipient)
         to = recipient if isinstance(recipient, str) else recipient.email
@@ -210,16 +251,18 @@ def send_mail(
             )
 
         if send_mail:
-            kind = mail_kind(message)
             try:
                 with mail.connect() as conn:
                     conn.send(msg)
             except Exception as e:
-                # Restores the guard #2840 added upstream and a later refactor
-                # dropped: a failed send used to leave no trace at all. The
-                # exception is re-raised so callers keep the behaviour they
-                # have today — the point is the audit trail, not swallowing
-                # failures, which would make a failed send look successful.
+                # A failed send used to leave no trace at all. Upstream #2840
+                # once logged one here, but inside the loop and without
+                # re-raising, so a single refused recipient did not stop the
+                # rest; that guard is gone and this is NOT a restoration of it
+                # — the exception is re-raised, matching what this branch has
+                # done since. Swallowing it would make a failed send look
+                # successful, and changing the multi-recipient semantics is
+                # more than an audit trail should decide.
                 log_mail_dispatch(kind, to, "error", error=e)
                 raise
             log_mail_dispatch(kind, to, "sent")

@@ -1,3 +1,4 @@
+import io
 import logging
 import smtplib
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from udata.mail import (
     ParagraphWithLinks,
     mail,
     mail_kind,
+    sanitize_field,
     scrub_addresses,
     send_mail,
 )
@@ -251,6 +253,46 @@ class MailDispatchAuditLogTest(APITestCase):
         assert "result=error" in self.caplog.text
         assert "ConnectionRefusedError" in self.caplog.text
 
+    def test_recipient_without_an_at_sign_still_yields_a_parseable_field(self):
+        """A misconfigured MAIL_DEFAULT_RECEIVER must not break the shape.
+
+        mask_email returns "" for anything without an `@`, which would emit
+        `recipient=` and lose the field silently instead of visibly.
+        """
+        self._enable_sending()
+
+        with self.caplog.at_level(logging.INFO, logger=self.AUDIT_LOGGER):
+            with mail.record_messages():
+                send_mail("not-an-address", self._message())
+
+        assert "recipient=-" in self.caplog.text
+        assert "recipient= " not in self.caplog.text
+
+    def test_a_failure_stops_the_remaining_recipients(self):
+        """Documents the multi-recipient semantics rather than changing them.
+
+        The exception propagates out of the loop, so recipients after the
+        failing one get neither a mail nor an audit line. Upstream #2840 chose
+        the opposite (log and carry on), and several callers here do send to a
+        list — every admin of an organisation. Changing that is a delivery
+        decision, not an audit one, so it is left as is and pinned by this
+        test so a future change is deliberate.
+        """
+        self._enable_sending()
+        first = UserFactory(email="first@example.org")
+        second = UserFactory(email="second@example.org")
+
+        with self.caplog.at_level(logging.INFO, logger=self.AUDIT_LOGGER):
+            with patch(
+                "flask_mail.Connection.send",
+                side_effect=smtplib.SMTPRecipientsRefused({"first@example.org": (550, b"no")}),
+            ):
+                with pytest.raises(smtplib.SMTPRecipientsRefused):
+                    send_mail([first, second], self._message())
+
+        assert "recipient=f***@example.org result=error" in self.caplog.text
+        assert "s***@example.org" not in self.caplog.text
+
     def test_audit_logger_level_survives_a_production_like_parent(self):
         """Regression guard for the whole feature being a silent no-op.
 
@@ -259,9 +301,28 @@ class MailDispatchAuditLogTest(APITestCase):
         every INFO line before it reaches a handler. ``mail.init_app`` pins
         the child's level precisely to stop that.
         """
-        logging.getLogger("udata").setLevel(logging.WARNING)
+        parent = logging.getLogger("udata")
+        original = parent.level
+        try:
+            parent.setLevel(logging.WARNING)
 
-        assert logging.getLogger(self.AUDIT_LOGGER).getEffectiveLevel() == logging.INFO
+            assert logging.getLogger(self.AUDIT_LOGGER).getEffectiveLevel() == logging.INFO
+
+            # Effective level alone would not prove the record reaches a
+            # handler, which is the property that matters: attach one to the
+            # parent, as Flask's default_handler is attached, and check the
+            # line actually crosses.
+            stream = io.StringIO()
+            handler = logging.StreamHandler(stream)
+            parent.addHandler(handler)
+            try:
+                logging.getLogger(self.AUDIT_LOGGER).info("crossed")
+            finally:
+                parent.removeHandler(handler)
+
+            assert "crossed" in stream.getvalue()
+        finally:
+            parent.setLevel(original)
 
 
 class MailKindTest(APITestCase):
@@ -281,8 +342,52 @@ class MailKindTest(APITestCase):
         message = MailMessage(subject, paragraphs=[])
 
         assert not isinstance(subject, LazyString)
-        assert mail_kind(message) == str(subject)
-        assert "x" in mail_kind(message)
+        # The interesting property is that the msgid is *gone* — the kind is
+        # the interpolated, translated sentence, not the template.
+        assert not isinstance(subject, LazyString)
+        assert mail_kind(message) != "Inactivity of your {site} account"
+        assert "{site}" not in mail_kind(message)
+        assert mail_kind(message).endswith(" account") or "x" in mail_kind(message)
+
+    def test_user_input_stays_out_of_the_kind(self):
+        """The support form's subject is a free text field on a public page.
+
+        `lazy_gettext(msgid, **kwargs)` keeps the interpolated values in
+        `_kwargs`, so the kind is the msgid and the submitted text never
+        reaches the log line. This asserts that boundary rather than trusting
+        it, because the whole quoting scheme depends on it.
+        """
+        message = MailMessage(
+            _(
+                "[%(site)s] %(topic)s — %(subject)s",
+                site="dados.gov.pt",
+                topic="Question",
+                subject='CALL ME AT jane.doe@example.org" result=sent',
+            ),
+            paragraphs=[],
+        )
+
+        kind = mail_kind(message)
+
+        assert kind == "[%(site)s] %(topic)s — %(subject)s"
+        assert "jane.doe@example.org" not in kind
+
+
+class SanitizeFieldTest:
+    def test_newlines_cannot_forge_a_second_line(self):
+        forged = 'x" result=sent\nmail_dispatch kind="FORGED'
+
+        sanitized = sanitize_field(forged)
+
+        assert "\n" not in sanitized
+        assert "\r" not in sanitized
+        assert '"' not in sanitized
+
+    def test_carriage_returns_are_removed(self):
+        assert "\r" not in sanitize_field("a\r\nb")
+
+    def test_long_values_are_truncated(self):
+        assert len(sanitize_field("x" * 500)) == 120
 
 
 class ScrubAddressesTest:
@@ -314,3 +419,43 @@ class ScrubAddressesTest:
 
     def test_text_without_an_address_is_untouched(self):
         assert scrub_addresses("Connection refused") == "Connection refused"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Each of these has a domain whose first character is not ASCII
+            # alphanumeric. Matching the domain as well as the local part made
+            # the pattern fail open on all of them: no match at all, so the
+            # address went to the log verbatim.
+            "jane.doe@[192.168.1.10] relay access denied",
+            "jane.doe@例え.jp unknown user",
+            "jane.doe@ñandu.pt unknown user",
+            "jane.doe@_dmarc.example.pt bad domain",
+        ],
+    )
+    def test_domains_that_do_not_start_with_ascii_alphanumeric(self, text):
+        scrubbed = scrub_addresses(text)
+
+        assert "jane.doe@" not in scrubbed
+        assert scrubbed.startswith("j***@")
+
+    def test_two_refused_recipients_both_survive_as_separate_addresses(self):
+        # Consuming the domain greedily used to swallow the separator and
+        # collapse both addresses into one match, dropping the first entirely
+        # along with the fact that two recipients had failed.
+        scrubbed = scrub_addresses("jane@example.org;john@other.example both refused")
+
+        assert scrubbed == "j***@example.org;j***@other.example both refused"
+
+    def test_dsn_fields_around_the_address_are_preserved(self):
+        scrubbed = scrub_addresses("Final-Recipient=rfc822;jane.doe@example.org")
+
+        assert scrubbed == "Final-Recipient=rfc822;j***@example.org"
+
+    def test_input_is_capped_so_the_substitution_cannot_be_a_dos(self):
+        # The error text comes from the remote SMTP server and smtplib puts no
+        # ceiling on an accumulated multi-line response. The substitution is
+        # quadratic, so an unbounded input burns the worker's harakiri budget.
+        long_text = "x" * 200_000
+
+        assert len(scrub_addresses(long_text)) == 500

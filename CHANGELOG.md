@@ -11,10 +11,12 @@
     page, which is one of the most recurring operational questions.
   - Each attempt now emits a single `key=value` audit line — kind, masked
     recipient, outcome, and on failure the error class with a scrubbed message
-    — shaped after the SAML audit line. `conn.send` is wrapped again, restoring
-    a guard that came in upstream and a later refactor dropped; the exception
-    is still re-raised, so callers keep the behaviour they have and a failed
-    send never looks successful.
+    — shaped after the SAML audit line. `conn.send` is wrapped so a failure is
+    recorded instead of passing without a trace, and the exception is still
+    re-raised: a failed send must not look successful, and the multi-recipient
+    semantics (the loop stops) are left exactly as they were, since changing
+    who still receives a mail is a delivery decision rather than an audit one.
+    A test pins that behaviour so a future change to it is deliberate.
   - The logger is `udata.mail.audit`, deliberately inside the `udata` tree so
     its records reach the handlers of `app.logger`, whose stderr is written to
     the file that page reads. Its level is pinned in `init_app`: `init_logging`
@@ -25,8 +27,19 @@
   - The error text is scrubbed rather than logged verbatim, because
     `str(SMTPRecipientsRefused)` *is* the `{address: (code, response)}` dict:
     writing it out would leak the very address the line takes care to mask, in
-    exactly the case that matters (a refused recipient). The domain survives —
-    a whole domain refusing mail is a real signal.
+    exactly the case that matters (a refused recipient). Only the local part is
+    masked, so the domain survives — a whole domain refusing mail is a real
+    signal. Matching the domain too, the obvious way to write that pattern,
+    failed open on every domain not starting with an ASCII alphanumeric (an
+    address literal, an IDN, a leading underscore), letting the whole address
+    through untouched. The scrubbed text is also capped: it comes from the
+    remote server, `smtplib` puts no ceiling on an accumulated multi-line
+    response, and the substitution is quadratic.
+  - The audit logger is excluded from Sentry. Its ERROR line accompanies an
+    exception that already reaches Sentry through the Flask and Celery
+    integrations, so the logging integration's defaults would have raised a
+    second issue for every refused recipient and made a breadcrumb of every
+    successful send.
   - Flask-Security dispatches confirmation, welcome and password-reset mails
     itself, bypassing `send_mail` entirely, so `AuditMailUtil` now takes the
     place of the bare `MailUtil` and emits the same line for them. Its `kind`
