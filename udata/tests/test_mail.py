@@ -540,9 +540,10 @@ class MailKindOfRealMailsTest(APITestCase):
             ("inactive_user", inactive_user(UserFactory(email="jane@example.org"))),
             (
                 "new_discussion",
-                # A message is attached because this asserts the kind of a
-                # fully-formed discussion mail. The builder handles the empty
-                # list too -- see test_discussions.py.
+                # The kind is a literal, so this works with or without a
+                # message; the message is here because the other cases build a
+                # realistic mail. The empty-list path is covered in
+                # test_discussions.py.
                 new_discussion(
                     DiscussionFactory(
                         subject=DatasetFactory(),

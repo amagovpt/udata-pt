@@ -31,7 +31,7 @@ from udata.core.spam.signals import on_new_potential_spam
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.core.user.models import User
 from udata.features.notifications.models import Notification
-from udata.mail import LabelledContent, MailCTA, ParagraphWithLinks
+from udata.mail import LabelledContent, ParagraphWithLinks
 from udata.models import Dataset, Member
 from udata.tests.helpers import capture_mails
 from udata.utils import faker
@@ -1100,19 +1100,29 @@ class NotifyDiscussionsTest(APITestCase):
         self.assertEqual(len(mails), 1)
         self.assertEqual(mails[0].recipients[0], owner.email)
 
-        # And the comment block is omitted rather than the mail being empty.
-        # Compared structurally against the same mail with a message, because
-        # the labels are translated and the suite does not run in English.
+        # And it is the comment block that is omitted, not some other one.
+        # Counting paragraphs is not enough: omitting the title instead would
+        # keep the same count and pass. Labels are compared by msgid, read the
+        # way `mail_kind` reads it, because the suite does not run in English.
         empty = mails_module.new_discussion(discussion).paragraphs
+        labels = [p.label._args[0] for p in empty if hasattr(p, "label")]
+
+        self.assertEqual(labels, ["Discussion title:", "Reply"])
+        self.assertEqual(
+            [p for p in empty if isinstance(p, LabelledContent)][0].content,
+            discussion.title,
+        )
+        self.assertTrue(any(isinstance(p, ParagraphWithLinks) for p in empty))
+
+        # The same mail with a message keeps the comment block, so the omission
+        # above is conditional and not a removal.
         discussion.discussion = [Message(content=faker.sentence(), posted_by=user)]
         filled = mails_module.new_discussion(discussion).paragraphs
 
-        def labelled(paragraphs):
-            return [p for p in paragraphs if isinstance(p, LabelledContent)]
-
-        self.assertEqual(len(labelled(empty)), len(labelled(filled)) - 1)
-        self.assertTrue(any(isinstance(p, MailCTA) for p in empty))
-        self.assertTrue(any(isinstance(p, ParagraphWithLinks) for p in empty))
+        self.assertEqual(
+            [p.label._args[0] for p in filled if hasattr(p, "label")],
+            ["Discussion title:", "Comment:", "Reply"],
+        )
 
     def test_new_discussion_comment_mail(self):
         owner = UserFactory()
