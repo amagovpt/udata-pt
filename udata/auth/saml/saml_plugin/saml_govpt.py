@@ -1467,6 +1467,7 @@ def _send_migration_address_taken_notice(user):
     """
     site = current_app.config.get("SITE_TITLE", "dados.gov.pt")
     msg = MailMessage(
+        kind="migration_address_taken",
         subject=_("Your %(site)s account already exists", site=site),
         paragraphs=[
             _(
