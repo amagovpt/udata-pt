@@ -20,7 +20,15 @@ def new_discussion(discussion: Discussion) -> MailMessage:
                 )
             ),
             LabelledContent(_("Discussion title:"), discussion.title, inline=True),
-            LabelledContent(_("Comment:"), discussion.discussion[0].content),
+            # A discussion with no messages yet is a real state -- the list is
+            # empty until the first one is attached -- and indexing it
+            # unconditionally raised IndexError inside the notification task,
+            # so no mail was sent at all. Omitting the block is what
+            # `discussion_closed` below already does when there is no comment;
+            # MailMessage drops None paragraphs.
+            LabelledContent(_("Comment:"), discussion.discussion[0].content)
+            if discussion.discussion
+            else None,
             MailCTA(_("Reply"), discussion.url_for()),
         ],
     )

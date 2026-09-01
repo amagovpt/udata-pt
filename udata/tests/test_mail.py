@@ -540,8 +540,9 @@ class MailKindOfRealMailsTest(APITestCase):
             ("inactive_user", inactive_user(UserFactory(email="jane@example.org"))),
             (
                 "new_discussion",
-                # The builder reads discussion.discussion[0], so the factory
-                # needs a message: an empty discussion raises IndexError.
+                # A message is attached because this asserts the kind of a
+                # fully-formed discussion mail. The builder handles the empty
+                # list too -- see test_discussions.py.
                 new_discussion(
                     DiscussionFactory(
                         subject=DatasetFactory(),
