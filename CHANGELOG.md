@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix(discussions): send the new-discussion mail even when the discussion has no messages yet**
+  - The mail builder indexed `discussion.discussion[0]` unconditionally, so a
+    discussion whose message list is still empty raised `IndexError` inside the
+    notification task and no mail was sent at all. The empty list is a real
+    state, not a corrupt one: it is what a freshly created discussion looks
+    like before its first message is attached.
+  - The comment block is now omitted instead, which is what the
+    discussion-closed mail already did when there was no comment; the mail
+    keeps its title, context paragraph and reply link. Nothing changes for the
+    discussions created through the API, which always carry the first message.
+  - Worth noting how this surfaced: the failure used to be entirely silent.
+    Since every mail dispatch is logged, it would now appear as `result=error`
+    — the first case where that audit trail paid for itself.
+
 - **fix(mail): name the mails whose subject is a template, instead of logging the template**
   - The audit line derives its `kind` from the subject's msgid, which reads well
     for a subject that is a plain sentence and badly for one that is not: the
