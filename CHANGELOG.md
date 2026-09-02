@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix(discussions): send the new-discussion mail even when the discussion has no messages yet**
+  - The mail builder indexed `discussion.discussion[0]` unconditionally, so a
+    discussion whose message list is empty raised `IndexError` inside the
+    notification task and no mail was sent at all.
+  - The comment block is now omitted instead, which is what the
+    discussion-closed mail already did when there was no comment; the mail
+    keeps its title, context paragraph and reply link. Nothing changes for the
+    discussions created through the API, which always attach the first message
+    in the same expression that creates the discussion.
+  - On how reachable that state is: no path in this repository produces it.
+    Every creator attaches the first message atomically, deleting the message
+    at index 0 is refused, and the GDPR deletion either removes the discussion
+    or overwrites the content. The only producer is the test factory. The guard
+    is still right — the model permits the state, so a document written by a
+    migration, by legacy data or by hand reaches it, and the failure mode was
+    losing the mail entirely — but it is a guard against a state we cannot
+    currently create, not a fix for an observed production incident.
+  - The failure was and remains invisible in the mail dispatch audit log: the
+    exception is raised while the message is being built, before the send, so
+    the audit line is never reached. What it leaves is a Celery traceback.
+
 - **fix(mail): name the mails whose subject is a template, instead of logging the template**
   - The audit line derives its `kind` from the subject's msgid, which reads well
     for a subject that is a plain sentence and badly for one that is not: the
