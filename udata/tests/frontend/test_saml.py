@@ -5628,6 +5628,14 @@ class SAMLDeclaredCitizenTypeTest(APITestCase):
             "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
         )
 
+    def _mailed_token(self, mock_send):
+        """The token behind the CTA of the mail that was just sent."""
+        ctas = [
+            para for para in mock_send.call_args[0][1].paragraphs if getattr(para, "link", None)
+        ]
+        assert len(ctas) == 1
+        return ctas[0].link.rsplit("/", 1)[1]
+
     # --- the allowlist, at the route that reads the parameter ---
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
@@ -5851,3 +5859,53 @@ class SAMLDeclaredCitizenTypeTest(APITestCase):
         # The only thing that differs is the value itself.
         assert national["declared"] == AUTH_CITIZEN_NATIONAL
         assert foreign["declared"] == AUTH_CITIZEN_FOREIGN
+
+    # --- the emailed validation link: the one write path with no session ---
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_validation_link_records_the_declaration_with_no_session(
+        self, mock_client_for, mock_send
+    ):
+        """The click arrives with no session, so the declaration has to have
+        travelled in the record written when the link was issued.
+
+        This is the path a citizen takes when the CMD assertion brings no
+        email: they type a new address and the link is mailed to it. Of the
+        four places that write the declaration it was the only one left
+        without a test, and the mirror of it for `provider` lives in
+        SAMLAuthProviderWizardTest. Clicked from a fresh client so the absence
+        of a session is real rather than incidental.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+        from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_CITIZEN_FOREIGN
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        legacy = UserFactory(
+            email="teresa@example.pt",
+            password="S3cretPass!",
+            first_name="Teresa",
+            last_name="Bastos",
+        )
+
+        self._declare(AUTH_CITIZEN_FOREIGN)
+        self._cmd_acs(mock_client_for, nic=self.NIC, first_name="Teresa", last_name="Bastos")
+        proof = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": legacy.email, "password": "S3cretPass!"},
+        )
+        assert proof.status_code == 200
+
+        # In the record before the click, which is the whole point of the path.
+        legacy.reload()
+        assert legacy.extras[MIGRATION_LINK_PENDING]["citizen_declared"] == AUTH_CITIZEN_FOREIGN
+
+        fresh = self.app.test_client()
+        assert (
+            fresh.get(f"/saml/migration/confirm-link/{self._mailed_token(mock_send)}").status_code
+            == 302
+        )
+
+        legacy.reload()
+        assert legacy.extras[AUTH_CITIZEN_DECLARED] == AUTH_CITIZEN_FOREIGN
