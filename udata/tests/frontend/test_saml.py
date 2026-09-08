@@ -5392,6 +5392,32 @@ class SAMLAuthProviderRecordingTest(APITestCase):
 
         assert response.status_code == 302
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_account_created_on_the_wizard_off_path_carries_the_provider(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The CMD half of this is covered above; both routes reach the same
+        creation function, so both call sites need pinning -- a provider passed
+        on one route and forgotten on the other is precisely the shape of bug
+        this pair of identical handlers keeps producing."""
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_EIDAS
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._eidas_login(
+                mock_client_for,
+                person_identifier="FR/PT/1029384756",
+                given_name="Chloé",
+                family_name="Martin",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic("FR/PT/1029384756")).first()
+        assert created is not None
+        assert created.extras[AUTH_PROVIDER] == AUTH_PROVIDER_EIDAS
+
 
 class SAMLAuthProviderWizardTest(APITestCase):
     """The two paths that do not run inside an ACS request.
