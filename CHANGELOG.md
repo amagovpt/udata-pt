@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- **feat(auth): record whether an account authenticated through CMD or eIDAS**
+  - `extras.auth_nic` could not answer that question: it holds a NIC or an
+    eIDAS PersonIdentifier indifferently, and the hash does not say which. The
+    only distinction that existed was ephemeral, inside the migration wizard's
+    session, so "how many people use eIDAS?" had no answer at all.
+  - Adds `extras.auth_provider`, carried down from the ACS route that received
+    the assertion. The route is the only place that knows — the same reason
+    `_handle_migration_redirect` already took the provider explicitly: the two
+    routes converge downstream and the assertion attributes look identical
+    afterwards, so deducing it below them is wrong by construction.
+  - Written at account creation, so an account carries it from the moment it
+    exists, and again in the single funnel every path ending in a session
+    passes through, which is what backfills the accounts that predate the
+    field — they get it on their owner's next sign-in. That funnel also covers
+    the identity whose stored NIC is upgraded from the old plain format, so no
+    third write inside the resolver is needed. The write sits after the login
+    guards on purpose: an account turned away by the deleted or
+    pending-confirmation gate did not authenticate through anything, and
+    stamping it would say it did.
+  - Two paths do not run inside an ACS request and are handled separately. The
+    wizard reads the provider from its session. The emailed validation link
+    reads it from the record on the account, because that click arrives with
+    no session at all — the same reason the hashed NIC and the names already
+    travel there.
+  - **Absent means absent.** Nothing is written when no provider is supplied,
+    and no default is substituted for a missing one. The wizard's JSON
+    response does substitute `"cmd"` so its heading reads sensibly rather than
+    "Associar conta a"; that line now says in as many words that it is
+    presentation only, because reusing it to persist would store a supposition
+    that reads as a fact and the question this field exists to answer would
+    come back wrong with nobody able to tell. A test pins the rule from the
+    other side: a session carrying every key but that one produces an account
+    with no provider.
+  - It deliberately does **not** distinguish a national from a foreign CMD
+    citizen, even though their identity attributes differ. Both arrive on the
+    same ACS route, the frontend collects the citizen type and never sends it,
+    and the MDC document attributes that would tell them apart are not
+    requested yet. Inferring "foreign" from a missing NIC would be a deduction
+    from the attributes rather than the route, and a CMD assertion with no NIC
+    is also what a misconfigured IdP produces. That dimension belongs in
+    sibling keys, added when those attributes start arriving, which keeps
+    every value written now correct instead of needing a rewrite.
+  - `udata/core/user/nic.py` now records why the identifier hash carries no
+    provider prefix. The original request asked for one; the hash is the key
+    the login resolves accounts by and the original NIC cannot be recovered to
+    recompute it, so adding a prefix would mean either two formats forever or
+    locking out every already-registered CMD/eIDAS user. Without the reason
+    written where the field is defined, the next reader of that request
+    concludes it was forgotten.
+
 - **fix(auth): stop the change-email form disclosing whether an address is registered**
   - Submitting an address that already belonged to another account answered
     with a form error — "This email is already registered" — rendered straight
