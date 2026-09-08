@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **test(saml): cover the declared citizen type on the emailed validation link**
+  - Of the four places that write `extras.auth_citizen_declared`, the emailed
+    validation link was the only one with no test. It is also the one that
+    cannot use the session: the click arrives with no session at all, so the
+    declaration has to travel inside the pending-link record written when the
+    link was issued. The path was implemented by symmetry with `provider`,
+    whose equivalent test already existed — and symmetry is not proof.
+  - It is the path a citizen takes when the CMD assertion brings no email and
+    they type a new address, so it is neither rare nor a corner. The test
+    asserts the value is in the record *before* the click and on the account
+    *after* it, clicking from a fresh client so the absence of a session is
+    real rather than incidental.
+  - No production code changed: the behaviour was already correct. Verified by
+    mutation — dropping the value from the record, and dropping the write at
+    the click, each turn the test red.
+
 - **feat(auth): record the citizen type declared at CMD sign-in**
   - The login screen asks whether the citizen is national or foreign, and the
     answer was thrown away in the browser — it only enabled the submit button.
