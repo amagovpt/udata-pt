@@ -244,3 +244,93 @@ class AuthMailMessageBuilderTest(APITestCase):
         cta = next((p for p in msg.paragraphs if hasattr(p, "link")), None)
         assert cta is not None
         assert "/reset" in cta.link
+
+
+class AuthMailPortugueseTranslationTest(APITestCase):
+    """Every auth string a Portuguese reader can be shown must be translated.
+
+    The account-linking mail went out entirely in English -- subject included --
+    because its strings were wrapped in gettext but had no pt catalogue entry.
+    That fails silently: gettext returns the msgid, so the mail renders and
+    looks fine to anyone reading English.
+
+    Listing the msgids is deliberate. Re-extracting them with pybabel at test
+    time would also cover strings added later, but it would not know which of
+    them a pt reader can actually see -- seven strings in the SAML plugin are
+    already written in Portuguese as their msgid, and would show up as missing
+    forever. This pins the set that was actually broken.
+    """
+
+    # Spelled exactly as Python concatenates them in the source. An implicit
+    # concatenation whose line breaks fall elsewhere is a DIFFERENT msgid, and
+    # the lookup then silently returns the English -- which is the whole failure
+    # mode being guarded here, so it must not be reintroduced by the guard.
+    PT_REQUIRED = (
+        # udata/auth/forms.py
+        "Your new email must be different than your previous email",
+        "reCAPTCHA token",
+        "reCAPTCHA validation required",
+        "Invalid reCAPTCHA",
+        # udata/auth/mails.py -- address-taken notice
+        "Your %(site)s account already exists",
+        (
+            "You received this email because someone tried to use your email "
+            "address on %(site)s. It already belongs to an account, so nothing "
+            "was created and nothing changed."
+        ),
+        (
+            "If it was you, sign in to that account the way you normally "
+            "do, or use the account recovery if you cannot."
+        ),
+        "If it was not you, no action is needed. Your account is untouched.",
+        # SAML plugin -- the account-linking mail the user received in English
+        "Confirm linking a digital identity to your account",
+        (
+            "Someone signed in with the digital identity of %(name)s and asked to link "
+            "it to your %(site)s account."
+        ),
+        "an unnamed identity",
+        "Open the link below to complete the linking and sign in.",
+        "Confirm linking",
+        "The link is valid for 30 minutes and can only be used once.",
+        (
+            "If it was not you who started this, do NOT open the link and ignore this "
+            "email. Your account will not be changed."
+        ),
+        # SAML plugin -- its own address-taken notice
+        (
+            "Someone signing in with a digital identity tried to use this "
+            "address to create a new %(site)s account. It already belongs "
+            "to an account, so nothing was created and nothing changed."
+        ),
+        (
+            "To link that account to your digital identity, start the "
+            "sign-in again and follow the account association steps."
+        ),
+    )
+
+    @pytest.mark.options(DEFAULT_LANGUAGE="pt")
+    def test_auth_strings_have_a_portuguese_translation(self):
+        from udata.i18n import gettext
+
+        missing = [s for s in self.PT_REQUIRED if gettext(s) == s]
+        assert not missing, (
+            "These auth strings fall back to English for a pt reader, which "
+            "means they have no msgid in udata/translations/pt. Add them to the "
+            "catalogue and recompile the .mo:\n" + "\n".join(f"  - {s!r}" for s in missing)
+        )
+
+    @pytest.mark.options(DEFAULT_LANGUAGE="pt")
+    def test_address_taken_notice_renders_fully_in_portuguese(self):
+        """Structural check on the notice added with this flow.
+
+        The list above pins known msgids; this one pins the message, so a
+        paragraph added to it later without a translation is caught even though
+        nobody remembered to extend the list.
+        """
+        from udata.auth.mails import address_taken_notice
+
+        msg = address_taken_notice()
+        rendered = [str(msg.subject)] + [str(p) for p in msg.paragraphs]
+        english = [t for t in rendered if " the " in t or "account already exists" in t]
+        assert not english, f"untranslated fragments in the notice: {english}"

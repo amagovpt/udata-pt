@@ -11,6 +11,28 @@ The field historically accumulated several formats:
   decrypted with the legacy portal key before migration.
 - **junk**: assorted non-NIC values (old usernames) left behind by even older
   code paths.
+
+It carries no provider prefix, and must not be given one
+=======================================================
+
+A prefix naming the provider ("cmd-<hash>", "eidas-<hash>") reads like the
+obvious way to make an identity unambiguous, and the original request for the
+authentication review asked for exactly that. It was considered and rejected,
+and this note exists so nobody concludes it was simply forgotten.
+
+The value is a one-way hash, and it is the key the login resolves accounts by
+(``User.objects(extras__auth_nic=hash_nic(nic))``). The original NIC is not
+recoverable from it, so the values already stored cannot be recomputed into a
+prefixed form. Adding the prefix would therefore mean either accepting two
+formats indefinitely, or losing the match for every CMD/eIDAS user already
+registered -- which is to say locking them out of their own accounts.
+
+``extras.auth_provider`` (see ``udata/core/user/constants.py``) records the
+provider in a field of its own instead. It achieves the same disambiguation
+without touching the login key, and it can be extended -- the document type
+and nationality of a foreign citizen's identity go in sibling keys when those
+attributes start arriving -- where a prefix baked into the hash could not be
+changed afterwards at all.
 """
 
 import hashlib

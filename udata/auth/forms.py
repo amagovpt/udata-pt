@@ -147,20 +147,21 @@ class ChangeEmailForm(Form):
         self.user = current_user
 
         if self.user.email.strip() == self.new_email.data.strip():
+            # Discloses nothing: the caller is being told about their own
+            # address, which they just submitted.
             self.new_email.errors.append(
-                "Your new email must be different than your previous email"
+                _("Your new email must be different than your previous email")
             )
             return False
 
-        # Reject already-registered emails at submit time; otherwise the
-        # collision only surfaces after the user clicks the confirmation
-        # link (confirm_change_email redirects with change_email_already_taken).
-        from udata.models import datastore
-
-        existing = datastore.find_user(email=self.new_email.data.strip())
-        if existing and existing.id != self.user.id:
-            self.new_email.errors.append(_("This email is already registered"))
-            return False
+        # A taken address is deliberately NOT rejected here. The collision is
+        # still handled at submit time -- see `change_email` in views.py -- but
+        # a form error is the wrong instrument: it is rendered back to whoever
+        # submitted the address, which tells them the address has an account.
+        # One account is then enough to test any address, and the answer had to
+        # be the same for both cases, so the check moved to the view, where it
+        # can warn the mailbox owner and answer the browser identically.
+        # Do not restore it here.
         return True
 
 

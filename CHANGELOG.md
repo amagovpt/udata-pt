@@ -2,6 +2,124 @@
 
 ## Unreleased
 
+- **feat(auth): record whether an account authenticated through CMD or eIDAS**
+  - `extras.auth_nic` could not answer that question: it holds a NIC or an
+    eIDAS PersonIdentifier indifferently, and the hash does not say which. The
+    only distinction that existed was ephemeral, inside the migration wizard's
+    session, so "how many people use eIDAS?" had no answer at all.
+  - Adds `extras.auth_provider`, carried down from the ACS route that received
+    the assertion. The route is the only place that knows — the same reason
+    `_handle_migration_redirect` already took the provider explicitly: the two
+    routes converge downstream and the assertion attributes look identical
+    afterwards, so deducing it below them is wrong by construction.
+  - Written at account creation, so an account carries it from the moment it
+    exists, and again in the single funnel every path ending in a session
+    passes through, which is what backfills the accounts that predate the
+    field — they get it on their owner's next sign-in. That funnel also covers
+    the identity whose stored NIC is upgraded from the old plain format, so no
+    third write inside the resolver is needed. The write sits after the login
+    guards on purpose: an account turned away by the deleted or
+    pending-confirmation gate did not authenticate through anything, and
+    stamping it would say it did.
+  - Two paths do not run inside an ACS request and are handled separately. The
+    wizard reads the provider from its session. The emailed validation link
+    reads it from the record on the account, because that click arrives with
+    no session at all — the same reason the hashed NIC and the names already
+    travel there.
+  - **Absent means absent.** Nothing is written when no provider is supplied,
+    and no default is substituted for a missing one. The wizard's JSON
+    response does substitute `"cmd"` so its heading reads sensibly rather than
+    "Associar conta a"; that line now says in as many words that it is
+    presentation only, because reusing it to persist would store a supposition
+    that reads as a fact and the question this field exists to answer would
+    come back wrong with nobody able to tell. A test pins the rule from the
+    other side: a session carrying every key but that one produces an account
+    with no provider.
+  - It deliberately does **not** distinguish a national from a foreign CMD
+    citizen, even though their identity attributes differ. Both arrive on the
+    same ACS route, the frontend collects the citizen type and never sends it,
+    and the MDC document attributes that would tell them apart are not
+    requested yet. Inferring "foreign" from a missing NIC would be a deduction
+    from the attributes rather than the route, and a CMD assertion with no NIC
+    is also what a misconfigured IdP produces. That dimension belongs in
+    sibling keys, added when those attributes start arriving, which keeps
+    every value written now correct instead of needing a rewrite.
+  - `udata/core/user/nic.py` now records why the identifier hash carries no
+    provider prefix. The original request asked for one; the hash is the key
+    the login resolves accounts by and the original NIC cannot be recovered to
+    recompute it, so adding a prefix would mean either two formats forever or
+    locking out every already-registered CMD/eIDAS user. Without the reason
+    written where the field is defined, the next reader of that request
+    concludes it was forgotten.
+
+- **fix(auth): stop the change-email form disclosing whether an address is registered**
+  - Submitting an address that already belonged to another account answered
+    with a form error — "This email is already registered" — rendered straight
+    back to whoever submitted it. One account was therefore enough to test any
+    address for existence, which is the same CWE-203 oracle the account
+    migration wizard was fixed to close, and it was reached from the
+    complete-registration screen that every CMD/eIDAS account with a
+    placeholder address lands on.
+  - The check moves out of `ChangeEmailForm`, which can only refuse, and into
+    the `change_email` view, which can answer identically either way: the owner
+    of the address is warned by mail, and the browser gets the free-address
+    response down to the echoed address — which discloses nothing, because the
+    caller is the one who submitted it.
+  - No confirmation link is issued for a taken address. Sending one would act
+    on an account the requesting session has proved nothing about, and would
+    turn this into a way to spray confirmation mail at any address on demand.
+    The notice therefore carries no link at all, and prescribes no particular
+    next step: the account may have been created through SAML and have no
+    usable password, so "use your password" would be impossible advice.
+  - Replicates the taken-address branch of the migration wizard, including its
+    two load-bearing details: the deleted-row guard (`mark_as_deleted` rewrites
+    the address, so mailing such a row would be mailing nobody) and the single
+    shared rate-limit budget — a per-branch budget would diverge, and a
+    divergence is itself an oracle. The notice mail is a sibling of
+    `welcome_existing` rather than a reuse of the wizard's, whose copy names a
+    digital identity; that is false here, because `change_email` is also
+    reached from the profile by a password user.
+  - `confirm_change_email` keeps its own already-taken guard. It is the net for
+    an address that becomes taken between the request and the click, which the
+    new branch cannot see.
+  - The regression suite carried a class for each enumeration vector the audit
+    found — login, register, forgot-password, resend-confirmation — and none
+    for change-email, which is why this survived. One is added in the same
+    shape, plus coverage that the taken branch warns the owner and leaves both
+    accounts untouched. The test that previously asserted the disclosure is
+    rewritten with its original intent — the collision is still handled at
+    submit time — keeping its one load-bearing assertion: the address does not
+    move.
+
+- **fix(auth): translate the authentication mails and form errors that reached readers in English**
+  - The SAML account-linking mail went out entirely in English, subject
+    included — "Confirm linking a digital identity to your account". Its
+    strings were wrapped in gettext but had no pt catalogue entry, and that
+    fails silently: gettext returns the msgid, so the mail renders and reads
+    perfectly well to anyone reading English. It had been doing so unnoticed.
+  - "Your new email must be different than your previous email" was worse: it
+    was never wrapped in gettext at all, so no catalogue entry could have
+    helped it.
+  - Measured with `pybabel` over `udata/auth/`: 56 msgids, 37 translated, 19
+    not. Twelve of those are shown to a Portuguese reader in English and are
+    added — the seven of the account-linking mail, the two still missing from
+    the address-taken notice, and the three reCAPTCHA form strings.
+  - The remaining seven are left alone deliberately, not by omission: their
+    msgid is already written in Portuguese ("Autenticação rejeitada: …"), so a
+    pt reader sees them correctly. What is wrong there is the reverse — the
+    msgid should be English with a pt translation, like every other string in
+    the catalogue — and correcting it rewrites the msgids and touches the five
+    other locales, which is a change of its own rather than a line in this one.
+  - The regression test pins the twelve msgids instead of re-extracting them,
+    because an extraction cannot tell which missing entries a pt reader can
+    actually see and would report those seven as missing forever. A second test
+    pins the notice message structurally, so a paragraph added to it later
+    without a translation is caught even if nobody extends the list.
+  - The catalogue is edited and recompiled directly, without regenerating the
+    `.pot` or touching the other locales, which is how the existing translation
+    commits in this repository do it. The other five locales compiled to
+    identical bytes and were left untouched.
+
 - **fix(discussions): send the new-discussion mail even when the discussion has no messages yet**
   - The mail builder indexed `discussion.discussion[0]` unconditionally, so a
     discussion whose message list is empty raised `IndexError` inside the

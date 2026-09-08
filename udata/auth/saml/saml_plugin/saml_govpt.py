@@ -95,6 +95,7 @@ from limits import parse
 
 from udata.api.limits import MIGRATION_SUBMIT_LIMIT
 from udata.app import csrf
+from udata.core.user.constants import AUTH_PROVIDER_CMD, AUTH_PROVIDER_EIDAS
 from udata.core.user.nic import hash_nic as _hash_nic
 from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
@@ -698,8 +699,15 @@ def _idp_status_rejection(raw_saml_response, kind):
     return None
 
 
-def _create_saml_user(user_email, user_nic, first_name, last_name):
-    """Create a new account from SAML attributes (scenario 4)."""
+def _create_saml_user(user_email, user_nic, first_name, last_name, *, provider=None):
+    """Create a new account from SAML attributes (scenario 4).
+
+    ``provider`` is AUTH_PROVIDER_CMD or AUTH_PROVIDER_EIDAS, and comes from the
+    ACS route that received the assertion -- the same reason
+    _handle_migration_redirect takes it explicitly: nothing this far downstream
+    can infer which one started the flow. Recorded only when supplied, so a
+    caller without a route to speak for stores nothing rather than a guess.
+    """
     # Generate a placeholder email when the IdP does not provide one, or
     # when the CMD email is already taken by an existing account (the
     # user explicitly chose to create a new one in the wizard).
@@ -715,13 +723,24 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
             f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
         )
 
+    from udata.core.user.constants import AUTH_PROVIDER
+
     user_data = {
         "first_name": (first_name or "").title(),
         "last_name": (last_name or "").title(),
         "email": user_email,
     }
+    # Built separately from the identifier: the provider is known even when the
+    # assertion carried no NIC/PersonIdentifier, which is a real case (see the
+    # identity-without-identifier bug) and the one where knowing the provider
+    # matters most.
+    extras = {}
     if user_nic:
-        user_data["extras"] = {"auth_nic": _hash_nic(user_nic)}
+        extras["auth_nic"] = _hash_nic(user_nic)
+    if provider:
+        extras[AUTH_PROVIDER] = provider
+    if extras:
+        user_data["extras"] = extras
 
     user = datastore.create_user(**user_data)
     # Auto-confirm users created via SAML — they were already verified
@@ -784,7 +803,7 @@ MAX_MIGRATION_LINK_SENDS = 5
 MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
 
 
-def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
+def _create_pending_saml_user(user_email, user_nic, first_name, last_name, *, provider=None):
     """Create an account from a user-declared email, left unconfirmed.
 
     Unlike :func:`_create_saml_user` this never mints a placeholder address —
@@ -792,12 +811,23 @@ def _create_pending_saml_user(user_email, user_nic, first_name, last_name):
     unused — and it deliberately does NOT set ``confirmed_at``: the account
     stays unconfirmed, and without a session, until the owner follows the
     emailed confirmation link.
+
+    ``provider`` reaches here from the wizard session, which recorded it from
+    the ACS route. Recorded only when present: a session opened before that
+    field existed carries none, and the account is then created without one
+    rather than with a guess.
     """
+    from udata.core.user.constants import AUTH_PROVIDER
+
+    extras = {"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True}
+    if provider:
+        extras[AUTH_PROVIDER] = provider
+
     user = datastore.create_user(
         first_name=(first_name or "").title(),
         last_name=(last_name or "").title(),
         email=user_email,
-        extras={"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True},
+        extras=extras,
     )
     datastore.commit()
 
@@ -941,12 +971,20 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     return None, "no_match"
 
 
-def _handle_saml_user_login(user, new_account=False):
+def _handle_saml_user_login(user, new_account=False, *, provider=None):
     """Handle login/redirect after SAML authentication.
 
     When ``new_account`` is True the redirect carries ``cmd_new_account=1``
     so the frontend can inform the user that a new account was created
     (scenario 4).
+
+    ``provider`` is AUTH_PROVIDER_CMD or AUTH_PROVIDER_EIDAS, from the ACS
+    route. This is the single funnel every path that ends in a session passes
+    through -- a freshly created account, an identity already linked, and an
+    identity whose stored NIC was upgraded from the old plain format -- so
+    recording it here is what backfills the accounts that predate the field.
+    That also makes a write inside _find_or_create_saml_user unnecessary: its
+    plain-NIC upgrade returns "existing_saml" and lands here.
     """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
@@ -999,6 +1037,38 @@ def _handle_saml_user_login(user, new_account=False):
         # to the self-declared addresses gated above.
         user.confirmed_at = datetime.utcnow()
         datastore.commit()
+
+    # Record which provider this session came through, now that the guards
+    # above have established there is going to be one. Accounts that predate
+    # the field get it here, on their owner's next sign-in; nothing is written
+    # for a caller that supplied no provider, and nothing is written when the
+    # stored value already agrees, so a repeat login is not a repeat save.
+    #
+    # Deliberately last: an account blocked by the guards above did not
+    # authenticate through anything yet, and stamping it would say it did.
+    # This is bookkeeping, and bookkeeping must never deny anyone their
+    # account. The save is the only new way this function could raise, and it
+    # sits before login_user: unguarded, a legacy document that fails to
+    # validate for some unrelated reason would turn a working sign-in into a
+    # 500 -- a behaviour change, on the accounts most likely to be affected.
+    # So a failure here loses the field and is logged, and the login proceeds.
+    # (Not the same call as the mail sends that deliberately re-raise: there,
+    # swallowing made a failure the user cared about look successful. Here the
+    # outcome the user came for still happens.)
+    if provider:
+        from udata.core.user.constants import AUTH_PROVIDER
+
+        if (user.extras or {}).get(AUTH_PROVIDER) != provider:
+            try:
+                if not user.extras:
+                    user.extras = {}
+                user.extras[AUTH_PROVIDER] = provider
+                user.save()
+            except Exception as exc:
+                current_app.logger.warning(
+                    f"SAML: could not record auth provider {provider!r} for user "
+                    f"{user.id}: {type(exc).__name__}: {exc}"
+                )
 
     login_user(user)
     session["saml_login"] = True
@@ -1152,14 +1222,20 @@ def _migration_link_send_allowed(user):
     return True, {"count": count + 1, "window_start": tally["window_start"]}
 
 
-def _issue_migration_link(user, nic_hash, first_name, last_name):
+def _issue_migration_link(user, nic_hash, first_name, last_name, *, provider=None):
     """Record a pending link request on ``user`` and return its token.
 
-    The record carries everything the click needs — the hashed NIC and the
-    names from the assertion — so the consuming route never has to read the
-    session. A fresh nonce is minted on every call, which is what makes a
-    resend invalidate the link that preceded it. Takes the NIC already hashed
-    so a reissue can work from a record, where the raw value is long gone.
+    The record carries everything the click needs — the hashed NIC, the names
+    from the assertion, and which provider the assertion came from — so the
+    consuming route never has to read the session. A fresh nonce is minted on
+    every call, which is what makes a resend invalidate the link that preceded
+    it. Takes the NIC already hashed so a reissue can work from a record, where
+    the raw value is long gone.
+
+    ``provider`` travels in the record for the same reason as everything else
+    in it: the click arrives with no session, so a value left behind in one
+    would not be there to read. A record written before this field existed
+    carries none, and the link then completes without recording one.
     """
     nonce = secrets.token_urlsafe(32)
 
@@ -1170,6 +1246,7 @@ def _issue_migration_link(user, nic_hash, first_name, last_name):
         "nic_hash": nic_hash,
         "first_name": first_name,
         "last_name": last_name,
+        "provider": provider,
         "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
     }
 
@@ -1181,7 +1258,7 @@ def _issue_migration_link(user, nic_hash, first_name, last_name):
     return serializer.dumps([MIGRATION_LINK_TOKEN_TAG, str(user.id), hash_data(nonce)])
 
 
-def _link_identity_and_login(user, nic_hash, first_name, last_name):
+def _link_identity_and_login(user, nic_hash, first_name, last_name, *, provider=None):
     """Bind the authenticated identity to ``user`` and start its session.
 
     The single place that completes a link, shared by every branch that can:
@@ -1190,11 +1267,19 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name):
     responsibilities, and a branch that linked an account without clearing it
     would leave a live link able to overwrite the identity it just bound. The
     password is left untouched so the account stays reachable both ways.
+
+    ``provider`` comes from the link record, not the session: the consuming
+    route is a click that arrives with no session at all. Recorded under the
+    same rule as everywhere else — only when there is one to record.
     """
+    from udata.core.user.constants import AUTH_PROVIDER
+
     if not user.extras:
         user.extras = {}
     if nic_hash:
         user.extras["auth_nic"] = nic_hash
+    if provider:
+        user.extras[AUTH_PROVIDER] = provider
     if first_name:
         user.first_name = first_name.title()
     if last_name:
@@ -1537,6 +1622,10 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
         _hash_nic(pending["saml_nic"]),
         pending.get("saml_first_name"),
         pending.get("saml_last_name"),
+        # Bare get, never `or AUTH_PROVIDER_CMD`: a session opened before the
+        # provider was recorded must produce a record without one, so the link
+        # completes without inventing a provider for it.
+        provider=pending.get("saml_provider"),
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
@@ -2019,7 +2108,9 @@ def idp_initiated():
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
         # creating the account outright, exactly as before (scenario 4).
-        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+        user = _create_saml_user(
+            user_email, user_nic, first_name, last_name, provider=AUTH_PROVIDER_CMD
+        )
         status = "new"
 
     _audit_saml(
@@ -2035,7 +2126,7 @@ def idp_initiated():
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
     session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
-    return _handle_saml_user_login(user, new_account=(status == "new"))
+    return _handle_saml_user_login(user, new_account=(status == "new"), provider=AUTH_PROVIDER_CMD)
 
 
 #################################################################
@@ -2462,7 +2553,9 @@ def idp_eidas_initiated():
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
         # creating the account outright, exactly as before (scenario 4).
-        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+        user = _create_saml_user(
+            user_email, user_nic, first_name, last_name, provider=AUTH_PROVIDER_EIDAS
+        )
         status = "new"
 
     if user is None:
@@ -2493,7 +2586,9 @@ def idp_eidas_initiated():
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
     session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
-    return _handle_saml_user_login(user, new_account=(status == "new"))
+    return _handle_saml_user_login(
+        user, new_account=(status == "new"), provider=AUTH_PROVIDER_EIDAS
+    )
 
 
 #################################################################
@@ -2660,6 +2755,14 @@ def migration_pending():
             "last_name": last_name,
             # Defaults to CMD so a session opened before this field existed
             # still names a provider, rather than rendering "Associar conta a".
+            #
+            # PRESENTATION ONLY — never persist this expression. The default
+            # exists so a heading reads sensibly; written to extras.auth_provider
+            # it would become a supposition stored as a fact, and the question
+            # that field answers ("how many people use eIDAS?") would come back
+            # wrong with nobody able to tell. Every path that persists the
+            # provider uses a bare pending.get("saml_provider") and writes
+            # nothing when it is absent.
             "provider": pending.get("saml_provider") or "cmd",
         }
     )
@@ -2775,6 +2878,9 @@ def migration_confirm_link(token):
         record.get("nic_hash"),
         record.get("first_name"),
         record.get("last_name"),
+        # From the record, because this route has no session to read. A record
+        # issued before the field existed simply has none.
+        provider=record.get("provider"),
     )
     current_app.logger.info(f"Migration completed by validation link for user {user.id}")
 
@@ -3015,6 +3121,9 @@ def migration_skip():
             user_nic,
             pending.get("saml_first_name"),
             pending.get("saml_last_name"),
+            # Bare get, for the same reason as the validation link: an older
+            # session names no provider, and none is invented for it.
+            provider=pending.get("saml_provider"),
         )
 
     send_confirmation_instructions(user)
