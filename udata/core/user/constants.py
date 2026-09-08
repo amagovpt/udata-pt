@@ -31,3 +31,37 @@ SAML_PLACEHOLDER_EMAIL_DOMAIN = "autenticacao.gov.pt"
 AUTH_PROVIDER = "auth_provider"
 AUTH_PROVIDER_CMD = "cmd"
 AUTH_PROVIDER_EIDAS = "eidas"
+
+# `extras` key holding whether the citizen said they were national or foreign
+# when starting a CMD sign-in: AUTH_CITIZEN_NATIONAL or AUTH_CITIZEN_FOREIGN.
+#
+# SELF-DECLARED. NOT PROOF. It comes from a radio button, travels in a query
+# parameter the caller controls, and anyone can open /saml/login?citizen=foreign
+# and claim whatever they like. Nothing may decide anything from it: it gates no
+# access, selects no authentication path, and never substitutes for verifying an
+# identity. It exists to be counted and to be contrasted with a verified value
+# later -- the name says `declared` so no reader can mistake it for a fact.
+#
+# When the MDC document attributes start arriving, the verified value wins on
+# disagreement, and a mismatch becomes the signal for a misconfigured IdP: a
+# citizen who declares "national" and brings no NIC is far more likely to be a
+# broken assertion than a foreign national, which is the ambiguity that
+# currently has no way of being resolved.
+#
+# THE VALUE IS THE LAST ONE DECLARED, not the one declared at this sign-in.
+# The write is conditional, so a sign-in that carries no parameter -- someone
+# opening /saml/login directly, without the screen -- keeps whatever was there.
+# That is deliberate: a direct link must not destroy a good value, and no guess
+# is written in its place. Anyone counting these needs to read it as "what this
+# person last told us", not "what they told us on their most recent login".
+#
+# Only the CMD route collects this. The eIDAS sign-in does not ask, and the
+# question would not make sense there.
+AUTH_CITIZEN_DECLARED = "auth_citizen_declared"
+AUTH_CITIZEN_NATIONAL = "national"
+AUTH_CITIZEN_FOREIGN = "foreign"
+
+#: The only values accepted from the query parameter. An unrecognised one is
+#: dropped -- never stored raw, never replaced by a default -- because a guess
+#: written here reads exactly like something the citizen said.
+AUTH_CITIZEN_DECLARED_VALUES = frozenset({AUTH_CITIZEN_NATIONAL, AUTH_CITIZEN_FOREIGN})
