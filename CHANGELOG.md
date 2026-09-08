@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **feat(auth): record the citizen type declared at CMD sign-in**
+  - The login screen asks whether the citizen is national or foreign, and the
+    answer was thrown away in the browser — it only enabled the submit button.
+    The portal was collecting an answer it then had no way of using.
+  - Adds `extras.auth_citizen_declared`. The login route reads `?citizen=`,
+    checks it against an exact allowlist, and only then puts it in the session
+    — the same treatment the neighbouring `next` parameter gets, and for the
+    same reason: it arrives in a query parameter the caller controls. An
+    unrecognised value is **dropped**, never stored raw and never replaced by a
+    default, because a guess written into this field reads exactly like
+    something the citizen said.
+  - Wherever `auth_provider` is recorded, this is recorded, under the same
+    conditions: account creation, the login funnel that backfills older
+    accounts, the wizard's create branch, and the emailed validation link —
+    whose click arrives with no session, so the value travels in the link
+    record alongside the hashed NIC and the names.
+  - Unlike the provider it is known at `/saml/login`, *before* the redirect to
+    the IdP, so it lives at the top of the session next to `saml_next_url`
+    rather than inside the wizard's pending record. That made
+    `_handle_migration_redirect` unnecessary to touch.
+  - **Self-declared, and it gates nothing.** Anyone can open
+    `/saml/login?citizen=foreign` and claim whatever they like, so a test
+    drives both declarations through a full sign-in and requires the outcomes
+    to be identical in status, redirect and resolved account — everything
+    except the value stored. If something ever starts deciding from it, that
+    test fails. When the document attributes arrive, the verified value wins,
+    and a disagreement becomes the signal for a misconfigured IdP.
+  - Only CMD collects it: the eIDAS screen does not ask, and a declaration left
+    in the session is not recorded on an eIDAS login.
+  - **The value is the last one declared**, not the one declared at this
+    sign-in. The write is conditional, so opening `/saml/login` directly keeps
+    whatever was there — a direct link must not destroy a good value, and no
+    guess stands in for it. Anyone counting these needs to read the field as
+    "what this person last told us".
+
 - **feat(auth): record whether an account authenticated through CMD or eIDAS**
   - `extras.auth_nic` could not answer that question: it holds a NIC or an
     eIDAS PersonIdentifier indifferently, and the hash does not say which. The
