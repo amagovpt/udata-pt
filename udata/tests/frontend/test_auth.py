@@ -1,3 +1,5 @@
+from urllib.parse import quote_plus
+
 from flask import current_app, url_for
 from flask_security.utils import hash_data
 
@@ -118,28 +120,132 @@ class AuthTest(APITestCase):
         assert user.email == new_email
         assert not user.has_placeholder_email
 
-    def test_change_mail_rejects_already_registered_email_at_submit(self):
-        """The collision must surface at submit time, not only after the
-        confirmation link is clicked."""
+    def _submit_change_email(self, address):
+        # Form-encoded POST: this is the shape the frontend proxy sends, and
+        # the only one whose failure path used to render the error back.
+        return self.post(
+            url_for("security.change_email"),
+            {"new_email": address, "new_email_confirm": address, "submit": True},
+            json=False,
+        )
+
+    def test_change_mail_rejects_a_padded_address(self):
+        """A padded address never reaches the taken/free decision at all.
+
+        udata's StringField has no strip filter, so the submitted value arrives
+        with its whitespace -- but validators.Email() refuses it inside
+        super().validate(), before the form's own checks and before the view.
+        That is why the strip in the view is defence rather than the check.
+
+        Worth pinning: if the email validator ever became lenient about
+        surrounding whitespace, that strip would silently become the only thing
+        between "taken@example.org " and a confirmation link for someone else's
+        address, since confirm_change_email also matches exactly. This test
+        fails the moment that assumption stops holding.
+        """
         user = self.login(UserFactory(email="saml-deadbeef@autenticacao.gov.pt", password=None))
-        UserFactory(email="taken@example.com")
+        UserFactory(email="taken@example.org")
 
         with capture_mails() as mails:
-            # Form-encoded POST: validation errors only surface in the HTML
-            # render (the JSON branch returns a bare csrf_token payload).
-            resp = self.post(
-                url_for("security.change_email"),
-                {
-                    "new_email": "taken@example.com",
-                    "new_email_confirm": "taken@example.com",
-                    "submit": True,
-                },
-                json=False,
-            )
-        # Validation failure: no confirmation mail is sent and the email
-        # is left untouched.
+            resp = self._submit_change_email("  taken@example.org  ")
+
+        # Refused outright: no mail to anyone, and nothing moves. Note this is
+        # not an oracle -- a padded free address is refused identically,
+        # because the refusal is about the format, not about existence.
         assert len(mails) == 0
+        assert resp.status_code == 200
+
         user.reload()
         assert user.email == "saml-deadbeef@autenticacao.gov.pt"
+
+    def test_change_mail_taken_address_warns_the_owner_at_submit(self):
+        """The collision is still handled at submit time, not only after the
+        confirmation link is clicked.
+
+        What changed is who is told: the owner of the address, by mail, and not
+        whoever submitted it. The previous version of this test asserted the
+        opposite -- 200 with "already registered" in the body -- which is the
+        disclosure this replaces.
+        """
+        user = self.login(UserFactory(email="saml-deadbeef@autenticacao.gov.pt", password=None))
+        owner = UserFactory(email="taken@example.com")
+
+        with capture_mails() as mails:
+            resp = self._submit_change_email("taken@example.com")
+
+        # Exactly one mail, to the mailbox that already holds the address.
+        # Never to the requester, who must learn nothing.
+        assert len(mails) == 1
+        assert mails[0].recipients == [owner.email]
+
+        # No confirmation link was issued for an address this session has
+        # proved nothing about.
+        assert "confirm-change-email" not in mails[0].body
+
+        # Neither account moves. This is the assertion that stops an account
+        # being claimed by naming its address, and it is the one the previous
+        # version of this test got right.
+        user.reload()
+        assert user.email == "saml-deadbeef@autenticacao.gov.pt"
+        owner.reload()
+        assert owner.email == "taken@example.com"
+
+        # Answered in the success shape; pinned against a free address below.
+        assert resp.status_code == 302
+
+    def test_change_mail_taken_address_answers_like_a_free_one(self):
+        """The taken and free branches must be indistinguishable to the caller.
+
+        If they differ in any observable way, one account is enough to test
+        any address, which is the enumeration oracle this flow must not be.
+        """
+        self.login(UserFactory(email="saml-deadbeef@autenticacao.gov.pt", password=None))
+        UserFactory(email="taken@example.com")
+
+        taken = self._submit_change_email("taken@example.com")
+        free = self._submit_change_email("free@example.com")
+
+        assert taken.status_code == free.status_code
+
+        # The redirect echoes the submitted address, which discloses nothing
+        # because the caller chose it -- so normalise it out and require
+        # everything else to match byte for byte.
+        #
+        # Both encodings are normalised: homepage_url goes through cdata_url
+        # (urlencode, so "@" becomes %40) when CDATA_BASE_URL is set, and falls
+        # back to url_for otherwise, which leaves "@" literal. Normalising only
+        # one of them silently turns this into a no-op comparison.
+        def normalise(location, address):
+            return location.replace(quote_plus(address), "ADDR").replace(address, "ADDR")
+
+        assert normalise(taken.location, "taken@example.com") == normalise(
+            free.location, "free@example.com"
+        )
+
+    def test_change_mail_same_address_error_is_translated(self):
+        """The form's own error must not reach a Portuguese user in English.
+
+        The language comes from the signed-in user: i18n.get_locale reads
+        `default_lang`, which is `prefered_language` before it is the configured
+        default -- and this suite's default is fr (settings.Testing), not pt.
+        The security views are not locale-prefixed, so passing lang_code to
+        url_for only appends a query parameter and changes nothing.
+        """
+        user = self.login(
+            UserFactory(email="mine@example.com", password=None, prefered_language="pt")
+        )
+
+        resp = self.post(
+            url_for("security.change_email"),
+            {
+                "new_email": user.email,
+                "new_email_confirm": user.email,
+                "submit": True,
+            },
+            json=False,
+        )
+
         assert resp.status_code == 200
-        assert b"already registered" in resp.data
+        body = resp.data.decode()
+        assert "must be different than your previous email" not in body
+        assert "tem de ser diferente do anterior" in body

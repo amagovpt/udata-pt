@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+- **fix(auth): stop the change-email form disclosing whether an address is registered**
+  - Submitting an address that already belonged to another account answered
+    with a form error — "This email is already registered" — rendered straight
+    back to whoever submitted it. One account was therefore enough to test any
+    address for existence, which is the same CWE-203 oracle the account
+    migration wizard was fixed to close, and it was reached from the
+    complete-registration screen that every CMD/eIDAS account with a
+    placeholder address lands on.
+  - The check moves out of `ChangeEmailForm`, which can only refuse, and into
+    the `change_email` view, which can answer identically either way: the owner
+    of the address is warned by mail, and the browser gets the free-address
+    response down to the echoed address — which discloses nothing, because the
+    caller is the one who submitted it.
+  - No confirmation link is issued for a taken address. Sending one would act
+    on an account the requesting session has proved nothing about, and would
+    turn this into a way to spray confirmation mail at any address on demand.
+    The notice therefore carries no link at all, and prescribes no particular
+    next step: the account may have been created through SAML and have no
+    usable password, so "use your password" would be impossible advice.
+  - Replicates the taken-address branch of the migration wizard, including its
+    two load-bearing details: the deleted-row guard (`mark_as_deleted` rewrites
+    the address, so mailing such a row would be mailing nobody) and the single
+    shared rate-limit budget — a per-branch budget would diverge, and a
+    divergence is itself an oracle. The notice mail is a sibling of
+    `welcome_existing` rather than a reuse of the wizard's, whose copy names a
+    digital identity; that is false here, because `change_email` is also
+    reached from the profile by a password user.
+  - `confirm_change_email` keeps its own already-taken guard. It is the net for
+    an address that becomes taken between the request and the click, which the
+    new branch cannot see.
+  - The regression suite carried a class for each enumeration vector the audit
+    found — login, register, forgot-password, resend-confirmation — and none
+    for change-email, which is why this survived. One is added in the same
+    shape, plus coverage that the taken branch warns the owner and leaves both
+    accounts untouched. The test that previously asserted the disclosure is
+    rewritten with its original intent — the collision is still handled at
+    submit time — keeping its one load-bearing assertion: the address does not
+    move.
+
+- **fix(auth): translate the authentication mails and form errors that reached readers in English**
+  - The SAML account-linking mail went out entirely in English, subject
+    included — "Confirm linking a digital identity to your account". Its
+    strings were wrapped in gettext but had no pt catalogue entry, and that
+    fails silently: gettext returns the msgid, so the mail renders and reads
+    perfectly well to anyone reading English. It had been doing so unnoticed.
+  - "Your new email must be different than your previous email" was worse: it
+    was never wrapped in gettext at all, so no catalogue entry could have
+    helped it.
+  - Measured with `pybabel` over `udata/auth/`: 56 msgids, 37 translated, 19
+    not. Twelve of those are shown to a Portuguese reader in English and are
+    added — the seven of the account-linking mail, the two still missing from
+    the address-taken notice, and the three reCAPTCHA form strings.
+  - The remaining seven are left alone deliberately, not by omission: their
+    msgid is already written in Portuguese ("Autenticação rejeitada: …"), so a
+    pt reader sees them correctly. What is wrong there is the reverse — the
+    msgid should be English with a pt translation, like every other string in
+    the catalogue — and correcting it rewrites the msgids and touches the five
+    other locales, which is a change of its own rather than a line in this one.
+  - The regression test pins the twelve msgids instead of re-extracting them,
+    because an extraction cannot tell which missing entries a pt reader can
+    actually see and would report those seven as missing forever. A second test
+    pins the notice message structurally, so a paragraph added to it later
+    without a translation is caught even if nobody extends the list.
+  - The catalogue is edited and recompiled directly, without regenerating the
+    `.pot` or touching the other locales, which is how the existing translation
+    commits in this repository do it. The other five locales compiled to
+    identical bytes and were left untouched.
+
 - **fix(discussions): send the new-discussion mail even when the discussion has no messages yet**
   - The mail builder indexed `discussion.discussion[0]` unconditionally, so a
     discussion whose message list is empty raised `IndexError` inside the

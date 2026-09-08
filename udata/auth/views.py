@@ -175,9 +175,53 @@ def change_email():
     form = ChangeEmailForm()
 
     if form.validate_on_submit():
-        new_email = form.new_email.data
-        send_change_email_confirmation_instructions(current_user, new_email)
+        # Stripped once and used for every step below, so the lookup and the
+        # confirmation token can never disagree about the address.
+        #
+        # This is defence, not the check: udata's StringField has no strip
+        # filter, but validators.Email() refuses a padded address inside
+        # super().validate(), so the branch below only ever sees a trimmed one.
+        # The check this replaced stripped here too, and it was unreachable for
+        # the same reason. Kept because it costs nothing and stops a laxer
+        # email validator from quietly making this lookup the only thing
+        # between "taken@example.org " and a confirmation link for someone
+        # else's address. Pinned by test_change_mail_rejects_a_padded_address.
+        #
+        # `or ""` because EmptyNone turns a blank field into None; DataRequired
+        # means validation never gets here with one, so this is a type guard.
+        new_email = (form.new_email.data or "").strip()
 
+        # The address is taken -- but the caller must not learn that. A form
+        # error, which is what used to happen here, is rendered straight back
+        # to them, and one account is then enough to test any address. So the
+        # party who can actually act on this is told instead: whoever reads
+        # that mailbox. The browser is answered exactly as it would be for a
+        # free address, down to echoing the submitted address, which discloses
+        # nothing because the caller is the one who submitted it.
+        #
+        # No confirmation link is issued for a taken address. Sending one would
+        # act on an account this session has proved nothing about, and would
+        # make this a way to spray confirmation mail at any address on demand.
+        #
+        # `confirm_change_email` keeps its own already-taken guard: it is the
+        # net for an address that becomes taken between this request and the
+        # click, which this branch cannot see.
+        existing = _datastore.find_user(email=new_email)
+        if existing and existing.id != current_user.id:
+            # mark_as_deleted rewrites the address to <id>@deleted, so a row
+            # deleted through the product is not found by a submitted address
+            # at all; this guard is for rows deleted by any other means, and
+            # mailing one would be mailing nobody. The response does not change
+            # either way -- the caller must not learn which case it was.
+            if not existing.deleted:
+                mails.address_taken_notice().send(existing)
+        else:
+            send_change_email_confirmation_instructions(current_user, new_email)
+
+        # Shared exit on purpose: the two branches above must not be
+        # distinguishable from out here. The rate limit on this view is also
+        # shared by both -- a per-branch budget would diverge, and a divergence
+        # is an oracle.
         if wants_json():
             return jsonify({})
 
