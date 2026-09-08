@@ -1046,14 +1046,29 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None):
     #
     # Deliberately last: an account blocked by the guards above did not
     # authenticate through anything yet, and stamping it would say it did.
+    # This is bookkeeping, and bookkeeping must never deny anyone their
+    # account. The save is the only new way this function could raise, and it
+    # sits before login_user: unguarded, a legacy document that fails to
+    # validate for some unrelated reason would turn a working sign-in into a
+    # 500 -- a behaviour change, on the accounts most likely to be affected.
+    # So a failure here loses the field and is logged, and the login proceeds.
+    # (Not the same call as the mail sends that deliberately re-raise: there,
+    # swallowing made a failure the user cared about look successful. Here the
+    # outcome the user came for still happens.)
     if provider:
         from udata.core.user.constants import AUTH_PROVIDER
 
         if (user.extras or {}).get(AUTH_PROVIDER) != provider:
-            if not user.extras:
-                user.extras = {}
-            user.extras[AUTH_PROVIDER] = provider
-            user.save()
+            try:
+                if not user.extras:
+                    user.extras = {}
+                user.extras[AUTH_PROVIDER] = provider
+                user.save()
+            except Exception as exc:
+                current_app.logger.warning(
+                    f"SAML: could not record auth provider {provider!r} for user "
+                    f"{user.id}: {type(exc).__name__}: {exc}"
+                )
 
     login_user(user)
     session["saml_login"] = True

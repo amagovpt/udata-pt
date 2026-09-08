@@ -5368,6 +5368,30 @@ class SAMLAuthProviderRecordingTest(APITestCase):
         blocked.reload()
         assert AUTH_PROVIDER not in (blocked.extras or {})
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_failed_provider_write_does_not_deny_the_login(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Bookkeeping must never cost anyone their account.
+
+        The write sits before login_user, so unguarded it would turn a working
+        sign-in into a 500 for any document that fails to save -- and legacy
+        accounts, the ones this field exists to backfill, are exactly where
+        that is most likely. The field is lost and logged; the login proceeds.
+        """
+        existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with patch("udata.core.user.models.User.save", side_effect=RuntimeError("boom")):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = self._cmd_login(
+                    mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva"
+                )
+                assert mock_login.call_count == 1
+                assert mock_login.call_args[0][0].id == existing.id
+
+        assert response.status_code == 302
+
 
 class SAMLAuthProviderWizardTest(APITestCase):
     """The two paths that do not run inside an ACS request.
