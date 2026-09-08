@@ -289,3 +289,57 @@ class SendConfirmationRateLimitRegressionTest(PytestOnlyAPITestCase):
             "send_confirmation view at udata/auth/views.py:205-209 is "
             f"not wrapped in auth_rate_limit. observed statuses: {statuses}"
         )
+
+
+# ---------------------------------------------------------------------------
+# LEDG-2456 — Enumeration on /change-email/
+# ---------------------------------------------------------------------------
+class ChangeEmailEnumerationRegressionTest(PytestOnlyAPITestCase):
+    """``/change-email`` answered a taken address with a form error saying
+    "This email is already registered", rendered straight back to the caller.
+
+    Not from the KITS24 audit — found while refining the SAML authentication
+    review — but the same CWE-203 shape as the four above, and reached from the
+    complete-registration screen every CMD/eIDAS account with a placeholder
+    address lands on. The oracle is weaker than the others because the view is
+    ``@login_required``, so an attacker needs one account; one account is still
+    enough to test any address.
+
+    The mitigation is not Flask-Security's generic responses: this check was
+    ours, in ``ChangeEmailForm``. It moved to the view, which warns the owner
+    of the address by mail and answers the browser identically either way.
+    """
+
+    @pytest.mark.options(
+        CAPTCHETAT_BASE_URL=None,
+        SECURITY_RETURN_GENERIC_RESPONSES=True,
+        RATELIMIT_ENABLED=False,
+    )
+    def test_change_email_does_not_leak_email_existence(self):
+        # Deliberately the same length. The success redirect echoes the
+        # submitted address, so unequal lengths would move the body length on
+        # their own and _bodies_indistinguishable would be comparing the
+        # addresses rather than the branches.
+        taken, fresh = "taken@example.org", "fresh@example.org"
+        assert len(taken) == len(fresh)
+
+        self.login(UserFactory(email="mine@example.org", confirmed_at=datetime.now()))
+        UserFactory(email=taken, confirmed_at=datetime.now())
+
+        def submit(address):
+            return self.post(
+                url_for("security.change_email"),
+                {"new_email": address, "new_email_confirm": address, "submit": True},
+                json=False,
+            )
+
+        known = submit(taken)
+        unknown = submit(fresh)
+
+        assert _bodies_indistinguishable(known, unknown), _diff_message(
+            "LEDG-2456 change_email", known, unknown
+        )
+
+        # The strong assertion the length check cannot make: the redirect
+        # target must match once the caller's own address is normalised out.
+        assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")
