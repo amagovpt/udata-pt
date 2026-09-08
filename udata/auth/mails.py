@@ -91,6 +91,47 @@ def welcome_existing(recovery_link: str, **kwargs) -> MailMessage:
     )
 
 
+def address_taken_notice(**kwargs) -> MailMessage:
+    """Tell the owner of an address that a change-email request named it.
+
+    The counterpart of the identical answer `change_email` gives either way:
+    the browser learns nothing about the address, and the only party told
+    anything is whoever can read that mailbox.
+
+    Deliberately carries no link of any kind. A confirmation link here would
+    act on an account the requesting session has proved nothing about, and
+    would be a way to spray confirmation mail at any address on demand. It also
+    prescribes no particular next step: the account may have been created
+    through SAML and have no usable password, so "use your password" would be
+    impossible advice.
+
+    The sibling notice in the SAML migration wizard says the same thing for
+    that flow, and is kept separate on purpose -- its copy names a digital
+    identity, which is false here, because `change_email` is also reached from
+    the profile by a password user.
+    """
+    from udata.i18n import lazy_gettext as _
+
+    site = current_app.config["SITE_TITLE"]
+    return MailMessage(
+        kind="change_email_address_taken",
+        subject=_("Your %(site)s account already exists", site=site),
+        paragraphs=[
+            _(
+                "You received this email because someone tried to use your email "
+                "address on %(site)s. It already belongs to an account, so nothing "
+                "was created and nothing changed.",
+                site=site,
+            ),
+            _(
+                "If it was you, sign in to that account the way you normally "
+                "do, or use the account recovery if you cannot."
+            ),
+            _("If it was not you, no action is needed. Your account is untouched."),
+        ],
+    )
+
+
 def confirmation_instructions(confirmation_link: str, **kwargs) -> MailMessage:
     from udata.i18n import lazy_gettext as _
 

@@ -176,8 +176,38 @@ def change_email():
 
     if form.validate_on_submit():
         new_email = form.new_email.data
-        send_change_email_confirmation_instructions(current_user, new_email)
 
+        # The address is taken -- but the caller must not learn that. A form
+        # error, which is what used to happen here, is rendered straight back
+        # to them, and one account is then enough to test any address. So the
+        # party who can actually act on this is told instead: whoever reads
+        # that mailbox. The browser is answered exactly as it would be for a
+        # free address, down to echoing the submitted address, which discloses
+        # nothing because the caller is the one who submitted it.
+        #
+        # No confirmation link is issued for a taken address. Sending one would
+        # act on an account this session has proved nothing about, and would
+        # make this a way to spray confirmation mail at any address on demand.
+        #
+        # `confirm_change_email` keeps its own already-taken guard: it is the
+        # net for an address that becomes taken between this request and the
+        # click, which this branch cannot see.
+        existing = _datastore.find_user(email=new_email)
+        if existing and existing.id != current_user.id:
+            # mark_as_deleted rewrites the address to <id>@deleted, so a row
+            # deleted through the product is not found by a submitted address
+            # at all; this guard is for rows deleted by any other means, and
+            # mailing one would be mailing nobody. The response does not change
+            # either way -- the caller must not learn which case it was.
+            if not existing.deleted:
+                mails.address_taken_notice().send(existing)
+        else:
+            send_change_email_confirmation_instructions(current_user, new_email)
+
+        # Shared exit on purpose: the two branches above must not be
+        # distinguishable from out here. The rate limit on this view is also
+        # shared by both -- a per-branch budget would diverge, and a divergence
+        # is an oracle.
         if wants_json():
             return jsonify({})
 
