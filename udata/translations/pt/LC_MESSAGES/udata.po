@@ -2813,3 +2813,69 @@ msgstr ""
 msgid "If it was not you, no action is needed. Your account is untouched."
 msgstr ""
 "Se não foi você, não é necessária nenhuma ação. A sua conta está intacta."
+
+#: udata/auth/forms.py:35
+msgid "reCAPTCHA token"
+msgstr "Token reCAPTCHA"
+
+#: udata/auth/forms.py:44
+msgid "reCAPTCHA validation required"
+msgstr "É necessária a validação reCAPTCHA"
+
+#: udata/auth/forms.py:60
+msgid "Invalid reCAPTCHA"
+msgstr "reCAPTCHA inválido"
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1332
+msgid "Confirm linking a digital identity to your account"
+msgstr "Confirme a associação de uma identidade digital à sua conta"
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1336
+msgid ""
+"Someone signed in with the digital identity of %(name)s and asked to link "
+"it to your %(site)s account."
+msgstr ""
+"Alguém iniciou sessão com a identidade digital de %(name)s e pediu para a "
+"associar à sua conta %(site)s."
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1338
+msgid "an unnamed identity"
+msgstr "uma identidade sem nome"
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1341
+msgid "Open the link below to complete the linking and sign in."
+msgstr "Abra o link abaixo para concluir a associação e iniciar sessão."
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1343
+msgid "Confirm linking"
+msgstr "Confirmar a associação"
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1345
+msgid "The link is valid for 30 minutes and can only be used once."
+msgstr "O link é válido durante 30 minutos e só pode ser usado uma vez."
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1348
+msgid ""
+"If it was not you who started this, do NOT open the link and ignore this "
+"email. Your account will not be changed."
+msgstr ""
+"Se não foi você que iniciou este pedido, NÃO abra o link e ignore esta "
+"mensagem. A sua conta não será alterada."
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1474
+msgid ""
+"Someone signing in with a digital identity tried to use this address to "
+"create a new %(site)s account. It already belongs to an account, so nothing "
+"was created and nothing changed."
+msgstr ""
+"Alguém que iniciou sessão com uma identidade digital tentou usar este "
+"endereço para criar uma conta nova no %(site)s. O endereço já pertence a uma "
+"conta, por isso nada foi criado e nada mudou."
+
+#: udata/auth/saml/saml_plugin/saml_govpt.py:1486
+msgid ""
+"To link that account to your digital identity, start the sign-in again and "
+"follow the account association steps."
+msgstr ""
+"Para associar essa conta à sua identidade digital, inicie a sessão outra vez "
+"e siga os passos de associação de conta."
