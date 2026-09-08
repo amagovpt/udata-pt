@@ -192,3 +192,31 @@ class AuthTest(APITestCase):
         assert normalise(taken.location, "taken@example.com") == normalise(
             free.location, "free@example.com"
         )
+
+    def test_change_mail_same_address_error_is_translated(self):
+        """The form's own error must not reach a Portuguese user in English.
+
+        The language comes from the signed-in user: i18n.get_locale reads
+        `default_lang`, which is `prefered_language` before it is the configured
+        default -- and this suite's default is fr (settings.Testing), not pt.
+        The security views are not locale-prefixed, so passing lang_code to
+        url_for only appends a query parameter and changes nothing.
+        """
+        user = self.login(
+            UserFactory(email="mine@example.com", password=None, prefered_language="pt")
+        )
+
+        resp = self.post(
+            url_for("security.change_email"),
+            {
+                "new_email": user.email,
+                "new_email_confirm": user.email,
+                "submit": True,
+            },
+            json=False,
+        )
+
+        assert resp.status_code == 200
+        body = resp.data.decode()
+        assert "must be different than your previous email" not in body
+        assert "tem de ser diferente do anterior" in body

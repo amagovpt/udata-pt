@@ -2782,3 +2782,34 @@ msgstr "Eliminação da sua conta inativa em {site}"
 #~ msgid "POI"
 #~ msgstr "POI"
 
+
+#: udata/auth/forms.py:151
+msgid "Your new email must be different than your previous email"
+msgstr "O seu novo e-mail tem de ser diferente do anterior"
+
+#: udata/auth/mails.py:96
+msgid "Your %(site)s account already exists"
+msgstr "A sua conta %(site)s já existe"
+
+#: udata/auth/mails.py:98
+msgid ""
+"You received this email because someone tried to use your email address on "
+"%(site)s. It already belongs to an account, so nothing was created and "
+"nothing changed."
+msgstr ""
+"Recebeu esta mensagem porque alguém tentou usar o seu endereço de e-mail no "
+"%(site)s. Esse endereço já pertence a uma conta, por isso nada foi criado e "
+"nada mudou."
+
+#: udata/auth/mails.py:104
+msgid ""
+"If it was you, sign in to that account the way you normally do, or use the "
+"account recovery if you cannot."
+msgstr ""
+"Se foi você, inicie sessão nessa conta como habitualmente, ou use a "
+"recuperação de conta se não conseguir."
+
+#: udata/auth/mails.py:108
+msgid "If it was not you, no action is needed. Your account is untouched."
+msgstr ""
+"Se não foi você, não é necessária nenhuma ação. A sua conta está intacta."

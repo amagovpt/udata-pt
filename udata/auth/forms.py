@@ -147,8 +147,10 @@ class ChangeEmailForm(Form):
         self.user = current_user
 
         if self.user.email.strip() == self.new_email.data.strip():
+            # Discloses nothing: the caller is being told about their own
+            # address, which they just submitted.
             self.new_email.errors.append(
-                "Your new email must be different than your previous email"
+                _("Your new email must be different than your previous email")
             )
             return False
 
