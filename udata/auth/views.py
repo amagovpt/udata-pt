@@ -175,7 +175,21 @@ def change_email():
     form = ChangeEmailForm()
 
     if form.validate_on_submit():
-        new_email = form.new_email.data
+        # Stripped once and used for every step below, so the lookup and the
+        # confirmation token can never disagree about the address.
+        #
+        # This is defence, not the check: udata's StringField has no strip
+        # filter, but validators.Email() refuses a padded address inside
+        # super().validate(), so the branch below only ever sees a trimmed one.
+        # The check this replaced stripped here too, and it was unreachable for
+        # the same reason. Kept because it costs nothing and stops a laxer
+        # email validator from quietly making this lookup the only thing
+        # between "taken@example.org " and a confirmation link for someone
+        # else's address. Pinned by test_change_mail_rejects_a_padded_address.
+        #
+        # `or ""` because EmptyNone turns a blank field into None; DataRequired
+        # means validation never gets here with one, so this is a type guard.
+        new_email = (form.new_email.data or "").strip()
 
         # The address is taken -- but the caller must not learn that. A form
         # error, which is what used to happen here, is rendered straight back

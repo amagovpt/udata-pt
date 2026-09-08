@@ -129,6 +129,35 @@ class AuthTest(APITestCase):
             json=False,
         )
 
+    def test_change_mail_rejects_a_padded_address(self):
+        """A padded address never reaches the taken/free decision at all.
+
+        udata's StringField has no strip filter, so the submitted value arrives
+        with its whitespace -- but validators.Email() refuses it inside
+        super().validate(), before the form's own checks and before the view.
+        That is why the strip in the view is defence rather than the check.
+
+        Worth pinning: if the email validator ever became lenient about
+        surrounding whitespace, that strip would silently become the only thing
+        between "taken@example.org " and a confirmation link for someone else's
+        address, since confirm_change_email also matches exactly. This test
+        fails the moment that assumption stops holding.
+        """
+        user = self.login(UserFactory(email="saml-deadbeef@autenticacao.gov.pt", password=None))
+        UserFactory(email="taken@example.org")
+
+        with capture_mails() as mails:
+            resp = self._submit_change_email("  taken@example.org  ")
+
+        # Refused outright: no mail to anyone, and nothing moves. Note this is
+        # not an oracle -- a padded free address is refused identically,
+        # because the refusal is about the format, not about existence.
+        assert len(mails) == 0
+        assert resp.status_code == 200
+
+        user.reload()
+        assert user.email == "saml-deadbeef@autenticacao.gov.pt"
+
     def test_change_mail_taken_address_warns_the_owner_at_submit(self):
         """The collision is still handled at submit time, not only after the
         confirmation link is clicked.
