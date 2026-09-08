@@ -5567,3 +5567,234 @@ class SAMLAuthProviderWizardTest(APITestCase):
 
         legacy.reload()
         assert legacy.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
+
+
+class SAMLDeclaredCitizenTypeTest(APITestCase):
+    """`extras.auth_citizen_declared` holds what the citizen said on the login
+    screen: national or foreign.
+
+    It is SELF-DECLARED. It arrives in a query parameter the caller controls,
+    so the tests here are as much about what it must NOT do -- gate anything,
+    accept anything outside the allowlist, or acquire a default -- as about
+    what it records.
+
+    Only CMD collects it. The eIDAS screen does not ask.
+    """
+
+    NIC = "24242424"
+    PERSON_ID = "IE/PT/1112223334"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _start_login(self, mock_client_for, query=""):
+        """GET /saml/login, which is where the parameter is read and vetted."""
+        mock_saml_client = MagicMock()
+        mock_saml_client.prepare_for_authenticate.return_value = (
+            "reqid-1",
+            {"data": '<form action="https://idp.example/sso">'},
+        )
+        mock_client_for.return_value = mock_saml_client
+        return self.client.get(f"/saml/login{query}")
+
+    def _declare(self, value):
+        """Put an already-vetted declaration in the session, as the login
+        route would have. Lets the ACS tests stay about the write path."""
+        with self.client.session_transaction() as sess:
+            sess["saml_citizen_declared"] = value
+
+    def _cmd_acs(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def _eidas_acs(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post(
+            "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
+        )
+
+    # --- the allowlist, at the route that reads the parameter ---
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_login_route_keeps_a_recognised_declaration(self, mock_client_for):
+        from udata.core.user.constants import AUTH_CITIZEN_FOREIGN, AUTH_CITIZEN_NATIONAL
+
+        for value in (AUTH_CITIZEN_NATIONAL, AUTH_CITIZEN_FOREIGN):
+            self._start_login(mock_client_for, f"?citizen={value}")
+            with self.client.session_transaction() as sess:
+                assert sess.get("saml_citizen_declared") == value
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_login_route_drops_anything_outside_the_allowlist(self, mock_client_for):
+        """Never stored raw, never replaced by a default.
+
+        A value written here reads exactly like something the citizen said, so
+        the only safe answer to an unrecognised one is to keep nothing. Note
+        "nacional"/"estrangeiro": the frontend used to hold the Portuguese
+        spellings, and accepting them would leave two vocabularies in the
+        database for one thing.
+
+        A loop rather than pytest.mark.parametrize: this class is unittest-based
+        (APITestCase), where the marker is silently ignored and every case but
+        one would go unrun.
+        """
+        payloads = [
+            "bogus",
+            "",
+            "NATIONAL",
+            "nacional",
+            "estrangeiro",
+            "national,foreign",
+            "<script>alert(1)</script>",
+            "national ",
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self._start_login(mock_client_for, f"?citizen={payload}")
+                with self.client.session_transaction() as sess:
+                    assert "saml_citizen_declared" not in sess, payload
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_login_route_without_the_parameter_stores_nothing(self, mock_client_for):
+        self._start_login(mock_client_for, "?next=/datasets")
+        with self.client.session_transaction() as sess:
+            assert "saml_citizen_declared" not in sess
+            # The neighbouring parameter still works — this did not break it.
+            assert sess.get("saml_next_url") == "/datasets"
+
+    # --- the write path ---
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_login_records_the_declaration(self, mock_client_for, mock_requires_conf):
+        from udata.core.user.constants import (
+            AUTH_CITIZEN_DECLARED,
+            AUTH_CITIZEN_FOREIGN,
+            AUTH_CITIZEN_NATIONAL,
+        )
+
+        existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        self._declare(AUTH_CITIZEN_FOREIGN)
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._cmd_acs(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+            assert mock_login.call_count == 1
+
+        existing.reload()
+        assert existing.extras[AUTH_CITIZEN_DECLARED] == AUTH_CITIZEN_FOREIGN
+        assert existing.extras[AUTH_CITIZEN_DECLARED] != AUTH_CITIZEN_NATIONAL
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_login_without_a_declaration_records_the_provider_only(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Someone opening /saml/login directly bypasses the screen. The
+        provider is still known from the route; the declaration is not, and no
+        default stands in for it."""
+        from udata.core.user.constants import (
+            AUTH_CITIZEN_DECLARED,
+            AUTH_PROVIDER,
+            AUTH_PROVIDER_CMD,
+        )
+
+        existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._cmd_acs(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+            assert mock_login.call_count == 1
+
+        existing.reload()
+        assert existing.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
+        assert AUTH_CITIZEN_DECLARED not in existing.extras
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_login_records_no_declaration(self, mock_client_for, mock_requires_conf):
+        """The eIDAS screen does not ask, so nothing is recorded even if a
+        declaration is somehow sitting in the session."""
+        from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_CITIZEN_FOREIGN
+
+        existing = UserFactory(
+            email="saml-dddddddd@autenticacao.gov.pt",
+            confirmed_at="2024-01-01",
+            extras={"auth_nic": _hash_nic(self.PERSON_ID)},
+        )
+
+        self._declare(AUTH_CITIZEN_FOREIGN)
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._eidas_acs(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Aoife",
+                family_name="Byrne",
+            )
+            assert mock_login.call_count == 1
+
+        existing.reload()
+        assert AUTH_CITIZEN_DECLARED not in (existing.extras or {})
+
+    # --- the criterion that matters most: it gates nothing ---
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_forged_declaration_changes_nothing_but_the_stored_value(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Anyone can open /saml/login?citizen=foreign and claim anything.
+
+        So the two declarations must produce identical outcomes in every
+        respect except the value written: same status, same redirect, same
+        account resolved, same login. If this ever stops holding, something has
+        started deciding from a value the caller chose, which is exactly what
+        this field must never allow.
+        """
+        from udata.core.user.constants import (
+            AUTH_CITIZEN_DECLARED,
+            AUTH_CITIZEN_FOREIGN,
+            AUTH_CITIZEN_NATIONAL,
+        )
+
+        outcomes = {}
+        for value in (AUTH_CITIZEN_NATIONAL, AUTH_CITIZEN_FOREIGN):
+            nic = f"9{value[:6]}"
+            account = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(nic)})
+            self._declare(value)
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = self._cmd_acs(
+                    mock_client_for, nic=nic, first_name="Ana", last_name="Silva"
+                )
+                logged_in = mock_login.call_count == 1 and mock_login.call_args[0][0].id
+            account.reload()
+            outcomes[value] = {
+                "status": response.status_code,
+                "location": response.headers.get("Location"),
+                "logged_in_is_the_account": logged_in == account.id,
+                "declared": account.extras.get(AUTH_CITIZEN_DECLARED),
+            }
+
+        national, foreign = outcomes[AUTH_CITIZEN_NATIONAL], outcomes[AUTH_CITIZEN_FOREIGN]
+
+        assert national["status"] == foreign["status"]
+        assert national["location"] == foreign["location"]
+        assert national["logged_in_is_the_account"] is True
+        assert foreign["logged_in_is_the_account"] is True
+
+        # The only thing that differs is the value itself.
+        assert national["declared"] == AUTH_CITIZEN_NATIONAL
+        assert foreign["declared"] == AUTH_CITIZEN_FOREIGN

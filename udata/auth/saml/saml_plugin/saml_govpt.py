@@ -95,7 +95,11 @@ from limits import parse
 
 from udata.api.limits import MIGRATION_SUBMIT_LIMIT
 from udata.app import csrf
-from udata.core.user.constants import AUTH_PROVIDER_CMD, AUTH_PROVIDER_EIDAS
+from udata.core.user.constants import (
+    AUTH_CITIZEN_DECLARED_VALUES,
+    AUTH_PROVIDER_CMD,
+    AUTH_PROVIDER_EIDAS,
+)
 from udata.core.user.nic import hash_nic as _hash_nic
 from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
@@ -699,7 +703,9 @@ def _idp_status_rejection(raw_saml_response, kind):
     return None
 
 
-def _create_saml_user(user_email, user_nic, first_name, last_name, *, provider=None):
+def _create_saml_user(
+    user_email, user_nic, first_name, last_name, *, provider=None, citizen_declared=None
+):
     """Create a new account from SAML attributes (scenario 4).
 
     ``provider`` is AUTH_PROVIDER_CMD or AUTH_PROVIDER_EIDAS, and comes from the
@@ -707,6 +713,11 @@ def _create_saml_user(user_email, user_nic, first_name, last_name, *, provider=N
     _handle_migration_redirect takes it explicitly: nothing this far downstream
     can infer which one started the flow. Recorded only when supplied, so a
     caller without a route to speak for stores nothing rather than a guess.
+
+    ``citizen_declared`` is what the citizen said on the login screen, already
+    allowlisted by the route that received it. Same rule as the provider: only
+    written when there is one. It is SELF-DECLARED and gates nothing -- see
+    AUTH_CITIZEN_DECLARED for why that matters.
     """
     # Generate a placeholder email when the IdP does not provide one, or
     # when the CMD email is already taken by an existing account (the
@@ -723,7 +734,7 @@ def _create_saml_user(user_email, user_nic, first_name, last_name, *, provider=N
             f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
         )
 
-    from udata.core.user.constants import AUTH_PROVIDER
+    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -739,6 +750,8 @@ def _create_saml_user(user_email, user_nic, first_name, last_name, *, provider=N
         extras["auth_nic"] = _hash_nic(user_nic)
     if provider:
         extras[AUTH_PROVIDER] = provider
+    if citizen_declared:
+        extras[AUTH_CITIZEN_DECLARED] = citizen_declared
     if extras:
         user_data["extras"] = extras
 
@@ -803,7 +816,25 @@ MAX_MIGRATION_LINK_SENDS = 5
 MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
 
 
-def _create_pending_saml_user(user_email, user_nic, first_name, last_name, *, provider=None):
+def _declared_citizen():
+    """What the citizen said on the login screen, or None if they said nothing.
+
+    Read from the top level of the session, not from the wizard's pending
+    record, and that is the difference from the provider: the provider is only
+    known once the assertion comes back, while this is known at ``/saml/login``
+    — before the redirect to the IdP — so it is stored alongside
+    ``saml_next_url`` and survives the same round trip.
+
+    Already allowlisted by the route that stored it, so a value read back here
+    is one of the two accepted ones or absent. Deliberately not popped: the
+    wizard runs in later requests and needs it too.
+    """
+    return session.get("saml_citizen_declared")
+
+
+def _create_pending_saml_user(
+    user_email, user_nic, first_name, last_name, *, provider=None, citizen_declared=None
+):
     """Create an account from a user-declared email, left unconfirmed.
 
     Unlike :func:`_create_saml_user` this never mints a placeholder address —
@@ -816,12 +847,17 @@ def _create_pending_saml_user(user_email, user_nic, first_name, last_name, *, pr
     the ACS route. Recorded only when present: a session opened before that
     field existed carries none, and the account is then created without one
     rather than with a guess.
+
+    ``citizen_declared`` reaches here the same way, from the session key the
+    login route set after allowlisting it. Same rule, same reason.
     """
-    from udata.core.user.constants import AUTH_PROVIDER
+    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
 
     extras = {"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True}
     if provider:
         extras[AUTH_PROVIDER] = provider
+    if citizen_declared:
+        extras[AUTH_CITIZEN_DECLARED] = citizen_declared
 
     user = datastore.create_user(
         first_name=(first_name or "").title(),
@@ -971,7 +1007,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     return None, "no_match"
 
 
-def _handle_saml_user_login(user, new_account=False, *, provider=None):
+def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_declared=None):
     """Handle login/redirect after SAML authentication.
 
     When ``new_account`` is True the redirect carries ``cmd_new_account=1``
@@ -1055,18 +1091,28 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None):
     # (Not the same call as the mail sends that deliberately re-raise: there,
     # swallowing made a failure the user cared about look successful. Here the
     # outcome the user came for still happens.)
-    if provider:
-        from udata.core.user.constants import AUTH_PROVIDER
+    if provider or citizen_declared:
+        from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
 
-        if (user.extras or {}).get(AUTH_PROVIDER) != provider:
+        incoming = {}
+        if provider:
+            incoming[AUTH_PROVIDER] = provider
+        if citizen_declared:
+            incoming[AUTH_CITIZEN_DECLARED] = citizen_declared
+
+        # Only what actually differs, so a repeat login is not a repeat write,
+        # and one save for both keys rather than one each.
+        current = user.extras or {}
+        changed = {key: value for key, value in incoming.items() if current.get(key) != value}
+        if changed:
             try:
                 if not user.extras:
                     user.extras = {}
-                user.extras[AUTH_PROVIDER] = provider
+                user.extras.update(changed)
                 user.save()
             except Exception as exc:
                 current_app.logger.warning(
-                    f"SAML: could not record auth provider {provider!r} for user "
+                    f"SAML: could not record {sorted(changed)} for user "
                     f"{user.id}: {type(exc).__name__}: {exc}"
                 )
 
@@ -1222,20 +1268,23 @@ def _migration_link_send_allowed(user):
     return True, {"count": count + 1, "window_start": tally["window_start"]}
 
 
-def _issue_migration_link(user, nic_hash, first_name, last_name, *, provider=None):
+def _issue_migration_link(
+    user, nic_hash, first_name, last_name, *, provider=None, citizen_declared=None
+):
     """Record a pending link request on ``user`` and return its token.
 
     The record carries everything the click needs — the hashed NIC, the names
-    from the assertion, and which provider the assertion came from — so the
-    consuming route never has to read the session. A fresh nonce is minted on
-    every call, which is what makes a resend invalidate the link that preceded
-    it. Takes the NIC already hashed so a reissue can work from a record, where
-    the raw value is long gone.
+    from the assertion, which provider it came from, and what the citizen
+    declared — so the consuming route never has to read the session. A fresh
+    nonce is minted on every call, which is what makes a resend invalidate the
+    link that preceded it. Takes the NIC already hashed so a reissue can work
+    from a record, where the raw value is long gone.
 
-    ``provider`` travels in the record for the same reason as everything else
-    in it: the click arrives with no session, so a value left behind in one
-    would not be there to read. A record written before this field existed
-    carries none, and the link then completes without recording one.
+    ``provider`` and ``citizen_declared`` travel in the record for the same
+    reason as everything else in it: the click arrives with no session, so a
+    value left behind in one would not be there to read. A record written before
+    either field existed carries none, and the link then completes without
+    recording it.
     """
     nonce = secrets.token_urlsafe(32)
 
@@ -1247,6 +1296,7 @@ def _issue_migration_link(user, nic_hash, first_name, last_name, *, provider=Non
         "first_name": first_name,
         "last_name": last_name,
         "provider": provider,
+        "citizen_declared": citizen_declared,
         "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
     }
 
@@ -1258,7 +1308,9 @@ def _issue_migration_link(user, nic_hash, first_name, last_name, *, provider=Non
     return serializer.dumps([MIGRATION_LINK_TOKEN_TAG, str(user.id), hash_data(nonce)])
 
 
-def _link_identity_and_login(user, nic_hash, first_name, last_name, *, provider=None):
+def _link_identity_and_login(
+    user, nic_hash, first_name, last_name, *, provider=None, citizen_declared=None
+):
     """Bind the authenticated identity to ``user`` and start its session.
 
     The single place that completes a link, shared by every branch that can:
@@ -1268,11 +1320,12 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name, *, provider=
     would leave a live link able to overwrite the identity it just bound. The
     password is left untouched so the account stays reachable both ways.
 
-    ``provider`` comes from the link record, not the session: the consuming
-    route is a click that arrives with no session at all. Recorded under the
-    same rule as everywhere else — only when there is one to record.
+    ``provider`` and ``citizen_declared`` come from the link record, not the
+    session: the consuming route is a click that arrives with no session at all.
+    Recorded under the same rule as everywhere else — only when there is one to
+    record.
     """
-    from udata.core.user.constants import AUTH_PROVIDER
+    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
 
     if not user.extras:
         user.extras = {}
@@ -1280,6 +1333,8 @@ def _link_identity_and_login(user, nic_hash, first_name, last_name, *, provider=
         user.extras["auth_nic"] = nic_hash
     if provider:
         user.extras[AUTH_PROVIDER] = provider
+    if citizen_declared:
+        user.extras[AUTH_CITIZEN_DECLARED] = citizen_declared
     if first_name:
         user.first_name = first_name.title()
     if last_name:
@@ -1626,6 +1681,7 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
         # provider was recorded must produce a record without one, so the link
         # completes without inventing a provider for it.
         provider=pending.get("saml_provider"),
+        citizen_declared=_declared_citizen(),
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
@@ -1769,6 +1825,19 @@ def sp_initiated():
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
+
+    # The citizen type the login screen collected, on its way to the account.
+    # Validated against an exact allowlist and only then put in the session, for
+    # the same reason `next` is checked above: this arrives in a query parameter
+    # the caller controls, so an unrecognised value is DROPPED -- never stored
+    # raw, never replaced by a default. A guess written into
+    # extras.auth_citizen_declared reads exactly like something the citizen
+    # said, which is the one thing that field must never do.
+    #
+    # It is self-declared and gates nothing; see the constant for why.
+    declared = request.args.get("citizen", "")
+    if declared in AUTH_CITIZEN_DECLARED_VALUES:
+        session["saml_citizen_declared"] = declared
 
     saml_client = saml_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
@@ -2109,7 +2178,12 @@ def idp_initiated():
         # nobody is around to ask for a confirmed email — fall back to
         # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(
-            user_email, user_nic, first_name, last_name, provider=AUTH_PROVIDER_CMD
+            user_email,
+            user_nic,
+            first_name,
+            last_name,
+            provider=AUTH_PROVIDER_CMD,
+            citizen_declared=_declared_citizen(),
         )
         status = "new"
 
@@ -2126,7 +2200,12 @@ def idp_initiated():
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
     session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
-    return _handle_saml_user_login(user, new_account=(status == "new"), provider=AUTH_PROVIDER_CMD)
+    return _handle_saml_user_login(
+        user,
+        new_account=(status == "new"),
+        provider=AUTH_PROVIDER_CMD,
+        citizen_declared=_declared_citizen(),
+    )
 
 
 #################################################################
@@ -2879,8 +2958,9 @@ def migration_confirm_link(token):
         record.get("first_name"),
         record.get("last_name"),
         # From the record, because this route has no session to read. A record
-        # issued before the field existed simply has none.
+        # issued before either field existed simply has none.
         provider=record.get("provider"),
+        citizen_declared=record.get("citizen_declared"),
     )
     current_app.logger.info(f"Migration completed by validation link for user {user.id}")
 
@@ -3124,6 +3204,7 @@ def migration_skip():
             # Bare get, for the same reason as the validation link: an older
             # session names no provider, and none is invented for it.
             provider=pending.get("saml_provider"),
+            citizen_declared=_declared_citizen(),
         )
 
     send_confirmation_instructions(user)
