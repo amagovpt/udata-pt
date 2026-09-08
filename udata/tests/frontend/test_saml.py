@@ -5197,3 +5197,173 @@ class SAMLMigrationSecurityTest(APITestCase):
             json={"method": "password", "email": "pedro@example.pt", "password": "S3cretPass1!"},
         )
         assert r.status_code == 400
+
+
+class SAMLAuthProviderRecordingTest(APITestCase):
+    """`extras.auth_provider` names which government IdP a session came through.
+
+    The hash in `extras.auth_nic` cannot answer that -- it holds a NIC or an
+    eIDAS PersonIdentifier indifferently -- and nothing downstream of the ACS
+    routes can either, because the two converge and the attributes look the
+    same afterwards. So the value has to be carried down from the route, and
+    these tests pin that it is, for both providers and for the account that
+    predates the field.
+
+    They do NOT cover a national-versus-foreign CMD distinction, and that is
+    deliberate: both arrive on the same ACS route, and the attributes that
+    would tell them apart are not requested yet.
+    """
+
+    NIC = "77777777"
+    PERSON_ID = "ES/PT/9988776655"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def _eidas_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post(
+            "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_login_backfills_the_provider_on_an_account_that_predates_it(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The whole point of writing it at login and not only at creation."""
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+
+        existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+        assert AUTH_PROVIDER not in (existing.extras or {})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+            assert mock_login.call_count == 1
+
+        existing.reload()
+        assert existing.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_login_records_a_provider_distinct_from_cmd(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Distinct is the requirement: a value that could not tell the two
+        apart would answer "how many people use eIDAS?" wrongly."""
+        from udata.core.user.constants import (
+            AUTH_PROVIDER,
+            AUTH_PROVIDER_CMD,
+            AUTH_PROVIDER_EIDAS,
+        )
+
+        existing = UserFactory(
+            email="saml-abadcafe@autenticacao.gov.pt",
+            confirmed_at="2024-01-01",
+            extras={"auth_nic": _hash_nic(self.PERSON_ID)},
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._eidas_login(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+            assert mock_login.call_count == 1
+
+        existing.reload()
+        assert existing.extras[AUTH_PROVIDER] == AUTH_PROVIDER_EIDAS
+        assert existing.extras[AUTH_PROVIDER] != AUTH_PROVIDER_CMD
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_account_created_on_the_wizard_off_path_carries_the_provider(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """With the wizard off an unmatched identity gets an account outright.
+        It must carry the provider from the moment it exists, not from the
+        moment its first login finishes."""
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                nic="12121212",
+                email="nova@example.pt",
+                first_name="Nova",
+                last_name="Conta",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic("12121212")).first()
+        assert created is not None
+        assert created.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_identity_sent_to_the_wizard_records_nothing(self, mock_client_for):
+        """A wizard candidate has proved nothing yet, so nothing is stamped on
+        the account it might turn out to own -- and absent must stay absent
+        rather than becoming a default."""
+        from udata.core.user.constants import AUTH_PROVIDER
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        candidate = UserFactory(
+            email="homonimo@example.pt",
+            password="S3cretPass!",
+            first_name="Ana",
+            last_name="Silva",
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._cmd_login(
+                mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva"
+            )
+            assert mock_login.call_count == 0
+
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        candidate.reload()
+        assert AUTH_PROVIDER not in (candidate.extras or {})
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_login_blocked_by_a_guard_records_nothing(self, mock_client_for):
+        """The write sits after the guards on purpose: an account turned away
+        did not authenticate through anything, and stamping it would say it
+        did. Uses the deleted-account guard, which is the one reachable with
+        an identity that already resolves."""
+        from udata.core.user.constants import AUTH_PROVIDER
+
+        blocked = UserFactory(
+            confirmed_at="2024-01-01",
+            deleted=datetime.utcnow(),
+            extras={"auth_nic": _hash_nic(self.NIC)},
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+            assert mock_login.call_count == 0
+
+        blocked.reload()
+        assert AUTH_PROVIDER not in (blocked.extras or {})
