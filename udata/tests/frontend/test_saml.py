@@ -5749,6 +5749,59 @@ class SAMLDeclaredCitizenTypeTest(APITestCase):
         existing.reload()
         assert AUTH_CITIZEN_DECLARED not in (existing.extras or {})
 
+    # --- the declaration must not outlive the sign-in that made it ---
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_declaration_is_not_inherited_by_the_next_sign_in(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """One person's answer must never land on another person's account.
+
+        The session key is set at /saml/login and read at the ACS postback. Left
+        behind, the next CMD sign-in on the same browser -- someone opening a
+        bookmarked /saml/login with no parameter -- would have the previous
+        person's answer recorded as if they had given it. Same hazard the
+        confirmation handle next to it is popped for.
+        """
+        from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_CITIZEN_FOREIGN
+
+        first = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+        second = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic("31313131")})
+
+        # Someone declares, and signs in.
+        self._declare(AUTH_CITIZEN_FOREIGN)
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_acs(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+        first.reload()
+        assert first.extras[AUTH_CITIZEN_DECLARED] == AUTH_CITIZEN_FOREIGN
+
+        # The session must no longer carry it.
+        with self.client.session_transaction() as sess:
+            assert "saml_citizen_declared" not in sess
+
+        # The next sign-in on this browser declares nothing, and inherits
+        # nothing.
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_acs(mock_client_for, nic="31313131", first_name="Rui", last_name="Costa")
+        second.reload()
+        assert AUTH_CITIZEN_DECLARED not in (second.extras or {})
+
+    def test_the_logout_clears_a_declaration(self):
+        """The other exit: someone who declared and then signed out.
+
+        _terminate_local_session enumerates the keys it clears, so a new one is
+        only cleared if it is added to that list -- which is exactly the kind of
+        thing that gets forgotten.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _terminate_local_session
+        from udata.core.user.constants import AUTH_CITIZEN_FOREIGN
+
+        with self.app.test_request_context("/"):
+            session["saml_citizen_declared"] = AUTH_CITIZEN_FOREIGN
+            _terminate_local_session()
+            assert "saml_citizen_declared" not in session
+
     # --- the criterion that matters most: it gates nothing ---
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)

@@ -1024,6 +1024,13 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_d
     """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
+    # Consumed here for the same reason as the next-URL above: this sign-in is
+    # over, the caller already read the value into `citizen_declared`, and a
+    # declaration left in the session would be applied to whatever sign-in came
+    # next on this browser. The wizard path never reaches this function -- it
+    # returns at _handle_migration_redirect -- so its own later requests still
+    # find the value, and the logout clears it for them.
+    session.pop("saml_citizen_declared", None)
 
     if user is None:
         current_app.logger.warning(
@@ -2267,6 +2274,11 @@ def _terminate_local_session():
     # Ends with the session like the rest: it is a handle onto someone's
     # pending account, and the next person on this browser must not inherit it.
     session.pop("saml_confirmation_pending", None)
+    # Same rule, same reason: this is what *someone* said about themselves. Left
+    # behind, the next person to start a CMD sign-in on this browser without
+    # passing through the screen -- a bookmarked /saml/login, say -- would have
+    # that answer recorded on their own account as if they had given it.
+    session.pop("saml_citizen_declared", None)
     logout_user()
 
 
