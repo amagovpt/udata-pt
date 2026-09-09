@@ -6120,14 +6120,21 @@ class SAMLTrackableLoginFieldsTest(APITestCase):
     ):
         """Bookkeeping must never cost anyone their account.
 
-        Same reasoning as the provider write next to it: legacy accounts are
-        both the ones this backfills and the ones most likely to fail to save,
-        so an unguarded write would turn a working sign-in into a 500 exactly
-        there. The fields are lost and logged; the login proceeds.
+        Same reasoning as the provider write next to it: an unguarded write on
+        this path would turn a working sign-in into a 500, and legacy accounts
+        are both the ones this backfills and the ones most likely to fail.
+        The fields are lost and logged; the login proceeds.
+
+        Patches the atomic update rather than User.save, because that is what
+        this writes with -- and a test still pointed at save would pass
+        without exercising the guard at all.
         """
         existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
 
-        with patch("udata.core.user.models.User.save", side_effect=RuntimeError("boom")):
+        with patch(
+            "mongoengine.queryset.base.BaseQuerySet.update_one",
+            side_effect=RuntimeError("boom"),
+        ):
             with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
                 response = self._cmd_login(
                     mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva"
@@ -6210,41 +6217,6 @@ class SAMLTrackableLoginFieldsTest(APITestCase):
 
         assert saml_govpt.login_user is flask_login.login_user
 
-    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_the_save_also_persists_the_auto_confirm_it_used_to_lose(self, mock_client_for):
-        """A consequence of this fix, declared rather than left to luck.
-
-        The auto-confirm branch above sets confirmed_at and then calls
-        datastore.commit(), which is a no-op on MongoEngine -- the base
-        Datastore.commit() is `pass` and MongoEngineDatastore does not
-        override it, because its put() already writes. So the value only ever
-        reached the database when the provider block below happened to save,
-        which is to say not on a repeat login with nothing new to record.
-        This helper's save persists it, on every login.
-
-        The account therefore has to already carry the provider and no
-        pending-confirmation marker, so that block finds nothing changed and
-        saves nothing: otherwise it, and not the helper, would be the writer,
-        and the mutation would not be detectable.
-        """
-        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
-
-        existing = UserFactory(
-            confirmed_at=None,
-            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
-        )
-        assert existing.confirmed_at is None
-
-        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
-            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
-
-        existing.reload()
-        assert existing.confirmed_at is not None
-        assert existing.login_count == 1
-        # The provider block had nothing to change, so the helper was the only
-        # writer -- which is what makes the assertion above mean something.
-        assert existing.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
-
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_the_fields_are_written_with_the_migration_wizard_on(
@@ -6299,3 +6271,87 @@ class SAMLTrackableLoginFieldsTest(APITestCase):
         assert created.login_count == 1
         assert created.current_login_at is not None
         assert created.current_login_ip == "127.0.0.1"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_write_does_not_touch_anything_else(self, mock_client_for, mock_requires_conf):
+        """Why this writes five fields atomically instead of saving the user.
+
+        `User.pre_save` sanitizes `about`, `first_name` and `last_name` on
+        every write path. On a document predating that sanitization the value
+        genuinely changes -- an ampersand gets escaped -- so MongoEngine marks
+        the field dirty and a full save carries it along in the same `$set`.
+        Someone signing in with CMD would find their own name rewritten on
+        screen, silently, because this write is deliberately swallowed. The
+        same coupling would let a login clobber a bio edited in another tab.
+
+        The legacy value is written straight through the queryset so it
+        bypasses `pre_save`, which is exactly the state of a document stored
+        before that hook existed.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+        from udata.core.user.models import User
+
+        # The provider already recorded, so the write next to this one finds
+        # nothing changed and saves nothing: otherwise IT would be the one
+        # rewriting the name, and this test would be pinning the wrong write.
+        existing = UserFactory(
+            confirmed_at="2024-01-01",
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+        User.objects(id=existing.id).update_one(
+            set__last_name="Silva & Sousa", set__about="bio <mark>antiga</mark>"
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC)
+
+        existing.reload()
+        assert existing.login_count == 1
+        assert existing.last_name == "Silva & Sousa"
+        assert existing.about == "bio <mark>antiga</mark>"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_real_login_user_reaches_the_write(self, mock_client_for, mock_requires_conf):
+        """The one path the other tests cannot reach.
+
+        They patch `login_user` with a MagicMock, whose return value is always
+        truthy, so none of them exercises the true branch of the guard with
+        the real function. If `flask_login.login_user` ever started refusing
+        on a successful path -- an `active` default lost, an `is_active`
+        override -- they would all stay green while production wrote nothing.
+        """
+        existing = UserFactory(
+            active=True, confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)}
+        )
+
+        assert self._cmd_login(mock_client_for, nic=self.NIC).status_code == 302
+
+        existing.reload()
+        assert existing.login_count == 1
+        assert existing.current_login_at is not None
+        assert existing.current_login_ip == "127.0.0.1"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_nothing_is_written_when_tracking_is_off(self, mock_client_for, mock_requires_conf):
+        """Mirrors the upstream condition instead of only its body.
+
+        flask_security writes these fields inside `if _security.trackable:`,
+        so a deployment that turns tracking off stops keeping them. This
+        settings default is True, which is why the branch has no live effect
+        today -- and exactly why it needs a test: without one it is a claim in
+        a comment, and a SAML login would keep stamping accounts in a
+        deployment whose password logins had stopped.
+        """
+        existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+        security = self.app.extensions["security"]
+
+        with patch.object(security, "trackable", False):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_login(mock_client_for, nic=self.NIC)
+
+        existing.reload()
+        assert existing.login_count is None
+        assert existing.current_login_at is None

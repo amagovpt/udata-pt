@@ -1038,18 +1038,45 @@ def _record_login_activity(user):
     ``last_login_*`` carry the PREVIOUS login's values, which is why
     ``last_login_ip`` is empty until the second sign-in.
 
-    The save is guarded because bookkeeping must never deny anyone their
-    account -- the same reasoning, and the same shape, as the provider write
-    below. A failure loses the fields, is logged, and the sign-in stands.
+    Written as an atomic update of exactly these five fields, and NOT with
+    ``user.save()``. A save writes the whole dirty document, and
+    ``User.pre_save`` sanitizes ``about``, ``first_name`` and ``last_name`` on
+    every write path: on a document predating that sanitization the value
+    genuinely changes (``Silva & Sousa`` becomes ``Silva &amp; Sousa``),
+    MongoEngine therefore marks the field dirty, and it rides along in the
+    same ``$set``. Someone signing in with CMD would see their own name
+    mangled on screen, silently, because this write is deliberately swallowed.
+    The same coupling would let this write clobber a bio edited in another tab
+    between the moment this request loaded the document and this line.
+    Sanitizing legacy documents is a migration, not a side effect of a login.
+    The atomic write also makes the counter safe: ``inc__`` cannot lose a
+    count when two sign-ins land at once, which ``+ 1`` in Python can.
+
+    Guarded because bookkeeping must never deny anyone their account -- the
+    same reasoning, and the same shape, as the provider write below. A failure
+    loses the fields, is logged, and the sign-in stands. Only the write is
+    inside the guard: a mistake computing the values should surface, not be
+    logged as a warning.
     """
-    now = datetime.utcnow()
+    from udata.core.user.models import User
+
+    security = current_app.extensions.get("security")
+    # Mirrors the upstream condition, so a deployment that turns tracking off
+    # stops writing here too instead of diverging from its password logins.
+    if security is not None and not security.trackable:
+        return
+
+    # Same clock as the password login writes into the same fields, rather
+    # than one that happens to agree today.
+    now = security.datetime_factory() if security is not None else datetime.utcnow()
     try:
-        user.last_login_at = user.current_login_at or now
-        user.current_login_at = now
-        user.last_login_ip = user.current_login_ip
-        user.current_login_ip = request.remote_addr or None
-        user.login_count = (user.login_count or 0) + 1
-        user.save()
+        User.objects(id=user.id).update_one(
+            set__last_login_at=user.current_login_at or now,
+            set__current_login_at=now,
+            set__last_login_ip=user.current_login_ip,
+            set__current_login_ip=request.remote_addr or None,
+            inc__login_count=1,
+        )
     except Exception as exc:
         current_app.logger.warning(
             f"SAML: could not record login activity for user {user.id}: {type(exc).__name__}: {exc}"
