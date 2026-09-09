@@ -28,23 +28,33 @@
     trusting that they do, and another pins which `login_user` is imported —
     the tidier-looking swap would otherwise double-count logins in production
     while the suite stayed green.
+  - Written as an atomic update of exactly those five fields, **not** through
+    `user.save()`. A save writes the whole dirty document, and `User.pre_save`
+    sanitizes `about`, `first_name` and `last_name` on every write path: on a
+    document predating that sanitization the value genuinely changes, so
+    MongoEngine marks the field dirty and it rides along in the same `$set` —
+    someone signing in with CMD would find their own name rewritten on screen,
+    silently, since this write is deliberately swallowed. The same coupling
+    would let a login clobber a bio edited in another tab. Cleaning up legacy
+    documents is a migration, not a side effect of a login. The atomic write
+    also makes the counter safe, where read-modify-write loses a count when two
+    sign-ins land at once.
   - Written only when the login actually happened, and never able to cost
     someone their account. `login_user` returns false without establishing a
     session for an account that is not active, and `active` has no default on
     the document, so a legacy account imported without the field lands there;
-    stamping it would claim a sign-in that was refused. The save is guarded,
-    so a failure loses the fields, is logged, and the login stands.
+    stamping it would claim a sign-in that was refused. The write is guarded,
+    so a failure loses the fields, is logged, and the login stands. It is also
+    gated on the extension's trackable flag and timestamped from its datetime
+    factory, so it cannot outlive or drift from what the password login writes
+    into the same fields.
   - Covers both places that sign someone in — the shared ACS funnel behind
     `/saml/sso` and `/saml/eidas/sso`, and the emailed validation link, which
     arrives with no session — pinned by separate tests, because the asymmetry
     between those two paths is what left an earlier write in the same function
     unproven.
-  - Two side effects worth knowing. The save also persists the `confirmed_at`
-    that the auto-confirm branch sets and then tried to flush with
-    `datastore.commit()`, which is a no-op on MongoEngine, so that value
-    previously reached the database only when a neighbouring write happened to
-    save. And accounts authenticated through CMD/eIDAS now carry the dates the
-    admin listings and the inactivity tasks read, where they previously showed
+  - Accounts authenticated through CMD/eIDAS now carry the dates the admin
+    listings and the inactivity tasks read, where they previously showed
     nothing. **Not retroactive:** the fields have meaning only from this
     deploy onward, and their absence on older accounts does not mean the
     account was unused.
