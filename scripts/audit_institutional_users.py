@@ -185,8 +185,12 @@ def main():
     db = client[args.db]
 
     # Every user referenced as a member of some organization.
+    # Deleted organizations do not count: a membership in one is not a
+    # membership, and counting them inflated the sole-admin exposure by half
+    # when this audit was first used on production data (three AGIT records,
+    # two of them already deleted).
     org_member_ids = set()
-    for org in db.organization.find({}, {"members.user": 1}):
+    for org in db.organization.find({"deleted": None}, {"members.user": 1}):
         for member in org.get("members") or []:
             if member.get("user"):
                 org_member_ids.add(member["user"])

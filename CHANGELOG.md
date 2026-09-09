@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **fix(scripts): ignore deleted organizations when auditing membership**
+  - The audit built its set of organization members from every organization,
+    deleted ones included, so an account counted as a member of organizations
+    that no longer exist. On production data that inflated the sole-admin
+    exposure by half: six organizations reported, four actually live, because
+    one entity had been created three times on the same day and two of the
+    records were already cleaned up.
+
 - **feat(scripts): count both duplicate-account axes in the institutional audit**
   - `migrate-nics --dry-run` cannot answer either. Its `_find_shared_nics`
     filters on `is_nic_hashed`, so in an environment where nothing is hashed
