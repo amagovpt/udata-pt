@@ -37,7 +37,7 @@ import argparse
 import csv
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 import pymongo
 
@@ -185,8 +185,12 @@ def main():
     db = client[args.db]
 
     # Every user referenced as a member of some organization.
+    # Deleted organizations do not count: a membership in one is not a
+    # membership, and counting them inflated the sole-admin exposure by half
+    # when this audit was first used on production data (three AGIT records,
+    # two of them already deleted).
     org_member_ids = set()
-    for org in db.organization.find({}, {"members.user": 1}):
+    for org in db.organization.find({"deleted": None}, {"members.user": 1}):
         for member in org.get("members") or []:
             if member.get("user"):
                 org_member_ids.add(member["user"])
@@ -207,11 +211,20 @@ def main():
     }
 
     rows, counts, flagged, domain_counter = [], Counter(), [], Counter()
+    # The two duplicate axes migrate-nics cannot answer. Both are grouped from
+    # the values as stored, so neither needs the SECRET_KEY -- see the caveats
+    # printed with the report.
+    by_nic, by_email = defaultdict(list), defaultdict(list)
 
     for user in db.user.find(query, projection):
         status = cmd_status(user)
         reasons = institutional_reasons(user, org_member_ids, extra_domains)
         email = (user.get("email") or "").lower()
+        nic_raw = (user.get("extras") or {}).get("auth_nic")
+        if nic_raw:
+            by_nic[str(nic_raw)].append((user.get("email"), status, user.get("created_at")))
+        if email:
+            by_email[email].append((user.get("email"), status, user.get("created_at")))
         placeholder = email.startswith(SAML_PLACEHOLDER_EMAIL_PREFIX) and email.endswith(
             f"@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
         )
@@ -264,6 +277,48 @@ def main():
     print(f"  ...WITH a CMD link (review) ..... {counts['institutional_with_cmd']}")
     print(f"CMD-linked accounts (all) ......... {counts['cmd_linked']}")
     print(f"saml-* placeholder emails ......... {counts['placeholder_email']}")
+
+    shared_nics = {v: accts for v, accts in by_nic.items() if len(accts) > 1}
+    case_collisions = {e: accts for e, accts in by_email.items() if len(accts) > 1}
+
+    print()
+    print(f"accounts sharing one stored NIC ... {len(shared_nics)} group(s)")
+    print(f"emails colliding on case only ..... {len(case_collisions)} group(s)")
+
+    if shared_nics:
+        print()
+        print("Accounts holding the SAME stored identifier — one person, several accounts.")
+        print("CMD login resolves these by .first(), so it returns an arbitrary one; after")
+        print("migrate-nics they collide on the same hash. Each needs a manual decision on")
+        print("which account keeps the link:")
+        for accts in shared_nics.values():
+            print("  -")
+            for mail, status, created in sorted(accts, key=lambda a: str(a[2] or "")):
+                print(f"      {mail}  ({status}; created {created})")
+
+    if case_collisions:
+        print()
+        print("Emails differing ONLY in capitalization — two accounts for one address.")
+        print("The unique index on User.email is case-sensitive, so these coexist; the")
+        print("login resolver matches case-insensitively and _create_saml_user matches")
+        print("exactly, which is how they were created in the first place:")
+        for accts in case_collisions.values():
+            print("  -")
+            for mail, status, created in sorted(accts, key=lambda a: str(a[2] or "")):
+                print(f"      {mail}  ({status}; created {created})")
+
+    print()
+    print("Caveats on the two counts above — read before quoting them:")
+    print("  * Grouped on the values AS STORED, so no SECRET_KEY is needed and the")
+    print("    answer holds for any environment. Two accounts with the same plain NIC")
+    print("    produce the same hash, so grouping the plain values finds them without")
+    print("    hashing anything. This is what migrate-nics --dry-run cannot do:")
+    print("    _find_shared_nics filters on is_nic_hashed, so where nothing is hashed")
+    print("    yet it has nothing to look at and its zero is guaranteed, not measured.")
+    print("  * NOT DETECTED: one account holding a plain NIC and another holding the")
+    print("    hash OF THAT SAME NIC. The raw values differ and telling them apart")
+    print("    needs the key. Treat the NIC figure as a lower bound.")
+    print("  * Deleted accounts are excluded unless --include-deleted is passed.")
 
     if flagged:
         print()
