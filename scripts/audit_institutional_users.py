@@ -48,11 +48,40 @@ HEX_DIGITS = set("0123456789abcdef")
 
 # Shared/functional mailboxes: nobody's personal address.
 GENERIC_LOCAL_PARTS = {
-    "geral", "info", "informacao", "dados", "dadosabertos", "opendata", "open-data",
-    "sig", "gis", "ti", "dsi", "di", "informatica", "sistemas", "webmaster", "admin",
-    "administrador", "secretaria", "secretariado", "expediente", "apoio", "helpdesk",
-    "suporte", "support", "contacto", "contactos", "geral.dados", "comunicacao",
-    "estatistica", "estatisticas", "gabinete", "servicos", "noreply", "no-reply",
+    "geral",
+    "info",
+    "informacao",
+    "dados",
+    "dadosabertos",
+    "opendata",
+    "open-data",
+    "sig",
+    "gis",
+    "ti",
+    "dsi",
+    "di",
+    "informatica",
+    "sistemas",
+    "webmaster",
+    "admin",
+    "administrador",
+    "secretaria",
+    "secretariado",
+    "expediente",
+    "apoio",
+    "helpdesk",
+    "suporte",
+    "support",
+    "contacto",
+    "contactos",
+    "geral.dados",
+    "comunicacao",
+    "estatistica",
+    "estatisticas",
+    "gabinete",
+    "servicos",
+    "noreply",
+    "no-reply",
 }
 
 # Public-administration domains in .pt.
@@ -156,9 +185,17 @@ def main():
 
     query = {} if args.include_deleted else {"deleted": None}
     projection = {
-        "email": 1, "first_name": 1, "last_name": 1, "slug": 1, "roles": 1,
-        "active": 1, "deleted": 1, "confirmed_at": 1, "created_at": 1,
-        "last_login_at": 1, "extras": 1,
+        "email": 1,
+        "first_name": 1,
+        "last_name": 1,
+        "slug": 1,
+        "roles": 1,
+        "active": 1,
+        "deleted": 1,
+        "confirmed_at": 1,
+        "created_at": 1,
+        "last_login_at": 1,
+        "extras": 1,
     }
 
     rows, counts, flagged, domain_counter = [], Counter(), [], Counter()
@@ -186,9 +223,7 @@ def main():
 
         row = {
             "email": user.get("email"),
-            "name": " ".join(
-                filter(None, [user.get("first_name"), user.get("last_name")])
-            ).strip(),
+            "name": " ".join(filter(None, [user.get("first_name"), user.get("last_name")])).strip(),
             "cmd": status,
             "institutional": ",".join(reasons) or "-",
             "placeholder_email": "yes" if placeholder else "no",
