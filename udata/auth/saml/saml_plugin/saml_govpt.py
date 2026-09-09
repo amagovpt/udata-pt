@@ -1412,7 +1412,13 @@ def _link_identity_and_login(
     user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
     user.save()
 
-    login_user(user)
+    # The save above is the link itself and must fail the operation if it
+    # fails. The trackable write is bookkeeping and goes after the login,
+    # guarded, on the same terms as the ACS funnel: this is the second of the
+    # two places that sign someone in, and it is reached only by the emailed
+    # link, which arrives with no session at all.
+    if login_user(user):
+        _record_login_activity(user)
     session["saml_login"] = True
 
     # Clean up migration session data

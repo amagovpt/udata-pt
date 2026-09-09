@@ -4494,6 +4494,50 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert legacy.confirmed_at is not None
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_click_records_the_login_activity(self, mock_client_for):
+        """LEDG-2462: the second of the two places that sign someone in.
+
+        This path never touches the ACS funnel -- it is reached only by the
+        emailed link, and the click arrives with no session -- so covering the
+        funnel says nothing about it. That asymmetry is what left the one
+        write in this function untested before, so it is pinned separately:
+        commenting out the call here leaves the funnel's tests green.
+
+        The wizard steps that mint the link do not log anyone in, which is why
+        the count is exactly one afterwards rather than one-plus-the-wizard.
+        """
+        legacy = UserFactory(
+            email="nadia.old@example.pt",
+            password="S3cretPass!",
+            first_name="nadia",
+            last_name="ramos",
+            confirmed_at=None,
+        )
+
+        token = self._issue_link_for(
+            mock_client_for,
+            legacy,
+            nic="40302010",
+            first_name="Nadia",
+            last_name="Ramos",
+        )
+
+        legacy.reload()
+        assert legacy.login_count is None
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+                mock_login.assert_called_once()
+
+        legacy.reload()
+        assert legacy.login_count == 1
+        assert legacy.current_login_at is not None
+        assert legacy.last_login_at == legacy.current_login_at
+        assert legacy.current_login_ip == "127.0.0.1"
+        assert legacy.last_login_ip is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_the_link_is_single_use(self, mock_client_for):
         """Criterion 6: a second click reports itself instead of relinking."""
         legacy = UserFactory(
