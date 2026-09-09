@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix(scripts): classify NICs in the institutional audit with the production predicates**
+  - The audit script re-implemented the NIC classification instead of importing
+    it, and the two copies had already drifted: it lowercased a value before
+    testing it for hex and `udata/core/user/nic.py` does not. An uppercase hex
+    ciphertext was therefore `legacy-encrypted` to the audit and `unrecognized`
+    to the login — and that bucket holds most of the accounts carrying an
+    identifier, so the risk sat exactly where the volume is.
+  - It now imports `is_nic_hashed`, `is_nic_legacy_encrypted` and
+    `is_nic_plain`, so the audit and `migrate-nics` put every account in the
+    same bucket by construction rather than by two authors agreeing. The
+    predicates need no app context; only `hash_nic` does, for the `SECRET_KEY`.
+  - The script consequently runs inside the project venv (`uv run python …`),
+    which the usage lines now say. It stays strictly read-only.
+
 - **test(saml): cover the declared citizen type on the emailed validation link**
   - Of the four places that write `extras.auth_citizen_declared`, the emailed
     validation link was the only one with no test. It is also the one that

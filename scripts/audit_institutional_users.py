@@ -23,10 +23,10 @@ bound to a shared mailbox.
 Read-only. Never writes to the database.
 
 Usage:
-    python scripts/audit_institutional_users.py --host 10.55.37.143
-    python scripts/audit_institutional_users.py --host 10.55.37.40 --only-flagged
-    python scripts/audit_institutional_users.py --host 10.55.37.143 --csv audit.csv
-    python scripts/audit_institutional_users.py --host 10.55.37.143 --all-users
+    uv run python scripts/audit_institutional_users.py --host 10.55.37.143
+    uv run python scripts/audit_institutional_users.py --host 10.55.37.40 --only-flagged
+    uv run python scripts/audit_institutional_users.py --host 10.55.37.143 --csv audit.csv
+    uv run python scripts/audit_institutional_users.py --host 10.55.37.143 --all-users
 
 Environments:
     DEV: --host 10.55.37.143
@@ -41,10 +41,21 @@ from collections import Counter
 
 import pymongo
 
+# Imported, never re-implemented: this script COUNTS accounts by how the login
+# classifies their stored identifier, so it has to ask the very code the login
+# asks. The copies these replaced had already drifted -- they lowercased before
+# testing for hex and these do not, so an uppercase 512-hex ciphertext was
+# legacy-encrypted to the script and unrecognized to the login. That is the
+# bucket holding most of the accounts, and a counting tool that disagrees with
+# production produces wrong counts.
+#
+# The predicates take no app context (only hash_nic does, for the SECRET_KEY),
+# so importing them costs nothing but requires the script to run inside the
+# project venv -- hence `uv run python` in the usage above.
+from udata.core.user.nic import is_nic_hashed, is_nic_legacy_encrypted, is_nic_plain
+
 SAML_PLACEHOLDER_EMAIL_PREFIX = "saml-"
 SAML_PLACEHOLDER_EMAIL_DOMAIN = "autenticacao.gov.pt"
-
-HEX_DIGITS = set("0123456789abcdef")
 
 # Shared/functional mailboxes: nobody's personal address.
 GENERIC_LOCAL_PARTS = {
@@ -92,25 +103,22 @@ INSTITUTIONAL_DOMAIN_RE = re.compile(
 )
 
 
-def is_hashed(nic):
-    return bool(nic and len(nic) == 64 and all(c in HEX_DIGITS for c in nic.lower()))
-
-
-def is_legacy_encrypted(nic):
-    return bool(nic and len(nic) >= 128 and all(c in HEX_DIGITS for c in nic.lower()))
-
-
 def cmd_status(user):
-    """Classify the CMD/eIDAS link recorded on the account."""
+    """Classify the CMD/eIDAS link recorded on the account.
+
+    Same order and same predicates as ``_hash_plain_nics`` in
+    ``udata/core/user/commands.py``, so this audit and ``migrate-nics`` put
+    every account in the same bucket.
+    """
     nic = (user.get("extras") or {}).get("auth_nic")
     if not nic:
         return "no"
     nic = str(nic)
-    if is_hashed(nic):
+    if is_nic_hashed(nic):
         return "yes (hashed)"
-    if is_legacy_encrypted(nic):
+    if is_nic_legacy_encrypted(nic):
         return "stale (legacy-encrypted)"
-    if nic.isdigit():
+    if is_nic_plain(nic):
         return "stale (plain NIC)"
     return "stale (unrecognized)"
 
