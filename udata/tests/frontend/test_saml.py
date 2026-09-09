@@ -6209,3 +6209,93 @@ class SAMLTrackableLoginFieldsTest(APITestCase):
         from udata.auth.saml.saml_plugin import saml_govpt
 
         assert saml_govpt.login_user is flask_login.login_user
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_save_also_persists_the_auto_confirm_it_used_to_lose(self, mock_client_for):
+        """A consequence of this fix, declared rather than left to luck.
+
+        The auto-confirm branch above sets confirmed_at and then calls
+        datastore.commit(), which is a no-op on MongoEngine -- the base
+        Datastore.commit() is `pass` and MongoEngineDatastore does not
+        override it, because its put() already writes. So the value only ever
+        reached the database when the provider block below happened to save,
+        which is to say not on a repeat login with nothing new to record.
+        This helper's save persists it, on every login.
+
+        The account therefore has to already carry the provider and no
+        pending-confirmation marker, so that block finds nothing changed and
+        saves nothing: otherwise it, and not the helper, would be the writer,
+        and the mutation would not be detectable.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+        assert existing.confirmed_at is None
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+
+        existing.reload()
+        assert existing.confirmed_at is not None
+        assert existing.login_count == 1
+        # The provider block had nothing to change, so the helper was the only
+        # writer -- which is what makes the assertion above mean something.
+        assert existing.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_fields_are_written_with_the_migration_wizard_on(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The flag has three different defaults across the codebase, so no
+        behaviour here may depend on a guess about its value.
+
+        With the wizard on, an identity that already resolves to an account
+        goes straight down the funnel -- the wizard only catches identities
+        that do not resolve -- so the fields are written exactly as with it
+        off.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        existing = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+
+        existing.reload()
+        assert existing.login_count == 1
+        assert existing.current_login_at is not None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_account_created_with_the_wizard_off_is_tracked_from_its_first_login(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The population the ticket is about.
+
+        With the wizard off an unresolved identity gets an account outright,
+        and that is the path the accounts with a synthetic address came down.
+        They are the ones whose four fields were measured empty in
+        production, so the fix has to hold on the login that creates the
+        account and not only on later ones.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                nic="13131313",
+                email="nova.conta@example.pt",
+                first_name="Nova",
+                last_name="Conta",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic("13131313")).first()
+        assert created is not None
+        assert created.login_count == 1
+        assert created.current_login_at is not None
+        assert created.current_login_ip == "127.0.0.1"
