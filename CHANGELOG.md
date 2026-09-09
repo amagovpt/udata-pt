@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+- **fix(auth): SAML sign-ins now keep the trackable session fields**
+  - `SECURITY_TRACKABLE` is on and the five fields are declared on our own
+    `User` document, so a password login kept `last_login_at`,
+    `current_login_at`, `last_login_ip`, `current_login_ip` and `login_count`
+    up to date. A CMD or eIDAS login did not: the SAML plugin imports
+    `login_user` from `flask_login`, which only establishes the session, while
+    the code that maintains those fields lives in `flask_security`'s
+    `login_user`. Measured on production data, 83% of the accounts created
+    before 2026-01 carry `last_login_at` against 3% of those created between
+    June and August 2026, and every account with a synthetic address had all
+    five empty — so "how many of these accounts are still in use?" had no
+    answer from the data, and anything keyed on inactivity read every recent
+    CMD/eIDAS user as dormant.
+  - Fixed by mirroring that block rather than by importing it. Reaching
+    flask_security's `login_user` would have persisted the fields on its own,
+    since its `_datastore.put()` is `document.save()` under MongoEngine, but
+    the swap is wider than the defect and every part of it lands on the
+    sign-in path: that `put()` is unguarded, so a legacy document failing
+    validation would turn a working sign-in into a 500; it sets `fs_cc`/
+    `fs_paa` in the session; and it fires `identity_changed`/
+    `user_authenticated`, which never fired here. There is no smaller unit to
+    import, the semantics being inline rather than a public function, so a
+    test asserts the mirrored write and the dependency agree instead of
+    trusting that they do, and another pins which `login_user` is imported —
+    the tidier-looking swap would otherwise double-count logins in production
+    while the suite stayed green.
+  - Written as an atomic update of exactly those five fields, **not** through
+    `user.save()`. A save writes the whole dirty document, and `User.pre_save`
+    sanitizes `about`, `first_name` and `last_name` on every write path: on a
+    document predating that sanitization the value genuinely changes, so
+    MongoEngine marks the field dirty and it rides along in the same `$set` —
+    someone signing in with CMD would find their own name rewritten on screen,
+    silently, since this write is deliberately swallowed. The same coupling
+    would let a login clobber a bio edited in another tab. Cleaning up legacy
+    documents is a migration, not a side effect of a login. The atomic write
+    also makes the counter safe, where read-modify-write loses a count when two
+    sign-ins land at once.
+  - Written only when the login actually happened, and never able to cost
+    someone their account. `login_user` returns false without establishing a
+    session for an account that is not active, and `active` has no default on
+    the document, so a legacy account imported without the field lands there;
+    stamping it would claim a sign-in that was refused. The write is guarded,
+    so a failure loses the fields, is logged, and the login stands. It is also
+    gated on the extension's trackable flag and timestamped from its datetime
+    factory, so it cannot outlive or drift from what the password login writes
+    into the same fields.
+  - Covers both places that sign someone in — the shared ACS funnel behind
+    `/saml/sso` and `/saml/eidas/sso`, and the emailed validation link, which
+    arrives with no session — pinned by separate tests, because the asymmetry
+    between those two paths is what left an earlier write in the same function
+    unproven.
+  - Accounts authenticated through CMD/eIDAS now carry the dates the admin
+    listings and the inactivity tasks read, where they previously showed
+    nothing. **Not retroactive:** the fields have meaning only from this
+    deploy onward, and their absence on older accounts does not mean the
+    account was unused.
+
 - **fix(scripts): ignore deleted organizations when auditing membership**
   - The audit built its set of organization members from every organization,
     deleted ones included, so an account counted as a member of organizations

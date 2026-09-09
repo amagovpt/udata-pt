@@ -1007,6 +1007,82 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     return None, "no_match"
 
 
+def _record_login_activity(user):
+    """Write the trackable session fields flask_security would have written.
+
+    ``SECURITY_TRACKABLE`` is on (``udata/settings.py``), and the five fields
+    are declared on our own document (``udata/core/user/models.py``), so a
+    password login keeps ``last_login_at``, ``current_login_at``,
+    ``last_login_ip``, ``current_login_ip`` and ``login_count`` up to date.
+    A SAML login did not: this module imports ``login_user`` from
+    ``flask_login``, which only establishes the session, while the code that
+    maintains those fields lives in ``flask_security``'s ``login_user``
+    (``flask_security/utils.py``, the ``if _security.trackable:`` block).
+
+    Deliberately NOT fixed by importing flask_security's ``login_user``
+    instead, even though ``proconnect.py`` reaches it through ``udata.auth``
+    and that would persist the fields on its own (its ``_datastore.put()`` is
+    ``document.save()`` under MongoEngine, so no extra write is needed there).
+    The swap is wider than this defect, in three ways that all land on the
+    sign-in path: that ``put()`` is unguarded, so a legacy document failing
+    validation for an unrelated reason would turn a working sign-in into a
+    500 -- the regression the comment further down deliberately avoids, on
+    the accounts most likely to be affected; it sets ``fs_cc``/``fs_paa`` in
+    the session; and it fires ``identity_changed``/``user_authenticated``,
+    which never fired on this path. Three behaviour changes to persist five
+    fields. There is no smaller unit to import either -- the semantics are
+    inline in that block, not a public function -- so they are mirrored here,
+    and a test asserts the two agree rather than trusting that they do.
+
+    The semantics come from that block and are load-bearing, not incidental:
+    ``last_login_*`` carry the PREVIOUS login's values, which is why
+    ``last_login_ip`` is empty until the second sign-in.
+
+    Written as an atomic update of exactly these five fields, and NOT with
+    ``user.save()``. A save writes the whole dirty document, and
+    ``User.pre_save`` sanitizes ``about``, ``first_name`` and ``last_name`` on
+    every write path: on a document predating that sanitization the value
+    genuinely changes (``Silva & Sousa`` becomes ``Silva &amp; Sousa``),
+    MongoEngine therefore marks the field dirty, and it rides along in the
+    same ``$set``. Someone signing in with CMD would see their own name
+    mangled on screen, silently, because this write is deliberately swallowed.
+    The same coupling would let this write clobber a bio edited in another tab
+    between the moment this request loaded the document and this line.
+    Sanitizing legacy documents is a migration, not a side effect of a login.
+    The atomic write also makes the counter safe: ``inc__`` cannot lose a
+    count when two sign-ins land at once, which ``+ 1`` in Python can.
+
+    Guarded because bookkeeping must never deny anyone their account -- the
+    same reasoning, and the same shape, as the provider write below. A failure
+    loses the fields, is logged, and the sign-in stands. Only the write is
+    inside the guard: a mistake computing the values should surface, not be
+    logged as a warning.
+    """
+    from udata.core.user.models import User
+
+    security = current_app.extensions.get("security")
+    # Mirrors the upstream condition, so a deployment that turns tracking off
+    # stops writing here too instead of diverging from its password logins.
+    if security is not None and not security.trackable:
+        return
+
+    # Same clock as the password login writes into the same fields, rather
+    # than one that happens to agree today.
+    now = security.datetime_factory() if security is not None else datetime.utcnow()
+    try:
+        User.objects(id=user.id).update_one(
+            set__last_login_at=user.current_login_at or now,
+            set__current_login_at=now,
+            set__last_login_ip=user.current_login_ip,
+            set__current_login_ip=request.remote_addr or None,
+            inc__login_count=1,
+        )
+    except Exception as exc:
+        current_app.logger.warning(
+            f"SAML: could not record login activity for user {user.id}: {type(exc).__name__}: {exc}"
+        )
+
+
 def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_declared=None):
     """Handle login/redirect after SAML authentication.
 
@@ -1123,7 +1199,13 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_d
                     f"{user.id}: {type(exc).__name__}: {exc}"
                 )
 
-    login_user(user)
+    # Only on a login that actually happened. login_user returns False without
+    # establishing a session when the account is not active, and flask_security
+    # leaves its own trackable block for the same reason -- stamping a refused
+    # sign-in would say someone entered when they were turned away, and would
+    # corrupt the very activity figures this exists to make trustworthy.
+    if login_user(user):
+        _record_login_activity(user)
     session["saml_login"] = True
     # Whoever is logging in now owns this session. A confirmation handle left
     # by someone else on a shared browser would otherwise disclose their masked
@@ -1357,7 +1439,13 @@ def _link_identity_and_login(
     user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
     user.save()
 
-    login_user(user)
+    # The save above is the link itself and must fail the operation if it
+    # fails. The trackable write is bookkeeping and goes after the login,
+    # guarded, on the same terms as the ACS funnel: this is the second of the
+    # two places that sign someone in, and it is reached only by the emailed
+    # link, which arrives with no session at all.
+    if login_user(user):
+        _record_login_activity(user)
     session["saml_login"] = True
 
     # Clean up migration session data
