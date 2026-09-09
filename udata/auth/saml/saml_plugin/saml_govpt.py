@@ -1007,6 +1007,55 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     return None, "no_match"
 
 
+def _record_login_activity(user):
+    """Write the trackable session fields flask_security would have written.
+
+    ``SECURITY_TRACKABLE`` is on (``udata/settings.py``), and the five fields
+    are declared on our own document (``udata/core/user/models.py``), so a
+    password login keeps ``last_login_at``, ``current_login_at``,
+    ``last_login_ip``, ``current_login_ip`` and ``login_count`` up to date.
+    A SAML login did not: this module imports ``login_user`` from
+    ``flask_login``, which only establishes the session, while the code that
+    maintains those fields lives in ``flask_security``'s ``login_user``
+    (``flask_security/utils.py``, the ``if _security.trackable:`` block).
+
+    Deliberately NOT fixed by importing flask_security's ``login_user``
+    instead, even though ``proconnect.py`` reaches it through ``udata.auth``
+    and that would persist the fields on its own (its ``_datastore.put()`` is
+    ``document.save()`` under MongoEngine, so no extra write is needed there).
+    The swap is wider than this defect, in three ways that all land on the
+    sign-in path: that ``put()`` is unguarded, so a legacy document failing
+    validation for an unrelated reason would turn a working sign-in into a
+    500 -- the regression the comment further down deliberately avoids, on
+    the accounts most likely to be affected; it sets ``fs_cc``/``fs_paa`` in
+    the session; and it fires ``identity_changed``/``user_authenticated``,
+    which never fired on this path. Three behaviour changes to persist five
+    fields. There is no smaller unit to import either -- the semantics are
+    inline in that block, not a public function -- so they are mirrored here,
+    and a test asserts the two agree rather than trusting that they do.
+
+    The semantics come from that block and are load-bearing, not incidental:
+    ``last_login_*`` carry the PREVIOUS login's values, which is why
+    ``last_login_ip`` is empty until the second sign-in.
+
+    The save is guarded because bookkeeping must never deny anyone their
+    account -- the same reasoning, and the same shape, as the provider write
+    below. A failure loses the fields, is logged, and the sign-in stands.
+    """
+    now = datetime.utcnow()
+    try:
+        user.last_login_at = user.current_login_at or now
+        user.current_login_at = now
+        user.last_login_ip = user.current_login_ip
+        user.current_login_ip = request.remote_addr or None
+        user.login_count = (user.login_count or 0) + 1
+        user.save()
+    except Exception as exc:
+        current_app.logger.warning(
+            f"SAML: could not record login activity for user {user.id}: {type(exc).__name__}: {exc}"
+        )
+
+
 def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_declared=None):
     """Handle login/redirect after SAML authentication.
 
@@ -1123,7 +1172,13 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_d
                     f"{user.id}: {type(exc).__name__}: {exc}"
                 )
 
-    login_user(user)
+    # Only on a login that actually happened. login_user returns False without
+    # establishing a session when the account is not active, and flask_security
+    # leaves its own trackable block for the same reason -- stamping a refused
+    # sign-in would say someone entered when they were turned away, and would
+    # corrupt the very activity figures this exists to make trustworthy.
+    if login_user(user):
+        _record_login_activity(user)
     session["saml_login"] = True
     # Whoever is logging in now owns this session. A confirmation handle left
     # by someone else on a shared browser would otherwise disclose their masked
