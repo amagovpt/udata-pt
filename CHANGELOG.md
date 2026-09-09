@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **feat(scripts): count both duplicate-account axes in the institutional audit**
+  - `migrate-nics --dry-run` cannot answer either. Its `_find_shared_nics`
+    filters on `is_nic_hashed`, so in an environment where nothing is hashed
+    yet it has nothing to look at and reports zero — guaranteed rather than
+    measured. And it only ever iterates accounts with the `saml-` placeholder
+    prefix, so duplicates without one are invisible to it.
+  - The audit now groups accounts by their stored identifier and by their
+    lowercased email, reporting every group with more than one account. Both
+    are grouped on the values **as stored**, so neither needs the `SECRET_KEY`
+    and the answer holds in any environment: two accounts with the same plain
+    NIC hash to the same digest, so grouping the plain values finds them
+    without hashing anything.
+  - The report states what it cannot see rather than implying completeness: a
+    plain NIC on one account and the hash of that same NIC on another cannot be
+    matched without the key, so the identifier figure is a lower bound.
+
 - **fix(scripts): classify NICs in the institutional audit with the production predicates**
   - The audit script re-implemented the NIC classification instead of importing
     it, and the two copies had already drifted: it lowercased a value before
