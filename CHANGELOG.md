@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **fix(auth): Flask-Security's mails were going out from a non-existent domain**
+  - Password reset, email confirmation and welcome mails were all sent from
+    `webmaster@udata` — a domain that is not even a valid TLD — while udata's
+    own mails used the real configured address. The mails were delivered, from
+    an unrecognisable sender and flagged as external by the recipient's mail
+    system, which is why they read as "not arriving" to the person waiting for
+    them. Confirmed in a delivered message, not inferred.
+  - The cause was `SECURITY_EMAIL_SENDER = MAIL_DEFAULT_SENDER` in the
+    `Defaults` class body. A class-body assignment captures the class value
+    once, and the environment overrides only `MAIL_DEFAULT_SENDER`, so the
+    sender stayed frozen at the placeholder no matter what was configured.
+    Flask-Security's own default for that key is already a `LocalProxy` that
+    reads `MAIL_DEFAULT_SENDER` from the live config at send time, so that line
+    had replaced a correct lazy default with a broken eager one. Removing it —
+    rather than overriding it — restores the value to follow
+    `MAIL_DEFAULT_SENDER` wherever it is set: config file, environment, a
+    test's settings class, or `create_app`'s override.
+  - ⚠️ **If an environment does not set `MAIL_DEFAULT_SENDER`, it now inherits
+    the same placeholder from the defaults** — the same symptom by another
+    route. Worth confirming the value per environment.
+  - The test has to make the two settings *differ* to be a test at all: the
+    testing profile defines neither, so both inherit the placeholder and an
+    assertion comparing them would pass whether or not the defect is present.
+    Both the reset and the confirmation mail are asserted, since the defect was
+    in the setting they share.
+  - Also fixed alongside it: **`SEND_MAIL` could not be switched off from
+    configuration.** It read the raw string, so `SEND_MAIL=False` produced
+    `"False"` — truthy. Every other boolean in that file already parsed
+    properly. The default is unchanged, so no environment changes behaviour;
+    the variable simply becomes usable.
+  - Three hypotheses that the investigation **eliminated**, recorded so they are
+    not re-explored: the recovery form is case-insensitive and finds accounts
+    whose address differs in capitalisation; the contact-form default recipient
+    does not redirect these mails; and mail sending could not have been off,
+    because of the bug above.
+
 - **fix(auth): a refused SAML sign-in is now refused all the way down**
   - `flask_login.login_user` returns `False` *without establishing a session*
     when the account is not active, and everything downstream carried on as if

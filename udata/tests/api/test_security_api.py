@@ -291,3 +291,78 @@ class SecurityMailAuditLogTest(PytestOnlyAPITestCase):
     def test_audit_mail_util_is_the_one_wired_when_sending_is_enabled(self):
         """Guards the wiring itself, which no assertion above would catch."""
         assert isinstance(self.app.extensions["security"].mail_util, AuditMailUtil)
+
+
+class SecurityMailSenderTest(PytestOnlyAPITestCase):
+    """Flask-Security's mails must go out from MAIL_DEFAULT_SENDER.
+
+    `SECURITY_EMAIL_SENDER` used to be bound in the `Defaults` class body as
+    `SECURITY_EMAIL_SENDER = MAIL_DEFAULT_SENDER`, which captured the class
+    value ("webmaster@udata") once. `udata.cfg` overrides only
+    MAIL_DEFAULT_SENDER, so every Flask-Security mail -- password reset, email
+    confirmation, welcome -- was sent from a domain that is not a valid TLD,
+    while udata's own mails used the real address. It was reaching real
+    inboxes that way.
+
+    The two settings MUST differ for this to be a test at all. `Testing`
+    defines neither, so both would inherit "webmaster@udata" from `Defaults`
+    and an assertion comparing the sent sender against MAIL_DEFAULT_SENDER
+    would pass whether or not the bug is present. Overriding
+    MAIL_DEFAULT_SENDER here reproduces exactly what a deployed `.env` does,
+    and is what makes the assertion able to fail.
+    """
+
+    SENDER = "noreply.test@example.org"
+    FROZEN = "webmaster@udata"
+
+    def get_settings(self, request):
+        # SEND_MAIL through get_settings, not config.update: `mail_util_cls` is
+        # chosen while the app is built, so flipping it later would leave the
+        # NoopMailUtil wired -- same reason SecurityMailAuditLogTest does it.
+        class SenderSettings(settings.Testing):
+            SEND_MAIL = True
+            MAIL_DEFAULT_SENDER = "noreply.test@example.org"
+
+        return SenderSettings
+
+    def test_the_two_settings_actually_differ_in_this_fixture(self):
+        """Guards the guard: if a future default made these equal again, every
+        assertion below would pass vacuously."""
+        assert self.app.config["MAIL_DEFAULT_SENDER"] == self.SENDER
+        assert self.FROZEN != self.SENDER
+
+    def test_the_password_reset_mail_is_sent_from_mail_default_sender(self):
+        UserFactory(email="jane.doe@example.org", confirmed_at=datetime.now())
+
+        with mail.record_messages() as outbox:
+            response = self.post(
+                url_for("security.forgot_password"),
+                {"email": "jane.doe@example.org", "submit": True},
+            )
+
+        self.assertStatus(response, 200)
+        assert len(outbox) == 1
+        assert outbox[0].sender == self.SENDER
+        assert self.FROZEN not in outbox[0].sender
+
+    def test_the_confirmation_mail_is_sent_from_mail_default_sender(self):
+        """Not only the reset: the defect was in the shared setting, so a fix
+        proved on one mail says nothing about the others."""
+        with mail.record_messages() as outbox:
+            response = self.post(
+                url_for("security.register"),
+                {
+                    "first_name": "Jane",
+                    "last_name": "Doe",
+                    "accept_conditions": True,
+                    "email": "jane.doe@example.org",
+                    "password": "Password123!@#",
+                    "password_confirm": "Password123!@#",
+                    "submit": True,
+                },
+            )
+
+        self.assertStatus(response, 200)
+        assert len(outbox) == 1
+        assert outbox[0].sender == self.SENDER
+        assert self.FROZEN not in outbox[0].sender
