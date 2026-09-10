@@ -1501,7 +1501,21 @@ def _migration_link_token_status(token):
         return None, None, "invalid"
 
     user = User.objects(id=user_id).first()
-    if not user or user.deleted:
+    # ``is_active`` joins ``deleted`` here rather than at the login below,
+    # because this helper is read-only by construction: refusing here means
+    # the token is never consumed, since the consumption is the write further
+    # down that this return value stops us reaching. A click that cannot
+    # produce a session must not burn a single-use link.
+    #
+    # "invalid" rather than a distinct code is deliberate, and the cost is
+    # real: the legitimate owner is told the link is invalid when the actual
+    # problem is that their account is disabled. That is the price of not
+    # handing an unauthenticated GET -- a mail scanner pre-opening the link,
+    # a forwarded URL -- an oracle for account state, and it is exactly the
+    # answer ``deleted`` already gives on this same line. The way out is the
+    # ACS guard: a fresh CMD attempt now says ``inactive_account`` before the
+    # wizard branch, so the account is no longer handed another doomed link.
+    if not user or user.deleted or not user.is_active:
         return None, None, "invalid"
 
     record = (user.extras or {}).get(MIGRATION_LINK_PENDING)
@@ -2251,6 +2265,34 @@ def idp_initiated():
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
+    # flask_login.login_user returns False without establishing a session when
+    # the account is not active, and everything downstream used to treat that
+    # refusal as a success. The guard belongs HERE, and not at that return
+    # value: by the time the login funnel reaches login_user it has already
+    # auto-confirmed the account and stamped auth_provider on it, so refusing
+    # later would leave an account confirmed and marked as having authenticated
+    # through CMD by a login that was declined — exactly what the comment above
+    # that stamp forbids.
+    #
+    # It also sits before the wizard branch below on purpose: an inactive
+    # legacy account that is not linked yet is, by construction, the one that
+    # receives validation links, and a guard placed any lower would send it
+    # back to the wizard on every attempt — mailing it another link that the
+    # link path then refuses — without ever telling it what is wrong.
+    #
+    # ``user`` may be None here: _find_or_create_saml_user returns (None, ...)
+    # for an assertion carrying neither an email nor a NIC.
+    if user and not user.is_active:
+        return _reject_saml_login(
+            f"[SAML cmd] refused login for inactive account user_id={user.id}",
+            get_message("DISABLED_ACCOUNT")[0],
+            log_level="warning",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="inactive_account",
+        )
+
     if status in ("migration_candidate", "no_match"):
         if _migration_enabled():
             _audit_saml(
@@ -2710,6 +2752,22 @@ def idp_eidas_initiated():
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+
+    # Same guard, same reasoning as the CMD route above — see the comment there
+    # for why it sits here and not at the login_user return value. Duplicated
+    # per route because that is how every other rejection code in this file is
+    # placed, and the tests run the same scenario through both handlers so a
+    # future divergence between the two copies turns one of them red.
+    if user and not user.is_active:
+        return _reject_saml_login(
+            f"[SAML eidas] refused login for inactive account user_id={user.id}",
+            get_message("DISABLED_ACCOUNT")[0],
+            log_level="warning",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="inactive_account",
+        )
 
     if status in ("migration_candidate", "no_match"):
         if _migration_enabled():

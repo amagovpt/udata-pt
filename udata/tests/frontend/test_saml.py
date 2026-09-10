@@ -10,6 +10,7 @@ then perform the udata login (login_user + session['saml_login']).
 
 import base64
 import inspect
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -4448,6 +4449,109 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert len(ctas) == 1
         return ctas[0].link.rsplit("/", 1)[1]
 
+    def _legacy_with_link(self, mock_client_for):
+        """A legacy account holding a live validation link, and its token."""
+        legacy = UserFactory(
+            email="rui.old@example.pt",
+            password="S3cretPass!",
+            first_name="rui",
+            last_name="santos",
+            confirmed_at=None,
+        )
+        token = self._issue_link_for(
+            mock_client_for, legacy, nic="50607080", first_name="Rui", last_name="Santos"
+        )
+        return legacy, token
+
+    @staticmethod
+    def _set_active(user, value):
+        """Atomically, so the extras -- and the link record inside them -- are
+        not clobbered by writing back a stale document."""
+        from udata.core.user.models import User
+
+        User.objects(id=user.id).update_one(set__active=value)
+
+    def _deactivate(self, user):
+        self._set_active(user, False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_inactive_account_does_not_burn_the_validation_link(self, mock_client_for):
+        """LEDG-2465: the click could not have produced a session anyway.
+
+        `login_user` refuses an inactive account, so the click was already
+        going to fail -- but it consumed the single-use token on the way,
+        leaving the person with no link, no session and no way to retry.
+
+        The check lives in `_migration_link_token_status`, which is read-only
+        by construction: refusing there means the consumption, which is a
+        write further down, is never reached.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy, token = self._legacy_with_link(mock_client_for)
+        self._deactivate(legacy)
+
+        with self.app.test_client() as fresh:
+            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            assert response.status_code == 302
+            assert "flash=migration_link_invalid" in response.headers["Location"]
+            with fresh.session_transaction() as sess:
+                assert "saml_login" not in sess
+
+        legacy.reload()
+        assert not (legacy.extras or {}).get("auth_nic")
+        assert (legacy.extras or {}).get(MIGRATION_LINK_PENDING), (
+            "the link record must survive a click that could not sign anyone in"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_same_token_still_works_once_the_account_is_active_again(self, mock_client_for):
+        """The direct proof of non-consumption, and the reason the assertion
+        above is not enough on its own: a surviving record could still have
+        had its nonce rotated. Replaying the very same token is what shows
+        the link is intact."""
+        legacy, token = self._legacy_with_link(mock_client_for)
+        self._deactivate(legacy)
+
+        with self.app.test_client() as fresh:
+            assert (
+                "flash=migration_link_invalid"
+                in fresh.get(f"/saml/migration/confirm-link/{token}").headers["Location"]
+            )
+
+        self._set_active(legacy, True)
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == legacy.id
+            assert response.status_code == 302
+
+        legacy.reload()
+        assert legacy.extras["auth_nic"] == _hash_nic("50607080")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_click_is_refused_with_the_migration_flag_off(self, mock_client_for):
+        """Criterion 5, and what this test actually pins is the FLAG gate, not
+        the new check: the route returns `migration_link_invalid` from the
+        `_migration_enabled()` guard before the helper ever runs, so the
+        `is_active` check is not even reached. Said here so the test is not
+        mistaken for coverage of the inactive-account refusal."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy, token = self._legacy_with_link(mock_client_for)
+        self._deactivate(legacy)
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with self.app.test_client() as fresh:
+            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            assert response.status_code == 302
+            assert "flash=migration_link_invalid" in response.headers["Location"]
+
+        legacy.reload()
+        assert (legacy.extras or {}).get(MIGRATION_LINK_PENDING)
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_click_links_the_account_and_starts_a_session_without_one(self, mock_client_for):
         """Criteria 2 and 3: 401 before the click, and the click alone links
@@ -6355,3 +6459,252 @@ class SAMLTrackableLoginFieldsTest(APITestCase):
         existing.reload()
         assert existing.login_count is None
         assert existing.current_login_at is None
+
+
+class SAMLInactiveAccountRefusalTest(APITestCase):
+    """A refused sign-in must be refused all the way down, and refused early.
+
+    `flask_login.login_user` returns False *without establishing a session*
+    when the account is not active, and everything downstream used to carry
+    on as if it had succeeded: the session was marked `saml_login`, the debug
+    log said "login_user OK", and the route had already emitted an audit line
+    saying `outcome=success`.
+
+    It is reachable rather than theoretical: `active = field(BooleanField())`
+    on the user document carries no default, so a legacy account imported
+    without the field lands here, and no guard in the funnel looks at it.
+
+    These tests pin the refusal in both ACS routes and, just as importantly,
+    pin that it happens BEFORE the funnel writes anything -- the auto-confirm
+    and the `auth_provider` stamp both persist, and stamping an account that
+    was turned away would record that it authenticated when it did not.
+
+    Deliberately does NOT patch `login_user` anywhere: the refusal is the
+    thing under test, and a MagicMock's return value is always truthy.
+    """
+
+    NIC = "99887766"
+    PERSON_ID = "ES/PT/9988776655"
+    AUDIT_LOGGER = "saml.audit"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def _eidas_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post(
+            "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
+        )
+
+    def _inactive_cmd_account(self):
+        return UserFactory(
+            active=False, confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)}
+        )
+
+    def _inactive_eidas_account(self):
+        return UserFactory(
+            active=False,
+            confirmed_at="2024-01-01",
+            extras={"auth_nic": _hash_nic(self.PERSON_ID)},
+        )
+
+    def _assert_refused(self, response):
+        assert response.status_code == 302
+        assert "saml_error=inactive_account" in response.headers["Location"]
+        with self.client.session_transaction() as sess:
+            assert "saml_login" not in sess
+
+    def _assert_nothing_was_written(self, user):
+        """The five trackable fields AND the provider stamp.
+
+        The provider stamp is the one that proves *where* the refusal
+        happened: it is written a few lines above `login_user`, so its
+        absence is only possible if the funnel never ran at all.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER
+
+        user.reload()
+        assert user.login_count is None
+        assert user.current_login_at is None
+        assert user.last_login_at is None
+        assert AUTH_PROVIDER not in (user.extras or {})
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_refuses_an_inactive_account_before_any_write(
+        self, mock_client_for, mock_requires_conf
+    ):
+        inactive = self._inactive_cmd_account()
+
+        response = self._cmd_login(
+            mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva"
+        )
+
+        self._assert_refused(response)
+        self._assert_nothing_was_written(inactive)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_refuses_an_inactive_account_before_any_write(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The two ACS routes converge on one funnel, but the guard is
+        duplicated per route -- which is this file's pattern for every other
+        rejection code. Running the same scenario through both handlers is
+        what turns a future divergence between the two copies red."""
+        inactive = self._inactive_eidas_account()
+
+        response = self._eidas_login(
+            mock_client_for,
+            person_identifier=self.PERSON_ID,
+            given_name="Carmen",
+            family_name="García",
+        )
+
+        self._assert_refused(response)
+        self._assert_nothing_was_written(inactive)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_refusal_is_audited_as_a_failure_and_never_as_a_success(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Whoever counts `outcome=success` was counting this login.
+
+        `assertLogs` rather than pytest's `caplog`: this class descends from
+        unittest.TestCase, into which caplog cannot be injected. It does the
+        same job -- attaches a handler and pins the level -- and without that
+        the "no success line" assertion would pass on an empty capture.
+        """
+        self._inactive_cmd_account()
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=rejected" in lines[0]
+        assert "reason=inactive_account" in lines[0]
+        assert not any("outcome=success" in line for line in lines)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_active_account_still_audits_exactly_one_success(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The control. A guard that refused everyone would satisfy every
+        assertion above and break the portal."""
+        active = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=success" in lines[0]
+
+        active.reload()
+        assert active.login_count == 1
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_unlinked_inactive_candidate_is_refused_instead_of_sent_to_the_wizard(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The test that distinguishes where the guard sits.
+
+        An inactive account with no `auth_nic` is a migration candidate, and
+        with the flag on the route would divert it to the wizard. That is the
+        account which, by construction, receives validation links -- so a
+        guard placed below the wizard branch would mail it another link that
+        the link path then refuses, on every attempt, and never tell it why.
+
+        Placed above the branch, it is refused with `inactive_account`
+        whatever its migration status.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        inactive = UserFactory(active=False, confirmed_at="2024-01-01", extras={})
+
+        response = self._cmd_login(
+            mock_client_for,
+            email=inactive.email,
+            nic=self.NIC,
+            first_name="Ana",
+            last_name="Silva",
+        )
+
+        self._assert_refused(response)
+        assert "migration" not in response.headers["Location"]
+        self._assert_nothing_was_written(inactive)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_refuses_the_inactive_account_with_the_migration_flag_off(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The flag decides whether a candidate goes to the wizard; it must
+        not decide whether an inactive account gets in."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        inactive = self._inactive_cmd_account()
+
+        self._assert_refused(
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Silva")
+        )
+        self._assert_nothing_was_written(inactive)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_refuses_the_inactive_account_with_the_migration_flag_off(
+        self, mock_client_for, mock_requires_conf
+    ):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        inactive = self._inactive_eidas_account()
+
+        self._assert_refused(
+            self._eidas_login(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+        )
+        self._assert_nothing_was_written(inactive)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_assertion_with_neither_email_nor_identifier_does_not_500(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The guard reads an attribute off `user`, and at that point in the
+        route `user` can be None -- _find_or_create_saml_user returns
+        (None, ...) for an assertion carrying neither an email nor a NIC.
+
+        Without the `user and` in the condition this is a 500 on a real,
+        non-theoretical assertion. The existing coverage does NOT catch it:
+        `test_none_user_redirects_to_login` calls the funnel directly inside
+        a request context and never goes through the route. It also closes a
+        coverage asymmetry -- the eIDAS route had this case, CMD did not.
+        """
+        response = self._cmd_login(mock_client_for, first_name="Ana", last_name="Silva")
+
+        assert response.status_code == 302
+        assert "saml_error=missing_attributes" in response.headers["Location"]
