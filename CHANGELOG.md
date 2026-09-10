@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **fix(auth): a refused SAML sign-in is now refused all the way down**
+  - `flask_login.login_user` returns `False` *without establishing a session*
+    when the account is not active, and everything downstream carried on as if
+    it had succeeded: the session was marked `saml_login`, the debug log said
+    `login_user OK`, and the ACS route had already emitted an audit line
+    reading `outcome=success`. Whoever counted successful sign-ins was
+    counting logins that never happened. It is reachable rather than
+    theoretical — `active` carries no default on the user document, so a
+    legacy account imported without the field lands here, and no guard in the
+    funnel looked at it.
+  - The guard goes in both ACS routes right after the account is resolved, and
+    deliberately not at the `login_user` return value. By the time the funnel
+    reaches that call it has already auto-confirmed the account and stamped
+    the authentication provider on it, so refusing later would leave an
+    account confirmed and marked as having authenticated through CMD by a
+    login that was declined. Refusing before any of it runs is what keeps
+    those two writes honest, and the refusal is logged at `warning` rather
+    than `error` because it reaches the legacy population in bulk and the
+    error level opens a Sentry issue per login.
+  - It also sits above the wizard branch, which matters for the people most
+    affected: an inactive legacy account that is not linked yet is, by
+    construction, the one that receives validation links. A guard any lower
+    would have sent it back to the wizard on every attempt, mailing it another
+    link that the link path then refuses, without ever telling it what was
+    wrong.
+  - The validation link is no longer burned by a click that cannot sign anyone
+    in. The check joins the deleted-account one inside the read-only token
+    validation, so the single-use token is preserved by *where* the check
+    lives rather than by remembering to undo the consumption. The click
+    answers "link invalid" rather than naming the real cause, which is the
+    same deliberately opaque answer a deleted account already gets: an
+    unauthenticated GET — a mail scanner pre-opening the link, a forwarded URL
+    — must not become an oracle for account state.
+  - ⚠️ **The refusal is now distinguishable, but not yet visible to the
+    person.** Two pre-existing gaps, common to every rejection code in this
+    flow and not introduced here: the frontend does not render `saml_error`,
+    so the explanatory message is carried in the redirect but never shown;
+    and the `saml.audit` logger has no handler and neither does the root, so
+    the audit line is emitted but does not reach anywhere in production at
+    any level. Both need their own work — a frontend ticket covering all the
+    rejection codes at once, and the separate fix for the audit logger.
+
 - **fix(auth): SAML sign-ins now keep the trackable session fields**
   - `SECURITY_TRACKABLE` is on and the five fields are declared on our own
     `User` document, so a password login kept `last_login_at`,
