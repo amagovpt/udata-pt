@@ -4449,6 +4449,109 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert len(ctas) == 1
         return ctas[0].link.rsplit("/", 1)[1]
 
+    def _legacy_with_link(self, mock_client_for):
+        """A legacy account holding a live validation link, and its token."""
+        legacy = UserFactory(
+            email="rui.old@example.pt",
+            password="S3cretPass!",
+            first_name="rui",
+            last_name="santos",
+            confirmed_at=None,
+        )
+        token = self._issue_link_for(
+            mock_client_for, legacy, nic="50607080", first_name="Rui", last_name="Santos"
+        )
+        return legacy, token
+
+    @staticmethod
+    def _set_active(user, value):
+        """Atomically, so the extras -- and the link record inside them -- are
+        not clobbered by writing back a stale document."""
+        from udata.core.user.models import User
+
+        User.objects(id=user.id).update_one(set__active=value)
+
+    def _deactivate(self, user):
+        self._set_active(user, False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_inactive_account_does_not_burn_the_validation_link(self, mock_client_for):
+        """LEDG-2465: the click could not have produced a session anyway.
+
+        `login_user` refuses an inactive account, so the click was already
+        going to fail -- but it consumed the single-use token on the way,
+        leaving the person with no link, no session and no way to retry.
+
+        The check lives in `_migration_link_token_status`, which is read-only
+        by construction: refusing there means the consumption, which is a
+        write further down, is never reached.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy, token = self._legacy_with_link(mock_client_for)
+        self._deactivate(legacy)
+
+        with self.app.test_client() as fresh:
+            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            assert response.status_code == 302
+            assert "flash=migration_link_invalid" in response.headers["Location"]
+            with fresh.session_transaction() as sess:
+                assert "saml_login" not in sess
+
+        legacy.reload()
+        assert not (legacy.extras or {}).get("auth_nic")
+        assert (legacy.extras or {}).get(MIGRATION_LINK_PENDING), (
+            "the link record must survive a click that could not sign anyone in"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_same_token_still_works_once_the_account_is_active_again(self, mock_client_for):
+        """The direct proof of non-consumption, and the reason the assertion
+        above is not enough on its own: a surviving record could still have
+        had its nonce rotated. Replaying the very same token is what shows
+        the link is intact."""
+        legacy, token = self._legacy_with_link(mock_client_for)
+        self._deactivate(legacy)
+
+        with self.app.test_client() as fresh:
+            assert (
+                "flash=migration_link_invalid"
+                in fresh.get(f"/saml/migration/confirm-link/{token}").headers["Location"]
+            )
+
+        self._set_active(legacy, True)
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == legacy.id
+            assert response.status_code == 302
+
+        legacy.reload()
+        assert legacy.extras["auth_nic"] == _hash_nic("50607080")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_click_is_refused_with_the_migration_flag_off(self, mock_client_for):
+        """Criterion 5, and what this test actually pins is the FLAG gate, not
+        the new check: the route returns `migration_link_invalid` from the
+        `_migration_enabled()` guard before the helper ever runs, so the
+        `is_active` check is not even reached. Said here so the test is not
+        mistaken for coverage of the inactive-account refusal."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy, token = self._legacy_with_link(mock_client_for)
+        self._deactivate(legacy)
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with self.app.test_client() as fresh:
+            response = fresh.get(f"/saml/migration/confirm-link/{token}")
+            assert response.status_code == 302
+            assert "flash=migration_link_invalid" in response.headers["Location"]
+
+        legacy.reload()
+        assert (legacy.extras or {}).get(MIGRATION_LINK_PENDING)
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_click_links_the_account_and_starts_a_session_without_one(self, mock_client_for):
         """Criteria 2 and 3: 401 before the click, and the click alone links

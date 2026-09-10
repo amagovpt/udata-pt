@@ -1501,7 +1501,21 @@ def _migration_link_token_status(token):
         return None, None, "invalid"
 
     user = User.objects(id=user_id).first()
-    if not user or user.deleted:
+    # ``is_active`` joins ``deleted`` here rather than at the login below,
+    # because this helper is read-only by construction: refusing here means
+    # the token is never consumed, since the consumption is the write further
+    # down that this return value stops us reaching. A click that cannot
+    # produce a session must not burn a single-use link.
+    #
+    # "invalid" rather than a distinct code is deliberate, and the cost is
+    # real: the legitimate owner is told the link is invalid when the actual
+    # problem is that their account is disabled. That is the price of not
+    # handing an unauthenticated GET -- a mail scanner pre-opening the link,
+    # a forwarded URL -- an oracle for account state, and it is exactly the
+    # answer ``deleted`` already gives on this same line. The way out is the
+    # ACS guard: a fresh CMD attempt now says ``inactive_account`` before the
+    # wizard branch, so the account is no longer handed another doomed link.
+    if not user or user.deleted or not user.is_active:
         return None, None, "invalid"
 
     record = (user.extras or {}).get(MIGRATION_LINK_PENDING)
