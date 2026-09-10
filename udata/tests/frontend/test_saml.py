@@ -6708,3 +6708,164 @@ class SAMLInactiveAccountRefusalTest(APITestCase):
 
         assert response.status_code == 302
         assert "saml_error=missing_attributes" in response.headers["Location"]
+
+
+class SAMLConfirmedAtPersistenceTest(APITestCase):
+    """`confirmed_at` has to reach the database, not just the object.
+
+    The plugin called `datastore.commit()` in three places as if it flushed.
+    It does not: `Datastore.commit` is `pass` on the base class and
+    `MongoEngineDatastore` does not override it, because its `put()` is
+    already `model.save()`.
+
+    The consequence was worse than "lost on a repeat login". In
+    `_create_saml_user`, `create_user` ends in that `put()`, so the document
+    was written BEFORE `confirmed_at` was assigned; the returned object
+    carried the value, so `requires_confirmation()` -- which is
+    `confirmed_at is None` -- said False and the funnel's auto-confirm never
+    ran, while the provider stamp saw its value already agreed and saved
+    nothing. The next login reran the same loop, so the field stayed null
+    forever.
+
+    That matters beyond tidiness: an account with a null `confirmed_at` is
+    refused by password recovery with CONFIRMATION_REQUIRED, and the generic
+    anti-enumeration response makes that refusal look like a sent mail.
+
+    🚨 Every test here reads the value back FROM THE DATABASE. Asserting on
+    the in-memory object is exactly what would have passed while the bug was
+    present.
+    """
+
+    NIC = "31415926"
+    PERSON_ID = "ES/PT/3141592653"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @staticmethod
+    def _reload(user):
+        """From the database, never from the handed-in object."""
+        from udata.core.user.models import User
+
+        return User.objects(id=user.id).first()
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_account_created_by_saml_is_confirmed_in_the_database(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Point 1: the creation path.
+
+        The wizard has to be off for an unmatched identity to get an account
+        outright -- with it on, the route diverts to the wizard and nothing is
+        created. And `requires_confirmation` is patched to False on purpose:
+        it takes the funnel's auto-confirm out of the picture, so the only
+        thing that could have written the field is `_create_saml_user` itself.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                nic=self.NIC,
+                email="ada@example.pt",
+                first_name="Ada",
+                last_name="Lovelace",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.NIC)).first()
+        assert created is not None, "the login should have created the account"
+        assert created.confirmed_at is not None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_funnel_persists_the_auto_confirm_on_an_existing_account(self, mock_client_for):
+        """Point 3, and the trap this ticket names explicitly.
+
+        🚨 The account is set up so the funnel's auto-confirm is the ONLY
+        writer: `auth_provider` is already stored and already agrees, so the
+        provider stamp saves nothing. Without that, the stamp's `save()` would
+        carry `confirmed_at` along and this test would pass green while
+        proving nothing -- which is how the defect survived.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+        assert existing.confirmed_at is None
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Lovelace")
+
+        assert self._reload(existing).confirmed_at is not None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_auto_confirm_write_leaves_the_sanitised_fields_alone(self, mock_client_for):
+        """The LEDG-2462 lesson, applied to this write.
+
+        A document save would drag `about`, `first_name` and `last_name`
+        through `User.pre_save`, whose sanitisation genuinely changes a legacy
+        raw value -- so signing in would rewrite the person's own name. The
+        atomic single-field update cannot.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+        # Written past the model so pre_save does not sanitise it on the way
+        # in: this is what a legacy row looks like.
+        User.objects(id=existing.id).update_one(
+            set__about="Silva & Sousa", set__first_name="ada", set__last_name="lovelace"
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Lovelace")
+
+        after = self._reload(existing)
+        assert after.confirmed_at is not None, "the field under test must still be written"
+        assert after.about == "Silva & Sousa"
+        assert after.first_name == "ada"
+        assert after.last_name == "lovelace"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_failing_auto_confirm_write_does_not_cost_the_login(self, mock_client_for):
+        """Bookkeeping must never deny anyone their account. The identity was
+        already verified by the IdP, so a write failure is logged and the
+        sign-in proceeds."""
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            with patch(
+                "mongoengine.queryset.base.BaseQuerySet.update_one",
+                side_effect=RuntimeError("boom"),
+            ):
+                response = self._cmd_login(
+                    mock_client_for, nic=self.NIC, first_name="Ada", last_name="Lovelace"
+                )
+            assert mock_login.call_count == 1
+
+        assert response.status_code == 302
+        assert self._reload(existing).confirmed_at is None
