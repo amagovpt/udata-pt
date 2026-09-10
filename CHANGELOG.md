@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **fix(auth): the SAML auto-confirm was never actually stored**
+  - `datastore.commit()` does nothing in this application. `Datastore.commit`
+    is `pass` on Flask-Security's base class and `MongoEngineDatastore` does
+    not override it, because its `put()` is already `model.save()`. The SAML
+    plugin called it in three places as if it flushed pending changes, which
+    is correct advice for SQLAlchemy and noise here.
+  - The consequence was not a write lost on a repeat login but a field that
+    never reached the database at all. `create_user` ends in that `put()`, so
+    the document was written *before* `confirmed_at` was assigned; the
+    returned object carried the value, so the check that decides whether to
+    auto-confirm — which is simply `confirmed_at is None` — said no, and the
+    provider stamp saw its own value already agreed and saved nothing. The
+    next sign-in reloaded from the database, found the field null, assigned it
+    in memory again, and lost it again.
+  - ⚠️ **That reaches beyond tidiness.** An account whose `confirmed_at` is
+    null is refused by password recovery, and the deliberately generic
+    anti-enumeration response makes that refusal indistinguishable from a mail
+    that was sent. Every account created through this path could never recover
+    its password and was never told why.
+  - Fixed in the two places that matter, differently on purpose: the creation
+    path now passes the field *into* `create_user`, so there is one write and
+    the ordering mistake stops being expressible; the sign-in path uses an
+    atomic single-field update. **Not a document save** — that would drag
+    `about`, `first_name` and `last_name` through the model's sanitisation,
+    which genuinely changes a legacy value, so signing in would silently
+    rewrite the person's own name. A failure there is logged and the login
+    proceeds: bookkeeping must never cost anyone their account.
+  - The third call, on the pending-account path, is simply removed. Nothing
+    was assigned after it — that path leaves the field unset by design, since
+    the address is self-declared and still has to be proved — so the call only
+    ever suggested a flush that does not exist.
+  - Searched the whole backend: those three were the only occurrences, so the
+    pattern is not spread elsewhere.
+  - ⚠️ **Observable data change:** accounts whose `confirmed_at` is null today
+    will have it filled in on their next sign-in. That is what the code always
+    intended, but anyone counting unconfirmed accounts will see the number
+    fall. No migration is proposed — the next login of each account resolves
+    it — but the count of affected accounts still needs measuring in
+    production.
+  - The tests read the value back from the database, never from the handed-in
+    object, and the sign-in test is set up so the auto-confirm is the *only*
+    writer: with the provider already stored and agreeing, the stamp saves
+    nothing. Without that, the stamp's save would carry the field along and
+    the test would pass green while proving nothing — which is how this
+    survived in the first place.
+
 - **fix(auth): Flask-Security's mails were going out from a non-existent domain**
   - Password reset, email confirmation and welcome mails were all sent from
     `webmaster@udata` — a domain that is not even a valid TLD — while udata's
