@@ -158,7 +158,8 @@ class Defaults(object):
     SECURITY_RESET_SALT = "Default uData secret reset salt"
     SECURITY_REMEMBER_SALT = "Default uData remember salt"
 
-    SECURITY_EMAIL_SENDER = MAIL_DEFAULT_SENDER
+    # SECURITY_EMAIL_SENDER intentionally unset: Flask-Security's own default
+    # resolves MAIL_DEFAULT_SENDER lazily. See SecurityMailSenderTest.
 
     SECURITY_EMAIL_SUBJECT_REGISTER = _("Welcome")
     SECURITY_EMAIL_SUBJECT_CONFIRM = _("Please confirm your email")
