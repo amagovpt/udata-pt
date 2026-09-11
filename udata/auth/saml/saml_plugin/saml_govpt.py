@@ -755,13 +755,24 @@ def _create_saml_user(
     if extras:
         user_data["extras"] = extras
 
-    user = datastore.create_user(**user_data)
     # Auto-confirm users created via SAML — they were already verified
     # by autenticação.gov, so no email confirmation is needed.
-    user.confirmed_at = datetime.utcnow()
-    datastore.commit()
+    #
+    # Passed INTO create_user rather than assigned after it. `create_user`
+    # ends in `put(user)`, which under MongoEngine is `model.save()` -- the
+    # document is already written by the time it returns. Assigning the field
+    # afterwards and calling `datastore.commit()` left it in memory only:
+    # commit() is `pass` on the base Datastore and MongoEngineDatastore does
+    # not override it, because its put() already writes.
+    #
+    # The consequence was not "lost on a repeat login" but never stored at
+    # all: the returned object carries the value, so requires_confirmation()
+    # -- which is `confirmed_at is None` -- said False and the funnel's
+    # auto-confirm never ran, while the provider stamp saw its value already
+    # agreed and saved nothing. The next login reran the same loop.
+    user_data["confirmed_at"] = datetime.utcnow()
 
-    return user
+    return datastore.create_user(**user_data)
 
 
 # Marks an account whose email was typed by the user rather than vouched for
@@ -859,15 +870,17 @@ def _create_pending_saml_user(
     if citizen_declared:
         extras[AUTH_CITIZEN_DECLARED] = citizen_declared
 
-    user = datastore.create_user(
+    # No datastore.commit() here: create_user already wrote the document, and
+    # commit() is a no-op under MongoEngine anyway. Nothing is assigned after
+    # the call -- confirmed_at is deliberately left unset on this path, since
+    # the address is self-declared and still has to be proved -- so the call
+    # only ever suggested a flush that does not exist.
+    return datastore.create_user(
         first_name=(first_name or "").title(),
         last_name=(last_name or "").title(),
         email=user_email,
         extras=extras,
     )
-    datastore.commit()
-
-    return user
 
 
 def _find_user_by_email_ci(email):
@@ -1154,8 +1167,34 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_d
         # Auto-confirm on SAML login — autenticação.gov already verified the
         # user. This vouches for the IDENTITY, which is why it does not apply
         # to the self-declared addresses gated above.
-        user.confirmed_at = datetime.utcnow()
-        datastore.commit()
+        #
+        # An atomic single-field write, not `user.save()`. The document save
+        # drags `about`, `first_name` and `last_name` through `User.pre_save`,
+        # which sanitises them on every write path -- on a legacy document the
+        # value genuinely changes, so the field is marked dirty and rides
+        # along in the same update. Signing in would silently rewrite the
+        # person's own name. Same reasoning, and same shape, as
+        # `_record_login_activity`.
+        #
+        # This replaces a `datastore.commit()` that did nothing: the value
+        # only ever reached the database when some later write in this
+        # function happened to save the document, and on a repeat login --
+        # where the provider stamp already agrees and saves nothing -- it was
+        # lost. The intent stated in the comment above never held.
+        from udata.core.user.models import User
+
+        confirmed_at = datetime.utcnow()
+        try:
+            User.objects(id=user.id).update_one(set__confirmed_at=confirmed_at)
+            user.confirmed_at = confirmed_at
+        except Exception as exc:
+            # Bookkeeping must never cost anyone their sign-in: the identity
+            # was already verified by the IdP, so a failure here is logged and
+            # the login proceeds. Same call as the provider stamp below.
+            current_app.logger.warning(
+                f"SAML: could not persist auto-confirm for user {user.id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     # Record which provider this session came through, now that the guards
     # above have established there is going to be one. Accounts that predate
