@@ -126,6 +126,8 @@ def confirm_change_email_token_status(token):
 
 
 def confirm_change_email(token):
+    from udata.core.user.models import find_user_by_email_ci
+
     expired, invalid, user, new_email = confirm_change_email_token_status(token)
 
     flash = None
@@ -143,8 +145,13 @@ def confirm_change_email(token):
     if flash:
         return redirect(homepage_url(flash=flash, flash_data=flash_data))
 
-    # Check if the new email is already taken by another user
-    existing_user = _datastore.find_user(email=new_email)
+    # Check if the new email is already taken by another user.
+    #
+    # Case-insensitively: the unique index on User.email is case-sensitive, so
+    # an exact check let "maria@x.pt" through while "Maria@x.pt" already
+    # existed, and this is the line that writes the address -- the two rows
+    # answering to one mailbox were born right here.
+    existing_user = find_user_by_email_ci(new_email)
     if existing_user and existing_user.id != user.id:
         return redirect(homepage_url(flash="change_email_already_taken"))
 
@@ -171,6 +178,7 @@ def get_csrf():
 @login_required
 def change_email():
     """Change email page."""
+    from udata.core.user.models import find_user_by_email_ci
 
     form = ChangeEmailForm()
 
@@ -206,7 +214,11 @@ def change_email():
         # `confirm_change_email` keeps its own already-taken guard: it is the
         # net for an address that becomes taken between this request and the
         # click, which this branch cannot see.
-        existing = _datastore.find_user(email=new_email)
+        # Case-insensitive for the same reason as in confirm_change_email:
+        # a spelling that differs only in case is the SAME mailbox, so it is
+        # taken. This widens what counts as taken -- deliberately -- and the
+        # answer to the caller must stay identical either way.
+        existing = find_user_by_email_ci(new_email)
         if existing and existing.id != current_user.id:
             # mark_as_deleted rewrites the address to <id>@deleted, so a row
             # deleted through the product is not found by a submitted address
