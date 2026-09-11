@@ -6708,3 +6708,346 @@ class SAMLInactiveAccountRefusalTest(APITestCase):
 
         assert response.status_code == 302
         assert "saml_error=missing_attributes" in response.headers["Location"]
+
+
+class SAMLConfirmedAtPersistenceTest(APITestCase):
+    """`confirmed_at` has to reach the database, not just the object.
+
+    The plugin called `datastore.commit()` in three places as if it flushed.
+    It does not: `Datastore.commit` is `pass` on the base class and
+    `MongoEngineDatastore` does not override it, because its `put()` is
+    already `model.save()`.
+
+    The consequence was worse than "lost on a repeat login". In
+    `_create_saml_user`, `create_user` ends in that `put()`, so the document
+    was written BEFORE `confirmed_at` was assigned; the returned object
+    carried the value, so `requires_confirmation()` -- which is
+    `confirmed_at is None` -- said False and the funnel's auto-confirm never
+    ran, while the provider stamp saw its value already agreed and saved
+    nothing. The next login reran the same loop, so the field stayed null
+    forever.
+
+    That matters beyond tidiness: an account with a null `confirmed_at` is
+    refused by password recovery with CONFIRMATION_REQUIRED, and the generic
+    anti-enumeration response makes that refusal look like a sent mail.
+
+    🚨 Every test here reads the value back FROM THE DATABASE. Asserting on
+    the in-memory object is exactly what would have passed while the bug was
+    present.
+    """
+
+    NIC = "31415926"
+    PERSON_ID = "ES/PT/3141592653"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @staticmethod
+    def _reload(user):
+        """From the database, never from the handed-in object."""
+        from udata.core.user.models import User
+
+        return User.objects(id=user.id).first()
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_account_created_by_saml_is_confirmed_in_the_database(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Point 1: the creation path.
+
+        The wizard has to be off for an unmatched identity to get an account
+        outright -- with it on, the route diverts to the wizard and nothing is
+        created. And `requires_confirmation` is patched to False on purpose:
+        it takes the funnel's auto-confirm out of the picture, so the only
+        thing that could have written the field is `_create_saml_user` itself.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                nic=self.NIC,
+                email="ada@example.pt",
+                first_name="Ada",
+                last_name="Lovelace",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.NIC)).first()
+        assert created is not None, "the login should have created the account"
+        assert created.confirmed_at is not None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_funnel_persists_the_auto_confirm_on_an_existing_account(self, mock_client_for):
+        """Point 3, and the trap this ticket names explicitly.
+
+        🚨 The account is set up so the funnel's auto-confirm is the ONLY
+        writer: `auth_provider` is already stored and already agrees, so the
+        provider stamp saves nothing. Without that, the stamp's `save()` would
+        carry `confirmed_at` along and this test would pass green while
+        proving nothing -- which is how the defect survived.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+        assert existing.confirmed_at is None
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Lovelace")
+
+        assert self._reload(existing).confirmed_at is not None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_auto_confirm_write_leaves_the_sanitised_fields_alone(self, mock_client_for):
+        """The LEDG-2462 lesson, applied to this write.
+
+        A document save would drag `about`, `first_name` and `last_name`
+        through `User.pre_save`, whose sanitisation genuinely changes a legacy
+        raw value -- so signing in would rewrite the person's own name. The
+        atomic single-field update cannot.
+        """
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+        from udata.core.user.models import User
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+        # Written past the model so pre_save does not sanitise it on the way
+        # in: this is what a legacy row looks like.
+        User.objects(id=existing.id).update_one(
+            set__about="Silva & Sousa", set__first_name="ada", set__last_name="lovelace"
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Lovelace")
+
+        after = self._reload(existing)
+        assert after.confirmed_at is not None, "the field under test must still be written"
+        assert after.about == "Silva & Sousa"
+        assert after.first_name == "ada"
+        assert after.last_name == "lovelace"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_failing_auto_confirm_write_does_not_cost_the_login(self, mock_client_for):
+        """Bookkeeping must never deny anyone their account. The identity was
+        already verified by the IdP, so a write failure is logged and the
+        sign-in proceeds."""
+        from udata.core.user.constants import AUTH_PROVIDER, AUTH_PROVIDER_CMD
+
+        existing = UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), AUTH_PROVIDER: AUTH_PROVIDER_CMD},
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            with patch(
+                "mongoengine.queryset.base.BaseQuerySet.update_one",
+                side_effect=RuntimeError("boom"),
+            ):
+                response = self._cmd_login(
+                    mock_client_for, nic=self.NIC, first_name="Ada", last_name="Lovelace"
+                )
+            assert mock_login.call_count == 1
+
+        assert response.status_code == 302
+        assert self._reload(existing).confirmed_at is None
+
+
+class SAMLAmbiguousIdentityTest(APITestCase):
+    """When two accounts claim one identity, nobody gets in.
+
+    The login lookup used `.first()` on `extras.auth_nic`. That reads like a
+    coin toss and is not one: `User._meta` orders by `-created_at`, so the
+    newest account won every time -- silently and consistently.
+
+    🚨 That is worse than a random pick, not better. A random one would
+    eventually be noticed by the person it happened to; this hands over the
+    same wrong session, content and organisation memberships on every sign-in
+    and never contradicts the impression that the account is theirs.
+
+    Making the choice deterministic was never the missing piece -- it already
+    was. What is missing is proof of possession, which cannot be obtained
+    here, so the only honest answer is to refuse.
+
+    🚨 Asserting the redirect is not enough. Every test below also reads BOTH
+    accounts back from the database: "refused" and "signed into the other one"
+    look identical from the outside, and only the absence of a session on
+    either account tells them apart.
+    """
+
+    NIC = "27182818"
+    PERSON_ID = "IT/PT/2718281828"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def _eidas_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post(
+            "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
+        )
+
+    def _two_accounts_claiming(self, identifier):
+        """The production shape: same person, two addresses, minutes apart."""
+        older = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(identifier)})
+        newer = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(identifier)})
+        return older, newer
+
+    def _assert_refused(self, response):
+        assert response.status_code == 302
+        assert "saml_error=ambiguous_identity" in response.headers["Location"]
+        with self.client.session_transaction() as sess:
+            assert "saml_login" not in sess
+
+    def _assert_neither_was_signed_in(self, *users):
+        """The assertion that distinguishes a refusal from signing into the
+        other account. Without it, picking the older one instead of the newer
+        would pass every other check here."""
+        for user in users:
+            user.reload()
+            assert user.login_count is None, f"{user.id} was signed into"
+            assert user.current_login_at is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_refuses_when_two_accounts_claim_the_identity(
+        self, mock_client_for, mock_requires_conf
+    ):
+        older, newer = self._two_accounts_claiming(self.NIC)
+
+        self._assert_refused(
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
+        )
+        self._assert_neither_was_signed_in(older, newer)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_refuses_when_two_accounts_claim_the_identity(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The two ACS routes converge on one resolver, but the refusal is
+        duplicated per route -- this file's pattern for every rejection code.
+        Running the same scenario through both is what turns a future
+        divergence between the copies red."""
+        older, newer = self._two_accounts_claiming(self.PERSON_ID)
+
+        self._assert_refused(
+            self._eidas_login(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Ada",
+                family_name="Byron",
+            )
+        )
+        self._assert_neither_was_signed_in(older, newer)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_refusal_is_audited_and_never_as_a_success(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """`assertLogs` rather than caplog: this class descends from
+        unittest.TestCase. Pinning the level matters -- without it the "no
+        success line" assertion would pass on an empty capture."""
+        self._two_accounts_claiming(self.NIC)
+
+        with self.assertLogs("saml.audit", level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=rejected" in lines[0]
+        assert "reason=ambiguous_identity" in lines[0]
+        assert not any("outcome=success" in line for line in lines)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_one_account_with_the_identity_still_signs_in(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The control. A guard that refused everyone would satisfy every
+        assertion above and lock the portal."""
+        only = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        response = self._cmd_login(
+            mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron"
+        )
+
+        assert "saml_error" not in response.headers["Location"]
+        only.reload()
+        assert only.login_count == 1
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_hashed_and_a_plain_account_see_each_other(self, mock_client_for, mock_requires_conf):
+        """The case the old code could not see at all.
+
+        The hashed lookup ran first and the plain one only when it found
+        nothing, so an account holding the hash and another holding the same
+        NIC in plain form were invisible to each other: the first returned
+        one, the fallback never ran, and the sign-in proceeded as if the
+        identity were unambiguous.
+        """
+        hashed = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.NIC)})
+        plain = UserFactory(confirmed_at="2024-01-01", extras={"auth_nic": self.NIC})
+
+        self._assert_refused(
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
+        )
+        self._assert_neither_was_signed_in(hashed, plain)
+        # And the plain value was NOT upgraded to a hash on the way out: the
+        # refusal must not leave a write behind.
+        plain.reload()
+        assert plain.extras["auth_nic"] == self.NIC
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_refusal_holds_with_the_migration_flag_off(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The flag decides whether an unmatched identity goes to the wizard.
+        It must not decide whether an ambiguous one gets in."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        older, newer = self._two_accounts_claiming(self.NIC)
+
+        self._assert_refused(
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
+        )
+        self._assert_neither_was_signed_in(older, newer)
