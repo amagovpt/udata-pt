@@ -7016,9 +7016,7 @@ class SAMLAmbiguousIdentityTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_a_hashed_and_a_plain_account_see_each_other(
-        self, mock_client_for, mock_requires_conf
-    ):
+    def test_a_hashed_and_a_plain_account_see_each_other(self, mock_client_for, mock_requires_conf):
         """The case the old code could not see at all.
 
         The hashed lookup ran first and the plain one only when it found
