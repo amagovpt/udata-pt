@@ -7051,3 +7051,113 @@ class SAMLAmbiguousIdentityTest(APITestCase):
             self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
         )
         self._assert_neither_was_signed_in(older, newer)
+
+
+class SAMLCaseVariantAddressTest(APITestCase):
+    """The duplicate that carries no placeholder prefix, and so is not counted.
+
+    Two functions decided whether an address already existed and disagreed:
+    the resolver asked case-insensitively, `_create_saml_user` asked exactly.
+    The unique index on `User.email` is case-sensitive, so "Maria@x.pt" and
+    "maria@x.pt" coexist -- and the account minted by the second question
+    holds the REAL address, not a `saml-` placeholder.
+
+    🚨 That is what makes it expensive. A placeholder duplicate is ugly and
+    findable: every count filtered by the prefix sees it, and `migrate-nics`
+    iterates exactly those. A duplicate holding the real address in another
+    casing is invisible to both, which is why the production audit had to
+    grow a second axis before it could find any.
+
+    ⚠️ Reading these tests: the fix does NOT stop an account being created
+    with the flag off -- that fallback creates one by design (scenario 4).
+    What it changes is WHICH address the new row holds. Asserting "no new
+    account" would be asserting the (b) clause, which is a different ticket.
+
+    ⚠️ And the casing has to vary in the LOCAL part: `validate_email` lowers
+    the domain, so a test that only varied the domain would pass either way.
+    """
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def test_create_saml_user_mints_a_placeholder_for_a_taken_case_variant(self):
+        """The unit the whole fix turns on, asserted directly."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _create_saml_user
+        from udata.core.user.models import User
+
+        owner = UserFactory(email="Maria@example.pt", confirmed_at="2024-01-01")
+
+        with self.app.app_context():
+            created = _create_saml_user("maria@example.pt", "31415926", "Maria", "Silva")
+
+        assert created is not None
+        assert created.id != owner.id
+        assert _SAML_PLACEHOLDER_EMAIL_RE.match(created.email), created.email
+        # The point of the fix: exactly one row still answers to the address.
+        assert User.objects(email__iexact="maria@example.pt").count() == 1
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_acs_with_the_flag_off_mints_a_placeholder_for_a_case_variant(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The flag-off fallback is the path that held the bug."""
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        owner = UserFactory(email="Maria@example.pt", confirmed_at="2024-01-01")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                email="maria@example.pt",
+                nic="31415926",
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        assert User.objects(email__iexact="maria@example.pt").count() == 1
+        owner.reload()
+        assert owner.email == "Maria@example.pt"
+        created = User.objects(extras__auth_nic=_hash_nic("31415926")).first()
+        assert created is not None and created.id != owner.id
+        assert _SAML_PLACEHOLDER_EMAIL_RE.match(created.email), created.email
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_acs_with_the_flag_on_creates_no_account_for_a_case_variant(
+        self, mock_client_for, _mock_confirm
+    ):
+        """With the flag on -- the production value -- the resolver matches the
+        address case-insensitively and diverts to the wizard, so nothing is
+        created at all. Here to pin the OTHER state of the flag: the fix must
+        not disturb it, and assuming one value is what produced LEDG-2432."""
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        owner = UserFactory(email="Maria@example.pt", confirmed_at="2024-01-01")
+        users_before = User.objects.count()
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            response = self._cmd_login(
+                mock_client_for,
+                email="maria@example.pt",
+                nic="31415926",
+                first_name="Maria",
+                last_name="Silva",
+            )
+            assert mock_login.call_count == 0
+
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        assert User.objects.count() == users_before
+        owner.reload()
+        assert not (owner.extras or {}).get("auth_nic")

@@ -719,10 +719,18 @@ def _create_saml_user(
     written when there is one. It is SELF-DECLARED and gates nothing -- see
     AUTH_CITIZEN_DECLARED for why that matters.
     """
+    from udata.core.user.models import find_user_by_email_ci
+
     # Generate a placeholder email when the IdP does not provide one, or
     # when the CMD email is already taken by an existing account (the
     # user explicitly chose to create a new one in the wizard).
-    if not user_email or datastore.find_user(email=user_email):
+    #
+    # Case-insensitively, like the resolver that decided this identity has no
+    # account of its own. An exact check here saw "maria@x.pt" as free while
+    # "Maria@x.pt" already existed, and minted a second row holding the real
+    # address -- a duplicate with no placeholder prefix, invisible to every
+    # count filtered by it and to migrate-nics.
+    if not user_email or find_user_by_email_ci(user_email):
         import uuid
 
         from udata.core.user.constants import (
