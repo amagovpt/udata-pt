@@ -918,6 +918,35 @@ def _has_linked_nic(user):
     return _is_nic_hashed((user.extras or {}).get("auth_nic"))
 
 
+def _accounts_claiming_nic(user_nic, limit=2):
+    """Every account holding this identity, in either stored form.
+
+    Answers "how many accounts claim this identity?", which is the question
+    the login lookup actually needs -- and it has to span BOTH forms to be
+    answerable. The hashed value and the plain one were previously queried in
+    sequence, the second only when the first found nothing, so an account
+    holding the hash and another holding the same NIC in plain form were
+    invisible to each other: the first lookup returned one and the fallback
+    never ran.
+
+    Capped at ``limit`` documents because the caller only has to tell "one"
+    from "more than one" -- there is no reason to load a whole duplicate set
+    on every sign-in.
+
+    Deduplicated by id: a single account cannot hold both forms at once, but
+    the union is only sound if that is enforced rather than assumed.
+    """
+    from udata.core.user.models import User
+
+    found = {}
+    for stored in (_hash_nic(user_nic), user_nic):
+        for user in User.objects(extras__auth_nic=stored)[:limit]:
+            found[user.id] = user
+        if len(found) >= limit:
+            break
+    return list(found.values())
+
+
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
 
@@ -950,6 +979,10 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     - "existing_saml" — NIC already linked, normal login
     - "migration_candidate" — email or name match; user is the single
       candidate account, or None when several homonyms exist
+    - "ambiguous_identity" — more than one account claims this identifier;
+      user is always None. The caller must refuse the sign-in: there is no
+      way to tell which account is the right one, and picking is how someone
+      ends up in a stranger's account
     - "no_match" — nothing matched; user is always None
     - "error" — neither email nor NIC available
     """
@@ -959,19 +992,34 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     #    (Use MongoEngine nested dict syntax, not find_user, because
     #    find_user(extras={...}) matches the entire dict exactly.)
     if user_nic:
-        user = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
-        if user:
-            return user, "existing_saml"
+        claimants = _accounts_claiming_nic(user_nic)
 
-        # 1b. Same identity stored in plain form by an old plugin version:
-        #     the incoming NIC comes from a signed autenticacao.gov
-        #     assertion, so an exact match proves the link — upgrade the
-        #     stored value to the hashed format and log the user in.
-        user = User.objects(extras__auth_nic=user_nic).first()
-        if user:
-            user.extras["auth_nic"] = _hash_nic(user_nic)
-            user.save()
-            current_app.logger.info(f"SAML: upgraded plain stored NIC to hash for user {user.id}")
+        # More than one account holds this identity. Refuse rather than pick:
+        # `.first()` is not the coin toss it looks like -- User._meta orders by
+        # -created_at, so the newest account always won, silently and
+        # consistently. That is worse than a random pick, not better: a random
+        # one would eventually be noticed, while this hands the same wrong
+        # session, content and organisation memberships over every time and
+        # never contradicts the illusion that the account is yours.
+        #
+        # Making the choice "deterministic" was never the missing piece. It
+        # already was. What is missing is proof of possession, and there is no
+        # way to obtain it here -- so the only honest answer is to refuse and
+        # let a human disambiguate (LEDG-2469).
+        if len(claimants) > 1:
+            return None, "ambiguous_identity"
+
+        if claimants:
+            user = claimants[0]
+            # Upgrade a plain stored value to the hashed format. The incoming
+            # NIC comes from a signed autenticacao.gov assertion, so an exact
+            # match proves the link.
+            if (user.extras or {}).get("auth_nic") == user_nic:
+                user.extras["auth_nic"] = _hash_nic(user_nic)
+                user.save()
+                current_app.logger.info(
+                    f"SAML: upgraded plain stored NIC to hash for user {user.id}"
+                )
             return user, "existing_saml"
 
     # 2. Match by email: never auto-link — ownership must be proven
@@ -2304,6 +2352,33 @@ def idp_initiated():
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
+    # More than one account claims this identity. There is no way to tell which
+    # one belongs to the person in front of us, so the sign-in is refused
+    # rather than resolved -- letting someone into a stranger's account is a
+    # worse outcome than letting nobody in.
+    #
+    # Sits here, before the wizard branch, for the same reason as the guard
+    # below: nothing has been written yet, and the route's success audit line
+    # is never reached.
+    if status == "ambiguous_identity":
+        return _reject_saml_login(
+            "[SAML cmd] refused login for an identity claimed by more than one account",
+            # The file's own wording for a SAML-specific refusal, rather than
+            # flask_security's GENERIC_AUTHN_FAILED -- that one says "identity
+            # or password invalid", which is actively misleading here: the
+            # identity is perfectly valid, it is claimed twice. And this is a
+            # case only support can resolve, so the message has to say so.
+            _(
+                "Autenticação rejeitada: esta identidade está associada a mais do que uma "
+                "conta. Contacte o suporte para as reunir."
+            ),
+            log_level="warning",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="ambiguous_identity",
+        )
+
     # flask_login.login_user returns False without establishing a session when
     # the account is not active, and everything downstream used to treat that
     # refusal as a success. The guard belongs HERE, and not at that return
@@ -2791,6 +2866,21 @@ def idp_eidas_initiated():
         )
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+
+    # Same refusal, same reasoning as the CMD route above.
+    if status == "ambiguous_identity":
+        return _reject_saml_login(
+            "[SAML eidas] refused login for an identity claimed by more than one account",
+            _(
+                "Autenticação rejeitada: esta identidade está associada a mais do que uma "
+                "conta. Contacte o suporte para as reunir."
+            ),
+            log_level="warning",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="ambiguous_identity",
+        )
 
     # Same guard, same reasoning as the CMD route above — see the comment there
     # for why it sits here and not at the login_user return value. Duplicated
