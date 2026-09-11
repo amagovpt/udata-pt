@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **fix(auth): a spelling that differs only in capitalisation is now the same address everywhere**
+  - Two functions decided whether an email already existed and disagreed: the
+    SAML resolver asked case-insensitively, the account-creation path and the
+    profile's email-change flow asked exactly. The unique index on `User.email`
+    is case-sensitive, so `Maria@x.pt` and `maria@x.pt` coexist — and the row
+    minted by the exact check held the **real** address, not a placeholder.
+  - That duplicate was the expensive kind, because nothing found it: every
+    count filtered by the `saml-` prefix missed it, and `migrate-nics` iterates
+    exactly those. The audit had to grow a second axis before it could see any.
+  - The lookup that already did the right thing moved out of the SAML plugin to
+    sit next to `User`, so the profile can ask the same question. Its reason to
+    exist is the preference for the **exactly matching** row, not the
+    case-insensitivity: two rows can answer to one address and `User` orders by
+    `-created_at`, so a bare `.first()` returns whichever was created last. The
+    docstring now says so, because flask_security's own
+    `find_user(case_insensitive=True)` is precisely that bare `.first()`.
+  - Re-casing your own address still works — the lookup returns your own row,
+    so the identity guard holds.
+  - 🚨 **Known consequence, accepted.** Someone whose real address is held by
+    another row in a different casing can no longer set it, and the response is
+    generic by design so they are not told why. That is the population a
+    manual merge has to reconcile; it is not created by this change, only made
+    visible by refusing to paper over it.
+  - Both states of the migration flag are pinned by tests. With the flag on —
+    the production value — the resolver already diverted to the wizard, so this
+    fixes the fallback that runs where the flag is off.
+
 - **chore(scripts): the account audit now answers the three counts that were blocking decisions**
   - Three questions were being decided without a number behind them: how many
     accounts carry no confirmation date, how many organisations are already
