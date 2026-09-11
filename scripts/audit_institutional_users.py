@@ -356,20 +356,16 @@ def main():
         for accts in shared_nics.values():
             print("  -")
             for mail, status, created, holds in sorted(accts, key=lambda a: str(a[2] or "")):
-                marks = " ".join(
-                    filter(
-                        None,
-                        [
-                            "[content]" if holds["content"] else "",
-                            "[ADMIN]" if holds["admin"] else ("[member]" if holds["member"] else ""),
-                        ],
-                    )
-                )
-                print(f"      {mail}  ({status}; created {created}) {marks}")
+                marks = []
+                if holds["content"]:
+                    marks.append("[content]")
+                if holds["admin"]:
+                    marks.append("[ADMIN]")
+                elif holds["member"]:
+                    marks.append("[member]")
+                print(f"      {mail}  ({status}; created {created}) {' '.join(marks)}")
         both = sum(
-            1
-            for accts in shared_nics.values()
-            if sum(1 for a in accts if a[3]["content"]) > 1
+            1 for accts in shared_nics.values() if sum(1 for a in accts if a[3]["content"]) > 1
         )
         print()
         # Printed so a zero above cannot be read as a scan that found nothing:
