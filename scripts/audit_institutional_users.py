@@ -189,11 +189,48 @@ def main():
     # membership, and counting them inflated the sole-admin exposure by half
     # when this audit was first used on production data (three AGIT records,
     # two of them already deleted).
+    # Read the roles as well as the ids: an organization with no member holding
+    # "admin" is stuck -- nobody can manage members, accept transfers or edit
+    # it, and it cannot promote anyone from the inside, so recovering needs a
+    # sysadmin. The guard added on the member endpoints stops NEW ones; it does
+    # not repair the ones that already exist, and nobody has counted them.
     org_member_ids = set()
-    for org in db.organization.find({"deleted": None}, {"members.user": 1}):
+    org_admin_ids = set()
+    orgs_without_admin = []
+    org_member_refs = []  # (org label, user id) for every membership
+    for org in db.organization.find(
+        {"deleted": None}, {"members.user": 1, "members.role": 1, "name": 1, "slug": 1}
+    ):
+        label = org.get("name") or org.get("slug") or str(org.get("_id"))
+        has_admin = False
         for member in org.get("members") or []:
             if member.get("user"):
                 org_member_ids.add(member["user"])
+                org_member_refs.append((label, member["user"]))
+                if member.get("role") == "admin":
+                    has_admin = True
+                    org_admin_ids.add(member["user"])
+        if not has_admin:
+            orgs_without_admin.append(label)
+
+    # Accounts that own content, collected once rather than queried per user.
+    # Needed to answer "which of these duplicate accounts can be merged away
+    # safely" -- applying the existing merge command to a group where both
+    # sides hold content would delete it.
+    owners_with_content = set()
+    for collection in ("dataset", "reuse", "dataservice"):
+        try:
+            for doc in db[collection].find({"deleted": None}, {"owner": 1}):
+                if doc.get("owner"):
+                    owners_with_content.add(doc["owner"])
+        except Exception as exc:  # noqa: BLE001 - an absent collection is not fatal
+            print(f"WARNING: could not scan {collection}: {exc}", file=sys.stderr)
+
+    # Every user document that exists, regardless of the deleted filter below.
+    # A soft-deleted account is still a document, so a membership pointing at
+    # one is not dangling -- only a membership pointing at an id with no
+    # document at all is, which is what a hard delete leaves behind.
+    all_user_ids = {doc["_id"] for doc in db.user.find({}, {"_id": 1})}
 
     query = {} if args.include_deleted else {"deleted": None}
     projection = {
@@ -222,7 +259,19 @@ def main():
         email = (user.get("email") or "").lower()
         nic_raw = (user.get("extras") or {}).get("auth_nic")
         if nic_raw:
-            by_nic[str(nic_raw)].append((user.get("email"), status, user.get("created_at")))
+            by_nic[str(nic_raw)].append(
+                (
+                    user.get("email"),
+                    status,
+                    user.get("created_at"),
+                    # What a merge decision needs to know about each side.
+                    {
+                        "content": user["_id"] in owners_with_content,
+                        "member": user["_id"] in org_member_ids,
+                        "admin": user["_id"] in org_admin_ids,
+                    },
+                )
+            )
         if email:
             by_email[email].append((user.get("email"), status, user.get("created_at")))
         placeholder = email.startswith(SAML_PLACEHOLDER_EMAIL_PREFIX) and email.endswith(
@@ -299,13 +348,36 @@ def main():
     if shared_nics:
         print()
         print("Accounts holding the SAME stored identifier — one person, several accounts.")
-        print("CMD login resolves these by .first(), so it returns an arbitrary one; after")
-        print("migrate-nics they collide on the same hash. Each needs a manual decision on")
-        print("which account keeps the link:")
+        print("The CMD login now REFUSES these outright rather than picking one, so every")
+        print("account listed here is locked out until the group is merged by hand.")
+        print()
+        print("[content] owns datasets/reuses/dataservices — merging it away would destroy them")
+        print("[member]  belongs to an organization   [ADMIN] administers one")
         for accts in shared_nics.values():
             print("  -")
-            for mail, status, created in sorted(accts, key=lambda a: str(a[2] or "")):
-                print(f"      {mail}  ({status}; created {created})")
+            for mail, status, created, holds in sorted(accts, key=lambda a: str(a[2] or "")):
+                marks = " ".join(
+                    filter(
+                        None,
+                        [
+                            "[content]" if holds["content"] else "",
+                            "[ADMIN]" if holds["admin"] else ("[member]" if holds["member"] else ""),
+                        ],
+                    )
+                )
+                print(f"      {mail}  ({status}; created {created}) {marks}")
+        both = sum(
+            1
+            for accts in shared_nics.values()
+            if sum(1 for a in accts if a[3]["content"]) > 1
+        )
+        print()
+        # Printed so a zero above cannot be read as a scan that found nothing:
+        # if this number is 0 too, the content check is broken, not clean.
+        print(f"  (content check live: {len(owners_with_content)} accounts own content overall)")
+        print(f"  ⚠ groups with content on MORE THAN ONE side: {both}")
+        print("    Those cannot be merged by moving the identifier alone; the existing")
+        print("    merge command deletes the duplicate without transferring anything.")
 
     if case_collisions:
         print()
@@ -317,6 +389,25 @@ def main():
             print("  -")
             for mail, status, created in sorted(accts, key=lambda a: str(a[2] or "")):
                 print(f"      {mail}  ({status}; created {created})")
+
+    print()
+    print(f"organizations with NO administrator  {len(orgs_without_admin)}")
+    if orgs_without_admin:
+        print("  Stuck: nobody can manage members, accept transfers or edit them, and they")
+        print("  cannot promote anyone from the inside — recovering needs a sysadmin.")
+        for label in sorted(orgs_without_admin):
+            print(f"      {label}")
+
+    dangling = [(org, uid) for org, uid in org_member_refs if uid not in all_user_ids]
+    print()
+    print(f"membership rows pointing at a MISSING user  {len(dangling)}")
+    if dangling:
+        print("  Left behind by a hard delete that removed the account without removing")
+        print("  its memberships. Worse than an orphaned organization: inconsistent.")
+        for org, uid in sorted(dangling, key=lambda d: d[0])[:20]:
+            print(f"      {org}  ->  {uid}")
+        if len(dangling) > 20:
+            print(f"      ... and {len(dangling) - 20} more")
 
     print()
     print("Caveats on the two counts above — read before quoting them:")
