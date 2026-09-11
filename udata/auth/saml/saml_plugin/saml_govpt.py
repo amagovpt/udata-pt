@@ -929,22 +929,19 @@ def _accounts_claiming_nic(user_nic, limit=2):
     invisible to each other: the first lookup returned one and the fallback
     never ran.
 
+    One query with ``$in`` rather than one per form: ``extras.auth_nic`` has
+    no index (creating it belongs with merging the duplicates, since a unique
+    index cannot be added while they exist), so every lookup here is a
+    collection scan. Asking both forms separately would double the cost of the
+    most common sign-in, where the hashed value matches on the first try.
+
     Capped at ``limit`` documents because the caller only has to tell "one"
     from "more than one" -- there is no reason to load a whole duplicate set
     on every sign-in.
-
-    Deduplicated by id: a single account cannot hold both forms at once, but
-    the union is only sound if that is enforced rather than assumed.
     """
     from udata.core.user.models import User
 
-    found = {}
-    for stored in (_hash_nic(user_nic), user_nic):
-        for user in User.objects(extras__auth_nic=stored)[:limit]:
-            found[user.id] = user
-        if len(found) >= limit:
-            break
-    return list(found.values())
+    return list(User.objects(extras__auth_nic__in=[_hash_nic(user_nic), user_nic])[:limit])
 
 
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
