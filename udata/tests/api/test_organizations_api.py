@@ -936,6 +936,101 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         organization.reload()
         assert organization.is_member(deleted_user)
 
+    def test_cannot_delete_the_last_administrator(self):
+        """An organisation without an administrator is stuck: nobody can
+        manage members, accept transfers or edit it, and it cannot promote
+        anyone from the inside -- recovering needs a sysadmin."""
+        user = self.login()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=UserFactory(), role="editor")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=user)
+        response = self.delete(api_url)
+        assert400(response)
+
+        organization.reload()
+        assert organization.is_admin(user), "the admin must still be there"
+
+    def test_cannot_demote_the_last_administrator(self):
+        """The other way to empty an organisation of administrators."""
+        user = self.login()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=UserFactory(), role="editor")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=user)
+        response = self.put(api_url, {"role": "editor"})
+        assert400(response)
+
+        organization.reload()
+        assert organization.is_admin(user), "the role must not have changed"
+
+    def test_can_update_the_last_administrator_without_changing_the_role(self):
+        """The guard fires on a role CHANGE, not on any update of the last
+        admin's record. Without this, dropping the new-role condition would
+        refuse a PUT that keeps them admin -- and nothing else here would
+        notice."""
+        user = self.login()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=UserFactory(), role="editor")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=user)
+        response = self.put(api_url, {"role": "admin"})
+        assert200(response)
+
+        organization.reload()
+        assert organization.is_admin(user)
+
+    def test_can_delete_an_administrator_when_another_one_remains(self):
+        """The control. A guard that refused every admin removal would satisfy
+        the two assertions above and make organisations unmanageable."""
+        user = self.login()
+        other_admin = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=other_admin, role="admin")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=other_admin)
+        response = self.delete(api_url)
+        assert204(response)
+
+        organization.reload()
+        assert not organization.is_member(other_admin)
+        assert organization.is_admin(user)
+
+    def test_can_demote_an_administrator_when_another_one_remains(self):
+        user = self.login()
+        other_admin = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=other_admin, role="admin")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=other_admin)
+        response = self.put(api_url, {"role": "editor"})
+        assert200(response)
+
+        organization.reload()
+        assert not organization.is_admin(other_admin)
+        assert organization.is_admin(user)
+
+    def test_an_organisation_already_without_an_admin_is_not_frozen(self):
+        """Deliberately NOT refused. The guard stops an organisation from
+        losing its last administrator; it must not freeze one that has none
+        already, over an operation that cannot make it worse."""
+        user = self.login()
+        removed = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="editor"), Member(user=removed, role="editor")]
+        )
+        # Written past the API: the endpoint requires the members permission,
+        # which an editor does not have. What is under test is the guard, not
+        # the authorisation that already sits in front of it.
+        assert not any(m.role == "admin" for m in organization.members)
+
+        assert organization.is_last_admin(removed) is False
+
     def test_follow_org(self):
         """It should follow an organization on POST"""
         user = self.login()
