@@ -241,6 +241,15 @@ def main():
             counts["cmd_linked"] += 1
         if placeholder:
             counts["placeholder_email"] += 1
+        # An account with no confirmation date is refused by password recovery,
+        # and the deliberately generic anti-enumeration response makes that
+        # refusal look like a mail that was sent. Split by CMD link because the
+        # SAML creation path was leaving the field null permanently, so that
+        # subset is the population the fix has yet to reach.
+        if not user.get("confirmed_at"):
+            counts["unconfirmed"] += 1
+            if status != "no":
+                counts["unconfirmed_with_cmd"] += 1
 
         row = {
             "email": user.get("email"),
@@ -277,6 +286,8 @@ def main():
     print(f"  ...WITH a CMD link (review) ..... {counts['institutional_with_cmd']}")
     print(f"CMD-linked accounts (all) ......... {counts['cmd_linked']}")
     print(f"saml-* placeholder emails ......... {counts['placeholder_email']}")
+    print(f"accounts with NO confirmation date  {counts['unconfirmed']}")
+    print(f"  ...of those, CMD-linked ......... {counts['unconfirmed_with_cmd']}")
 
     shared_nics = {v: accts for v, accts in by_nic.items() if len(accts) > 1}
     case_collisions = {e: accts for e, accts in by_email.items() if len(accts) > 1}
