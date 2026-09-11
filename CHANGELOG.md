@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **fix(organization): removing or demoting the last administrator is now refused**
+  - Neither member endpoint checked that an administrator remained. Both
+    verified only who may manage members, so the last admin could be removed
+    or demoted to editor and the organisation was left stuck: nobody can
+    manage members, accept transfers or edit it, and — the part that makes it
+    expensive — **it cannot promote anyone from the inside**, so recovering
+    needs a sysadmin.
+  - The check is a single predicate on the organisation model rather than a
+    rule restated in each endpoint, so the account-deletion paths can ask the
+    same question when their behaviour is decided.
+  - It fires on a role *change*, not on any update of the last admin's record,
+    and it deliberately does **not** fire for an organisation that already has
+    no administrator: refusing there would freeze an organisation that is
+    already stuck, over an operation that cannot make it worse.
+  - 🚨 **This does NOT close the problem, and the gap is the larger half.**
+    Deleting an account still strips the person from every organisation with a
+    direct write that never passes through these endpoints, so **an
+    organisation can still be left without an administrator that way** — by a
+    person deleting their own profile, by an admin deleting someone, by the
+    inactive-account job, or by the command line.
+  - That half is not a matter of adding the same guard: refusing to delete
+    one's own account would tie a person to it, which has data-protection
+    implications. It needs a product decision, and it is tracked separately.
+  - Also still open: nobody has counted the organisations that are *already*
+    without an administrator. This guard prevents new ones; it does not repair
+    old ones.
+
 - **fix(auth): an identity claimed by two accounts is now refused, not resolved**
   - The CMD/eIDAS login looked the identifier up with `.first()`. That reads
     like a coin toss and is not one: the user document orders by newest first,
