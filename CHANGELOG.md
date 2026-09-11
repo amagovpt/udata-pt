@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **fix(auth): an identity claimed by two accounts is now refused, not resolved**
+  - The CMD/eIDAS login looked the identifier up with `.first()`. That reads
+    like a coin toss and is not one: the user document orders by newest first,
+    so **the most recently created account won every time** — silently and
+    consistently.
+  - ⚠️ **That is worse than a random pick, not better.** A random one would
+    eventually be noticed by whoever it happened to. This hands over the same
+    wrong session, content and organisation memberships on every sign-in, and
+    nothing ever contradicts the impression that the account is yours. Making
+    the choice "deterministic" was never the missing piece — it already was.
+    What is missing is proof of possession, and there is no way to obtain it
+    at that point, so the only honest answer is to refuse and let a person
+    disambiguate.
+  - The resolver now reports the ambiguity instead of resolving it, and both
+    ACS routes refuse with their own code and audit line, before anything is
+    written and before the migration wizard branch.
+  - 🔑 **It also closes a case the previous code could not see at all.** The
+    hashed lookup ran first and the plain-value fallback only when it found
+    nothing, so an account holding the hashed identifier and another holding
+    the same identifier in plain form were **invisible to each other** — the
+    first returned one and the fallback never ran. The question that matters
+    is "how many accounts claim this identity?", and only asking across both
+    stored forms answers it.
+  - 🚨 **This denies access to roughly 26 accounts** — the 13 duplicate groups
+    measured in production. They sign in today, into the wrong account; after
+    this they do not sign in at all until the duplicates are merged. That is
+    the correct outcome and a real change in access, so it is stated here
+    rather than discovered. Merging them is separate work.
+  - The tests read **both** accounts back from the database. "Refused" and
+    "signed into the other one" look identical from the outside, and only the
+    absence of a session on either account tells them apart — an assertion on
+    the redirect alone would pass while the defect was present.
+
 - **fix(auth): the SAML auto-confirm was never actually stored**
   - `datastore.commit()` does nothing in this application. `Datastore.commit`
     is `pass` on Flask-Security's base class and `MongoEngineDatastore` does
