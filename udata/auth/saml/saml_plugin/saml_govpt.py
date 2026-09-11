@@ -883,30 +883,6 @@ def _create_pending_saml_user(
     )
 
 
-def _find_user_by_email_ci(email):
-    """Resolve an address case-insensitively, preferring an exact match.
-
-    Every login and recovery lookup is case-insensitive, so the wizard has to
-    be too. But the unique index on ``User.email`` is case-SENSITIVE, so
-    "maria@x.pt" and "MARIA@x.pt" can coexist (the email-change form and
-    _create_saml_user both still check exact), and ``User`` orders by
-    ``-created_at`` — a bare ``__iexact`` lookup would hand back whichever row
-    was created last. Where two rows answer to one address, the one the caller
-    typed is the one they meant.
-    """
-    from udata.core.user.models import User
-
-    if not email:
-        return None
-    matches = list(User.objects(email__iexact=email))
-    if not matches:
-        return None
-    for user in matches:
-        if user.email == email:
-            return user
-    return matches[0]
-
-
 def _has_linked_nic(user):
     """True when the account holds a properly linked (hashed) CMD identity.
 
@@ -983,7 +959,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     - "no_match" — nothing matched; user is always None
     - "error" — neither email nor NIC available
     """
-    from udata.core.user.models import User
+    from udata.core.user.models import User, find_user_by_email_ci
 
     # 1. CMD identity already linked: direct login, nothing else to check.
     #    (Use MongoEngine nested dict syntax, not find_user, because
@@ -1027,7 +1003,7 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         # address: an exact match here sends the owner of "maria@x.pt" whose
         # CMD carries "Maria@x.pt" down the no_match branch, making them ask
         # for an account they already have.
-        user = _find_user_by_email_ci(user_email)
+        user = find_user_by_email_ci(user_email)
         if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
@@ -3046,6 +3022,8 @@ def migration_check():
 @csrf.exempt
 def migration_pending():
     """Check if there is a pending migration in the session."""
+    from udata.core.user.models import find_user_by_email_ci
+
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
@@ -3081,7 +3059,7 @@ def migration_pending():
     # the wizard pre-fills the account-creation field with it, and offering an
     # address that is already taken would only produce a guaranteed rejection.
     saml_email = pending.get("saml_email")
-    suggested_email = saml_email if saml_email and not _find_user_by_email_ci(saml_email) else None
+    suggested_email = saml_email if saml_email and not find_user_by_email_ci(saml_email) else None
 
     # True only when the identity matched no account at all (as opposed to
     # matching several homonyms) AND carries a NIC. Both cases reach the
@@ -3262,6 +3240,8 @@ def migration_confirm():
     mails the validation link and migration_confirm_link — the single place
     that binds the identity and starts a session — consumes the click.
     """
+    from udata.core.user.models import find_user_by_email_ci
+
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
@@ -3285,7 +3265,7 @@ def migration_confirm():
         # for. Exact-matching here failed the ownership proof for a correct
         # password, and the generic error below made that indistinguishable
         # from a wrong one.
-        user = _find_user_by_email_ci(email)
+        user = find_user_by_email_ci(email)
         # Generic error on any failure to avoid account enumeration.
         if (
             not user

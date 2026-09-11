@@ -405,6 +405,34 @@ class User(WithMetrics, UserMixin, Linkable, Document):
 
 datastore = MongoEngineUserDatastore(db, User, Role)
 
+
+def find_user_by_email_ci(email):
+    """Resolve an address case-insensitively, preferring an exact match.
+
+    Every login and recovery lookup is case-insensitive, so everything that
+    asks "does this address already exist" has to be too. But the unique index
+    on ``User.email`` is case-SENSITIVE, so "maria@x.pt" and "MARIA@x.pt" can
+    coexist, and ``User`` orders by ``-created_at`` — a bare ``__iexact``
+    lookup would hand back whichever row was created last. Where two rows
+    answer to one address, the one the caller typed is the one they meant.
+
+    That preference is not dead weight once the writers are aligned: the rows
+    that already collide stay in the database until they are merged by hand,
+    and the lookups that still go through flask_security's own
+    ``find_user(case_insensitive=True)`` — which is a bare ``.first()`` — keep
+    resolving to the newest of them. Do not simplify this to ``.first()``.
+    """
+    if not email:
+        return None
+    matches = list(User.objects(email__iexact=email))
+    if not matches:
+        return None
+    for user in matches:
+        if user.email == email:
+            return user
+    return matches[0]
+
+
 pre_save.connect(User.pre_save, sender=User)
 post_save.connect(User.post_save, sender=User)
 
