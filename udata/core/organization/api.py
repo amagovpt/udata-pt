@@ -758,6 +758,20 @@ class MemberAPI(API):
         member = org.member(user)
         old_role = member.role
         form = api.validate(MemberForm, member)
+
+        # Checked BEFORE populate_obj, and with the new role read from the
+        # form: once the member is populated its role is already the new one,
+        # so is_last_admin would say False and the guard would never fire.
+        # Refusing here also means nothing was mutated, not even in memory.
+        if old_role == "admin" and form.role.data != "admin" and org.is_last_admin(user):
+            api.abort(
+                400,
+                _(
+                    "Não é possível retirar o papel de administrador ao último administrador "
+                    "da organização. Promova outro membro a administrador primeiro."
+                ),
+            )
+
         form.populate_obj(member)
         org.save()
 
@@ -773,6 +787,17 @@ class MemberAPI(API):
         org.permissions["members"].test()
         member = org.member(user)
         if member:
+            # An organisation left without an administrator is stuck: nobody
+            # can manage members, accept transfers or edit it, and it cannot
+            # promote anyone from the inside -- recovering needs a sysadmin.
+            if org.is_last_admin(user):
+                api.abort(
+                    400,
+                    _(
+                        "Não é possível remover o último administrador da organização. "
+                        "Promova outro membro a administrador primeiro."
+                    ),
+                )
             Organization.objects(id=org.id).update_one(pull__members=member)
             Assignment.objects(user=user, organization=org).delete()
             org.reload()
