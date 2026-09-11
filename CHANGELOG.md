@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **chore(scripts): the account audit now answers the three counts that were blocking decisions**
+  - Three questions were being decided without a number behind them: how many
+    accounts carry no confirmation date, how many organisations are already
+    without an administrator, and which of the duplicate-identity groups can be
+    merged at all.
+  - **Accounts with no `confirmed_at`**, split by whether they carry a CMD link.
+    Password recovery refuses them, and the generic anti-enumeration response
+    makes that refusal look exactly like a mail that was sent — so the
+    population was invisible from the outside. The CMD-linked subset is the one
+    the SAML creation-path fix had never reached.
+  - **Organisations with no member holding the admin role**, listed by name.
+    The guard on the member endpoints stops new ones; it does not repair the
+    existing ones, and nobody had counted them. Reported alongside them:
+    membership rows pointing at a user document that no longer exists, which is
+    what a hard delete leaves behind when it removes the account but not its
+    memberships. Soft-deleted accounts are not counted as missing — the
+    document is still there.
+  - **Each duplicate account now says what it holds** — content, membership,
+    administration. Merging a group by moving the identifier alone destroys
+    whatever the other side owns, so the decision needs this before it can be
+    taken. The report also prints how many accounts own content overall, so a
+    zero on the dangerous groups cannot be mistaken for a scan that found
+    nothing.
+  - Read-only, as before: it never writes to the database.
+
 - **fix(organization): removing or demoting the last administrator is now refused**
   - Neither member endpoint checked that an administrator remained. Both
     verified only who may manage members, so the last admin could be removed
