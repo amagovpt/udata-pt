@@ -138,8 +138,19 @@ class HarvestSource(Owned, Document[HarvestSourceQuerySet]):
 
     @property
     def domain(self):
+        # `hostname`, never `netloc`: the netloc carries the userinfo prefix, and
+        # `URLS_ALLOW_CREDENTIALS` lets one through form validation. Splitting it
+        # on ":" therefore returns the *credentials*, not the host — so a source
+        # pointed at `https://www.ine.pt:1@attacker.example/c.xml` claims the
+        # domain `www.ine.pt` while downloading from somewhere else entirely,
+        # and the domain branch of the harvest scoping query matches every
+        # dataset that legitimate source ever harvested. `hostname` is what
+        # `url_filter._hostname` already uses for the SSRF guard; it also
+        # lowercases the host and unwraps IPv6 brackets, both of which the
+        # split could not do. It is `None` for a URL with no host, where the
+        # split returned "" — hence the fallback, which keeps the contract.
         parsed = urlparse(self.url)
-        return parsed.netloc.split(":")[0]
+        return parsed.hostname or ""
 
     @classmethod
     def get(cls, ident):

@@ -6,6 +6,7 @@ import pytest
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.organization.factories import OrganizationFactory
+from udata.core.user.factories import UserFactory
 from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
@@ -229,6 +230,94 @@ class INEResourceIdentityTest(PytestOnlyDBTestCase):
         dataset = self._dataset(source)
         assert "(revista)" in dataset.description
         assert [r.id for r in dataset.resources] == before
+
+
+# `CDATA_BASE_URL` so `Owned.page()` resolves to a URL and the conflict message
+# names the other owner, as in `test_base_backend.py`; without it `page()` is
+# None and the message falls back to a bare id.
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"], CDATA_BASE_URL="http://localhost")
+class INEUniqueOwnershipTest(PytestOnlyDBTestCase):
+    """A second source must not take over records that already have an owner.
+
+    Every other backend reaches an existing record through
+    `BaseBackend.get_dataset`, which asks `ensure_unique_ownership` before
+    handing it over. This one looks its datasets up in bulk and writes them in
+    bulk, so it used to overwrite whatever the `harvest.domain` branch of the
+    scoping query happened to match — the whole of another source's catalogue
+    at once, for a source claiming the same domain.
+    """
+
+    def _harvest(self, rmock, tmp_path, source, ids, revision=""):
+        rmock.get(INE_URL, text=_catalog_xml(ids, revision=revision))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / f"ine-{source.id}.xml")
+        return backend.harvest()
+
+    def _dataset(self, remote_id):
+        return Dataset.objects(__raw__={"harvest.remote_id": remote_id}).first()
+
+    @pytest.mark.parametrize(
+        "owner_field,owner_factory",
+        [
+            ("organization", OrganizationFactory),
+            ("owner", UserFactory),
+        ],
+    )
+    def test_second_source_cannot_take_over_a_dataset(
+        self, rmock, tmp_path, owner_field, owner_factory
+    ):
+        source1 = HarvestSourceFactory(backend="ine", url=INE_URL, **{owner_field: owner_factory()})
+        self._harvest(rmock, tmp_path, source1, ["0001", "0002"])
+        original = self._dataset("0001")
+        assert original is not None
+        original_title = original.title
+
+        # Same URL, so `_prefetch_datasets` matches "0001" on `harvest.domain`
+        # exactly as it would for the legitimate source.
+        source2 = HarvestSourceFactory(backend="ine", url=INE_URL, **{owner_field: owner_factory()})
+        job = self._harvest(rmock, tmp_path, source2, ["0001", "0003"], revision=" (revista)")
+
+        assert job.status == "done-errors"
+        by_remote_id = {item.remote_id: item for item in job.items}
+        assert by_remote_id["0001"].status == "failed"
+        # The record the second source does own is unaffected.
+        assert by_remote_id["0003"].status == "done"
+
+        # The failure says who the other owner is, instead of just "failed".
+        message = by_remote_id["0001"].errors[0].message
+        assert getattr(source1, owner_field).page() in message
+
+        kept = self._dataset("0001")
+        assert getattr(kept, owner_field) == getattr(source1, owner_field)
+        assert kept.title == original_title
+        assert "(revista)" not in kept.description
+        assert kept.harvest.source_id == str(source1.id)
+
+    def test_unchanged_record_of_another_owner_is_refused_not_skipped(self, rmock, tmp_path):
+        """The guard runs before change detection, not only before the write.
+
+        With identical metadata the record takes the SKIP branch, which writes
+        nothing — so a guard placed only on the update path would look just as
+        correct as this one. It is not: an unchanged record belonging to someone
+        else would then be reported as "skipped" against this source, which
+        reads as a record this source legitimately harvested and found current.
+        """
+        source1 = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        self._harvest(rmock, tmp_path, source1, ["0001"])
+
+        source2 = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        job = self._harvest(rmock, tmp_path, source2, ["0001"])
+
+        assert job.status == "done-errors"
+        assert [item.status for item in job.items] == ["failed"]
+        assert "another owner" in job.items[0].errors[0].message
+        # The failure points at the record it is about, not just at its owner.
+        assert job.items[0].dataset == self._dataset("0001").id
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])
