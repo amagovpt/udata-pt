@@ -1237,6 +1237,7 @@ def _handle_saml_user_login(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    asserted_email=None,
 ):
     """Handle login/redirect after SAML authentication.
 
@@ -1251,6 +1252,12 @@ def _handle_saml_user_login(
     recording it here is what backfills the accounts that predate the field.
     That also makes a write inside _find_or_create_saml_user unnecessary: its
     plain-NIC upgrade returns "existing_saml" and lands here.
+
+    ``asserted_email`` is the address the assertion carried, from the ACS
+    route. Only CMD ever supplies one -- the eIDAS Minimum Data Set has no
+    email attribute at all -- which is why the completion screen can tell the
+    two apart by the presence of the value alone, without being told the
+    provider.
     """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
@@ -1413,6 +1420,26 @@ def _handle_saml_user_login(
     # destination is dropped on purpose: completing registration is a hard
     # precondition, and the page explains the situation itself (no
     # cmd_new_account banner needed).
+    # Offer the asserted address back to the completion screen as a prefill:
+    # the common case becomes one click instead of retyping an address the IdP
+    # just asserted. The session, not extras: the IdP vouches for the identity,
+    # not for the mailbox, so this is an UNVERIFIED address whose only job is
+    # to fill a field for the few minutes that screen is up. Proving the
+    # mailbox is still the whole point of what happens after the submit.
+    #
+    # Written on every login that lands on the screen, not only on the one that
+    # created the account -- which is what gives the accounts minted before
+    # this existed a prefill too: they come back through this same funnel.
+    #
+    # The else-branch clears it deliberately. A value left behind by an earlier
+    # sign-in would be offered to whoever logs in next on a shared browser, and
+    # an address is exactly the kind of thing that must not survive a session
+    # it did not belong to.
+    if user.has_placeholder_email and asserted_email:
+        session["saml_asserted_email"] = asserted_email
+    else:
+        session.pop("saml_asserted_email", None)
+
     if user.has_placeholder_email:
         return redirect(f"{frontend_url}/complete-registration")
 
@@ -2613,6 +2640,14 @@ def idp_initiated():
         # describe something other than what auth_nic actually holds.
         doc_type=None if user_nic else doc_type,
         doc_nationality=None if user_nic else doc_nationality,
+        # The address the assertion carried, never the minted placeholder:
+        # _create_saml_user rebinds its own local when it has to mint one, so
+        # what is still bound here is what autenticacao.gov actually sent.
+        # Deliberately passed even when it is already taken by another account
+        # -- unlike migration_pending, which withholds a taken address because
+        # offering it there guarantees a rejection. Here the taken address is
+        # the point: it is how the user reaches their own older account.
+        asserted_email=user_email,
     )
 
 

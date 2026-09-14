@@ -1091,6 +1091,112 @@ class SAMLSSOCallbackTest(APITestCase):
         assert response.status_code == 302
         assert response.headers["Location"] == "http://localhost:3000/complete-registration"
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_placeholder_redirect_exposes_asserted_email_on_me(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The address the CMD asserted is offered back to the completion screen.
+
+        Deliberately does NOT patch login_user. The value is read out of the
+        session that the real login establishes, so patching the thing that
+        creates the session would leave the decision under test untested.
+
+        The account here is an OLDER placeholder, not one minted by this
+        sign-in, because that is the case the capture point was chosen for:
+        it sits in the funnel every login passes through, so accounts created
+        before this existed get a prefill on their next login rather than
+        needing a backfill.
+
+        The second half pins the else-branch: a sign-in by an account that is
+        NOT pending clears the key instead of leaving an address behind for
+        whoever uses the browser next.
+        """
+        pending = UserFactory(
+            email="saml-cafe0123@autenticacao.gov.pt",
+            extras={"auth_nic": _hash_nic("33334444")},
+            confirmed_at="2024-01-01",
+        )
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            nic="33334444",
+            email="pedro.nunes@example.org",
+            first_name="Pedro",
+            last_name="Nunes",
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        response = self._post_saml_response(
+            _build_saml_response_xml(
+                nic="33334444",
+                email="pedro.nunes@example.org",
+                first_name="Pedro",
+                last_name="Nunes",
+            )
+        )
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+        me = self.client.get("/api/1/me/").json
+        assert me["pending_registration"] is True
+        # The asserted address, not the minted placeholder the account holds.
+        assert me["pending_registration_email"] == "pedro.nunes@example.org"
+        assert me["email"] == "saml-cafe0123@autenticacao.gov.pt"
+
+        # Reading somebody ELSE through the same marshaller must not stamp this
+        # session's address onto their row. user_fields is what /api/1/users/
+        # serializes too, so without the caller guard an admin listing accounts
+        # would see their own pending address repeated on every user they may
+        # see. Asserted through the API rather than by calling the guard, so it
+        # is the served payload that is pinned.
+        # The other account is itself pending, on purpose: were it a finished
+        # account, the has_placeholder_email half of the guard would answer
+        # null by itself and this would pin nothing.
+        other = UserFactory(email="saml-1234abcd@autenticacao.gov.pt", confirmed_at="2024-01-01")
+        served = self.client.get(f"/api/1/users/{other.id}/").json
+        assert served["pending_registration_email"] is None
+
+        # The caller stops being pending -- which is what an association or a
+        # confirmed new address does -- while the session key stays exactly
+        # where it was. The field must go quiet on its own: nothing clears the
+        # session at that moment, so this guard is the only thing standing
+        # between a finished account and an address it no longer needs served.
+        # Read back through /api/1/users/ and not /me: this suite's ambient
+        # request context keeps the current_user object that login_user set, so
+        # /me would answer from the stale in-memory copy and this would pass
+        # whether the guard existed or not. The <user:user> converter loads the
+        # document fresh, while the id current_user carries is still the same,
+        # so the caller half of the guard holds and the pending half decides.
+        pending.email = "pedro.nunes@example.org"
+        pending.save()
+        served = self.client.get(f"/api/1/users/{pending.id}/").json
+        assert served["pending_registration_email"] is None
+
+        # A SECOND pending citizen signs in on the same browser, and this one
+        # brought no address -- a CMD assertion without email, which is also
+        # what every eIDAS login looks like. They are still pending, so the
+        # field is still served: if the first citizen's address were merely
+        # left in the session rather than cleared, this is where it would be
+        # handed to the wrong person.
+        UserFactory(
+            email="saml-beef4567@autenticacao.gov.pt",
+            extras={"auth_nic": _hash_nic("55556666")},
+            confirmed_at="2024-01-01",
+        )
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            nic="55556666", first_name="Ana", last_name="Dias"
+        )
+        response = self._post_saml_response(
+            _build_saml_response_xml(nic="55556666", first_name="Ana", last_name="Dias")
+        )
+        assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+        me = self.client.get("/api/1/me/").json
+        assert me["email"] == "saml-beef4567@autenticacao.gov.pt"
+        assert me["pending_registration"] is True
+        assert me["pending_registration_email"] is None
+
     def test_sso_rejects_missing_saml_response(self):
         """POST to /saml/sso without SAMLResponse should fail."""
         response = self.client.post("/saml/sso", data={})

@@ -12,6 +12,16 @@ def _get_saml_login():
     return session.get("saml_login", False)
 
 
+def _get_asserted_email():
+    """Return the address the SAML assertion carried, if this session has one.
+
+    Only set while the caller still holds a placeholder email, and only by CMD
+    -- the eIDAS Minimum Data Set has no email attribute, so an eIDAS session
+    reaches the completion screen with nothing to offer.
+    """
+    return session.get("saml_asserted_email")
+
+
 def _is_current_user(user) -> bool:
     """True when the serialized user is the authenticated caller.
 
@@ -105,6 +115,24 @@ user_fields = api.model(
             description="True while the account still has a minted saml-* placeholder "
             "email; the user must provide a real email to complete registration "
             "(only present for global admins and on /me)",
+            readonly=True,
+        ),
+        # Guarded by _is_current_user and NOT by current_user_is_admin_or_self,
+        # which the sibling pending_registration above uses. The difference
+        # matters because this value comes from the *session*, not from the
+        # document: under the admin guard, an admin listing users would see
+        # their own session's address stamped onto every row they may see.
+        # Nulled once the placeholder is gone, so it cannot outlive the screen
+        # it exists for -- an association leaves the session key behind, and
+        # this is what stops it being served afterwards.
+        "pending_registration_email": fields.Raw(
+            attribute=lambda o: (
+                _get_asserted_email() if _is_current_user(o) and o.has_placeholder_email else None
+            ),
+            description="The email address the CMD assertion carried, offered as a "
+            "prefill on the registration completion screen. Null for eIDAS (the "
+            "Minimum Data Set has no email attribute), for a CMD assertion that "
+            "carried none, and on any user other than the caller",
             readonly=True,
         ),
         "avatar": fields.ImageField(original=True, description="The user avatar URL"),
