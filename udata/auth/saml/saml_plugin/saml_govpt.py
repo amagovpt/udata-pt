@@ -1013,11 +1013,21 @@ def _accounts_claiming_nic(user_nic, limit=2):
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
 
-    ``user_nic`` carries the unique identifier of the authenticated identity:
-    the NIC for CMD logins, or the eIDAS PersonIdentifier (e.g. "ES/PT/...")
-    for eIDAS logins. Both are HMAC-hashed into ``extras.auth_nic`` — the
-    formats cannot collide, and every lookup/linking rule below applies to
-    either provider identically.
+    ``user_nic`` carries the unique identifier of the authenticated identity,
+    in one of THREE formats: the NIC for a national CMD login; the eIDAS
+    PersonIdentifier ("<alpha2>/<alpha2>/<id>", e.g. "ES/PT/...") for eIDAS;
+    and "MDC/<DocType>/<DocNationality>/<DocNumber>" for a foreign citizen
+    signing in with CMD, who has no NIC (see _compose_foreign_identifier).
+    All three are HMAC-hashed into ``extras.auth_nic`` — the formats cannot
+    collide, and every lookup/linking rule below applies to any of them
+    identically.
+
+    ⚠️ "Cannot collide" is an invariant that is maintained, not one that comes
+    for free: a NIC is digits only, an eIDAS identifier opens with a country
+    code, and the third opens with "MDC", which is three characters and so can
+    never be one. Two of the four document types ARE valid alpha-2 codes, so
+    without that leading segment the third format would overlap the second.
+    Anything added to this list has to keep the three disjoint.
 
     Decision order:
     1. NIC already linked (hashed, or stored in plain form by an old plugin
@@ -2213,6 +2223,7 @@ def sp_initiated():
 def idp_initiated():
     user_email = None
     user_nic = None
+    doc_type = doc_nationality = doc_number = None
     first_name = None
     last_name = None
     authn_response = None
@@ -2382,9 +2393,14 @@ def idp_initiated():
             user_nic = _first_value(identity, MDC_ATTR_NIC)
             first_name = _first_value(identity, MDC_ATTR_FIRST_NAME)
             last_name = _first_value(identity, MDC_ATTR_LAST_NAME)
+            doc_type = _first_value(identity, MDC_ATTR_DOC_TYPE)
+            doc_nationality = _first_value(identity, MDC_ATTR_DOC_NATIONALITY)
+            doc_number = _first_value(identity, MDC_ATTR_DOC_NUMBER)
             current_app.logger.warning(
                 f"[DEBUG] SAML atributos extraídos: email={user_email!r}, "
                 f"nic_present={bool(user_nic)}, nome={first_name!r} {last_name!r}, "
+                f"doc_type={doc_type!r}, doc_nationality={doc_nationality!r}, "
+                f"doc_number_present={bool(doc_number)}, "
                 f"identity_keys={list(identity.keys()) if identity else None}"
             )
         else:
@@ -2399,9 +2415,9 @@ def idp_initiated():
     except Exception as e:
         current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
 
-    if not user_email and not user_nic:
+    if not user_email and not user_nic and not doc_number:
         current_app.logger.error(
-            "SAML SSO: nenhum atributo extraído (email/NIC). "
+            "SAML SSO: nenhum atributo extraído (email/NIC/documento). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
             "tem acesso à chave privada para desencriptar."
         )
@@ -2432,7 +2448,17 @@ def idp_initiated():
             reason="subject_nic_mismatch",
         )
 
-    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    # A foreign citizen has no NIC, so their document is the identity. The NIC
+    # wins whenever there is one: a national's stored auth_nic must keep
+    # matching hash_nic(nic) byte for byte, and nothing here may change that.
+    #
+    # The NameID↔NIC binding above deliberately stays keyed on user_nic. That
+    # check is about the NIC attribute specifically -- the Subject would never
+    # carry the composed string -- so it is skipped for a foreigner exactly as
+    # it already is for any assertion that arrives without a NIC.
+    user_identifier = user_nic or _compose_foreign_identifier(doc_type, doc_nationality, doc_number)
+
+    user, status = _find_or_create_saml_user(user_email, user_identifier, first_name, last_name)
     current_app.logger.warning(
         f"[DEBUG cmd] post _find_or_create_saml_user: user_id={getattr(user, 'id', None)}, "
         f"user_email={getattr(user, 'email', None)!r}, status={status!r}, "
@@ -2506,7 +2532,7 @@ def idp_initiated():
             return _handle_migration_redirect(
                 user,
                 user_email,
-                user_nic,
+                user_identifier,
                 first_name,
                 last_name,
                 no_match=(status == "no_match"),
@@ -2517,7 +2543,7 @@ def idp_initiated():
         # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(
             user_email,
-            user_nic,
+            user_identifier,
             first_name,
             last_name,
             provider=AUTH_PROVIDER_CMD,
