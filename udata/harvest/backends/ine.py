@@ -20,6 +20,7 @@ from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_stric
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
+from udata.utils import safe_unicode
 
 from .tools.harvester_utils import normalize_url_slashes, sync_resources
 
@@ -862,6 +863,27 @@ class INEBackend(BaseBackend):
                         and getattr(dataset, "id", None) is not None
                     )
 
+                    if is_existing:
+                        # The guard every other backend gets for free. They reach
+                        # an existing record through `BaseBackend.get_dataset`,
+                        # which calls this right after the lookup; this backend
+                        # looks datasets up in bulk (`_prefetch_datasets`) and
+                        # writes them in bulk, so nothing on its path ever asked
+                        # whether the record it is about to overwrite belongs to
+                        # somebody else. It is asked here rather than in the
+                        # prefetch because the prefetch has no per-item error
+                        # handling — raising there would lose the whole chunk,
+                        # whereas the `except` below fails this one item and
+                        # carries on, which is what `process_dataset` does.
+                        # Asked before `_has_changed` too, for the same reason
+                        # the precedent asks before knowing whether anything
+                        # changed: an unchanged record owned by someone else
+                        # must not be quietly reported as "skipped" against
+                        # this source either. The CREATE branch needs no guard,
+                        # since it can only be reached with a `_new_dataset()`
+                        # already owned by this source.
+                        self.ensure_unique_ownership(dataset)
+
                     # ========================================
                     # CASO 1: Dataset já existe na base de dados
                     # ========================================
@@ -918,13 +940,21 @@ class INEBackend(BaseBackend):
                         created_remote_ids.append(remote_id)
                         self._log.debug("[INE] CREATE: remote_id=%s (novo dataset)", remote_id)
 
-                except Exception:
+                except Exception as e:
                     failed += 1
                     item_status = "failed"
                     self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
-                    # HarvestItem para falhas
+                    # HarvestItem para falhas. The message is carried onto the
+                    # item, as `process_dataset` does (`base.py`): a job over
+                    # 13k items that reports `failed` with an empty `errors`
+                    # list tells the operator nothing about which of them is
+                    # an ownership conflict and who the other owner is.
                     if self.job:
-                        h_item = HarvestItem(remote_id=remote_id, status=item_status)
+                        h_item = HarvestItem(
+                            remote_id=remote_id,
+                            status=item_status,
+                            errors=[HarvestError(message=safe_unicode(e))],
+                        )
                         batch_harvest_items.append(h_item)
 
             # --- Fim do loop do chunk ---
