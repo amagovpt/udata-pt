@@ -7488,3 +7488,80 @@ class SAMLForeignCitizenLoginTest(APITestCase):
             assert not (created.extras or {}).get("auth_nic"), (
                 "a national document type must not produce a composed identity"
             )
+
+
+class SAMLForeignDocExtrasTest(APITestCase):
+    """The verified document type and nationality, recorded beside the hash.
+
+    They are the counterpart of `auth_citizen_declared`, which comes from a
+    radio button and proves nothing. These come from the assertion.
+
+    ⚠️ Their absence does NOT mean "national" -- it also covers every account
+    that signed in before the attributes were requested. The test for a
+    national below pins that they are not written, not that their absence
+    carries a meaning.
+    """
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_foreign_login_records_doc_type_and_nationality(self, mock_client_for, _mock_confirm):
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self._cmd_login(
+            mock_client_for,
+            email="elena@example.pt",
+            first_name="Elena",
+            last_name="Marin",
+            doc_type="PAS",
+            doc_nationality="RO",
+            doc_number="AB998877",
+        )
+
+        created = User.objects(email="elena@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_doc_type"] == "PAS"
+        assert created.extras["auth_doc_nationality"] == "RO"
+        # The number identifies the person. It belongs in the digest and
+        # nowhere else -- storing it beside the other two would undo the
+        # reason the identifier is hashed at all.
+        assert "auth_doc_number" not in created.extras
+        assert "AB998877" not in str(created.extras)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_does_not_get_the_document_keys(self, mock_client_for, _mock_confirm):
+        """Even when the assertion carries the document attributes: the NIC
+        won in the composition, so recording them would describe something
+        other than what `auth_nic` actually holds."""
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self._cmd_login(
+            mock_client_for,
+            email="fabio@example.pt",
+            nic="90817263",
+            first_name="Fabio",
+            last_name="Nunes",
+            doc_type="TR",
+            doc_nationality="PT",
+            doc_number="Z1234567",
+        )
+
+        created = User.objects(email="fabio@example.pt").first()
+        assert created is not None
+        assert "auth_doc_type" not in created.extras
+        assert "auth_doc_nationality" not in created.extras

@@ -1217,7 +1217,15 @@ def _record_login_activity(user):
         )
 
 
-def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_declared=None):
+def _handle_saml_user_login(
+    user,
+    new_account=False,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+):
     """Handle login/redirect after SAML authentication.
 
     When ``new_account`` is True the redirect carries ``cmd_new_account=1``
@@ -1334,14 +1342,28 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_d
     # (Not the same call as the mail sends that deliberately re-raise: there,
     # swallowing made a failure the user cared about look successful. Here the
     # outcome the user came for still happens.)
-    if provider or citizen_declared:
-        from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    if provider or citizen_declared or doc_type or doc_nationality:
+        from udata.core.user.constants import (
+            AUTH_CITIZEN_DECLARED,
+            AUTH_DOC_NATIONALITY,
+            AUTH_DOC_TYPE,
+            AUTH_PROVIDER,
+        )
 
         incoming = {}
         if provider:
             incoming[AUTH_PROVIDER] = provider
         if citizen_declared:
             incoming[AUTH_CITIZEN_DECLARED] = citizen_declared
+        # The verified counterpart of the declared type. The caller passes
+        # these only when the document -- not a NIC -- was what identified the
+        # person, so they describe the identity that is actually stored in
+        # auth_nic rather than an attribute that merely came along for the
+        # ride. Never the document number: that one lives only in the digest.
+        if doc_type:
+            incoming[AUTH_DOC_TYPE] = doc_type
+        if doc_nationality:
+            incoming[AUTH_DOC_NATIONALITY] = doc_nationality
 
         # Only what actually differs, so a repeat login is not a repeat write,
         # and one save for both keys rather than one each.
@@ -2569,6 +2591,11 @@ def idp_initiated():
         new_account=(status == "new"),
         provider=AUTH_PROVIDER_CMD,
         citizen_declared=_declared_citizen(),
+        # Only when the document was the identity. For a national the NIC won
+        # in the composition above, so recording the document here would
+        # describe something other than what auth_nic actually holds.
+        doc_type=None if user_nic else doc_type,
+        doc_nationality=None if user_nic else doc_nationality,
     )
 
 
