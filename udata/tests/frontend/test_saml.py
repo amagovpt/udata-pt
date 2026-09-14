@@ -7722,3 +7722,50 @@ class SAMLAuditLoggerLevelTest(APITestCase):
         assert f'ignore_logger("{self.AUDIT_LOGGER}")' in source, (
             "the SAML audit logger must be ignored by Sentry, as the mail one is"
         )
+
+
+class SAMLAuditErrorOutcomeTest(APITestCase):
+    """The third leg of the acceptance criterion: success, rejection AND error.
+
+    🚩 The first plan for this ticket claimed every error path already came out
+    as `rejected`. It does not. A POST to the ACS with no SAMLResponse returns
+    400 without passing through the audit funnel at all, on both routes -- the
+    request ends and leaves no trace of having happened.
+
+    `error` rather than `rejected` because nothing was decided about anybody:
+    a rejection is an answer to an identity, and this request never carried
+    one. It is a fifth value alongside success, rejected, migration_pending
+    and user_not_found, and anyone counting lines needs to know all five.
+    """
+
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+
+    def test_a_missing_saml_response_is_audited_as_an_error_on_the_cmd_route(self):
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            response = self.client.post("/saml/sso", data={})
+
+        assert response.status_code == 400
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=error" in lines[0]
+        assert "kind=cmd" in lines[0]
+        assert "reason=missing_saml_response" in lines[0]
+
+    def test_a_missing_saml_response_is_audited_as_an_error_on_the_eidas_route(self):
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            response = self.client.post("/saml/eidas/sso", data={})
+
+        assert response.status_code == 400
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=error" in lines[0]
+        assert "kind=eidas" in lines[0]
+
+    def test_the_error_line_never_carries_a_raw_subject(self):
+        """Criterion 3 holds on this path too: there is no Subject to leak
+        here, and the line must not invent one."""
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self.client.post("/saml/sso", data={})
+
+        line = captured.records[0].getMessage()
+        assert "name_id_hash=-" in line, line

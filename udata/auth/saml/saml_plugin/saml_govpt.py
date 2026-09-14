@@ -2264,6 +2264,11 @@ def idp_initiated():
 
     raw_saml_response = request.form.get("SAMLResponse")
     if not raw_saml_response:
+        # A POST to the ACS with no assertion at all. Audited as `error`, not
+        # `rejected`: nothing was decided about anybody -- the request never
+        # carried an identity to decide on. Without this the funnel simply
+        # ends here with no trace, which is the gap LEDG-2371 closes.
+        _audit_saml("error", "cmd", reason="missing_saml_response")
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
@@ -2820,6 +2825,8 @@ def idp_eidas_initiated():
 
     raw_saml_response = request.form.get("SAMLResponse")
     if not raw_saml_response:
+        # Same as the CMD route: a malformed request, audited as `error`.
+        _audit_saml("error", "eidas", reason="missing_saml_response")
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
