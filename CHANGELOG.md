@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+- **fix(harvest): a source can no longer claim a domain it does not control, and the INE harvest asks who owns a record before overwriting it**
+  - Two pre-existing defects composed into one: any authenticated user could
+    stage a mass overwrite of the 13 054 datasets harvested from INE, the
+    largest source in the portal, without an administrator approving anything.
+  - `HarvestSource.domain` read the **netloc** and split it on `":"`. The netloc
+    carries the userinfo prefix, and allowing credentials in URLs is the
+    configured default, so that split returned the *credentials* rather than
+    the host: a source pointed at `https://www.ine.pt:1@attacker.example/c.xml`
+    claimed the domain `www.ine.pt` while downloading from somewhere else
+    entirely. The domain branch of the harvest scoping query then matched every
+    dataset the real source had ever harvested. It now reads `hostname`, which
+    is what the SSRF guard next door already used; as a side effect the host is
+    lowercased and IPv6 brackets are unwrapped, where the split returned `"["`.
+  - The INE backend is the only one of the fifteen that does not reach an
+    existing record through `BaseBackend.get_dataset`. It looks datasets up in
+    bulk and writes them in bulk, so nothing on that path ever asked whether the
+    record it was about to replace belonged to somebody else — the guard added
+    for the single-record case simply was not on this road. It is now asked once
+    per matched record, before any metadata is applied.
+  - The question is asked in the per-item loop rather than in the batched
+    lookup, because the lookup has no per-item error handling: raising there
+    would lose the whole chunk of 500, whereas the loop's handler fails that one
+    item and carries on, which is what the single-record path does. It is asked
+    before change detection for the same reason the precedent asks before
+    knowing whether anything changed — a record owned by someone else must not
+    be quietly reported as "skipped" against this source either. Creating a new
+    dataset needs no guard, since a new one is born owned by the source.
+  - That same handler now records the failure message and the id of the dataset
+    in conflict on the harvest item. A job over 13 000 items that reports
+    `failed` with an empty `errors` list does not tell the operator which
+    failure is an ownership conflict, who the other owner is, or which record
+    it is about; every other backend already carried the message. A refusal is
+    logged at info rather than as a traceback per item, since a catalogue that
+    conflicts wholesale can refuse every one of those items. The message is
+    truncated at 500 characters, because the items are pushed into a single job
+    document and unbounded messages at that volume would carry it past the
+    16 MB BSON limit and lose the whole record of a harvest whose writes had
+    already landed.
+  - 🚨 **Two operational consequences.** Any source whose URL carries credentials
+    or an uppercase host now resolves to a different `domain` than before, so
+    the datasets it already harvested keep a stale `harvest.domain` until the
+    next run; matching still works, because the scoping query also matches on
+    the source id. And `ine`, `inehvd` and `dgtIne` all live on `www.ine.pt`: if
+    they sit in different organizations and share any remote id, those items
+    will now be refused on every harvest. Worth counting both before promoting.
+  - Note that the harvest runs inside the long-lived Celery worker, which holds
+    its code in memory — the worker and beat have to be restarted after the
+    deploy, or asynchronous harvests keep running the old backend.
+
 - **fix(auth): a spelling that differs only in capitalisation is now the same address everywhere**
   - Two functions decided whether an email already existed and disagreed: the
     SAML resolver asked case-insensitively, the account-creation path and the
