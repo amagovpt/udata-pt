@@ -168,6 +168,33 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         response = self.put(url_for("api.organization", org=org), data)
         assert403(response)
 
+    def test_organization_api_update_keeps_existing_badges(self):
+        """An organization admin can PUT back the badges the organization already has"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        org.add_badge(org_constants.PUBLIC_SERVICE)
+        data = org.to_dict()
+        data["description"] = "new description"
+        response = self.put(url_for("api.organization", org=org), data)
+        assert200(response)
+        org.reload()
+        assert org.description == "new description"
+        assert {b.kind for b in org.badges} == {org_constants.PUBLIC_SERVICE}
+
+    def test_organization_api_update_cannot_drop_badges(self):
+        """Only site admins can drop badges via the organization PUT payload"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        org.add_badge(org_constants.PUBLIC_SERVICE)
+        data = org.to_dict()
+        data["badges"] = []
+        response = self.put(url_for("api.organization", org=org), data)
+        assert403(response)
+        org.reload()
+        assert {b.kind for b in org.badges} == {org_constants.PUBLIC_SERVICE}
+
     def test_organization_api_update_business_number_id(self):
         """It should update an organization from the API by adding a business number id"""
         user = self.login()
