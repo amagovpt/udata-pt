@@ -21,13 +21,11 @@ SAML_PLACEHOLDER_EMAIL_DOMAIN = "autenticacao.gov.pt"
 # nobody able to tell.
 #
 # It does NOT distinguish a national from a foreign CMD citizen, and must not be
-# extended to. Both arrive on the same ACS route, and the attributes that would
-# tell them apart (MDC DocType / DocNationality / DocNumber) are not requested
-# yet. Inferring "foreign" from a missing NIC would be wrong twice over: it is a
-# deduction from the attributes rather than the route, and a CMD assertion with
-# no NIC is also what a misconfigured IdP produces. That dimension belongs in
-# its own keys, added when those attributes start arriving -- which keeps every
-# value written here correct instead of needing a rewrite.
+# extended to. Both arrive on the same ACS route. Inferring "foreign" from a
+# missing NIC would be wrong twice over: it is a deduction from the attributes
+# rather than the route, and a CMD assertion with no NIC is also what a
+# misconfigured IdP produces. That dimension lives in its own keys, below --
+# which keeps every value written here correct instead of needing a rewrite.
 AUTH_PROVIDER = "auth_provider"
 AUTH_PROVIDER_CMD = "cmd"
 AUTH_PROVIDER_EIDAS = "eidas"
@@ -65,3 +63,27 @@ AUTH_CITIZEN_FOREIGN = "foreign"
 #: dropped -- never stored raw, never replaced by a default -- because a guess
 #: written here reads exactly like something the citizen said.
 AUTH_CITIZEN_DECLARED_VALUES = frozenset({AUTH_CITIZEN_NATIONAL, AUTH_CITIZEN_FOREIGN})
+
+
+# `extras` keys describing the document a FOREIGN citizen's CMD identity is
+# built from. They arrive together with AUTH_PROVIDER_CMD and are written only
+# when the document -- not a NIC -- was what identified the person.
+#
+# ABSENT MEANS ABSENT, and here the trap is sharper than for AUTH_PROVIDER: a
+# missing value does NOT mean "national". It also covers every account that
+# signed in before these attributes were requested, and every assertion that
+# arrived without them. Counting absences as nationals would turn a gap in the
+# data into a population figure.
+#
+# The document NUMBER is deliberately not among them. It is the personal part
+# of the identity and it lives only inside the HMAC digest in `auth_nic`;
+# storing it in the clear next to the type and the nationality would undo the
+# reason the identifier is hashed at all. (It does travel in the signed -- not
+# encrypted -- session cookie during the migration wizard, exactly as a NIC
+# already does today; that is the same exposure, not a new one.)
+#
+# These are the VERIFIED counterpart of AUTH_CITIZEN_DECLARED: where the two
+# disagree, these win, and the disagreement is itself the signal that an IdP is
+# misconfigured.
+AUTH_DOC_TYPE = "auth_doc_type"
+AUTH_DOC_NATIONALITY = "auth_doc_nationality"

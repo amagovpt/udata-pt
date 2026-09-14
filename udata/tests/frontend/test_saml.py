@@ -52,6 +52,9 @@ def _build_saml_response_xml(
     person_identifier=None,
     given_name=None,
     family_name=None,
+    doc_type=None,
+    doc_nationality=None,
+    doc_number=None,
 ):
     """Build a minimal SAML Response XML with the given attributes.
 
@@ -83,6 +86,27 @@ def _build_saml_response_xml(
         <saml:Attribute Name="http://interop.gov.pt/MDC/Cidadao/NomeApelido"
                         NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
             <saml:AttributeValue>{last_name}</saml:AttributeValue>
+        </saml:Attribute>"""
+    # The foreign citizen's document: what a CMD assertion carries instead of
+    # a NIC. Same shape as the blocks above so the three travel exactly as the
+    # real attributes do.
+    if doc_type:
+        attributes += f"""
+        <saml:Attribute Name="http://interop.gov.pt/MDC/Cidadao/DocType"
+                        NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
+            <saml:AttributeValue>{doc_type}</saml:AttributeValue>
+        </saml:Attribute>"""
+    if doc_nationality:
+        attributes += f"""
+        <saml:Attribute Name="http://interop.gov.pt/MDC/Cidadao/DocNationality"
+                        NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
+            <saml:AttributeValue>{doc_nationality}</saml:AttributeValue>
+        </saml:Attribute>"""
+    if doc_number:
+        attributes += f"""
+        <saml:Attribute Name="http://interop.gov.pt/MDC/Cidadao/DocNumber"
+                        NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">
+            <saml:AttributeValue>{doc_number}</saml:AttributeValue>
         </saml:Attribute>"""
     if person_identifier:
         attributes += f"""
@@ -132,6 +156,9 @@ def _make_authn_response_mock(
     given_name=None,
     family_name=None,
     eidas_friendly_names=False,
+    doc_type=None,
+    doc_nationality=None,
+    doc_number=None,
 ):
     """Build a MagicMock that mimics a validated pysaml2 AuthnResponse.
 
@@ -159,6 +186,14 @@ def _make_authn_response_mock(
         identity["http://interop.gov.pt/MDC/Cidadao/NomeProprio"] = [first_name]
     if last_name:
         identity["http://interop.gov.pt/MDC/Cidadao/NomeApelido"] = [last_name]
+    # The foreign citizen's document. Raw MDC URIs, like the four above: these
+    # are in no pysaml2 attribute map, so get_identity() keys them by URI.
+    if doc_type:
+        identity["http://interop.gov.pt/MDC/Cidadao/DocType"] = [doc_type]
+    if doc_nationality:
+        identity["http://interop.gov.pt/MDC/Cidadao/DocNationality"] = [doc_nationality]
+    if doc_number:
+        identity["http://interop.gov.pt/MDC/Cidadao/DocNumber"] = [doc_number]
     # pysaml2's built-in attribute maps translate the eIDAS natural-person
     # URIs into friendly names in get_identity() (PersonIdentifier,
     # FirstName, FamilyName) — that is what the real IdP responses yield.
@@ -7161,3 +7196,454 @@ class SAMLCaseVariantAddressTest(APITestCase):
         assert User.objects.count() == users_before
         owner.reload()
         assert not (owner.extras or {}).get("auth_nic")
+
+
+class SAMLForeignIdentifierCompositionTest(APITestCase):
+    """The pre-image of a foreign citizen's identity hash, pinned.
+
+    🚨 These tests exist to make the composition hard to change by accident.
+    It is the pre-image of a one-way HMAC and the digest is the login key, so
+    editing the order, the separator, the casing or the leading segment
+    silently unmatches every foreign citizen already registered. A test that
+    fails here is not a test to fix -- it is a change to reconsider.
+    """
+
+    def test_composes_the_three_attributes_in_a_frozen_order(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("TR", "PT", "123456") == "MDC/TR/PT/123456"
+
+    def test_same_number_different_doc_types_differ(self):
+        """The reason the number alone is not the identity: a passport number
+        and a residence permit number can coincide, and hashing the number
+        alone would hand two people one account."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("TR", "PT", "123456") != _compose_foreign_identifier(
+            "PAS", "PT", "123456"
+        )
+
+    def test_same_number_different_nationalities_differ(self):
+        """Built on PAS/DR on purpose: DocNationality is forced to "PT" on
+        residence permits and residence cards, so on TR and CR that segment is
+        degenerate and could not tell two holders apart."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("PAS", "BR", "123456") != _compose_foreign_identifier(
+            "PAS", "AO", "123456"
+        )
+
+    def test_never_looks_like_a_nic_or_an_eidas_identifier(self):
+        """The invariant the leading segment exists for.
+
+        "TR" and "CR" are valid ISO 3166-1 alpha-2 codes, and an eIDAS
+        PersonIdentifier is "<alpha2>/<alpha2>/<id>". Without "MDC/", a
+        residence-permit holder would compose exactly what a Turkish citizen
+        signing in through eIDAS presents -- and the two would share an
+        account, permanently and undetectably.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        composed = _compose_foreign_identifier("TR", "PT", "123456")
+
+        assert not composed.isdigit(), "a NIC is digits only"
+        assert composed != "TR/PT/123456", "this is an eIDAS PersonIdentifier"
+        head = composed.split("/")[0]
+        assert len(head) != 2, f"{head!r} must not be mistakable for a country code"
+
+    def test_is_case_insensitive_in_all_three_segments(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier(" tr ", "pt", "a1b2c3") == _compose_foreign_identifier(
+            "TR", "PT", "A1B2C3"
+        )
+
+    def test_returns_none_when_any_attribute_is_missing(self):
+        """Half an answer must not become a frozen identity."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier(None, "PT", "123456") is None
+        assert _compose_foreign_identifier("TR", None, "123456") is None
+        assert _compose_foreign_identifier("TR", "PT", None) is None
+        assert _compose_foreign_identifier("TR", "PT", "") is None
+
+    def test_returns_none_for_a_doc_type_outside_the_foreign_set(self):
+        """The guard that keeps a national out of this path.
+
+        A national's assertion normally carries a NIC and never gets here, but
+        one that merely lost it must fall through to the email/name branches --
+        not be resolved to a brand-new composed identity.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("CC", "PT", "123456") is None
+        assert _compose_foreign_identifier("BI", "PT", "123456") is None
+
+
+class SAMLRequestedAttributesTest(APITestCase):
+    """What the CMD AuthnRequest asks the IdP for.
+
+    🚩 Nothing asserted this before: `grep RequestedAttribute` over this file
+    returned nothing. So the 200-odd tests here covered every branch of what we
+    do with the answer and none of the question -- which is the only thing that
+    changes for a national in this ticket.
+    """
+
+    def _requested_attributes(self, mock_client_for):
+        """Start a CMD login and read back the RequestedAttributes we sent."""
+        mock_saml_client = MagicMock()
+        mock_saml_client.prepare_for_authenticate.return_value = (
+            "reqid-1",
+            {"data": '<form action="https://idp.example/sso">'},
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        self.client.get("/saml/login")
+
+        kwargs = mock_saml_client.prepare_for_authenticate.call_args.kwargs
+        extensions = kwargs["extensions"]
+        # The RequestedAttributes element is the second extension (FAAALevel
+        # is the first); read every RequestedAttribute out of whichever one
+        # carries them rather than relying on the order.
+        found = {}
+        for element in extensions.extension_elements:
+            for child in element.children:
+                name = child.attributes.get("Name")
+                if name:
+                    found[name] = child.attributes.get("isRequired")
+        return found
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_authn_request_asks_document_attributes_and_optional_nic(self, mock_client_for):
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MDC_ATTR_DOC_NATIONALITY,
+            MDC_ATTR_DOC_NUMBER,
+            MDC_ATTR_DOC_TYPE,
+            MDC_ATTR_EMAIL,
+            MDC_ATTR_FIRST_NAME,
+            MDC_ATTR_LAST_NAME,
+            MDC_ATTR_NIC,
+        )
+
+        requested = self._requested_attributes(mock_client_for)
+
+        # The three that identify a foreign citizen's document are now asked
+        # for -- without them the assertion carries no identity at all.
+        for attribute in (MDC_ATTR_DOC_TYPE, MDC_ATTR_DOC_NATIONALITY, MDC_ATTR_DOC_NUMBER):
+            assert attribute in requested, f"{attribute} is not requested"
+            assert requested[attribute] == "False"
+
+        # And the NIC is no longer demanded: isRequired tells the IdP the
+        # sign-in cannot proceed without it, which is what excludes a foreigner.
+        assert requested[MDC_ATTR_NIC] == "False"
+
+        # Everything else is untouched. Email and the names stay required, so
+        # nothing about a national's consent screen changes here.
+        assert requested[MDC_ATTR_EMAIL] == "True"
+        assert requested[MDC_ATTR_FIRST_NAME] == "True"
+        assert requested[MDC_ATTR_LAST_NAME] == "True"
+
+
+class SAMLForeignCitizenLoginTest(APITestCase):
+    """A foreign citizen signing in with CMD, end to end.
+
+    🚨 Every test here sets MIGRATION_MODE_ENABLED explicitly, and the value
+    matters more than it looks. `class Testing` defaults it to True, and with
+    it on an unmatched identity is diverted to the wizard before any account
+    is created at all -- so these tests would not be exercising the path this
+    ticket changes, they would be failing on a different one. The flag-off
+    fallback is where the composed identity is used; the wizard path is
+    covered separately, with the flag on, so both states are pinned.
+    """
+
+    DOC = {"doc_type": "TR", "doc_nationality": "PT", "doc_number": "X9912345"}
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_three_logins_produce_one_account(self, mock_client_for, _mock_confirm):
+        """The invariant the ticket is about: the document IS the identity, so
+        the second and third sign-in must find the first account rather than
+        mint another. One login proves nothing here -- the old code created an
+        account on the first one too."""
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        before = User.objects.count()
+
+        ids = []
+        for _ in range(3):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_login(
+                    mock_client_for,
+                    email="ana@example.pt",
+                    first_name="Ana",
+                    last_name="Rocha",
+                    **self.DOC,
+                )
+            created = User.objects(email="ana@example.pt").first()
+            assert created is not None
+            ids.append(created.id)
+
+        assert User.objects.count() == before + 1, "a second account was minted"
+        assert ids[0] == ids[1] == ids[2], "the later logins did not find the first account"
+        assert created.extras["auth_nic"] == hash_nic("MDC/TR/PT/X9912345")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_with_a_nic_is_unaffected(self, mock_client_for, _mock_confirm):
+        """The non-regression that matters most.
+
+        Touching how the identifier is composed is the fastest way to lock
+        every national out of their own account. The NIC wins even when the
+        document attributes are present, and what is stored stays byte for
+        byte what it was before this ticket.
+        """
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                email="bruno@example.pt",
+                nic="16273849",
+                first_name="Bruno",
+                last_name="Dias",
+                **self.DOC,
+            )
+
+        created = User.objects(email="bruno@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_nic"] == hash_nic("16273849")
+        assert created.extras["auth_nic"] != hash_nic("MDC/TR/PT/X9912345")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_existing_national_still_matches_their_stored_identifier(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The other half of the same worry, from the database side: an account
+        registered before this ticket must still be found by its own NIC."""
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        existing = UserFactory(
+            email="carla@example.pt",
+            confirmed_at="2024-01-01",
+            extras={"auth_nic": hash_nic("55667788")},
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+            self._cmd_login(
+                mock_client_for,
+                email="carla@example.pt",
+                nic="55667788",
+                first_name="Carla",
+                last_name="Sousa",
+            )
+            assert mock_login.call_count == 1
+            assert mock_login.call_args[0][0].id == existing.id
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_without_a_nic_gets_no_composed_identity(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The guard on the document-type set, seen from the route.
+
+        An assertion that lost its NIC but carries a national document type
+        must fall through to the email/name branches, not be handed a brand-new
+        composed identity that nothing else will ever match.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_login(
+                mock_client_for,
+                email="diogo@example.pt",
+                first_name="Diogo",
+                last_name="Melo",
+                doc_type="CC",
+                doc_nationality="PT",
+                doc_number="12345678",
+            )
+
+        created = User.objects(email="diogo@example.pt").first()
+        if created is not None:
+            assert not (created.extras or {}).get("auth_nic"), (
+                "a national document type must not produce a composed identity"
+            )
+
+
+class SAMLForeignDocExtrasTest(APITestCase):
+    """The verified document type and nationality, recorded beside the hash.
+
+    They are the counterpart of `auth_citizen_declared`, which comes from a
+    radio button and proves nothing. These come from the assertion.
+
+    ⚠️ Their absence does NOT mean "national" -- it also covers every account
+    that signed in before the attributes were requested. The test for a
+    national below pins that they are not written, not that their absence
+    carries a meaning.
+    """
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_foreign_login_records_doc_type_and_nationality(self, mock_client_for, _mock_confirm):
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self._cmd_login(
+            mock_client_for,
+            email="elena@example.pt",
+            first_name="Elena",
+            last_name="Marin",
+            doc_type="PAS",
+            doc_nationality="RO",
+            doc_number="AB998877",
+        )
+
+        created = User.objects(email="elena@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_doc_type"] == "PAS"
+        assert created.extras["auth_doc_nationality"] == "RO"
+        # The number identifies the person. It belongs in the digest and
+        # nowhere else -- storing it beside the other two would undo the
+        # reason the identifier is hashed at all.
+        assert "auth_doc_number" not in created.extras
+        assert "AB998877" not in str(created.extras)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_does_not_get_the_document_keys(self, mock_client_for, _mock_confirm):
+        """Even when the assertion carries the document attributes: the NIC
+        won in the composition, so recording them would describe something
+        other than what `auth_nic` actually holds."""
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self._cmd_login(
+            mock_client_for,
+            email="fabio@example.pt",
+            nic="90817263",
+            first_name="Fabio",
+            last_name="Nunes",
+            doc_type="TR",
+            doc_nationality="PT",
+            doc_number="Z1234567",
+        )
+
+        created = User.objects(email="fabio@example.pt").first()
+        assert created is not None
+        assert "auth_doc_type" not in created.extras
+        assert "auth_doc_nationality" not in created.extras
+
+
+class SAMLForeignMigrationWizardTest(APITestCase):
+    """The foreign identity through the wizard — the flag's OTHER state.
+
+    With MIGRATION_MODE_ENABLED on, which is the production value and this
+    suite's default, an unmatched identity never reaches the creation fallback:
+    it is parked in the session and the wizard asks for a real email. So the
+    composed identifier has to survive a round trip through the session and
+    still resolve to the same account on the next sign-in.
+
+    🚩 The guards in the wizard refuse an identity with no `saml_nic`. They
+    test presence, not shape — which is exactly why a composed string passes
+    them unchanged, and why this needs a test rather than an assumption.
+    """
+
+    DOC = {"doc_type": "PAS", "doc_nationality": "BR", "doc_number": "BR7788991"}
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_foreign_identity_completes_wizard_and_is_recognised(
+        self, mock_client_for, _mock_confirm
+    ):
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        users_before = User.objects.count()
+
+        # 1. First sign-in: nothing matches, so the wizard takes over and no
+        #    account is created yet.
+        response = self._cmd_login(
+            mock_client_for, first_name="Gabriel", last_name="Costa", **self.DOC
+        )
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        assert User.objects.count() == users_before
+
+        # The composed identity travels in the session, not a NIC.
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            assert pending["saml_nic"] == "MDC/PAS/BR/BR7788991"
+
+        # 2. The person gives a real address. The guards let the composed
+        #    identity through and the account is created against it.
+        created_response = self.client.post(
+            "/saml/migration/skip", json={"email": "gabriel@example.pt"}
+        )
+        assert created_response.status_code == 200
+
+        created = User.objects(email="gabriel@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
+
+        # 3. The sign-in after that must find that account, not make another.
+        #    This is the whole point: an identity that cannot be re-resolved is
+        #    a new person every time they come back.
+        #
+        #    ⚠️ It asserts the RESOLUTION, not a session. The account the wizard
+        #    creates is pending email confirmation, so the login is correctly
+        #    blocked until the link is clicked -- that guard belongs to another
+        #    ticket and asserting a session here would be asserting its absence
+        #    of bugs, not this one's.
+        users_after_creation = User.objects.count()
+        self._cmd_login(mock_client_for, first_name="Gabriel", last_name="Costa", **self.DOC)
+
+        assert User.objects.count() == users_after_creation, "a second account was minted"
+        assert User.objects(email="gabriel@example.pt").count() == 1
+        still = User.objects(email="gabriel@example.pt").first()
+        assert still.id == created.id
+        assert still.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
