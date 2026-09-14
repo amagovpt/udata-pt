@@ -143,3 +143,14 @@ def init_app(app):
     from .saml.saml_plugin import blueprint as saml_blueprint
 
     app.register_blueprint(saml_blueprint)
+
+    # See `audit_logger` in saml_govpt: without its own level it would inherit
+    # the WARNING that `init_logging` sets on the `udata` logger in production,
+    # and every SSO decision line would be dropped before reaching the log
+    # file. Pinned here rather than at module scope because this runs from
+    # `register_extensions`, which `create_app` calls AFTER `init_logging` --
+    # the same ordering `mail.init_app` relies on. At import time the level
+    # would be set before `init_logging` ran, and silently overwritten.
+    from .saml.saml_plugin.saml_govpt import audit_logger as saml_audit_logger
+
+    saml_audit_logger.setLevel(logging.INFO)

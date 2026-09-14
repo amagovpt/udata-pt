@@ -7655,3 +7655,70 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         still = User.objects(email="gabriel@example.pt").first()
         assert still.id == created.id
         assert still.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
+
+
+class SAMLAuditLoggerLevelTest(APITestCase):
+    """That the audit line reaches a handler at all — which it did not.
+
+    🚨 This is the test the feature was missing for four months. The two audit
+    tests above assert the CONTENT of the line, but they do it through
+    `assertLogs`, which pins the level on the logger under test -- so they
+    passed the whole time production was emitting nothing.
+
+    Two independent bugs had to be fixed for a line to appear, and this test
+    dies if either is put back: the logger sat outside the `udata.*` tree, so
+    its records propagated to a root the application configures no handler on;
+    and it had no level of its own, so it inherited the WARNING that
+    `init_logging` sets in production while every call is `.info()`.
+    """
+
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+
+    def test_audit_logger_level_survives_a_production_like_parent(self):
+        """Copied in form from MailDispatchAuditLogTest, which exists for the
+        same reason on the mail side -- the pattern this ticket retrofits."""
+        import io as _io
+
+        parent = logging.getLogger("udata")
+        original = parent.level
+        try:
+            # The suite runs with TESTING=True, which puts `udata` at DEBUG.
+            # Production is WARNING, and that is the state that broke this.
+            parent.setLevel(logging.WARNING)
+
+            assert logging.getLogger(self.AUDIT_LOGGER).getEffectiveLevel() == logging.INFO
+
+            # The effective level alone would not prove the record reaches a
+            # handler, and that is the property that matters. Attach one to
+            # the PARENT -- where Flask attaches its default_handler, and what
+            # uwsgi's stderr ultimately writes to the backoffice log file --
+            # and check the line actually crosses from the child.
+            stream = _io.StringIO()
+            handler = logging.StreamHandler(stream)
+            parent.addHandler(handler)
+            try:
+                logging.getLogger(self.AUDIT_LOGGER).info("crossed")
+            finally:
+                parent.removeHandler(handler)
+
+            assert "crossed" in stream.getvalue()
+        finally:
+            parent.setLevel(original)
+
+    def test_the_audit_logger_is_ignored_by_sentry(self):
+        """Emitting is what makes this necessary, not optional.
+
+        🚩 Sentry's LoggingIntegration defaults to INFO and hooks
+        `Logger.callHandlers`, so it sees records whether or not a handler is
+        attached. The audit line carries `ip=` and `ua=`, and this project
+        never sets `send_default_pii` -- meaning it deliberately runs with the
+        SDK's default of NOT sending them. Before this ticket the point was
+        moot because nothing was emitted; making it emit would have put that
+        data into Sentry through a side door.
+        """
+        import udata.sentry as udata_sentry
+
+        source = inspect.getsource(udata_sentry)
+        assert f'ignore_logger("{self.AUDIT_LOGGER}")' in source, (
+            "the SAML audit logger must be ignored by Sentry, as the mail one is"
+        )
