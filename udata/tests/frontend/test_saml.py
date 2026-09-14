@@ -4799,6 +4799,66 @@ class SAMLMigrationLinkClickTest(APITestCase):
             second = again.get(f"/saml/migration/confirm-link/{token}")
         assert "flash=registration_association_refused" not in second.headers["Location"]
 
+    def test_registration_link_click_refuses_when_placeholder_completed_registration(self):
+        """A stale link must never retire a finished account.
+
+        This is the guard the resolver exemption rests on. That exemption lets
+        the placeholder hold the record's NIC without invalidating the link --
+        without it no click of this origin would ever resolve. What keeps it
+        safe is that the account named in the record is still the pending one
+        it was issued for, asked again here.
+
+        Take that away and a link left in an inbox becomes a way to
+        mark_as_deleted an account that has since finished registering,
+        irreversibly, long after the citizen stopped thinking about it.
+
+        Both halves of "still the same account" are exercised: it finished
+        registering, and its identity moved elsewhere.
+        """
+        from udata.core.user.models import User
+
+        # (a) The citizen completed registration by another route -- a
+        # confirmed new address -- so the account is no longer pending.
+        placeholder, target, token = self._issue_association_link()
+        placeholder.email = "rita.nova@example.pt"
+        placeholder.save()
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                assert mock_login.call_count == 0
+
+        assert response.headers["Location"] == (
+            "http://localhost:3000/complete-registration?flash=registration_association_refused"
+        )
+        placeholder.reload()
+        # The finished account is untouched. This is the whole point.
+        assert not placeholder.deleted
+        assert placeholder.email == "rita.nova@example.pt"
+        target.reload()
+        assert not (target.extras or {}).get("auth_nic")
+
+        # (b) The identity moved on: the account is still pending, but what it
+        # holds is no longer what the record was issued for, so the record
+        # describes a state that no longer exists.
+        placeholder2, target2, token2 = self._issue_association_link(
+            target_email="nuno.old@example.pt",
+            nic="10203040",
+            placeholder_email="saml-cafebabe@autenticacao.gov.pt",
+        )
+        User.objects(id=placeholder2.id).update_one(set__extras__auth_nic=_hash_nic("99998888"))
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token2}")
+                assert mock_login.call_count == 0
+
+        assert "flash=registration_association_refused" in response.headers["Location"]
+        placeholder2.reload()
+        assert not placeholder2.deleted
+        target2.reload()
+        assert not (target2.extras or {}).get("auth_nic")
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_an_inactive_account_does_not_burn_the_validation_link(self, mock_client_for):
         """LEDG-2465: the click could not have produced a session anyway.

@@ -3658,6 +3658,22 @@ def _complete_registration_association(target, record):
         else None
     )
 
+    # Is the placeholder still the account this link was issued for? Three
+    # ways it can stop being: it was retired by something else, it finished
+    # its registration by another route, or its identity moved on. Any of them
+    # means the link in hand is stale, and consuming it would mark_as_deleted a
+    # live, finished account -- irreversible, and the only case that can break
+    # the resolver exemption this origin relies on. Exempting the placeholder
+    # from the claimed-NIC guard is safe precisely because this holds.
+    if not placeholder or (
+        not placeholder.has_placeholder_email
+        or (placeholder.extras or {}).get("auth_nic") != record.get("nic_hash")
+    ):
+        _drop_link_record(target)
+        return redirect(
+            f"{frontend_url}/complete-registration?flash={REGISTRATION_ASSOCIATION_REFUSED_FLASH}"
+        )
+
     if placeholder and _placeholder_owns_content(placeholder):
         # Re-asked at the click, because the submit's answer is minutes or
         # hours old and the citizen kept their session throughout: anything
