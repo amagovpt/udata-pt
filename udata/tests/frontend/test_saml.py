@@ -7565,3 +7565,85 @@ class SAMLForeignDocExtrasTest(APITestCase):
         assert created is not None
         assert "auth_doc_type" not in created.extras
         assert "auth_doc_nationality" not in created.extras
+
+
+class SAMLForeignMigrationWizardTest(APITestCase):
+    """The foreign identity through the wizard — the flag's OTHER state.
+
+    With MIGRATION_MODE_ENABLED on, which is the production value and this
+    suite's default, an unmatched identity never reaches the creation fallback:
+    it is parked in the session and the wizard asks for a real email. So the
+    composed identifier has to survive a round trip through the session and
+    still resolve to the same account on the next sign-in.
+
+    🚩 The guards in the wizard refuse an identity with no `saml_nic`. They
+    test presence, not shape — which is exactly why a composed string passes
+    them unchanged, and why this needs a test rather than an assumption.
+    """
+
+    DOC = {"doc_type": "PAS", "doc_nationality": "BR", "doc_number": "BR7788991"}
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_foreign_identity_completes_wizard_and_is_recognised(
+        self, mock_client_for, _mock_confirm
+    ):
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        users_before = User.objects.count()
+
+        # 1. First sign-in: nothing matches, so the wizard takes over and no
+        #    account is created yet.
+        response = self._cmd_login(
+            mock_client_for, first_name="Gabriel", last_name="Costa", **self.DOC
+        )
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+        assert User.objects.count() == users_before
+
+        # The composed identity travels in the session, not a NIC.
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+            assert pending["saml_nic"] == "MDC/PAS/BR/BR7788991"
+
+        # 2. The person gives a real address. The guards let the composed
+        #    identity through and the account is created against it.
+        created_response = self.client.post(
+            "/saml/migration/skip", json={"email": "gabriel@example.pt"}
+        )
+        assert created_response.status_code == 200
+
+        created = User.objects(email="gabriel@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
+
+        # 3. The sign-in after that must find that account, not make another.
+        #    This is the whole point: an identity that cannot be re-resolved is
+        #    a new person every time they come back.
+        #
+        #    ⚠️ It asserts the RESOLUTION, not a session. The account the wizard
+        #    creates is pending email confirmation, so the login is correctly
+        #    blocked until the link is clicked -- that guard belongs to another
+        #    ticket and asserting a session here would be asserting its absence
+        #    of bugs, not this one's.
+        users_after_creation = User.objects.count()
+        self._cmd_login(mock_client_for, first_name="Gabriel", last_name="Costa", **self.DOC)
+
+        assert User.objects.count() == users_after_creation, "a second account was minted"
+        assert User.objects(email="gabriel@example.pt").count() == 1
+        still = User.objects(email="gabriel@example.pt").first()
+        assert still.id == created.id
+        assert still.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
