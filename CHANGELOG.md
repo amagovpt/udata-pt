@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **fix(organization): an organization admin can save the organization again without being a site admin**
+  - Updating an organization demanded site-admin rights as soon as the payload
+    carried a `badges` key. A full-object PUT — what a client sends after
+    reading the organization back — always carries one, because the serialization
+    emits every stored field and `badges` defaults to an empty list. So an
+    organization admin editing nothing but the description or the business
+    number got a bare 403, naming a field they never touched.
+  - The requirement now applies only when the submitted set of badge kinds
+    differs from the persisted one. Changing badges stays reserved to site
+    admins in both directions: adding one and dropping one are equally refused.
+    When the sets match, the badges are left alone entirely instead of being
+    rewritten to the same value.
+  - A badges payload whose `kind` is not a string is now rejected with 400
+    rather than reaching the comparison, where an unhashable value used to
+    surface as a 500.
+
 - **fix(saml): the SSO audit log now actually reaches the log file**
   - The authentication funnel writes one structured line per terminal decision
     — success, rejection, error — so a sign-in problem can be reconstructed
