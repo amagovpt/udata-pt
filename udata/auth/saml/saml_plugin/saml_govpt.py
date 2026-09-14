@@ -938,6 +938,12 @@ MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
 # older account instead of finishing a new one, which is why the record has to
 # name the placeholder it came from -- the consuming route has no session to
 # read it out of, and it is the account that gets retired.
+# The one flash code this origin emits. Shared verbatim with the frontend --
+# CompleteRegistrationGate forwards it and CompleteRegistrationClient renders
+# it -- so it is a contract between two repositories and changing it is a
+# two-sided change.
+REGISTRATION_ASSOCIATION_REFUSED_FLASH = "registration_association_refused"
+
 MIGRATION_LINK_ORIGIN = "origin"
 MIGRATION_LINK_ORIGIN_REGISTRATION = "complete_registration"
 MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
@@ -3652,6 +3658,26 @@ def _complete_registration_association(target, record):
         else None
     )
 
+    if placeholder and _placeholder_owns_content(placeholder):
+        # Re-asked at the click, because the submit's answer is minutes or
+        # hours old and the citizen kept their session throughout: anything
+        # they did while the mail sat in an inbox happened after the audit
+        # that let the link out. Retiring the account now would destroy it.
+        #
+        # This is the one place the refusal reaches a browser rather than a
+        # mailbox, and it is not an oracle: whoever is here opened a link that
+        # only the holder of that mailbox received, so they have already
+        # proved what the submit refused to disclose.
+        #
+        # The record goes with the refusal. Leaving a live link on the target
+        # would let a second click retry the same doomed association, and the
+        # citizen is better served by resubmitting from a screen that can tell
+        # them what happened.
+        _drop_link_record(target)
+        return redirect(
+            f"{frontend_url}/complete-registration?flash={REGISTRATION_ASSOCIATION_REFUSED_FLASH}"
+        )
+
     if placeholder:
         # Atomic, and deliberately not a save() of the loaded document: the
         # only field that must change here is this one, and writing the whole
@@ -3688,6 +3714,18 @@ def _complete_registration_association(target, record):
         f"linked from placeholder {placeholder_id}"
     )
     return redirect(frontend_url or "/")
+
+
+def _drop_link_record(user):
+    """Remove a pending link record without touching anything else.
+
+    Atomic for the same reason the identity unset is: the document in hand was
+    read before the click and writing it back whole would carry along whatever
+    it was read with.
+    """
+    from udata.core.user.models import User
+
+    User.objects(id=user.id).update_one(**{f"unset__extras__{MIGRATION_LINK_PENDING}": True})
 
 
 def _move_follows(placeholder, target):

@@ -4751,6 +4751,54 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert not second_placeholder.deleted
         assert not (second_placeholder.extras or {}).get("auth_nic")
 
+    def test_registration_link_click_refuses_when_placeholder_gained_content(self):
+        """What the citizen did while the mail sat in the inbox still counts.
+
+        The submit audited an empty account and let the link out. Minutes or
+        hours later the same citizen -- who kept their session the whole time,
+        because the screen that holds them is enforced in the browser -- owns
+        a dataset. Consuming the link now would retire that account and take
+        the dataset with it.
+
+        This is the one refusal that reaches a browser instead of a mailbox,
+        and it discloses nothing: whoever is here opened a link only the
+        holder of that mailbox received.
+        """
+        from udata.core.dataset.factories import DatasetFactory
+        from udata.core.user.models import User
+
+        placeholder, target, token = self._issue_association_link()
+        DatasetFactory(owner=placeholder)
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                # Nothing was linked, so nobody was signed in either.
+                assert mock_login.call_count == 0
+
+        # Back to the screen that is still holding them, carrying the code the
+        # frontend renders.
+        assert response.status_code == 302
+        assert response.headers["Location"] == (
+            "http://localhost:3000/complete-registration?flash=registration_association_refused"
+        )
+
+        # Neither account moved, and the dataset is still owned by an account
+        # that still exists.
+        target.reload()
+        assert not (target.extras or {}).get("auth_nic")
+        placeholder.reload()
+        assert not placeholder.deleted
+        assert placeholder.extras["auth_nic"] == _hash_nic("50607080")
+        assert User.objects(extras__auth_nic=_hash_nic("50607080")).count() == 1
+
+        # The spent link is gone: a second click must not retry the same
+        # doomed association.
+        assert "migration_link_pending" not in (target.extras or {})
+        with self.app.test_client() as again:
+            second = again.get(f"/saml/migration/confirm-link/{token}")
+        assert "flash=registration_association_refused" not in second.headers["Location"]
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_an_inactive_account_does_not_burn_the_validation_link(self, mock_client_for):
         """LEDG-2465: the click could not have produced a session anyway.
