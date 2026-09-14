@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **fix(saml): the SSO audit log now actually reaches the log file**
+  - The authentication funnel writes one structured line per terminal decision
+    — success, rejection, error — so a sign-in problem can be reconstructed
+    afterwards instead of guessed. **In production none of those lines was ever
+    written**, and had not been since the feature was added in May.
+  - Two independent causes, and fixing either alone changes nothing. The logger
+    sat outside the `udata.*` tree, so its records propagated to a root the
+    application attaches no handler to; and it had no level of its own, so it
+    inherited the WARNING that production sets while every call is `INFO`.
+  - Both are fixed the way the mail dispatch audit already does it: the logger
+    moves under `udata.*` and its level is pinned where the startup order
+    guarantees it survives.
+  - **A malformed request now leaves a trace too.** A POST to either ACS route
+    with no assertion returned 400 without reaching the audit funnel at all —
+    the request ended and nothing recorded that it had happened. It is audited
+    as `error` rather than `rejected`, because nothing was decided about
+    anybody: a rejection answers an identity, and that request carries none.
+  - ⚠️ **Still not audited, and deliberately so:** an unhandled exception in
+    the funnel propagates as a 500 with no line, which is what the fail-closed
+    policy says it does. Catching it needs an error handler on the blueprint,
+    which would change how errors surface and belongs in its own change.
+  - 🚩 **The line is kept out of Sentry**, as the mail audit already is. Sentry's
+    logging integration sees records at INFO whether or not a handler is
+    attached, the line carries the caller's address and user agent, and this
+    project runs with the SDK default of not sending those. Emitting without
+    the exclusion would have pushed them out through a side door — a privacy
+    setting undone as a side effect rather than as a decision.
+  - The Subject identifier stays HMAC-hashed, as it always was. What is newly
+    written to disk is the **address and user agent** of each sign-in, in a
+    file administrators can read from the backoffice — intended, and worth
+    knowing.
+  - The test that was missing: the two existing audit tests assert what the
+    line *says*, through a helper that pins the level on the logger under test
+    — which is exactly why they stayed green for four months while production
+    stayed silent. The new one forces the parent to production's level,
+    attaches a handler to it, and asserts the record *crosses*.
+
 - **feat(auth): a foreign citizen signing in with CMD now gets an account tied to their identity**
   - A foreigner has no NIC. The portal demanded one as a *required* attribute
     and asked for nothing that identifies a foreign document, so the person
