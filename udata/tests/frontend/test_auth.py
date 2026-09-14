@@ -249,3 +249,105 @@ class AuthTest(APITestCase):
         body = resp.data.decode()
         assert "must be different than your previous email" not in body
         assert "tem de ser diferente do anterior" in body
+
+    def test_change_mail_case_variant_of_taken_address_answers_like_a_free_one(self):
+        """A spelling that differs only in case is the SAME mailbox.
+
+        This widens what counts as taken, which is the whole point -- and a
+        widening is exactly where an oracle gets reintroduced by accident. So
+        this asserts the same thing as
+        test_change_mail_taken_address_answers_like_a_free_one, with the same
+        discipline: same-length addresses, and everything but the echoed
+        address compared byte for byte.
+
+        ⚠️ The casing varies in the LOCAL part on purpose. The email validator
+        lowercases the domain, so a test that only varied the domain would pass
+        with and without the fix.
+        """
+        self.login(UserFactory(email="saml-deadbeef@autenticacao.gov.pt", password=None))
+        UserFactory(email="Maria@example.com")
+
+        variant = self._submit_change_email("maria@example.com")
+        free = self._submit_change_email("mirta@example.com")
+
+        assert variant.status_code == free.status_code
+
+        def normalise(location, address):
+            return location.replace(quote_plus(address), "ADDR").replace(address, "ADDR")
+
+        assert normalise(variant.location, "maria@example.com") == normalise(
+            free.location, "mirta@example.com"
+        )
+
+    def test_change_mail_case_variant_of_taken_address_issues_no_link(self):
+        """The refusal has to be real, not only indistinguishable.
+
+        The test above proves the caller cannot tell the branches apart; this
+        one proves the taken branch is the one that ran -- the owner of the
+        address is warned and no confirmation link is minted for the caller.
+        """
+        caller = self.login(UserFactory(email="saml-deadbeef@autenticacao.gov.pt", password=None))
+        owner = UserFactory(email="Maria@example.com")
+
+        with capture_mails() as mails:
+            self._submit_change_email("maria@example.com")
+
+        assert len(mails) == 1
+        assert mails[0].recipients == [owner.email]
+
+        caller.reload()
+        assert caller.email == "saml-deadbeef@autenticacao.gov.pt"
+
+    def test_confirm_change_mail_refuses_a_case_variant_taken_after_the_link_was_sent(self):
+        """The guard that actually stops the duplicate row being written.
+
+        change_email only decides whether a link is sent; confirm_change_email
+        is the line that assigns user.email. It exists for the address that
+        becomes taken between the request and the click -- which the submit
+        branch cannot see -- so it needs its own proof, and the case variant is
+        precisely the shape it used to miss.
+        """
+        user = self.login(AdminFactory())
+        original_email = user.email
+        UserFactory(email="Maria@example.com")
+
+        security = current_app.extensions["security"]
+        data = [str(user.fs_uniquifier), hash_data(user.email), "maria@example.com"]
+        token = security.confirm_serializer.dumps(data)
+
+        resp = self.get(url_for("security.confirm_change_email", token=token))
+
+        assert resp.status_code == 302
+        assert "change_email_already_taken" in resp.location
+        user.reload()
+        assert user.email == original_email
+
+    def test_change_mail_recasing_own_address_is_still_allowed(self):
+        """Widening "taken" must not lock the owner out of their own address.
+
+        The identity guard is what saves this, and it only works because the
+        lookup prefers the exactly matching row: asked for their own spelling,
+        it returns their own row, so existing.id == current_user.id.
+        """
+        user = self.login(UserFactory(email="maria@example.com", password=None))
+
+        with capture_mails() as mails:
+            resp = self._submit_change_email("Maria@example.com")
+
+        assert resp.status_code == 302
+        # A confirmation link to the new spelling -- not a refusal, and not the
+        # address-taken warning, which would have gone to the same mailbox and
+        # is why the recipient alone does not settle it.
+        assert len(mails) == 1
+        assert mails[0].recipients == ["Maria@example.com"]
+
+        # And the click goes through: confirm_change_email applies the same
+        # widened lookup, so the identity guard has to hold there too.
+        security = current_app.extensions["security"]
+        data = [str(user.fs_uniquifier), hash_data(user.email), "Maria@example.com"]
+        token = security.confirm_serializer.dumps(data)
+        confirmed = self.get(url_for("security.confirm_change_email", token=token))
+
+        assert "change_email_already_taken" not in confirmed.location
+        user.reload()
+        assert user.email == "Maria@example.com"
