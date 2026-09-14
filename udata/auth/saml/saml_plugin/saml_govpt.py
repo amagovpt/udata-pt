@@ -430,6 +430,88 @@ MDC_ATTR_NIC = "http://interop.gov.pt/MDC/Cidadao/NIC"
 MDC_ATTR_FIRST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
 MDC_ATTR_LAST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
 
+# The document a foreign citizen's CMD was created with. A foreigner has no
+# NIC, so these three together are the only identity the assertion carries.
+MDC_ATTR_DOC_TYPE = "http://interop.gov.pt/MDC/Cidadao/DocType"
+MDC_ATTR_DOC_NATIONALITY = "http://interop.gov.pt/MDC/Cidadao/DocNationality"
+MDC_ATTR_DOC_NUMBER = "http://interop.gov.pt/MDC/Cidadao/DocNumber"
+
+# The document types autenticacao.gov issues to a FOREIGN citizen: residence
+# permit, passport, residence card, residence authorisation certificate.
+#
+# The composition below is gated on this set on purpose. A national's assertion
+# normally carries a NIC and never reaches it -- but "normally" is not a
+# guarantee, and without the gate an assertion that merely lost its NIC would
+# be resolved to a brand-new composed identity instead of falling through to
+# the email/name branches. That is the fastest way to lock a national out of
+# their own account, which is the one thing this ticket must not do.
+MDC_FOREIGN_DOC_TYPES = frozenset({"TR", "PAS", "CR", "DR"})
+
+
+def _compose_foreign_identifier(doc_type, doc_nationality, doc_number):
+    """Build the identity string for a foreign citizen, from their document.
+
+    🚨 THIS COMPOSITION IS FROZEN. It is the pre-image of a one-way HMAC, and
+    the digest is the key the login resolves accounts by. Change the order, the
+    separator, the casing or the leading segment and every foreign citizen
+    already registered stops matching their own account, with no way to
+    recompute the stored values. Treat it the way a database migration is
+    treated: additive only, never edited.
+
+    Why a composition at all, rather than the document number alone: the number
+    is not unique across types. A passport number and a residence permit number
+    can coincide, and ``DocNationality`` is forced to "PT" on residence permits
+    and residence cards, so what separates two holders is the type plus the
+    number. Hashing the number alone would hand two different people the same
+    identity, and therefore the same account -- worse than a duplicate, it is
+    somebody else's session.
+
+    Why the leading "MDC" segment, which is the part that looks superfluous:
+    "TR" and "CR" are valid ISO 3166-1 alpha-2 codes (Turkey, Costa Rica), and
+    an eIDAS PersonIdentifier has the shape "<alpha2>/<alpha2>/<id>" -- the
+    "ES/PT/..." named in _find_or_create_saml_user. With the nationality forced
+    to "PT", a residence-permit holder would compose "TR/PT/123456", which is
+    byte for byte what a Turkish citizen signing in through eIDAS presents.
+    The two would share an account. "MDC" is three characters and can never be
+    an alpha-2 code, so the three identifier classes stay disjoint: a NIC is
+    digits only, an eIDAS identifier starts with a country code, ours with MDC.
+
+    ⚠️ This is NOT the provider prefix that ``udata/core/user/nic.py`` forbids.
+    That prohibition is about the STORED value ("cmd-<hash>"), and its argument
+    is that hashes already written cannot be recomputed into a prefixed form.
+    This segment lives in the PRE-IMAGE: what is stored is still a bare 64-hex
+    digest, ``is_nic_hashed`` still holds, and no existing value is touched.
+    The sibling keys that note prescribes still apply -- the document type and
+    nationality are also recorded in ``extras``, in the clear, for counting.
+
+    ⚠️ Known and accepted: this identity is LESS STABLE than a NIC. A residence
+    permit is renewed and changes number; a passport expires and is replaced.
+    When that happens the digest changes and the person arrives as a brand-new
+    identity, leaving the old account -- with its datasets and its organization
+    memberships -- unreachable, often behind a placeholder email nobody reads.
+    A verified email is the only thing that survives a document swap, which is
+    why it matters more for foreign citizens than for nationals. Reuniting the
+    two accounts is support work, not something this function can do.
+
+    Returns None when any attribute is missing or the type is not a foreign
+    one, so the caller falls through to the existing email/name branches
+    instead of minting an identity from half an answer.
+    """
+    if not (doc_type and doc_nationality and doc_number):
+        return None
+    doc_type = doc_type.strip().upper()
+    if doc_type not in MDC_FOREIGN_DOC_TYPES:
+        return None
+    # Upper-cased, including the number. The eIDAS PersonIdentifier is passed
+    # through verbatim, but it is an opaque string minted by another state --
+    # this is a number printed on a Portuguese document, and this project's own
+    # audit has already seen one carrying letters ("4595P5L28"). The risks are
+    # not symmetric: normalising risks colliding two documents that differ only
+    # in case, which do not exist; not normalising risks failing to recognise a
+    # person whose IdP sent a different casing, which locks them out.
+    return f"MDC/{doc_type}/{doc_nationality.strip().upper()}/{doc_number.strip().upper()}"
+
+
 # eIDAS natural-person attribute URIs. Field mapping to the CMD equivalents:
 # PersonIdentifier → NIC slot (extras.auth_nic, HMAC-hashed),
 # CurrentGivenName → first_name (NomeProprio), CurrentFamilyName → last_name

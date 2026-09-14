@@ -7161,3 +7161,85 @@ class SAMLCaseVariantAddressTest(APITestCase):
         assert User.objects.count() == users_before
         owner.reload()
         assert not (owner.extras or {}).get("auth_nic")
+
+
+class SAMLForeignIdentifierCompositionTest(APITestCase):
+    """The pre-image of a foreign citizen's identity hash, pinned.
+
+    🚨 These tests exist to make the composition hard to change by accident.
+    It is the pre-image of a one-way HMAC and the digest is the login key, so
+    editing the order, the separator, the casing or the leading segment
+    silently unmatches every foreign citizen already registered. A test that
+    fails here is not a test to fix -- it is a change to reconsider.
+    """
+
+    def test_composes_the_three_attributes_in_a_frozen_order(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("TR", "PT", "123456") == "MDC/TR/PT/123456"
+
+    def test_same_number_different_doc_types_differ(self):
+        """The reason the number alone is not the identity: a passport number
+        and a residence permit number can coincide, and hashing the number
+        alone would hand two people one account."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("TR", "PT", "123456") != _compose_foreign_identifier(
+            "PAS", "PT", "123456"
+        )
+
+    def test_same_number_different_nationalities_differ(self):
+        """Built on PAS/DR on purpose: DocNationality is forced to "PT" on
+        residence permits and residence cards, so on TR and CR that segment is
+        degenerate and could not tell two holders apart."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("PAS", "BR", "123456") != _compose_foreign_identifier(
+            "PAS", "AO", "123456"
+        )
+
+    def test_never_looks_like_a_nic_or_an_eidas_identifier(self):
+        """The invariant the leading segment exists for.
+
+        "TR" and "CR" are valid ISO 3166-1 alpha-2 codes, and an eIDAS
+        PersonIdentifier is "<alpha2>/<alpha2>/<id>". Without "MDC/", a
+        residence-permit holder would compose exactly what a Turkish citizen
+        signing in through eIDAS presents -- and the two would share an
+        account, permanently and undetectably.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        composed = _compose_foreign_identifier("TR", "PT", "123456")
+
+        assert not composed.isdigit(), "a NIC is digits only"
+        assert composed != "TR/PT/123456", "this is an eIDAS PersonIdentifier"
+        head = composed.split("/")[0]
+        assert len(head) != 2, f"{head!r} must not be mistakable for a country code"
+
+    def test_is_case_insensitive_in_all_three_segments(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier(" tr ", "pt", "a1b2c3") == _compose_foreign_identifier(
+            "TR", "PT", "A1B2C3"
+        )
+
+    def test_returns_none_when_any_attribute_is_missing(self):
+        """Half an answer must not become a frozen identity."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier(None, "PT", "123456") is None
+        assert _compose_foreign_identifier("TR", None, "123456") is None
+        assert _compose_foreign_identifier("TR", "PT", None) is None
+        assert _compose_foreign_identifier("TR", "PT", "") is None
+
+    def test_returns_none_for_a_doc_type_outside_the_foreign_set(self):
+        """The guard that keeps a national out of this path.
+
+        A national's assertion normally carries a NIC and never gets here, but
+        one that merely lost it must fall through to the email/name branches --
+        not be resolved to a brand-new composed identity.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("CC", "PT", "123456") is None
+        assert _compose_foreign_identifier("BI", "PT", "123456") is None
