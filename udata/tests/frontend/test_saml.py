@@ -6520,7 +6520,7 @@ class SAMLInactiveAccountRefusalTest(APITestCase):
 
     NIC = "99887766"
     PERSON_ID = "ES/PT/9988776655"
-    AUDIT_LOGGER = "saml.audit"
+    AUDIT_LOGGER = "udata.auth.saml.audit"
 
     @pytest.fixture(autouse=True)
     def _set_frontend_url(self, app):
@@ -6930,6 +6930,7 @@ class SAMLAmbiguousIdentityTest(APITestCase):
 
     NIC = "27182818"
     PERSON_ID = "IT/PT/2718281828"
+    AUDIT_LOGGER = "udata.auth.saml.audit"
 
     @pytest.fixture(autouse=True)
     def _set_frontend_url(self, app):
@@ -7020,10 +7021,17 @@ class SAMLAmbiguousIdentityTest(APITestCase):
     ):
         """`assertLogs` rather than caplog: this class descends from
         unittest.TestCase. Pinning the level matters -- without it the "no
-        success line" assertion would pass on an empty capture."""
+        success line" assertion would pass on an empty capture.
+
+        ⚠️ And pinning it is also what makes this test blind to LEDG-2371:
+        `assertLogs` sets the level on the logger under test, so this passed
+        for months while production emitted nothing. What it proves is the
+        CONTENT of the line, not that the line ever reaches a handler --
+        that property has its own test, SAMLAuditLoggerLevelTest.
+        """
         self._two_accounts_claiming(self.NIC)
 
-        with self.assertLogs("saml.audit", level=logging.INFO) as captured:
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
             self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
 
         lines = [record.getMessage() for record in captured.records]
@@ -7647,3 +7655,117 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         still = User.objects(email="gabriel@example.pt").first()
         assert still.id == created.id
         assert still.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
+
+
+class SAMLAuditLoggerLevelTest(APITestCase):
+    """That the audit line reaches a handler at all — which it did not.
+
+    🚨 This is the test the feature was missing for four months. The two audit
+    tests above assert the CONTENT of the line, but they do it through
+    `assertLogs`, which pins the level on the logger under test -- so they
+    passed the whole time production was emitting nothing.
+
+    Two independent bugs had to be fixed for a line to appear, and this test
+    dies if either is put back: the logger sat outside the `udata.*` tree, so
+    its records propagated to a root the application configures no handler on;
+    and it had no level of its own, so it inherited the WARNING that
+    `init_logging` sets in production while every call is `.info()`.
+    """
+
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+
+    def test_audit_logger_level_survives_a_production_like_parent(self):
+        """Copied in form from MailDispatchAuditLogTest, which exists for the
+        same reason on the mail side -- the pattern this ticket retrofits."""
+        import io as _io
+
+        parent = logging.getLogger("udata")
+        original = parent.level
+        try:
+            # The suite runs with TESTING=True, which puts `udata` at DEBUG.
+            # Production is WARNING, and that is the state that broke this.
+            parent.setLevel(logging.WARNING)
+
+            assert logging.getLogger(self.AUDIT_LOGGER).getEffectiveLevel() == logging.INFO
+
+            # The effective level alone would not prove the record reaches a
+            # handler, and that is the property that matters. Attach one to
+            # the PARENT -- where Flask attaches its default_handler, and what
+            # uwsgi's stderr ultimately writes to the backoffice log file --
+            # and check the line actually crosses from the child.
+            stream = _io.StringIO()
+            handler = logging.StreamHandler(stream)
+            parent.addHandler(handler)
+            try:
+                logging.getLogger(self.AUDIT_LOGGER).info("crossed")
+            finally:
+                parent.removeHandler(handler)
+
+            assert "crossed" in stream.getvalue()
+        finally:
+            parent.setLevel(original)
+
+    def test_the_audit_logger_is_ignored_by_sentry(self):
+        """Emitting is what makes this necessary, not optional.
+
+        🚩 Sentry's LoggingIntegration defaults to INFO and hooks
+        `Logger.callHandlers`, so it sees records whether or not a handler is
+        attached. The audit line carries `ip=` and `ua=`, and this project
+        never sets `send_default_pii` -- meaning it deliberately runs with the
+        SDK's default of NOT sending them. Before this ticket the point was
+        moot because nothing was emitted; making it emit would have put that
+        data into Sentry through a side door.
+        """
+        import udata.sentry as udata_sentry
+
+        source = inspect.getsource(udata_sentry)
+        assert f'ignore_logger("{self.AUDIT_LOGGER}")' in source, (
+            "the SAML audit logger must be ignored by Sentry, as the mail one is"
+        )
+
+
+class SAMLAuditErrorOutcomeTest(APITestCase):
+    """The third leg of the acceptance criterion: success, rejection AND error.
+
+    🚩 The first plan for this ticket claimed every error path already came out
+    as `rejected`. It does not. A POST to the ACS with no SAMLResponse returns
+    400 without passing through the audit funnel at all, on both routes -- the
+    request ends and leaves no trace of having happened.
+
+    `error` rather than `rejected` because nothing was decided about anybody:
+    a rejection is an answer to an identity, and this request never carried
+    one. It is a fifth value alongside success, rejected, migration_pending
+    and user_not_found, and anyone counting lines needs to know all five.
+    """
+
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+
+    def test_a_missing_saml_response_is_audited_as_an_error_on_the_cmd_route(self):
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            response = self.client.post("/saml/sso", data={})
+
+        assert response.status_code == 400
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=error" in lines[0]
+        assert "kind=cmd" in lines[0]
+        assert "reason=missing_saml_response" in lines[0]
+
+    def test_a_missing_saml_response_is_audited_as_an_error_on_the_eidas_route(self):
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            response = self.client.post("/saml/eidas/sso", data={})
+
+        assert response.status_code == 400
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=error" in lines[0]
+        assert "kind=eidas" in lines[0]
+
+    def test_the_error_line_never_carries_a_raw_subject(self):
+        """Criterion 3 holds on this path too: there is no Subject to leak
+        here, and the line must not invent one."""
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self.client.post("/saml/sso", data={})
+
+        line = captured.records[0].getMessage()
+        assert "name_id_hash=-" in line, line
