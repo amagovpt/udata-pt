@@ -928,6 +928,20 @@ MIGRATION_LINK_SEND_COUNT = "migration_link_send_count"
 MAX_MIGRATION_LINK_SENDS = 5
 MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
 
+# Which flow put a link record on an account. Absent means the wizard, which
+# is every record written before this existed, so the default must stay the
+# wizard's behaviour in every branch that reads it.
+#
+# The registration origin is the completion screen: someone who signed in with
+# a government identity, got a placeholder account, and submitted the address
+# of an account they already had. The click then moves the identity onto that
+# older account instead of finishing a new one, which is why the record has to
+# name the placeholder it came from -- the consuming route has no session to
+# read it out of, and it is the account that gets retired.
+MIGRATION_LINK_ORIGIN = "origin"
+MIGRATION_LINK_ORIGIN_REGISTRATION = "complete_registration"
+MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
+
 
 def _declared_citizen():
     """What the citizen said on the login screen, or None if they said nothing.
@@ -1579,7 +1593,15 @@ def _migration_link_send_allowed(user):
 
 
 def _issue_migration_link(
-    user, nic_hash, first_name, last_name, *, provider=None, citizen_declared=None
+    user,
+    nic_hash,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    origin=None,
+    placeholder_id=None,
 ):
     """Record a pending link request on ``user`` and return its token.
 
@@ -1595,6 +1617,10 @@ def _issue_migration_link(
     value left behind in one would not be there to read. A record written before
     either field existed carries none, and the link then completes without
     recording it.
+
+    ``origin`` and ``placeholder_id`` are written only when supplied, so a
+    wizard record keeps exactly the shape it had before they existed and every
+    branch reading them sees "absent" for the flow that never sets them.
     """
     nonce = secrets.token_urlsafe(32)
 
@@ -1609,6 +1635,13 @@ def _issue_migration_link(
         "citizen_declared": citizen_declared,
         "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
     }
+    # Written conditionally on purpose: a record that always carried the keys
+    # with None would be indistinguishable from one written by an older build,
+    # and the click has to tell those apart to know which flow it is in.
+    if origin:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_ORIGIN] = origin
+    if placeholder_id:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_PLACEHOLDER_ID] = str(placeholder_id)
 
     # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
     # outstanding sessions (LEDG-2134), and a password reset rotates it too,
@@ -1962,6 +1995,81 @@ def _send_migration_address_taken_notice(user):
         ],
     )
     send_mail(user, msg)
+
+
+def _mail_registration_association_link(requester, target):
+    """Mail ``target`` a link that moves ``requester``'s identity onto it.
+
+    The completion screen's second path. Someone signed in with a government
+    identity, was given a placeholder account, and typed the address of an
+    account they already had. Finishing registration for them means linking
+    the identity to that older account and retiring the placeholder -- and the
+    only acceptable proof that the address is theirs is opening the mail.
+
+    Returns True when a link went out, so the caller can fall back to the
+    silent notice. **It must not tell the caller anything else**: every return
+    path out of change_email is shared, and a branch that could be told apart
+    from out there would be the account oracle this whole flow exists without.
+
+    The guards are the wizard's, in the wizard's order (see
+    migration_send_link):
+
+    - the requester must still be pending and hold a linked identity. Without
+      the identity there is nothing to move, and the click would bind
+      ``nic_hash=None``;
+    - the target must be a real, finished, unlinked account. A deleted one is
+      nobody to mail; a placeholder is not the legacy account this path is
+      for; an already-linked one is somebody else's identity, and the click
+      would refuse anyway;
+    - issuing is destructive -- a fresh nonce lands on top of whatever record
+      the target already had -- so a live link belonging to another flow is
+      left alone. Without this, submitting addresses in a loop would void the
+      outstanding link of every owner it touched;
+    - and the per-target cap, because the address here is *typed*, which is
+      exactly the case MAX_MIGRATION_LINK_SENDS windows. change_email allows
+      five submissions a minute; without the cap that is three hundred mails
+      an hour at one address of the sender's choosing.
+    """
+    if not requester.has_placeholder_email or not _has_linked_nic(requester):
+        return False
+
+    if target.deleted or target.has_placeholder_email or _has_linked_nic(target):
+        return False
+
+    outstanding = (target.extras or {}).get(MIGRATION_LINK_PENDING)
+    if outstanding:
+        _, _, state = _migration_link_token_status_from_record(outstanding)
+        if state == "live":
+            return False
+
+    allowed, tally = _migration_link_send_allowed(target)
+    if not allowed:
+        return False
+
+    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+
+    extras = requester.extras or {}
+    token = _issue_migration_link(
+        target,
+        extras.get("auth_nic"),
+        requester.first_name,
+        requester.last_name,
+        # Bare gets, never a default: the record must describe the identity
+        # that actually signed in, and inventing a provider for an account
+        # that predates the field would be a worse answer than none.
+        provider=extras.get(AUTH_PROVIDER),
+        citizen_declared=extras.get(AUTH_CITIZEN_DECLARED),
+        origin=MIGRATION_LINK_ORIGIN_REGISTRATION,
+        placeholder_id=requester.id,
+    )
+    target.extras[MIGRATION_LINK_SEND_COUNT] = tally
+    target.save()
+
+    _send_migration_link(target, requester.first_name, requester.last_name, token)
+    current_app.logger.info(
+        f"Registration association link sent to user {target.id} for pending user {requester.id}"
+    )
+    return True
 
 
 def _mail_validation_link(pending, user, *, enforce_cap=True):

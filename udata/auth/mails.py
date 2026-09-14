@@ -105,6 +105,14 @@ def address_taken_notice(**kwargs) -> MailMessage:
     through SAML and have no usable password, so "use your password" would be
     impossible advice.
 
+    This is now the FALLBACK of that branch rather than all of it. A caller
+    still completing a government-identity registration is mailed an
+    association link instead -- a different instrument, granting the requesting
+    session nothing and acting only when the mailbox's owner clicks it (see
+    _mail_registration_association_link, LEDG-2431). This notice is what the
+    branch sends whenever that path does not apply or its guards refuse, and
+    the caller cannot tell the two apart: the response is the shared one.
+
     The sibling notice in the SAML migration wizard says the same thing for
     that flow, and is kept separate on purpose -- its copy names a digital
     identity, which is false here, because `change_email` is also reached from

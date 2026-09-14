@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
 from flask import current_app, url_for
@@ -192,6 +193,139 @@ class AuthTest(APITestCase):
 
         # Answered in the success shape; pinned against a free address below.
         assert resp.status_code == 302
+
+    def test_change_mail_taken_address_mails_association_link_to_placeholder_requester(self):
+        """The one case where a taken address is the destination, not a mistake.
+
+        A citizen signed in with the CMD, was given a placeholder account, and
+        typed the address of the account they already had. The sibling test
+        above pins what happens to everybody else: a silent notice with no
+        link. Here the owner is mailed an ASSOCIATION link instead -- which is
+        the difference between being stuck on the completion screen forever and
+        getting back into your own account.
+
+        The two requesters differ by exactly one thing: this one holds a linked
+        identity. That is what there is to move; the other has nothing, which
+        is why it still falls through to the notice.
+
+        What the CALLER sees is pinned separately, by the indistinguishability
+        test below and by the enumeration regression class. Nothing here may be
+        read as the caller learning anything.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MAX_MIGRATION_LINK_SENDS,
+            MIGRATION_LINK_ORIGIN,
+            MIGRATION_LINK_ORIGIN_REGISTRATION,
+            MIGRATION_LINK_PENDING,
+            MIGRATION_LINK_PLACEHOLDER_ID,
+            MIGRATION_LINK_SEND_COUNT,
+            _hash_nic,
+        )
+
+        requester = self.login(
+            UserFactory(
+                email="saml-deadbeef@autenticacao.gov.pt",
+                password=None,
+                extras={"auth_nic": _hash_nic("12345678")},
+                first_name="Pedro",
+                last_name="Nunes",
+            )
+        )
+        owner = UserFactory(email="taken@example.com")
+
+        with capture_mails() as mails:
+            resp = self._submit_change_email("taken@example.com")
+
+        # Still exactly one mail, still only to the mailbox that holds the
+        # address. The requester is told nothing, as in every other branch.
+        assert len(mails) == 1
+        assert mails[0].recipients == [owner.email]
+
+        # An association link, not a change-email confirmation: it grants this
+        # session nothing and acts only when the owner opens it.
+        assert "/saml/migration/confirm-link/" in mails[0].body
+        assert "confirm-change-email" not in mails[0].body
+
+        owner.reload()
+        record = owner.extras[MIGRATION_LINK_PENDING]
+        # The identity to move is the requester's, and the record names the
+        # placeholder to retire -- the click has no session to read either from.
+        assert record["nic_hash"] == _hash_nic("12345678")
+        assert record[MIGRATION_LINK_ORIGIN] == MIGRATION_LINK_ORIGIN_REGISTRATION
+        assert record[MIGRATION_LINK_PLACEHOLDER_ID] == str(requester.id)
+
+        # Emitting a link moves nothing by itself. Both accounts are exactly
+        # where they were until somebody proves the mailbox.
+        requester.reload()
+        assert requester.email == "saml-deadbeef@autenticacao.gov.pt"
+        assert owner.email == "taken@example.com"
+        assert not (owner.extras or {}).get("auth_nic")
+
+        assert resp.status_code == 302
+
+        # --- and now the refusals, which must all land on the silent notice ---
+
+        # A target that already holds an identity is somebody else's account.
+        linked = UserFactory(email="linked@example.com", extras={"auth_nic": _hash_nic("87654321")})
+        with capture_mails() as mails:
+            self._submit_change_email("linked@example.com")
+        assert len(mails) == 1
+        assert "/saml/migration/confirm-link/" not in mails[0].body
+        linked.reload()
+        assert MIGRATION_LINK_PENDING not in (linked.extras or {})
+
+        # A live link belonging to another flow is not overwritten. Issuing
+        # mints a fresh nonce over whatever was there, so without this guard
+        # submitting addresses in a loop would void the outstanding link of
+        # every owner it touched.
+        busy = UserFactory(email="busy@example.com")
+        busy.extras = {
+            MIGRATION_LINK_PENDING: {
+                "nonce": "irrelevant",
+                "nic_hash": _hash_nic("11112222"),
+                "expires": (datetime.utcnow() + timedelta(minutes=20)).isoformat(),
+            }
+        }
+        busy.save()
+        with capture_mails() as mails:
+            self._submit_change_email("busy@example.com")
+        assert len(mails) == 1
+        assert "/saml/migration/confirm-link/" not in mails[0].body
+        busy.reload()
+        assert busy.extras[MIGRATION_LINK_PENDING]["nonce"] == "irrelevant"
+
+        # The per-target cap. Reachable only once the previous record is gone
+        # -- while one is live the guard above refuses first -- so the tally is
+        # seeded rather than driven through six submissions that the live-link
+        # guard would refuse anyway. This is the ceiling that matters when the
+        # links are being consumed or left to expire, which is the only way a
+        # typed address can be mailed repeatedly.
+        capped = UserFactory(email="capped@example.com")
+        capped.extras = {
+            MIGRATION_LINK_SEND_COUNT: {
+                "count": MAX_MIGRATION_LINK_SENDS,
+                "window_start": datetime.utcnow().isoformat(),
+            }
+        }
+        capped.save()
+        with capture_mails() as mails:
+            self._submit_change_email("capped@example.com")
+        assert len(mails) == 1
+        assert "/saml/migration/confirm-link/" not in mails[0].body
+        capped.reload()
+        assert MIGRATION_LINK_PENDING not in (capped.extras or {})
+
+        # A requester with no linked identity has nothing to move. Without this
+        # guard the record would be written with nic_hash=None -- a link that
+        # opens a session and binds no identity at all.
+        self.login(UserFactory(email="saml-cafebabe@autenticacao.gov.pt", password=None))
+        untethered = UserFactory(email="untethered@example.com")
+        with capture_mails() as mails:
+            self._submit_change_email("untethered@example.com")
+        assert len(mails) == 1
+        assert "/saml/migration/confirm-link/" not in mails[0].body
+        untethered.reload()
+        assert MIGRATION_LINK_PENDING not in (untethered.extras or {})
 
     def test_change_mail_taken_address_answers_like_a_free_one(self):
         """The taken and free branches must be indistinguishable to the caller.
