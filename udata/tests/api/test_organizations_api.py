@@ -36,15 +36,6 @@ from udata.utils import faker
 # owns the production bug; strict=True means a fix turns the XPASS red and forces the
 # marker to be removed by the same change.
 
-R4 = (
-    "LEDG-2335 pending. udata/core/organization/api.py:245-247 demands site admin "
-    "whenever the payload carries a badges key, and to_dict() "
-    "(udata/mongo/document.py:55-67) always emits one, so an organization admin gets 403 "
-    "on a full PUT while editing anything at all. This is a production bug being "
-    "recorded, not a stale test: when it is fixed this starts passing and strict=True "
-    "turns the XPASS red, forcing the marker out."
-)
-
 R6 = (
     "LEDG-2337 pending. MembershipAcceptAPI.post (udata/core/organization/api.py:528-553) "
     "lost the invitation-kind guard that MembershipRefuseAPI still has at :568-569, so an "
@@ -143,7 +134,6 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         assert member.role == "admin", "Current user should be an administrator"
         assert org.get_metrics()["members"] == 1
 
-    @pytest.mark.xfail(strict=True, reason=R4)
     def test_organization_api_update(self):
         """It should update an organization from the API"""
         user = self.login()
@@ -178,7 +168,6 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         response = self.put(url_for("api.organization", org=org), data)
         assert403(response)
 
-    @pytest.mark.xfail(strict=True, reason=R4)
     def test_organization_api_update_business_number_id(self):
         """It should update an organization from the API by adding a business number id"""
         user = self.login()
@@ -191,7 +180,6 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         assert Organization.objects.count() == 1
         assert Organization.objects.first().business_number_id == "13002526500013"
 
-    @pytest.mark.xfail(strict=True, reason=R4)
     def test_organization_api_update_business_number_id_failing(self):
         """It should update an organization from the API by adding a business number id"""
         user = self.login()
