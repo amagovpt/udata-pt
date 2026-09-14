@@ -1722,6 +1722,21 @@ def _migration_link_token_status_from_record(record):
     return None, record, "live"
 
 
+def _association_exempt_ids(user, record):
+    """Which account ids may hold this record's NIC without invalidating it.
+
+    Always the account the link is for. For a registration association also
+    the placeholder named in the record, because the whole point of that click
+    is to take the identity off it.
+    """
+    exempt = [user.id]
+    if (record or {}).get(MIGRATION_LINK_ORIGIN) == MIGRATION_LINK_ORIGIN_REGISTRATION:
+        placeholder_id = record.get(MIGRATION_LINK_PLACEHOLDER_ID)
+        if placeholder_id and ObjectId.is_valid(placeholder_id):
+            exempt.append(ObjectId(placeholder_id))
+    return exempt
+
+
 def _migration_link_token_status(token):
     """Resolve a validation-link token to ``(user, record, state)``.
 
@@ -1799,7 +1814,24 @@ def _migration_link_token_status(token):
     # would leave one identity on two accounts, and the login lookup resolves
     # by auth_nic ordered by -created_at, so the newer one silently wins.
     # migration_skip already refuses a NIC that is taken; so must this.
-    if User.objects(extras__auth_nic=record.get("nic_hash"), id__ne=user.id).first():
+    # One id is always exempt: the account this link is for. A registration
+    # association link exempts a second -- the placeholder fixed into the
+    # record when the link was issued. That account is the one whose identity
+    # is being moved, so of course it still holds the NIC; without the
+    # exemption every click of this origin would resolve "invalid" and the
+    # flow could never complete once.
+    #
+    # This does not reopen what the guard is for. The exempt id is written
+    # server-side from a session that had already proved the identity, is
+    # never supplied by the click, and the same click retires that account. A
+    # THIRD account that acquired the NIC in the meantime -- the password
+    # branch, migration_skip -- is still found here and still refuses, which
+    # is the case the guard was written for.
+    claimed_elsewhere = User.objects(
+        extras__auth_nic=record.get("nic_hash"),
+        id__nin=_association_exempt_ids(user, record),
+    ).first()
+    if claimed_elsewhere:
         return user, None, "invalid"
 
     expires = _parse_isoformat(record.get("expires"))
@@ -3506,6 +3538,112 @@ def migration_send_link():
     return jsonify({"sent": True})
 
 
+def _complete_registration_association(target, record):
+    """Move a pending registration's identity onto the account that was clicked.
+
+    The order of the three writes is the whole design, and it is not the
+    obvious one.
+
+    The identity leaves the placeholder FIRST, before anything is bound to the
+    target. Do it the other way round and there is a window in which both
+    accounts hold the same NIC -- and the login lookup refuses that outright
+    (see _accounts_claiming_nic and "ambiguous_identity"), so a failure in the
+    window would lock the citizen out of BOTH accounts until a human
+    intervened. Failing between the unset and the link instead leaves the
+    identity on no account at all, which the next CMD sign-in resolves by
+    itself: the citizen is simply back where they started.
+
+    Then _link_identity_and_login, untouched. It is the single place that
+    binds an identity and clears the pending record, and this route is a
+    caller of it, never a second implementation of it.
+
+    The placeholder is retired last, and by mark_as_deleted rather than the
+    raw delete the administrative merge uses. That merge retires an account
+    minted moments earlier; this one has had a full session since before the
+    completion screen appeared -- the gate that holds it there is client-side
+    -- so it may own follows, API tokens and contact points, and the raw
+    delete would leave every one of them pointing at a document that is gone.
+    """
+    from udata.core.user.models import User
+
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+
+    placeholder_id = record.get(MIGRATION_LINK_PLACEHOLDER_ID)
+    placeholder = (
+        User.objects(id=placeholder_id).first()
+        if placeholder_id and ObjectId.is_valid(placeholder_id)
+        else None
+    )
+
+    if placeholder:
+        # Atomic, and deliberately not a save() of the loaded document: the
+        # only field that must change here is this one, and writing the whole
+        # document back would carry along anything read before the click.
+        User.objects(id=placeholder.id).update_one(unset__extras__auth_nic=True)
+
+    _link_identity_and_login(
+        target,
+        record.get("nic_hash"),
+        record.get("first_name"),
+        record.get("last_name"),
+        provider=record.get("provider"),
+        citizen_declared=record.get("citizen_declared"),
+    )
+
+    if placeholder:
+        # Guarded because the association is already done and must stand. A
+        # placeholder left behind is inert -- no identity, a synthetic address
+        # -- and the reconciliation command finds it; an exception raised here
+        # would answer a completed link with a 500 the citizen cannot retry.
+        try:
+            placeholder.reload()
+            _move_follows(placeholder, target)
+            placeholder.mark_as_deleted(notify=False)
+        except Exception as exc:
+            current_app.logger.error(
+                f"Registration association: identity moved to user {target.id} but "
+                f"placeholder {placeholder.id} was not retired: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    current_app.logger.info(
+        f"Registration association completed: user {target.id} "
+        f"linked from placeholder {placeholder_id}"
+    )
+    return redirect(frontend_url or "/")
+
+
+def _move_follows(placeholder, target):
+    """Re-point the placeholder's follows at the account that survives.
+
+    mark_as_deleted deletes follows outright, in both directions, and a
+    pending account is the likeliest of all to have some: it holds a full
+    session from the moment the assertion comes back, and the screen that
+    holds it is enforced in the browser, not in the API. Refusing the whole
+    association over a followed dataset would block the case this flow exists
+    for, at the cost of something nobody would miss losing the option to keep.
+
+    This is not the content transfer the design refused. Ownership, authorship
+    and attribution stay where they are and are what the refusal protects; a
+    follow is the person's own preference, and the person is the same.
+    """
+    from udata.core.followers.models import Follow
+
+    for follow in Follow.objects(follower=placeholder):
+        if Follow.objects(follower=target, following=follow.following, until=None).count():
+            follow.delete()
+        else:
+            follow.follower = target
+            follow.save()
+
+    for follow in Follow.objects(following=placeholder):
+        if Follow.objects(follower=follow.follower, following=target, until=None).count():
+            follow.delete()
+        else:
+            follow.following = target
+            follow.save()
+
+
 @autenticacao_gov.route("/saml/migration/confirm-link/<token>", methods=["GET"])
 @csrf.exempt
 def migration_confirm_link(token):
@@ -3523,10 +3661,18 @@ def migration_confirm_link(token):
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     wizard_url = f"{frontend_url}/migrate-account"
 
-    if not _migration_enabled():
-        return redirect(f"{wizard_url}?flash=migration_link_invalid")
-
+    # The token is resolved BEFORE the flag is read, so the route can tell
+    # which flow the click belongs to before deciding whether the flag applies
+    # to it. It does not apply to a registration association: that origin is
+    # not the migration wizard, it is the only way a citizen held on the
+    # completion screen reaches the account they already had, and it has to
+    # keep working wherever the wizard is closed. Wizard records answer exactly
+    # as before -- what moved is the order of the reads, not their verdict.
     user, record, state = _migration_link_token_status(token)
+    origin = (record or {}).get(MIGRATION_LINK_ORIGIN)
+
+    if not _migration_enabled() and origin != MIGRATION_LINK_ORIGIN_REGISTRATION:
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
 
     if state == "already_done":
         return redirect(f"{wizard_url}?flash=migration_link_already_done")
@@ -3541,7 +3687,16 @@ def migration_confirm_link(token):
         # let a scanner keep an old mail alive indefinitely, each pass minting
         # a fresh link with a fresh deadline. The user re-authenticates
         # instead — a few seconds of CMD, and something only they can trigger.
+        if origin == MIGRATION_LINK_ORIGIN_REGISTRATION:
+            # No flash: the completion screen is still there, still holding
+            # this citizen, and resubmitting the same address mails a fresh
+            # link. Telling them the link expired on a page that already asks
+            # for the address adds nothing they cannot see.
+            return redirect(f"{frontend_url}/complete-registration")
         return redirect(f"{wizard_url}?flash=migration_link_expired")
+
+    if origin == MIGRATION_LINK_ORIGIN_REGISTRATION:
+        return _complete_registration_association(user, record)
 
     _link_identity_and_login(
         user,

@@ -4615,6 +4615,142 @@ class SAMLMigrationLinkClickTest(APITestCase):
     def _deactivate(self, user):
         self._set_active(user, False)
 
+    def _issue_association_link(
+        self,
+        *,
+        target_email="rita.old@example.pt",
+        nic="50607080",
+        placeholder_email="saml-deadbeef@autenticacao.gov.pt",
+    ):
+        """Drive the completion screen to the point of having mailed an
+        association link, and return (placeholder, target, token).
+
+        Driven through change_email rather than by writing a record by hand:
+        the record's shape is the contract between the two halves of this
+        flow, and a hand-written one would pass even if the emitting side
+        stopped producing it.
+        """
+        from flask import url_for
+
+        placeholder = self.login(
+            UserFactory(
+                email=placeholder_email,
+                password=None,
+                extras={"auth_nic": _hash_nic(nic)},
+                first_name="Rita",
+                last_name="Santos",
+            )
+        )
+        target = UserFactory(
+            email=target_email, password="S3cretPass!", first_name="rita", last_name="antiga"
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            resp = self.post(
+                url_for("security.change_email"),
+                {
+                    "new_email": target_email,
+                    "new_email_confirm": target_email,
+                    "submit": True,
+                },
+                json=False,
+            )
+            assert resp.status_code == 302
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            assert len(ctas) == 1
+        return placeholder, target, ctas[0].link.rsplit("/", 1)[1]
+
+    def test_registration_link_click_links_target_and_retires_placeholder_with_migration_mode_off(
+        self,
+    ):
+        """The completion screen's association, end to end, with the wizard shut.
+
+        MIGRATION_MODE_ENABLED off is the case that matters: this origin is not
+        the wizard, and a citizen held on the completion screen must be able to
+        reach their own account wherever the wizard is closed. Before this, the
+        flag was read before the token, so every click answered "invalid".
+
+        Also pins the exemption the resolver needs: the placeholder still holds
+        the NIC at click time -- it is what is being moved -- and the guard
+        against a second claimant would otherwise refuse every click of this
+        origin.
+        """
+        from udata.core.followers.models import Follow
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        placeholder, target, token = self._issue_association_link()
+
+        # Something the placeholder did while it was held on the screen. The
+        # session is live from the assertion onward and the gate is enforced in
+        # the browser, so this is ordinary, not exotic.
+        followed = UserFactory()
+        Follow(follower=placeholder, following=followed).save()
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{token}")
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == target.id
+
+        # The destination, not the wizard: this citizen never was in it.
+        assert response.status_code == 302
+        assert response.headers["Location"] == "http://localhost:3000"
+
+        # The identity now sits on the older account, with the record consumed.
+        target.reload()
+        assert target.extras["auth_nic"] == _hash_nic("50607080")
+        assert "migration_link_pending" not in target.extras
+
+        # And on exactly one account: the placeholder was retired, so the next
+        # CMD sign-in resolves to the older account instead of refusing both
+        # for holding the same identity.
+        assert User.objects(extras__auth_nic=_hash_nic("50607080")).count() == 1
+        placeholder.reload()
+        assert placeholder.deleted
+        assert not (placeholder.extras or {}).get("auth_nic")
+
+        # The follow went with the person rather than being deleted with the
+        # account it happened to be made from.
+        assert Follow.objects(follower=target, following=followed).count() == 1
+        assert Follow.objects(follower=placeholder).count() == 0
+
+        # --- and the reason the identity leaves the placeholder FIRST ---
+        #
+        # In the happy path the order cannot be observed: mark_as_deleted
+        # clears extras anyway, so both orders end identically. It is only
+        # visible when the retirement fails, and that is the case the order
+        # was chosen for. Bind the identity first and a failure here leaves it
+        # on TWO accounts -- which the login lookup refuses outright, locking
+        # the citizen out of both until a human intervenes. Clearing first
+        # leaves it on none, and the next CMD sign-in puts things right by
+        # itself.
+        second_placeholder, second_target, second_token = self._issue_association_link(
+            target_email="nuno.old@example.pt",
+            nic="10203040",
+            placeholder_email="saml-cafebabe@autenticacao.gov.pt",
+        )
+
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                with patch.object(
+                    User, "mark_as_deleted", side_effect=RuntimeError("mongo is having a day")
+                ):
+                    response = fresh.get(f"/saml/migration/confirm-link/{second_token}")
+
+        # The association still stands: a completed link is not undone by a
+        # failure in the bookkeeping that follows it.
+        assert response.status_code == 302
+        second_target.reload()
+        assert second_target.extras["auth_nic"] == _hash_nic("10203040")
+
+        # And the identity is on exactly one account even though the
+        # placeholder survived. This is the assertion the ordering exists for.
+        assert User.objects(extras__auth_nic=_hash_nic("10203040")).count() == 1
+        second_placeholder.reload()
+        assert not second_placeholder.deleted
+        assert not (second_placeholder.extras or {}).get("auth_nic")
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_an_inactive_account_does_not_burn_the_validation_link(self, mock_client_for):
         """LEDG-2465: the click could not have produced a session anyway.
