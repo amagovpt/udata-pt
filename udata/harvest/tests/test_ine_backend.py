@@ -294,6 +294,31 @@ class INEUniqueOwnershipTest(PytestOnlyDBTestCase):
         assert "(revista)" not in kept.description
         assert kept.harvest.source_id == str(source1.id)
 
+    def test_unchanged_record_of_another_owner_is_refused_not_skipped(self, rmock, tmp_path):
+        """The guard runs before change detection, not only before the write.
+
+        With identical metadata the record takes the SKIP branch, which writes
+        nothing — so a guard placed only on the update path would look just as
+        correct as this one. It is not: an unchanged record belonging to someone
+        else would then be reported as "skipped" against this source, which
+        reads as a record this source legitimately harvested and found current.
+        """
+        source1 = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        self._harvest(rmock, tmp_path, source1, ["0001"])
+
+        source2 = HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory()
+        )
+        job = self._harvest(rmock, tmp_path, source2, ["0001"])
+
+        assert job.status == "done-errors"
+        assert [item.status for item in job.items] == ["failed"]
+        assert "another owner" in job.items[0].errors[0].message
+        # The failure points at the record it is about, not just at its owner.
+        assert job.items[0].dataset == self._dataset("0001").id
+
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])
 class INEPreviewDoesNotWriteTest(PytestOnlyDBTestCase):
