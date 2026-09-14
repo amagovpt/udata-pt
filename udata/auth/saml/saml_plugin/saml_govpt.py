@@ -430,6 +430,88 @@ MDC_ATTR_NIC = "http://interop.gov.pt/MDC/Cidadao/NIC"
 MDC_ATTR_FIRST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
 MDC_ATTR_LAST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
 
+# The document a foreign citizen's CMD was created with. A foreigner has no
+# NIC, so these three together are the only identity the assertion carries.
+MDC_ATTR_DOC_TYPE = "http://interop.gov.pt/MDC/Cidadao/DocType"
+MDC_ATTR_DOC_NATIONALITY = "http://interop.gov.pt/MDC/Cidadao/DocNationality"
+MDC_ATTR_DOC_NUMBER = "http://interop.gov.pt/MDC/Cidadao/DocNumber"
+
+# The document types autenticacao.gov issues to a FOREIGN citizen: residence
+# permit, passport, residence card, residence authorisation certificate.
+#
+# The composition below is gated on this set on purpose. A national's assertion
+# normally carries a NIC and never reaches it -- but "normally" is not a
+# guarantee, and without the gate an assertion that merely lost its NIC would
+# be resolved to a brand-new composed identity instead of falling through to
+# the email/name branches. That is the fastest way to lock a national out of
+# their own account, which is the one thing this ticket must not do.
+MDC_FOREIGN_DOC_TYPES = frozenset({"TR", "PAS", "CR", "DR"})
+
+
+def _compose_foreign_identifier(doc_type, doc_nationality, doc_number):
+    """Build the identity string for a foreign citizen, from their document.
+
+    🚨 THIS COMPOSITION IS FROZEN. It is the pre-image of a one-way HMAC, and
+    the digest is the key the login resolves accounts by. Change the order, the
+    separator, the casing or the leading segment and every foreign citizen
+    already registered stops matching their own account, with no way to
+    recompute the stored values. Treat it the way a database migration is
+    treated: additive only, never edited.
+
+    Why a composition at all, rather than the document number alone: the number
+    is not unique across types. A passport number and a residence permit number
+    can coincide, and ``DocNationality`` is forced to "PT" on residence permits
+    and residence cards, so what separates two holders is the type plus the
+    number. Hashing the number alone would hand two different people the same
+    identity, and therefore the same account -- worse than a duplicate, it is
+    somebody else's session.
+
+    Why the leading "MDC" segment, which is the part that looks superfluous:
+    "TR" and "CR" are valid ISO 3166-1 alpha-2 codes (Turkey, Costa Rica), and
+    an eIDAS PersonIdentifier has the shape "<alpha2>/<alpha2>/<id>" -- the
+    "ES/PT/..." named in _find_or_create_saml_user. With the nationality forced
+    to "PT", a residence-permit holder would compose "TR/PT/123456", which is
+    byte for byte what a Turkish citizen signing in through eIDAS presents.
+    The two would share an account. "MDC" is three characters and can never be
+    an alpha-2 code, so the three identifier classes stay disjoint: a NIC is
+    digits only, an eIDAS identifier starts with a country code, ours with MDC.
+
+    ⚠️ This is NOT the provider prefix that ``udata/core/user/nic.py`` forbids.
+    That prohibition is about the STORED value ("cmd-<hash>"), and its argument
+    is that hashes already written cannot be recomputed into a prefixed form.
+    This segment lives in the PRE-IMAGE: what is stored is still a bare 64-hex
+    digest, ``is_nic_hashed`` still holds, and no existing value is touched.
+    The sibling keys that note prescribes still apply -- the document type and
+    nationality are also recorded in ``extras``, in the clear, for counting.
+
+    ⚠️ Known and accepted: this identity is LESS STABLE than a NIC. A residence
+    permit is renewed and changes number; a passport expires and is replaced.
+    When that happens the digest changes and the person arrives as a brand-new
+    identity, leaving the old account -- with its datasets and its organization
+    memberships -- unreachable, often behind a placeholder email nobody reads.
+    A verified email is the only thing that survives a document swap, which is
+    why it matters more for foreign citizens than for nationals. Reuniting the
+    two accounts is support work, not something this function can do.
+
+    Returns None when any attribute is missing or the type is not a foreign
+    one, so the caller falls through to the existing email/name branches
+    instead of minting an identity from half an answer.
+    """
+    if not (doc_type and doc_nationality and doc_number):
+        return None
+    doc_type = doc_type.strip().upper()
+    if doc_type not in MDC_FOREIGN_DOC_TYPES:
+        return None
+    # Upper-cased, including the number. The eIDAS PersonIdentifier is passed
+    # through verbatim, but it is an opaque string minted by another state --
+    # this is a number printed on a Portuguese document, and this project's own
+    # audit has already seen one carrying letters ("4595P5L28"). The risks are
+    # not symmetric: normalising risks colliding two documents that differ only
+    # in case, which do not exist; not normalising risks failing to recognise a
+    # person whose IdP sent a different casing, which locks them out.
+    return f"MDC/{doc_type}/{doc_nationality.strip().upper()}/{doc_number.strip().upper()}"
+
+
 # eIDAS natural-person attribute URIs. Field mapping to the CMD equivalents:
 # PersonIdentifier → NIC slot (extras.auth_nic, HMAC-hashed),
 # CurrentGivenName → first_name (NomeProprio), CurrentFamilyName → last_name
@@ -931,11 +1013,21 @@ def _accounts_claiming_nic(user_nic, limit=2):
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
 
-    ``user_nic`` carries the unique identifier of the authenticated identity:
-    the NIC for CMD logins, or the eIDAS PersonIdentifier (e.g. "ES/PT/...")
-    for eIDAS logins. Both are HMAC-hashed into ``extras.auth_nic`` — the
-    formats cannot collide, and every lookup/linking rule below applies to
-    either provider identically.
+    ``user_nic`` carries the unique identifier of the authenticated identity,
+    in one of THREE formats: the NIC for a national CMD login; the eIDAS
+    PersonIdentifier ("<alpha2>/<alpha2>/<id>", e.g. "ES/PT/...") for eIDAS;
+    and "MDC/<DocType>/<DocNationality>/<DocNumber>" for a foreign citizen
+    signing in with CMD, who has no NIC (see _compose_foreign_identifier).
+    All three are HMAC-hashed into ``extras.auth_nic`` — the formats cannot
+    collide, and every lookup/linking rule below applies to any of them
+    identically.
+
+    ⚠️ "Cannot collide" is an invariant that is maintained, not one that comes
+    for free: a NIC is digits only, an eIDAS identifier opens with a country
+    code, and the third opens with "MDC", which is three characters and so can
+    never be one. Two of the four document types ARE valid alpha-2 codes, so
+    without that leading segment the third format would overlap the second.
+    Anything added to this list has to keep the three disjoint.
 
     Decision order:
     1. NIC already linked (hashed, or stored in plain form by an old plugin
@@ -1125,7 +1217,15 @@ def _record_login_activity(user):
         )
 
 
-def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_declared=None):
+def _handle_saml_user_login(
+    user,
+    new_account=False,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+):
     """Handle login/redirect after SAML authentication.
 
     When ``new_account`` is True the redirect carries ``cmd_new_account=1``
@@ -1242,14 +1342,28 @@ def _handle_saml_user_login(user, new_account=False, *, provider=None, citizen_d
     # (Not the same call as the mail sends that deliberately re-raise: there,
     # swallowing made a failure the user cared about look successful. Here the
     # outcome the user came for still happens.)
-    if provider or citizen_declared:
-        from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    if provider or citizen_declared or doc_type or doc_nationality:
+        from udata.core.user.constants import (
+            AUTH_CITIZEN_DECLARED,
+            AUTH_DOC_NATIONALITY,
+            AUTH_DOC_TYPE,
+            AUTH_PROVIDER,
+        )
 
         incoming = {}
         if provider:
             incoming[AUTH_PROVIDER] = provider
         if citizen_declared:
             incoming[AUTH_CITIZEN_DECLARED] = citizen_declared
+        # The verified counterpart of the declared type. The caller passes
+        # these only when the document -- not a NIC -- was what identified the
+        # person, so they describe the identity that is actually stored in
+        # auth_nic rather than an attribute that merely came along for the
+        # ride. Never the document number: that one lives only in the digest.
+        if doc_type:
+            incoming[AUTH_DOC_TYPE] = doc_type
+        if doc_nationality:
+            incoming[AUTH_DOC_NATIONALITY] = doc_nationality
 
         # Only what actually differs, so a repeat login is not a repeat write,
         # and one save for both keys rather than one each.
@@ -2029,10 +2143,16 @@ def sp_initiated():
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
+            # Optional, not required: isRequired tells the IdP the sign-in
+            # cannot proceed without the attribute, and a foreign citizen has
+            # no NIC to give. Demanding it is what shuts them out today. The
+            # IdP still sends it whenever it exists -- the flag governs the
+            # failure, not the supply -- and an assertion that arrives without
+            # one already falls through to the existing branches.
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="True",
+                is_required="False",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_FIRST_NAME,
@@ -2043,6 +2163,24 @@ def sp_initiated():
                 name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
+            ),
+            # The foreign citizen's document. Optional for the mirror-image
+            # reason: a national's CMD may not carry these at all, and asking
+            # for them as required would trade one excluded group for another.
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_TYPE,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="False",
+            ),
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_NATIONALITY,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="False",
+            ),
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_NUMBER,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="False",
             ),
         ]
     )
@@ -2107,6 +2245,7 @@ def sp_initiated():
 def idp_initiated():
     user_email = None
     user_nic = None
+    doc_type = doc_nationality = doc_number = None
     first_name = None
     last_name = None
     authn_response = None
@@ -2276,9 +2415,14 @@ def idp_initiated():
             user_nic = _first_value(identity, MDC_ATTR_NIC)
             first_name = _first_value(identity, MDC_ATTR_FIRST_NAME)
             last_name = _first_value(identity, MDC_ATTR_LAST_NAME)
+            doc_type = _first_value(identity, MDC_ATTR_DOC_TYPE)
+            doc_nationality = _first_value(identity, MDC_ATTR_DOC_NATIONALITY)
+            doc_number = _first_value(identity, MDC_ATTR_DOC_NUMBER)
             current_app.logger.warning(
                 f"[DEBUG] SAML atributos extraídos: email={user_email!r}, "
                 f"nic_present={bool(user_nic)}, nome={first_name!r} {last_name!r}, "
+                f"doc_type={doc_type!r}, doc_nationality={doc_nationality!r}, "
+                f"doc_number_present={bool(doc_number)}, "
                 f"identity_keys={list(identity.keys()) if identity else None}"
             )
         else:
@@ -2293,9 +2437,9 @@ def idp_initiated():
     except Exception as e:
         current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
 
-    if not user_email and not user_nic:
+    if not user_email and not user_nic and not doc_number:
         current_app.logger.error(
-            "SAML SSO: nenhum atributo extraído (email/NIC). "
+            "SAML SSO: nenhum atributo extraído (email/NIC/documento). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
             "tem acesso à chave privada para desencriptar."
         )
@@ -2326,7 +2470,17 @@ def idp_initiated():
             reason="subject_nic_mismatch",
         )
 
-    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    # A foreign citizen has no NIC, so their document is the identity. The NIC
+    # wins whenever there is one: a national's stored auth_nic must keep
+    # matching hash_nic(nic) byte for byte, and nothing here may change that.
+    #
+    # The NameID↔NIC binding above deliberately stays keyed on user_nic. That
+    # check is about the NIC attribute specifically -- the Subject would never
+    # carry the composed string -- so it is skipped for a foreigner exactly as
+    # it already is for any assertion that arrives without a NIC.
+    user_identifier = user_nic or _compose_foreign_identifier(doc_type, doc_nationality, doc_number)
+
+    user, status = _find_or_create_saml_user(user_email, user_identifier, first_name, last_name)
     current_app.logger.warning(
         f"[DEBUG cmd] post _find_or_create_saml_user: user_id={getattr(user, 'id', None)}, "
         f"user_email={getattr(user, 'email', None)!r}, status={status!r}, "
@@ -2400,7 +2554,7 @@ def idp_initiated():
             return _handle_migration_redirect(
                 user,
                 user_email,
-                user_nic,
+                user_identifier,
                 first_name,
                 last_name,
                 no_match=(status == "no_match"),
@@ -2411,7 +2565,7 @@ def idp_initiated():
         # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(
             user_email,
-            user_nic,
+            user_identifier,
             first_name,
             last_name,
             provider=AUTH_PROVIDER_CMD,
@@ -2437,6 +2591,11 @@ def idp_initiated():
         new_account=(status == "new"),
         provider=AUTH_PROVIDER_CMD,
         citizen_declared=_declared_citizen(),
+        # Only when the document was the identity. For a national the NIC won
+        # in the composition above, so recording the document here would
+        # describe something other than what auth_nic actually holds.
+        doc_type=None if user_nic else doc_type,
+        doc_nationality=None if user_nic else doc_nationality,
     )
 
 
