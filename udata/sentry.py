@@ -80,6 +80,17 @@ def init_app(app: UDataApp):
         # turn every successful send into an INFO breadcrumb.
         ignore_logger("udata.mail.audit")
 
+        # Same reasoning for the SAML SSO audit log, and one extra reason that
+        # is the sharper one: the line carries `ip=` and `ua=`. This project
+        # never sets `send_default_pii`, so it runs with the SDK default of
+        # NOT sending them -- and LoggingIntegration hooks `callHandlers` at
+        # INFO, which sees records whether or not a handler is attached. Left
+        # alone, making that logger emit (LEDG-2371) would have pushed the
+        # address and user agent of every sign-in into Sentry through a side
+        # door, undoing a deliberate setting. It was moot before only because
+        # the logger emitted nothing at all.
+        ignore_logger("udata.auth.saml.audit")
+
         # Set log level
         log_level_name = app.config["SENTRY_LOGGING"]
         if log_level_name:

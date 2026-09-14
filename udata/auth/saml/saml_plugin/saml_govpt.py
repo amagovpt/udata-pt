@@ -664,7 +664,19 @@ def _check_and_record_replay(response_id, kind, ttl=None):
     return True
 
 
-audit_logger = logging.getLogger("saml.audit")
+# Dedicated audit logger: one line per terminal SSO decision, so "what
+# happened to this sign-in?" can be answered from the backoffice log page
+# instead of reconstructed. It lives under `udata.*` on purpose — the records
+# propagate to the handlers of the `udata` logger (`app.logger`), whose stderr
+# uwsgi writes to the file that page reads. Its level is pinned in
+# `udata.auth.init_app` because `udata` is set to WARNING in production, which
+# a child with no level of its own would inherit, silently dropping every line.
+#
+# It was "saml.audit" until LEDG-2371, and that name was two bugs at once: no
+# level of its own, and a top-level logger outside the tree whose records
+# propagated to a root with no handler. Between May and September it emitted
+# nothing at all, which is why nothing can depend on the old name.
+audit_logger = logging.getLogger("udata.auth.saml.audit")
 
 
 def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
@@ -2252,6 +2264,11 @@ def idp_initiated():
 
     raw_saml_response = request.form.get("SAMLResponse")
     if not raw_saml_response:
+        # A POST to the ACS with no assertion at all. Audited as `error`, not
+        # `rejected`: nothing was decided about anybody -- the request never
+        # carried an identity to decide on. Without this the funnel simply
+        # ends here with no trace, which is the gap LEDG-2371 closes.
+        _audit_saml("error", "cmd", reason="missing_saml_response")
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
@@ -2808,6 +2825,8 @@ def idp_eidas_initiated():
 
     raw_saml_response = request.form.get("SAMLResponse")
     if not raw_saml_response:
+        # Same as the CMD route: a malformed request, audited as `error`.
+        _audit_saml("error", "eidas", reason="missing_saml_response")
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
