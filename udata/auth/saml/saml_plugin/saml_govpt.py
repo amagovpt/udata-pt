@@ -2111,10 +2111,16 @@ def sp_initiated():
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
+            # Optional, not required: isRequired tells the IdP the sign-in
+            # cannot proceed without the attribute, and a foreign citizen has
+            # no NIC to give. Demanding it is what shuts them out today. The
+            # IdP still sends it whenever it exists -- the flag governs the
+            # failure, not the supply -- and an assertion that arrives without
+            # one already falls through to the existing branches.
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="True",
+                is_required="False",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_FIRST_NAME,
@@ -2125,6 +2131,24 @@ def sp_initiated():
                 name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
+            ),
+            # The foreign citizen's document. Optional for the mirror-image
+            # reason: a national's CMD may not carry these at all, and asking
+            # for them as required would trade one excluded group for another.
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_TYPE,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="False",
+            ),
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_NATIONALITY,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="False",
+            ),
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_NUMBER,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="False",
             ),
         ]
     )

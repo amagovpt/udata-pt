@@ -7243,3 +7243,67 @@ class SAMLForeignIdentifierCompositionTest(APITestCase):
 
         assert _compose_foreign_identifier("CC", "PT", "123456") is None
         assert _compose_foreign_identifier("BI", "PT", "123456") is None
+
+
+class SAMLRequestedAttributesTest(APITestCase):
+    """What the CMD AuthnRequest asks the IdP for.
+
+    🚩 Nothing asserted this before: `grep RequestedAttribute` over this file
+    returned nothing. So the 200-odd tests here covered every branch of what we
+    do with the answer and none of the question -- which is the only thing that
+    changes for a national in this ticket.
+    """
+
+    def _requested_attributes(self, mock_client_for):
+        """Start a CMD login and read back the RequestedAttributes we sent."""
+        mock_saml_client = MagicMock()
+        mock_saml_client.prepare_for_authenticate.return_value = (
+            "reqid-1",
+            {"data": '<form action="https://idp.example/sso">'},
+        )
+        mock_client_for.return_value = mock_saml_client
+
+        self.client.get("/saml/login")
+
+        kwargs = mock_saml_client.prepare_for_authenticate.call_args.kwargs
+        extensions = kwargs["extensions"]
+        # The RequestedAttributes element is the second extension (FAAALevel
+        # is the first); read every RequestedAttribute out of whichever one
+        # carries them rather than relying on the order.
+        found = {}
+        for element in extensions.extension_elements:
+            for child in element.children:
+                name = child.attributes.get("Name")
+                if name:
+                    found[name] = child.attributes.get("isRequired")
+        return found
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_cmd_authn_request_asks_document_attributes_and_optional_nic(self, mock_client_for):
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MDC_ATTR_DOC_NATIONALITY,
+            MDC_ATTR_DOC_NUMBER,
+            MDC_ATTR_DOC_TYPE,
+            MDC_ATTR_EMAIL,
+            MDC_ATTR_FIRST_NAME,
+            MDC_ATTR_LAST_NAME,
+            MDC_ATTR_NIC,
+        )
+
+        requested = self._requested_attributes(mock_client_for)
+
+        # The three that identify a foreign citizen's document are now asked
+        # for -- without them the assertion carries no identity at all.
+        for attribute in (MDC_ATTR_DOC_TYPE, MDC_ATTR_DOC_NATIONALITY, MDC_ATTR_DOC_NUMBER):
+            assert attribute in requested, f"{attribute} is not requested"
+            assert requested[attribute] == "False"
+
+        # And the NIC is no longer demanded: isRequired tells the IdP the
+        # sign-in cannot proceed without it, which is what excludes a foreigner.
+        assert requested[MDC_ATTR_NIC] == "False"
+
+        # Everything else is untouched. Email and the names stay required, so
+        # nothing about a national's consent screen changes here.
+        assert requested[MDC_ATTR_EMAIL] == "True"
+        assert requested[MDC_ATTR_FIRST_NAME] == "True"
+        assert requested[MDC_ATTR_LAST_NAME] == "True"
