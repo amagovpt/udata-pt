@@ -14,9 +14,11 @@
     admins in both directions: adding one and dropping one are equally refused.
     When the sets match, the badges are left alone entirely instead of being
     rewritten to the same value.
-  - A badges payload whose `kind` is not a string is now rejected with 400
-    rather than reaching the comparison, where an unhashable value used to
-    surface as a 500.
+  - A badges payload whose `kind` is not a string is now rejected with 400.
+    It used to reach the badge machinery unchecked and surface as a 500 — only
+    for a site admin, since the permission check ran first; moving the parse
+    ahead of that check would have opened the same 500 to every editor, so the
+    validation closes it for both.
 
 - **fix(saml): the SSO audit log now actually reaches the log file**
   - The authentication funnel writes one structured line per terminal decision

@@ -243,10 +243,13 @@ class OrganizationAPI(API):
         payload = request.json or {}
         badge_kinds = None
         if "badges" in payload:
-            # A full-object PUT always carries a badges key, because to_dict()
-            # serializes every stored field. Only an actual change of the badge
-            # set is a site-admin operation: echoing back what is already there
-            # must not cost an organization admin their own edit permission.
+            # A full-object PUT always carries a badges key: org_fields marshals
+            # badges as a list on every read, and to_dict() emits every stored
+            # field, so both an API client echoing back what it read and the
+            # test suite send one whether or not they touched it. Only an actual
+            # change of the badge set is a site-admin operation: echoing back
+            # what is already there must not cost an organization admin their
+            # own edit permission.
             submitted_kinds = _parse_badge_kinds(payload["badges"])
             if set(submitted_kinds) != {badge.kind for badge in org.badges}:
                 admin_permission.test()
