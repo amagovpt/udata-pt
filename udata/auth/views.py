@@ -237,6 +237,18 @@ def change_email():
         # a spelling that differs only in case is the SAME mailbox, so it is
         # taken. This widens what counts as taken -- deliberately -- and the
         # answer to the caller must stay identical either way.
+        # Run BEFORE the address is looked up, and unconditionally. The
+        # migration notice's own budget check does the same thing for the same
+        # reason: work that happens only on one branch is work an attacker can
+        # time. It reads nothing but the caller's own account, so running it on
+        # the free branch too costs a query and discloses nothing.
+        from udata.auth.saml.saml_plugin.saml_govpt import _placeholder_owns_content
+
+        requester = current_user._get_current_object()
+        requester_owns_content = requester.has_placeholder_email and _placeholder_owns_content(
+            requester
+        )
+
         existing = find_user_by_email_ci(new_email)
         if existing and existing.id != current_user.id:
             # mark_as_deleted rewrites the address to <id>@deleted, so a row
@@ -251,11 +263,19 @@ def change_email():
             # shared exit below either way.
             from udata.auth.saml.saml_plugin.saml_govpt import (
                 _mail_registration_association_link,
+                _send_association_refused_notice,
             )
 
-            if not existing.deleted and not _mail_registration_association_link(
-                current_user._get_current_object(), existing
-            ):
+            if existing.deleted:
+                pass
+            elif requester_owns_content:
+                # Refused, and said so. The temporary account holds work that
+                # retiring it would destroy, and the product decision was to
+                # refuse rather than move content between accounts. The owner
+                # is told because they are the only party who can act; the
+                # caller is answered by the shared exit, as in every branch.
+                _send_association_refused_notice(existing)
+            elif not _mail_registration_association_link(requester, existing):
                 mails.address_taken_notice().send(existing)
         else:
             send_change_email_confirmation_instructions(current_user, new_email)

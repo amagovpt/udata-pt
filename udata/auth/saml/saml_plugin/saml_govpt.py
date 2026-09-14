@@ -2029,6 +2029,83 @@ def _send_migration_address_taken_notice(user):
     send_mail(user, msg)
 
 
+def _placeholder_owns_content(user):
+    """Whether retiring ``user`` would destroy something it cannot get back.
+
+    This is the question the association asks before it offers to retire a
+    placeholder, and the list is derived from one rule: what does
+    mark_as_deleted destroy irrecoverably? Everything it merely detaches, or
+    that the association carries across itself, is deliberately absent --
+    follows are moved rather than deleted, and the document survives as a soft
+    delete, so authored discussions keep their author.
+
+    It reads only the requester's own account. Nothing here looks at the
+    address that was submitted, which is why the caller may run it before the
+    address is resolved at all -- a refusal then says nothing about whether
+    that address exists.
+
+    Deliberately conservative where the two costs are asymmetric: a false
+    "owns content" costs the citizen a support conversation, a false "owns
+    nothing" costs them an API token nobody can show them again.
+    """
+    from udata.models import (
+        CommunityResource,
+        ContactPoint,
+        Dataservice,
+        Dataset,
+        Discussion,
+        Page,
+        Reuse,
+        Topic,
+    )
+
+    if user.organizations:
+        # mark_as_deleted walks the memberships out of every organization.
+        return True
+
+    for model in (Dataset, Reuse, Dataservice, CommunityResource, Topic, Page):
+        # Every Owned document, taken from the mixin rather than listed by
+        # eye: Topic and Page own exactly like the rest, and an enumeration
+        # written from memory is how they would be missed.
+        if model.objects(owner=user).first():
+            return True
+
+    from udata.harvest.models import HarvestSource
+
+    if HarvestSource.objects(owner=user).first():
+        return True
+
+    from udata.core.api_token.models import ApiToken
+
+    if ApiToken.objects(user=user, revoked_at=None).first():
+        # Revoked on retirement, and the secret is never shown twice.
+        return True
+
+    if ContactPoint.objects(owner=user).first():
+        # Deleted AND pulled out of every dataset and dataservice pointing at
+        # it, so this one reaches beyond the account itself.
+        return True
+
+    if Discussion.objects(discussion__posted_by=user).first():
+        return True
+
+    return False
+
+
+def _send_association_refused_notice(user):
+    """Tell the owner that the association was refused, and why.
+
+    Separate from address_taken_notice, whose only actionable line is "sign in
+    to that account the way you normally do" -- impossible advice for exactly
+    this person, who is held on the completion screen and cannot sign in
+    anywhere. Its docstring declines to prescribe a step because it cannot
+    know the case; here the case is known, so the mail says it.
+    """
+    from udata.auth import mails
+
+    mails.registration_association_refused_notice().send(user)
+
+
 def _mail_registration_association_link(requester, target):
     """Mail ``target`` a link that moves ``requester``'s identity onto it.
 

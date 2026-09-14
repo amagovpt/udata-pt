@@ -327,6 +327,59 @@ class AuthTest(APITestCase):
         untethered.reload()
         assert MIGRATION_LINK_PENDING not in (untethered.extras or {})
 
+    def test_change_mail_taken_address_refuses_association_when_placeholder_owns_content(self):
+        """The temporary account already holds work, so nothing is linked.
+
+        Linking retires the temporary account, and retiring it would destroy
+        what it holds. The product decision was to refuse rather than move
+        content between accounts, so the owner is told -- by a mail that says
+        what happened and what to do, not the generic notice whose only advice
+        is to sign in, which this citizen cannot do.
+
+        The dataset here stands for the whole list: a pending account holds a
+        live session from the assertion onward and the screen that holds it is
+        enforced in the browser, so owning something before finishing is
+        ordinary.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MIGRATION_LINK_PENDING,
+            _hash_nic,
+        )
+        from udata.core.dataset.factories import DatasetFactory
+
+        requester = self.login(
+            UserFactory(
+                email="saml-deadbeef@autenticacao.gov.pt",
+                password=None,
+                extras={"auth_nic": _hash_nic("12345678")},
+            )
+        )
+        owner = UserFactory(email="taken@example.com")
+        DatasetFactory(owner=requester)
+
+        with capture_mails() as mails:
+            resp = self._submit_change_email("taken@example.com")
+
+        # Still one mail, still only to the address's owner.
+        assert len(mails) == 1
+        assert mails[0].recipients == [owner.email]
+
+        # The refusal notice, not the association link and not the generic
+        # "sign in as you normally do" notice.
+        assert "/saml/migration/confirm-link/" not in mails[0].body
+        assert "could not be linked" in mails[0].subject
+
+        # Nothing was written anywhere. No link to click, no identity moved.
+        owner.reload()
+        assert MIGRATION_LINK_PENDING not in (owner.extras or {})
+        assert not (owner.extras or {}).get("auth_nic")
+        requester.reload()
+        assert requester.extras["auth_nic"] == _hash_nic("12345678")
+        assert requester.email == "saml-deadbeef@autenticacao.gov.pt"
+
+        # And the caller is answered exactly as every other branch answers.
+        assert resp.status_code == 302
+
     def test_change_mail_taken_address_answers_like_a_free_one(self):
         """The taken and free branches must be indistinguishable to the caller.
 

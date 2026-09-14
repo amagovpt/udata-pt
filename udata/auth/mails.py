@@ -91,6 +91,52 @@ def welcome_existing(recovery_link: str, **kwargs) -> MailMessage:
     )
 
 
+def registration_association_refused_notice(**kwargs) -> MailMessage:
+    """Tell the owner their account could not be associated, and what to do.
+
+    The sibling notice cannot serve this case. Its one actionable line is
+    "sign in to that account the way you normally do", which is impossible
+    advice for the person who triggers this: they are held on the registration
+    completion screen and cannot sign in anywhere until it lets them through.
+    Its docstring declines to prescribe a step because it cannot know the
+    case; here the case is known, so this one says it.
+
+    Carries no link, for the same reason as its sibling and one more: there is
+    nothing a link could do. The association was refused because the temporary
+    account already holds work of its own, and nothing this mail can offer
+    resolves that without somebody deciding what happens to it.
+
+    Says nothing about the temporary account beyond its existence -- no names,
+    no counts, no titles. The recipient is the owner of this address, which is
+    not by itself proof that they are the same person as the one who submitted
+    it.
+    """
+    from udata.i18n import lazy_gettext as _
+
+    site = current_app.config["SITE_TITLE"]
+    return MailMessage(
+        kind="registration_association_refused",
+        subject=_("Your %(site)s account could not be linked", site=site),
+        paragraphs=[
+            _(
+                "You received this email because someone signing in to %(site)s with a "
+                "digital identity asked to link it to the account that uses this address.",
+                site=site,
+            ),
+            _(
+                "It was not linked. The temporary account created for that sign-in "
+                "already holds content of its own, and linking would have discarded it. "
+                "Nothing was changed on either account."
+            ),
+            _(
+                "If it was you, contact support so the two accounts can be sorted out "
+                "together. If it was not you, no action is needed: your account is "
+                "untouched and nobody gained access to it."
+            ),
+        ],
+    )
+
+
 def address_taken_notice(**kwargs) -> MailMessage:
     """Tell the owner of an address that a change-email request named it.
 
