@@ -6520,7 +6520,7 @@ class SAMLInactiveAccountRefusalTest(APITestCase):
 
     NIC = "99887766"
     PERSON_ID = "ES/PT/9988776655"
-    AUDIT_LOGGER = "saml.audit"
+    AUDIT_LOGGER = "udata.auth.saml.audit"
 
     @pytest.fixture(autouse=True)
     def _set_frontend_url(self, app):
@@ -6930,6 +6930,7 @@ class SAMLAmbiguousIdentityTest(APITestCase):
 
     NIC = "27182818"
     PERSON_ID = "IT/PT/2718281828"
+    AUDIT_LOGGER = "udata.auth.saml.audit"
 
     @pytest.fixture(autouse=True)
     def _set_frontend_url(self, app):
@@ -7020,10 +7021,17 @@ class SAMLAmbiguousIdentityTest(APITestCase):
     ):
         """`assertLogs` rather than caplog: this class descends from
         unittest.TestCase. Pinning the level matters -- without it the "no
-        success line" assertion would pass on an empty capture."""
+        success line" assertion would pass on an empty capture.
+
+        ⚠️ And pinning it is also what makes this test blind to LEDG-2371:
+        `assertLogs` sets the level on the logger under test, so this passed
+        for months while production emitted nothing. What it proves is the
+        CONTENT of the line, not that the line ever reaches a handler --
+        that property has its own test, SAMLAuditLoggerLevelTest.
+        """
         self._two_accounts_claiming(self.NIC)
 
-        with self.assertLogs("saml.audit", level=logging.INFO) as captured:
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
             self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ada", last_name="Byron")
 
         lines = [record.getMessage() for record in captured.records]

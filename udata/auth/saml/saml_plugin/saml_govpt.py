@@ -664,7 +664,19 @@ def _check_and_record_replay(response_id, kind, ttl=None):
     return True
 
 
-audit_logger = logging.getLogger("saml.audit")
+# Dedicated audit logger: one line per terminal SSO decision, so "what
+# happened to this sign-in?" can be answered from the backoffice log page
+# instead of reconstructed. It lives under `udata.*` on purpose — the records
+# propagate to the handlers of the `udata` logger (`app.logger`), whose stderr
+# uwsgi writes to the file that page reads. Its level is pinned in
+# `udata.auth.init_app` because `udata` is set to WARNING in production, which
+# a child with no level of its own would inherit, silently dropping every line.
+#
+# It was "saml.audit" until LEDG-2371, and that name was two bugs at once: no
+# level of its own, and a top-level logger outside the tree whose records
+# propagated to a root with no handler. Between May and September it emitted
+# nothing at all, which is why nothing can depend on the old name.
+audit_logger = logging.getLogger("udata.auth.saml.audit")
 
 
 def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
