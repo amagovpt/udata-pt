@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **feat(auth): a foreign citizen signing in with CMD now gets an account tied to their identity**
+  - A foreigner has no NIC. The portal demanded one as a *required* attribute
+    and asked for nothing that identifies a foreign document, so the person
+    could not end up with an account bound to who they are — they arrived as a
+    stranger on every sign-in.
+  - The request now asks for the document type, nationality and number, and the
+    NIC drops to optional. `isRequired` tells the identity provider the sign-in
+    cannot proceed without the attribute, so demanding the one thing a
+    foreigner does not have *was* the exclusion. Email and the names stay
+    required, and nothing about a national's consent screen changes.
+  - When no NIC arrives, those three compose the identity that is hashed into
+    the login key. **The NIC always wins when there is one** — that ordering is
+    the whole non-regression, because reversing it would rewrite the identity
+    of every national whose assertion also carries document attributes.
+  - The composition is **frozen from the first deploy**, documented where it is
+    computed. Two details it has to get right: the number alone is not unique
+    (a passport and a residence permit can share one, and the nationality is
+    forced to `PT` on permits), and the leading segment exists because `TR` and
+    `CR` are real country codes — without it a residence-permit holder would
+    compose exactly what a Turkish citizen presents through eIDAS, and the two
+    would share an account.
+  - The verified document type and nationality are recorded beside the hash,
+    where the self-declared answer already sits. The **number is not** — it
+    identifies the person and stays inside the digest.
+  - 🚨 **Known limitation, accepted and not fixed here.** This identity is less
+    stable than a NIC. A residence permit is renewed and changes number; a
+    passport expires. When that happens the person arrives as a **new
+    identity**, and the old account — with its datasets and its organization
+    memberships — **becomes unreachable**, often behind a placeholder address
+    nobody reads. A verified email is the only thing that survives a document
+    swap, which is why it matters more for foreign citizens than for nationals.
+    Reuniting the two accounts is support work.
+  - ⚠️ The tests mock the SAML library, so they prove our side of the exchange
+    and not the identity provider's. Lowering the NIC to optional, the exact
+    shape of the three attributes, and whether a national's assertion can carry
+    a foreign document type all have to be confirmed against the real service
+    before this reaches production.
+
 - **fix(harvest): a source can no longer claim a domain it does not control, and the INE harvest asks who owns a record before overwriting it**
   - Two pre-existing defects composed into one: any authenticated user could
     stage a mass overwrite of the 13 054 datasets harvested from INE, the
