@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **fix(organization): the membership accept endpoint no longer force-accepts invitations**
+  - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
+    *join* — the organization side of the flow. An invitation travels the other
+    way, and only the invitee may accept it. The endpoint had lost the check
+    that tells the two apart, so an organization admin could point it at a
+    pending invitation and add that person as a member without them having
+    consented to anything.
+  - It now answers 400 and names the cancel endpoint, exactly as the refuse
+    endpoint has always done for invitations. The invitee's own route is
+    untouched: invitations are still accepted through
+    `POST /me/org_invitations/<id>/accept/`.
+  - ⚠️ **The admin members screen will start showing that 400.** It lists
+    pending invitations and pending join requests in one table with the same
+    Accept button, without distinguishing them. Clicking Accept on an
+    invitation row now fails instead of silently adding the member — which is
+    the point, and is already what Refuse does there. Giving those rows their
+    own action is a separate frontend change.
+  - **A repeated accept no longer rewrites who handled the request, or when.**
+    Accepting an already accepted request stays idempotent and still answers
+    200 with the existing member, but the request keeps the original
+    `handled_by`/`handled_on` instead of restamping them on every call. That
+    also stops the handled signal from firing a second time, which used to
+    rewrite `handled_at` on every notification of the same organization and
+    user. A request that is still pending against someone who already is a
+    member is a first handling, and is stamped as before.
+
 - **fix(organization): an organization admin can save the organization again without being a site admin**
   - Updating an organization demanded site-admin rights as soon as the payload
     carried a `badges` key. A full-object PUT — what a client sends after
