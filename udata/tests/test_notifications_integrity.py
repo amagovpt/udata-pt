@@ -2,6 +2,7 @@ import logging
 from datetime import UTC, datetime
 from unittest import mock
 
+from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
 from udata.core.discussions.models import Discussion
@@ -275,6 +276,39 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         tasks.purge_reuses()
 
         assert Discussion.objects(subject=reuse).count() == 0
+        assert Notification.objects.count() == 1
+        assert Notification.objects.first().details.discussion == kept_discussion
+
+    def test_discussion_notification_cleanup_on_dataservice_purge(self):
+        """Test that purging a dataservice leaves none of its discussions' notifications."""
+        from udata.core.dataservices import tasks
+
+        user = UserFactory()
+        dataservice = DataserviceFactory(deleted_at=datetime.now(UTC))
+        kept_dataservice = DataserviceFactory()
+        discussion = DiscussionFactory(
+            user=user, subject=dataservice, discussion=[MessageDiscussionFactory(posted_by=user)]
+        )
+        kept_discussion = DiscussionFactory(
+            user=user,
+            subject=kept_dataservice,
+            discussion=[MessageDiscussionFactory(posted_by=user)],
+        )
+        for each in (discussion, kept_discussion):
+            Notification(
+                user=user,
+                details=DiscussionNotificationDetails(
+                    discussion=each,
+                    status=DiscussionStatus.NEW_DISCUSSION,
+                    message_id=each.discussion[0].id,
+                ),
+            ).save()
+
+        assert Notification.objects.count() == 2
+
+        tasks.purge_dataservices()
+
+        assert Discussion.objects(subject=dataservice).count() == 0
         assert Notification.objects.count() == 1
         assert Notification.objects.first().details.discussion == kept_discussion
 
