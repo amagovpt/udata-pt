@@ -94,22 +94,26 @@ def welcome_existing(recovery_link: str, **kwargs) -> MailMessage:
 def registration_association_refused_notice(**kwargs) -> MailMessage:
     """Tell the owner their account could not be associated, and what to do.
 
-    The sibling notice cannot serve this case. Its one actionable line is
-    "sign in to that account the way you normally do", which is impossible
-    advice for the person who triggers this: they are held on the registration
-    completion screen and cannot sign in anywhere until it lets them through.
-    Its docstring declines to prescribe a step because it cannot know the
-    case; here the case is known, so this one says it.
+    The sibling notice cannot serve this case. It is deliberately vague about
+    what to do, because it cannot know which case it is in: the address may
+    have been named by a stranger, by the owner themselves, or by a pending
+    registration. Here the case IS known -- a registration was refused over
+    content on the temporary account -- so this one names the step.
 
     Carries no link, for the same reason as its sibling and one more: there is
     nothing a link could do. The association was refused because the temporary
     account already holds work of its own, and nothing this mail can offer
     resolves that without somebody deciding what happens to it.
 
-    Says nothing about the temporary account beyond its existence -- no names,
-    no counts, no titles. The recipient is the owner of this address, which is
-    not by itself proof that they are the same person as the one who submitted
-    it.
+    Says nothing about the temporary account beyond the fact that it exists
+    and holds content -- no names, no counts, no titles. That one extra bit is
+    unavoidable: without it the mail cannot say why the linking was refused,
+    which is the only reason it is sent. It leaks in the harmless direction --
+    from the requester's own account towards the owner of this mailbox -- and
+    the requester already knows everything about the account they just made.
+
+    The recipient is the owner of this address, which is not by itself proof
+    that they are the same person as the one who submitted it.
     """
     from udata.i18n import lazy_gettext as _
 
@@ -146,10 +150,14 @@ def address_taken_notice(**kwargs) -> MailMessage:
 
     Deliberately carries no link of any kind. A confirmation link here would
     act on an account the requesting session has proved nothing about, and
-    would be a way to spray confirmation mail at any address on demand. It also
-    prescribes no particular next step: the account may have been created
-    through SAML and have no usable password, so "use your password" would be
-    impossible advice.
+    would be a way to spray confirmation mail at any address on demand.
+
+    It also prescribes no step that assumes the recipient can sign in. It used
+    to say "sign in to that account the way you normally do", which is
+    impossible advice for the reader most likely to receive this: somebody
+    held on the registration completion screen, who cannot sign in anywhere
+    until that screen lets them through. The account may also have been
+    created through SAML and have no usable password at all.
 
     This is now the FALLBACK of that branch rather than all of it. A caller
     still completing a government-identity registration is mailed an
@@ -178,8 +186,8 @@ def address_taken_notice(**kwargs) -> MailMessage:
                 site=site,
             ),
             _(
-                "If it was you, sign in to that account the way you normally "
-                "do, or use the account recovery if you cannot."
+                "If it was you, nothing further is needed to keep the account. "
+                "If you cannot access it, contact support."
             ),
             _("If it was not you, no action is needed. Your account is untouched."),
         ],
@@ -187,13 +195,60 @@ def address_taken_notice(**kwargs) -> MailMessage:
 
 
 def confirmation_instructions(confirmation_link: str, **kwargs) -> MailMessage:
+    """Ask the owner of an address to prove they can read it.
+
+    Reached by three flows and worded to be true in all of them: the
+    registration completion screen, an email change from the profile, and a
+    plain resend. An earlier draft opened with "to finish registering", which
+    reads as nonsense to somebody who finished registering years ago and is
+    only changing their address.
+
+    Carries no greeting and no sign-off. The mail frame supplies both, in
+    Portuguese, for every message on the platform -- repeating them here would
+    print them twice.
+
+    The site name is written out rather than interpolated from SITE_TITLE,
+    which in production is the platform's full descriptive title and would
+    make the subject line unreadable. reset_instructions does the same.
+    """
     from udata.i18n import lazy_gettext as _
+    from udata.mail import Link, ParagraphWithLinks
+    from udata.uris import cdata_url
+
+    help_url = cdata_url("/ajuda-e-contactos")
 
     return MailMessage(
-        subject=_("Confirm your email address"),
+        subject=_("Confirm your email on dados.gov.pt"),
         paragraphs=[
-            _("Please confirm your email address."),
-            MailCTA(_("Confirm your email address"), confirmation_link),
+            _("This email address was provided for a dados.gov.pt account."),
+            _("To confirm this address and link it to your account, select the button below."),
+            # A msgid of its own rather than reusing the subject's: the welcome
+            # mail shares that string, and a CTA label wants the imperative
+            # ("Confirm email address"), not the sentence a subject line wants.
+            MailCTA(_("Confirm email address"), confirmation_link),
+            _("If you did not provide this email address, you can ignore this message."),
+            # ParagraphWithLinks is the only way to put a link inside running
+            # HTML text -- a plain paragraph is escaped, and MailCTA is a
+            # button on its own line, which would give this aside more weight
+            # than the confirmation it sits under. ⚠️ The text/plain template
+            # has no branch for it and renders the label alone, so a reader on
+            # that version gets the page name without a way to reach it. That
+            # limitation is the template's and is shared by every
+            # ParagraphWithLinks in the codebase.
+            #
+            # Guarded because cdata_url returns None with no CDATA_BASE_URL
+            # configured, and an unguarded Link then renders href="None".
+            # Same shape as udata/core/legal/mails.py.
+            (
+                ParagraphWithLinks(
+                    _(
+                        "Need help? See the %(help_link)s page on dados.gov.pt.",
+                        help_link=Link(_("Help and contacts"), help_url),
+                    )
+                )
+                if help_url
+                else _("Need help? See the help and contacts page on dados.gov.pt.")
+            ),
         ],
     )
 

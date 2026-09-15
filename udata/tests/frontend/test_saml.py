@@ -2269,6 +2269,61 @@ def _reset_migration_limiter():
     limiter.reset()
 
 
+class SAMLMigrationLinkMailCopyTest(APITestCase):
+    """The body of the account-linking mail is a security control.
+
+    Its own docstring says so, and says why: the wizard reaches an account
+    having proved nothing about it, so this mail is what stands between a
+    request nobody made and an identity bound to somebody else's account.
+    Where a one-time code is inert to a click -- the owner has to transcribe
+    it for an attacker to get anywhere -- a link is not.
+
+    Two properties carry that weight, and until now nothing held them:
+
+    - it **names the identity that asked**, so an unexpected recipient can
+      tell it is not theirs;
+    - it **says plainly not to open the link** if they did not start this.
+
+    Either could be dropped by somebody shortening the copy, and every other
+    test in this file would stay green.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    @pytest.mark.options(DEFAULT_LANGUAGE="pt")
+    def test_migration_link_mail_names_the_requester_and_warns(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _send_migration_link
+
+        owner = UserFactory(email="rita.antiga@example.pt")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            _send_migration_link(owner, "Rita", "Gomes", "tok123")
+
+        recipient, msg = mock_send.call_args[0][:2]
+        assert recipient is owner
+        body = " ".join(str(p) for p in msg.paragraphs)
+
+        # Names who asked -- from the assertion, which is what the caller
+        # passes; never from the account document, which its owner can edit.
+        assert "Rita Gomes" in body, body
+
+        # Tells an unexpected recipient not to open it. Asserted on the
+        # capitalised NOT, which is the part that carries the warning.
+        assert "NÃO abra o link" in body, body
+
+        # And the link is there to be refused in the first place.
+        cta = [p for p in msg.paragraphs if getattr(p, "link", None)]
+        assert len(cta) == 1
+        assert cta[0].link.endswith("/saml/migration/confirm-link/tok123")
+
+        # Portuguese, like its siblings. A missing catalogue entry renders the
+        # English msgid silently -- which is exactly how the refusal notice
+        # shipped in English for a week.
+        assert str(msg.subject) == "Confirme a associação de uma identidade digital à sua conta"
+
+
 class SAMLMigrationWizardTest(APITestCase):
     """End-to-end coverage of the account-linking wizard: an email or
     name match redirects to /migrate-account, where the user

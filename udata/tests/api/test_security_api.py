@@ -112,7 +112,12 @@ class SecurityAPITest(PytestOnlyAPITestCase):
         assert len(mails) == 1
         assert len(mails[0].recipients) == 1
         assert mails[0].recipients[0] == "jane2@example.org"
-        assert mails[0].subject == _("Confirm your email address")
+        # Pins that the change-email flow sends THAT mail and not another one.
+        # The string moved with the copy rewrite (LEDG-2350); what the
+        # assertion is for did not. Says so out loud because the previous
+        # version did not, and a bare string assertion is invisible to anyone
+        # searching for what a copy change might break.
+        assert mails[0].subject == _("Confirm your email on dados.gov.pt")
 
 
 class TwoFactorSecurityAPITest(PytestOnlyAPITestCase):
