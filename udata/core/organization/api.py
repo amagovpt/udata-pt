@@ -552,6 +552,16 @@ class MembershipAcceptAPI(MembershipAPI):
         if membership_request.kind == "invitation":
             api.abort(400, _("Use the cancel endpoint for invitations"))
 
+        # A repeated accept stays idempotent — same 200, same body — but must
+        # not restamp the request: handled_by/handled_on are the only record of
+        # who approved the membership, and re-firing after_handle would also
+        # rewrite handled_at on every notification of this pair. Both conditions
+        # are required: a request still pending against an existing member is a
+        # first handling and is stamped below, and an accepted request whose
+        # member was since removed still goes through the normal path.
+        if membership_request.status == "accepted" and org.is_member(membership_request.user):
+            return org.member(membership_request.user)
+
         membership_request.status = "accepted"
         membership_request.handled_by = current_user._get_current_object()
         membership_request.handled_on = datetime.now(UTC)

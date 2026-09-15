@@ -489,13 +489,70 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert request.refusal_comment is None
 
         # Accepting twice is deliberately idempotent: the endpoint returns the
-        # existing member with 200 instead of 409. Note that it also re-stamps
-        # status/handled_by/handled_on before that early return, so a second
-        # accept overwrites who handled the request and when; that audit-trail
-        # question is tracked separately, not asserted here.
+        # existing member with 200 instead of 409, and leaves the audit trail
+        # of the first acceptance alone. That preservation is asserted in
+        # test_accept_membership_twice_preserves_audit_trail.
         api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
         response = self.post(api_url)
         assert200(response)
+
+    def test_accept_membership_twice_preserves_audit_trail(self):
+        """A repeated accept must not rewrite who handled the request, nor when."""
+        user = self.login()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(user=applicant, comment="test")
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[membership_request]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        assert200(self.post(api_url))
+
+        organization.reload()
+        handled_by = organization.requests[0].handled_by
+        handled_on = organization.requests[0].handled_on
+        assert handled_by == user
+
+        # Second accept, same admin: the real-world shape of the bug.
+        with assert_not_emit(MembershipRequest.after_handle):
+            assert200(self.post(api_url))
+
+        organization.reload()
+        assert organization.requests[0].handled_by == handled_by
+        assert organization.requests[0].handled_on == handled_on
+        assert organization.requests[0].status == "accepted"
+        assert len(organization.members) == 2
+
+    def test_accept_membership_twice_preserves_another_admins_stamp(self):
+        """A second admin accepting an already accepted request keeps the first one's stamp."""
+        user = self.login()
+        other_admin = UserFactory()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(
+            user=applicant,
+            comment="test",
+            status="accepted",
+            handled_by=other_admin,
+            handled_on=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=applicant, role="editor")],
+            requests=[membership_request],
+        )
+        # Read the stamp back as stored: Mongo returns it naive.
+        organization.reload()
+        handled_on = organization.requests[0].handled_on
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        with assert_not_emit(MembershipRequest.after_handle):
+            assert200(self.post(api_url))
+
+        organization.reload()
+        request = organization.requests[0]
+        assert request.handled_by == other_admin
+        assert request.handled_on == handled_on
+        assert request.status == "accepted"
+        assert len(organization.members) == 2
 
     def test_only_admin_can_accept_membership(self):
         user = self.login()
