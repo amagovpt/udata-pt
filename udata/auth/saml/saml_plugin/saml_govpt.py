@@ -682,10 +682,16 @@ audit_logger = logging.getLogger("udata.auth.saml.audit")
 def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
     """Emit a structured SAML SSO audit log line.
 
-    **Exactly one line per request**, at the point where the outcome is
-    actually decided. That invariant is what makes the lines countable: two
-    lines double a sign-in, none hides it, and a line written before the
-    decision counts something that did not happen.
+    **Exactly one line per SSO callback request**, at the point where the
+    outcome is actually decided. That invariant is what makes the lines
+    countable: two lines double a sign-in, none hides it, and a line written
+    before the decision counts something that did not happen.
+
+    ⚠️ "per SSO callback" and not "per sign-in": the migration link click
+    (`migration_confirm_link`) establishes a session and emits nothing at
+    all. That gap predates this and is not closed here, but anyone counting
+    these lines to answer "how many people signed in" will undercount by the
+    number of people who arrived through an emailed link.
 
     ``outcome`` is one of five values, and this list is the vocabulary --
     anything counting these lines depends on it, so a sixth value is a
@@ -1497,6 +1503,14 @@ def _handle_saml_user_login(
     # After the session exists, never before. Both remaining exits below are
     # the same outcome -- one of them asks for an email first -- so the line
     # belongs here rather than duplicated at each return.
+    #
+    # Emitted unconditionally although login_user can return False. That is
+    # safe only because BOTH ACS routes refuse an inactive account before
+    # entering here (LEDG-2465), and `active` is the only property that makes
+    # login_user refuse. The guarantee therefore lives in the routes, not on
+    # this line -- so if either guard ever moves, this becomes a success line
+    # for a session that was never established. Wrapping the emission in the
+    # `if` would be worse: the refusal would then produce no line at all.
     _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=status)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts

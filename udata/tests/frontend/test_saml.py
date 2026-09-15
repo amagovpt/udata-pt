@@ -8345,11 +8345,8 @@ class SAMLFunnelAuditOutcomeTest(APITestCase):
         assert "outcome=user_not_found" in lines[0], lines
         assert "outcome=success" not in lines[0], lines
 
-    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_a_deleted_account_login_audits_rejected_and_never_success(
-        self, mock_client_for, mock_requires_conf
-    ):
+    def test_a_deleted_account_login_audits_rejected_and_never_success(self, mock_client_for):
         """Refused, and audited as refused.
 
         Reaching this exit at all takes THREE deviations from what
