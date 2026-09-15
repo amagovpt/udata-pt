@@ -537,11 +537,33 @@ class MembershipAPI(API):
 class MembershipAcceptAPI(MembershipAPI):
     @api.secure
     @api.doc("accept_membership", **common_doc)
+    @api.response(400, "Use the cancel endpoint for invitations")
     @api.marshal_with(member_fields)
     def post(self, org, id):
         """Accept user membership to a given organization."""
         org.permissions["members"].test()
         membership_request = self.get_or_404(org, id)
+
+        # This endpoint approves a request to join, so it is the organization
+        # side of the flow. An invitation travels the other way and only the
+        # invitee may accept it, through /me/org_invitations/<id>/accept/;
+        # without this guard an admin could add someone who consented to
+        # nothing. MembershipRefuseAPI keeps the symmetric check.
+        if membership_request.kind == "invitation":
+            api.abort(400, _("Use the cancel endpoint for invitations"))
+
+        # A repeated accept stays idempotent — same 200, same body — but must
+        # not restamp the request: handled_by/handled_on are the only record of
+        # who approved the membership, and re-firing after_handle would also
+        # rewrite handled_at on every notification of this pair. Both conditions
+        # are required: a request still pending against an existing member is a
+        # first handling and is stamped below, and an accepted request whose
+        # member was since removed still goes through the normal path.
+        # Trade-off: repeating the call used to double as a retry when the
+        # signal failed after the save, leaving notifications unhandled. That
+        # retry is gone; the receiver is where such a failure belongs.
+        if membership_request.status == "accepted" and org.is_member(membership_request.user):
+            return org.member(membership_request.user)
 
         membership_request.status = "accepted"
         membership_request.handled_by = current_user._get_current_object()
