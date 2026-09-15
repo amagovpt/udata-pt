@@ -242,9 +242,10 @@ def change_email():
         # reason: work that happens only on one branch is work an attacker can
         # time. It reads nothing but the caller's own account, so running it on
         # the free branch too costs a query and discloses nothing.
-        from udata.auth.saml.saml_plugin.saml_govpt import _placeholder_owns_content
-
-        from udata.auth.saml.saml_plugin.saml_govpt import _has_linked_nic
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            _has_linked_nic,
+            _placeholder_owns_content,
+        )
 
         requester = current_user._get_current_object()
         # The same two conditions the association itself requires of the
