@@ -190,6 +190,62 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         assert Notification.objects.count() == 1
         assert Notification.objects.first().details.discussion == discussions[2]
 
+    def test_discussion_notification_cleanup_on_dataset_purge(self):
+        """Test that purging a dataset leaves none of its discussions' notifications."""
+        from udata.core.dataset import tasks
+
+        user = UserFactory()
+        dataset = DatasetFactory(deleted=datetime.now(UTC))
+        kept_dataset = DatasetFactory()
+        discussion = DiscussionFactory(
+            user=user,
+            subject=dataset,
+            discussion=[
+                MessageDiscussionFactory(posted_by=user),
+                MessageDiscussionFactory(posted_by=user),
+            ],
+        )
+        kept_discussion = DiscussionFactory(
+            user=user,
+            subject=kept_dataset,
+            discussion=[MessageDiscussionFactory(posted_by=user)],
+        )
+
+        # Both kinds of detail referencing the purged discussion: the discussion
+        # itself, and a comment carrying a `message_id`.
+        Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=discussion.discussion[0].id,
+            ),
+        ).save()
+        Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_COMMENT,
+                message_id=discussion.discussion[1].id,
+            ),
+        ).save()
+        Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=kept_discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=kept_discussion.discussion[0].id,
+            ),
+        ).save()
+
+        assert Notification.objects.count() == 3
+
+        tasks.purge_datasets()
+
+        assert Discussion.objects(subject=dataset).count() == 0
+        assert Notification.objects.count() == 1
+        assert Notification.objects.first().details.discussion == kept_discussion
+
     def test_multiple_notifications_cleanup(self):
         """Test that multiple notifications are cleaned up correctly."""
         # Create users and discussions
