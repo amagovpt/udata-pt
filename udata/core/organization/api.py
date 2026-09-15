@@ -84,7 +84,7 @@ def _parse_badge_kinds(payload):
     for item in payload:
         if isinstance(item, str):
             kinds.append(item)
-        elif isinstance(item, dict) and "kind" in item:
+        elif isinstance(item, dict) and isinstance(item.get("kind"), str):
             kinds.append(item["kind"])
         else:
             api.abort(400, "Each badge must be a kind string or an object with a kind field")
@@ -243,8 +243,17 @@ class OrganizationAPI(API):
         payload = request.json or {}
         badge_kinds = None
         if "badges" in payload:
-            admin_permission.test()
-            badge_kinds = _parse_badge_kinds(payload["badges"])
+            # A full-object PUT always carries a badges key: org_fields marshals
+            # badges as a list on every read, and to_dict() emits every stored
+            # field, so both an API client echoing back what it read and the
+            # test suite send one whether or not they touched it. Only an actual
+            # change of the badge set is a site-admin operation: echoing back
+            # what is already there must not cost an organization admin their
+            # own edit permission.
+            submitted_kinds = _parse_badge_kinds(payload["badges"])
+            if set(submitted_kinds) != {badge.kind for badge in org.badges}:
+                admin_permission.test()
+                badge_kinds = submitted_kinds
 
         form = api.validate(OrganizationForm, org)
         org = form.save()
