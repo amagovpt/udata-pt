@@ -6,7 +6,7 @@ from flask_security import current_user
 
 from udata import search
 from udata.api import API, api, apiv2
-from udata.core.discussions.models import Discussion
+from udata.core.discussions.actions import delete_discussions_for_subject
 from udata.core.topic.api_fields import (
     element_fields,
     element_page_fields,
@@ -110,7 +110,7 @@ class TopicAPI(API):
         if not TopicEditPermission(topic).can():
             apiv2.abort(403, "Forbidden")
         # Remove discussions linked to the topic
-        Discussion.objects(subject=topic).delete()
+        delete_discussions_for_subject(topic)
         topic.delete()
         return "", 204
 

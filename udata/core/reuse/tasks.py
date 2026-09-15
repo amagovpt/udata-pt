@@ -1,8 +1,9 @@
 from udata.core import storages
+from udata.core.discussions.actions import delete_discussions_for_subject
 from udata.core.organization.assignment import Assignment
 from udata.core.pages.models import Page
 from udata.core.topic.models import TopicElement
-from udata.models import Activity, Discussion, Follow, Transfer
+from udata.models import Activity, Follow, Transfer
 from udata.tasks import get_logger, job, task
 
 from . import mails
@@ -18,7 +19,7 @@ def purge_reuses(self) -> None:
         # Remove followers
         Follow.objects(following=reuse).delete()
         # Remove discussions
-        Discussion.objects(subject=reuse).delete()
+        delete_discussions_for_subject(reuse)
         # Remove activity
         Activity.objects(related_to=reuse).delete()
         # Remove transfers

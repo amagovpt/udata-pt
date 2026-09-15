@@ -2,6 +2,103 @@
 
 ## Unreleased
 
+- **test(saml): the account-linking mail's security properties are now held by a test**
+  - That mail's own docstring calls its body a security control: the wizard reaches an
+    account having proved nothing about it, so the mail is what stands between a
+    request nobody made and an identity bound to somebody else's account.
+  - Two properties carry that weight — it **names who asked**, and it **says plainly
+    not to open the link** if you did not start this — and **nothing held either of
+    them**. Anyone shortening the copy could have dropped both and left every test in
+    the file green.
+  - No text changed. The test is the change.
+
+- **feat(auth): the confirm-email mail is written for the three flows that send it**
+  - It used to be two lines — *"Please confirm your email address"* and a button. It
+    now says what address it is about, what confirming does, what to do if you did
+    not ask for it, and where to get help.
+  - **Not "to finish registering".** The same mail serves an email change from the
+    profile, where that phrasing is false for somebody who registered years ago.
+  - **The site name is written out** rather than interpolated: `SITE_TITLE` in
+    production is the platform's full descriptive title, which would make the subject
+    line unreadable.
+  - 🔑 **No greeting and no sign-off in the body** — the mail frame already supplies
+    both for every message on the platform, so a paragraph repeating them would
+    print them twice.
+  - The help line carries an inline link, which needed the one paragraph type that
+    supports one; a button there would give an aside more weight than the
+    confirmation it sits under. ⚠️ The **text/plain** version of every mail renders
+    that paragraph without its URL — a template limitation shared by the whole
+    codebase, not introduced here — so that reader gets the page name and no way to
+    reach it.
+  - ⚠️ **French loses this mail's translation.** The old subject had a `fr` entry;
+    the new strings have only `pt`, so a French reader now receives it in English.
+    Consistent with the rest of the family, and named here rather than discovered
+    later.
+  - 🚩 **Left standing, and it contradicts this change's own reasoning:** the other
+    two notices still interpolate `SITE_TITLE` into their subject — the very thing
+    avoided here because in production it is the platform's full descriptive title.
+    Their subjects arrive unreadable. Out of scope for a ticket asked to translate
+    them, but it is the same defect.
+
+- **fix(auth): the address-taken notice stops giving advice its reader cannot follow**
+  - It said *"sign in to that account the way you normally do, or use the account
+    recovery if you cannot"*. For the reader most likely to receive it — somebody
+    held on the registration completion screen — **signing in is exactly what they
+    cannot do** until that screen lets them through. The account may also be a SAML
+    one with no usable password at all.
+  - It now says nothing is needed to keep the account, and points at support for
+    anyone who cannot reach it. No step that assumes a capability the reader may
+    not have.
+  - The old wording stays in use by the migration wizard's sibling notice, where the
+    advice **is** sound: that reader is not held anywhere, and the paragraph after it
+    tells them what to do.
+
+- **fix(auth): the registration-refusal email was going out in English**
+  - The notice that tells somebody their account could not be linked had **no entry
+    at all** in the Portuguese catalogue, so it shipped in English to every reader —
+    and production defaults to Portuguese.
+  - 🚩 **Nothing failed.** `gettext` returns the message id when a catalogue has no
+    entry, so the mail rendered cleanly and read fine to anyone who reads English.
+    Nobody reading it in production did.
+  - The cause is a gap in the guard, not in the translation: the test that pins
+    "every auth string has a Portuguese translation" lists them by hand, and this
+    notice was written **after** the commit that translated its siblings and
+    extended that list. A list pinning "the set that was actually broken" only
+    stays useful if it grows with the set — so the four strings are in it now,
+    with the reason written beside them.
+  - The notice also gains the structural check its sibling already had, plus an
+    assertion it carries **no link** — there is nothing a link could do here, and a
+    paragraph with one would be the first sign somebody added an action that cannot
+    help.
+- **refactor(discussions): stop the purge paths' notification cleanup from being a coincidence**
+  - The four places that delete a subject's discussions in bulk — the dataset, reuse and
+    dataservice purge jobs, and `DELETE /api/2/topics/<topic>/` — were reported as leaving
+    orphaned notifications behind, on the grounds that a `QuerySet.delete()` never
+    instantiates a document and so never reaches the `Discussion.delete()` override that
+    emits `on_discussion_deleted`. They were not. Mongoengine's `QuerySet.delete()` falls
+    back to deleting document by document whenever a `pre_delete`/`post_delete` receiver
+    is registered for the model, and two unrelated modules register one for `Discussion`:
+    `udata.core.reports`, because it is in `REPORTABLE_MODELS`, and `udata.search`,
+    because it has a search adapter. The override does run, the signal is emitted, and
+    the notifications were already being cleaned up.
+  - That is worth nothing as a guarantee. The correctness of the notification cleanup
+    rested on two registrations that exist for reasons having nothing to do with
+    notifications, and it needed only one of them to survive. Removing both -- or, later,
+    the last one standing -- would have reintroduced the orphans silently, in four places
+    at once, with nothing in the code to warn whoever did it.
+  - The four paths now go through a single `delete_discussions_for_subject()` helper that
+    deletes each discussion explicitly, so the cleanup no longer depends on that
+    coincidence, and a future fifth caller has something to copy.
+  - Five tests cover the helper and the four paths. They are green on both sides of this
+    change and are not claimed to prove a fix: they lock the behaviour, so that whichever
+    way the cleanup stops running, a test says so.
+  - Pre-existing orphaned notifications, if any were ever produced by another route, are
+    not cleaned up here; that would need a migration.
+  - The `fix(discussions)` entry further down this section still says the bulk purges are
+    not covered and still leave orphans. That sentence is wrong, for the reason above. It
+    is left as written because the entry has already been promoted, and editing a
+    promoted line is what makes the same line diverge between environment branches.
+
 - **fix(saml): the audit line now describes the sign-in that actually happened**
   - Both ACS routes wrote their `outcome=` line **before** handing control to the
     login funnel. Two of the funnel's exits do not sign anyone in — a deleted
@@ -63,6 +160,7 @@
     registering another way, or changes identity.
   - Works with the migration wizard switched off — this path is not the wizard, and
     the citizens who need it are held on a screen the wizard cannot help with.
+
 - **fix(organization): the membership accept endpoint no longer force-accepts invitations**
   - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
     *join* — the organization side of the flow. An invitation travels the other

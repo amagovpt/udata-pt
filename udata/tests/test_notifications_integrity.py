@@ -2,8 +2,10 @@ import logging
 from datetime import UTC, datetime
 from unittest import mock
 
+from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
+from udata.core.discussions.models import Discussion
 from udata.core.discussions.notifications import DiscussionNotificationDetails, DiscussionStatus
 from udata.core.organization.constants import CERTIFIED
 from udata.core.organization.factories import OrganizationFactory
@@ -11,6 +13,7 @@ from udata.core.organization.notifications import (
     MembershipRequestNotificationDetails,
     NewBadgeNotificationDetails,
 )
+from udata.core.reuse.factories import ReuseFactory
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.features.notifications.models import Notification, NotificationQuerySet
 from udata.features.transfer.factories import TransferFactory
@@ -156,6 +159,167 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
 
         # Verify notifications are cleaned up (via purge function)
         assert Notification.objects.count() == 0
+
+    def test_delete_discussions_for_subject_cleans_notifications(self):
+        """Test that the shared helper cleans up the notifications it deletes discussions for."""
+        from udata.core.discussions.actions import delete_discussions_for_subject
+
+        user = UserFactory()
+        dataset = DatasetFactory()
+        other_dataset = DatasetFactory()
+        discussions = [
+            DiscussionFactory(
+                user=user, subject=subject, discussion=[MessageDiscussionFactory(posted_by=user)]
+            )
+            for subject in (dataset, dataset, other_dataset)
+        ]
+        for discussion in discussions:
+            Notification(
+                user=user,
+                details=DiscussionNotificationDetails(
+                    discussion=discussion,
+                    status=DiscussionStatus.NEW_DISCUSSION,
+                    message_id=discussion.discussion[0].id,
+                ),
+            ).save()
+
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while an orphan
+        # is still there, which is exactly what this test exists to catch.
+        assert len(list(Notification.objects)) == 3
+
+        delete_discussions_for_subject(dataset)
+
+        # Only the discussion hanging off the untouched subject survives, with its notification.
+        assert Discussion.objects(subject=dataset).count() == 0
+        for gone in discussions[:2]:
+            assert Notification.objects(details__discussion=gone).count() == 0
+        assert len(list(Notification.objects)) == 1
+        assert Notification.objects.first().details.discussion == discussions[2]
+
+    def test_discussion_notification_cleanup_on_dataset_purge(self):
+        """Test that purging a dataset leaves none of its discussions' notifications."""
+        from udata.core.dataset import tasks
+
+        user = UserFactory()
+        dataset = DatasetFactory(deleted=datetime.now(UTC))
+        kept_dataset = DatasetFactory()
+        discussion = DiscussionFactory(
+            user=user,
+            subject=dataset,
+            discussion=[
+                MessageDiscussionFactory(posted_by=user),
+                MessageDiscussionFactory(posted_by=user),
+            ],
+        )
+        kept_discussion = DiscussionFactory(
+            user=user,
+            subject=kept_dataset,
+            discussion=[MessageDiscussionFactory(posted_by=user)],
+        )
+
+        # Both kinds of detail referencing the purged discussion: the discussion
+        # itself, and a comment carrying a `message_id`.
+        Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=discussion.discussion[0].id,
+            ),
+        ).save()
+        Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_COMMENT,
+                message_id=discussion.discussion[1].id,
+            ),
+        ).save()
+        Notification(
+            user=user,
+            details=DiscussionNotificationDetails(
+                discussion=kept_discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=kept_discussion.discussion[0].id,
+            ),
+        ).save()
+
+        assert len(list(Notification.objects)) == 3
+
+        tasks.purge_datasets()
+
+        assert Discussion.objects(subject=dataset).count() == 0
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 1
+        assert Notification.objects.first().details.discussion == kept_discussion
+
+    def test_discussion_notification_cleanup_on_reuse_purge(self):
+        """Test that purging a reuse leaves none of its discussions' notifications."""
+        from udata.core.reuse import tasks
+
+        user = UserFactory()
+        reuse = ReuseFactory(deleted=datetime.now(UTC))
+        kept_reuse = ReuseFactory()
+        discussion = DiscussionFactory(
+            user=user, subject=reuse, discussion=[MessageDiscussionFactory(posted_by=user)]
+        )
+        kept_discussion = DiscussionFactory(
+            user=user, subject=kept_reuse, discussion=[MessageDiscussionFactory(posted_by=user)]
+        )
+        for each in (discussion, kept_discussion):
+            Notification(
+                user=user,
+                details=DiscussionNotificationDetails(
+                    discussion=each,
+                    status=DiscussionStatus.NEW_DISCUSSION,
+                    message_id=each.discussion[0].id,
+                ),
+            ).save()
+
+        assert len(list(Notification.objects)) == 2
+
+        tasks.purge_reuses()
+
+        assert Discussion.objects(subject=reuse).count() == 0
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 1
+        assert Notification.objects.first().details.discussion == kept_discussion
+
+    def test_discussion_notification_cleanup_on_dataservice_purge(self):
+        """Test that purging a dataservice leaves none of its discussions' notifications."""
+        from udata.core.dataservices import tasks
+
+        user = UserFactory()
+        dataservice = DataserviceFactory(deleted_at=datetime.now(UTC))
+        kept_dataservice = DataserviceFactory()
+        discussion = DiscussionFactory(
+            user=user, subject=dataservice, discussion=[MessageDiscussionFactory(posted_by=user)]
+        )
+        kept_discussion = DiscussionFactory(
+            user=user,
+            subject=kept_dataservice,
+            discussion=[MessageDiscussionFactory(posted_by=user)],
+        )
+        for each in (discussion, kept_discussion):
+            Notification(
+                user=user,
+                details=DiscussionNotificationDetails(
+                    discussion=each,
+                    status=DiscussionStatus.NEW_DISCUSSION,
+                    message_id=each.discussion[0].id,
+                ),
+            ).save()
+
+        assert len(list(Notification.objects)) == 2
+
+        tasks.purge_dataservices()
+
+        assert Discussion.objects(subject=dataservice).count() == 0
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 1
+        assert Notification.objects.first().details.discussion == kept_discussion
 
     def test_multiple_notifications_cleanup(self):
         """Test that multiple notifications are cleaned up correctly."""
