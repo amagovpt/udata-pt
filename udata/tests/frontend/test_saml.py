@@ -8387,3 +8387,35 @@ class SAMLFunnelAuditOutcomeTest(APITestCase):
         # falsy check is the honest one -- `== 0` would be asserting a value
         # the factory does not set.
         assert not deleted.login_count
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_an_active_eidas_account_still_audits_exactly_one_success(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The control, for the route that did not have one.
+
+        Its CMD twin already exists. With the emission moved into the shared
+        funnel, a mistake there breaks both routes at once -- so the guard
+        against "refuse everyone and every assertion above passes" needs to
+        exist on both sides too.
+        """
+        active = UserFactory(
+            confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.PERSON_ID)}
+        )
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._eidas_login(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Nuno",
+                family_name="Faria",
+            )
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=success" in lines[0], lines
+        assert "kind=eidas" in lines[0], lines
+
+        active.reload()
+        assert active.login_count == 1
