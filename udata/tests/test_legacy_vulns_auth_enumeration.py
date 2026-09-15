@@ -343,3 +343,65 @@ class ChangeEmailEnumerationRegressionTest(PytestOnlyAPITestCase):
         # The strong assertion the length check cannot make: the redirect
         # target must match once the caller's own address is normalised out.
         assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")
+
+    @pytest.mark.options(
+        CAPTCHETAT_BASE_URL=None,
+        SECURITY_RETURN_GENERIC_RESPONSES=True,
+        RATELIMIT_ENABLED=False,
+    )
+    def test_change_email_stays_indistinguishable_for_placeholder_requesters(self):
+        """The registration association added branches to this exact view.
+
+        A requester still completing a CMD registration now takes a different
+        path for a taken address -- an association link, or a refusal notice
+        when their temporary account holds content -- where before every
+        taken address produced the same silent notice. Three branches instead
+        of one, each doing different work and sending different mail.
+
+        None of that may be visible to the caller. The test above pins the
+        ordinary requester; this pins the requester the new branches exist
+        for, in both of the states that pick between them.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _hash_nic
+        from udata.core.dataset.factories import DatasetFactory
+
+        taken, fresh = "taken@example.org", "fresh@example.org"
+        assert len(taken) == len(fresh)
+
+        def submit(address):
+            return self.post(
+                url_for("security.change_email"),
+                {"new_email": address, "new_email_confirm": address, "submit": True},
+                json=False,
+            )
+
+        # (a) The association fires: a pending requester with an identity to
+        # move, and a target that can receive it.
+        requester = self.login(
+            UserFactory(
+                email="saml-deadbeef@autenticacao.gov.pt",
+                password=None,
+                extras={"auth_nic": _hash_nic("12345678")},
+                confirmed_at=datetime.now(),
+            )
+        )
+        UserFactory(email=taken, confirmed_at=datetime.now())
+
+        known = submit(taken)
+        unknown = submit(fresh)
+        assert _bodies_indistinguishable(known, unknown), _diff_message(
+            "LEDG-2431 association branch", known, unknown
+        )
+        assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")
+
+        # (b) The refusal fires instead: same requester, now owning content,
+        # so the branch does different work and sends a different mail. Still
+        # nothing the caller can see.
+        DatasetFactory(owner=requester)
+
+        known = submit(taken)
+        unknown = submit(fresh)
+        assert _bodies_indistinguishable(known, unknown), _diff_message(
+            "LEDG-2431 refusal branch", known, unknown
+        )
+        assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")
