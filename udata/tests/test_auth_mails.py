@@ -298,6 +298,9 @@ class AuthMailPortugueseTranslationTest(APITestCase):
         "Confirm email address",
         "If you did not provide this email address, you can ignore this message.",
         "Need help? See the %(help_link)s page on dados.gov.pt.",
+        # The fallback for a deployment with no CDATA_BASE_URL: same sentence
+        # without the link, so that case is not the one that ships in English.
+        "Need help? See the help and contacts page on dados.gov.pt.",
         "Help and contacts",
         # udata/auth/mails.py -- registration-association refusal.
         #

@@ -105,10 +105,15 @@ def registration_association_refused_notice(**kwargs) -> MailMessage:
     account already holds work of its own, and nothing this mail can offer
     resolves that without somebody deciding what happens to it.
 
-    Says nothing about the temporary account beyond its existence -- no names,
-    no counts, no titles. The recipient is the owner of this address, which is
-    not by itself proof that they are the same person as the one who submitted
-    it.
+    Says nothing about the temporary account beyond the fact that it exists
+    and holds content -- no names, no counts, no titles. That one extra bit is
+    unavoidable: without it the mail cannot say why the linking was refused,
+    which is the only reason it is sent. It leaks in the harmless direction --
+    from the requester's own account towards the owner of this mailbox -- and
+    the requester already knows everything about the account they just made.
+
+    The recipient is the owner of this address, which is not by itself proof
+    that they are the same person as the one who submitted it.
     """
     from udata.i18n import lazy_gettext as _
 
@@ -210,6 +215,8 @@ def confirmation_instructions(confirmation_link: str, **kwargs) -> MailMessage:
     from udata.mail import Link, ParagraphWithLinks
     from udata.uris import cdata_url
 
+    help_url = cdata_url("/ajuda-e-contactos")
+
     return MailMessage(
         subject=_("Confirm your email on dados.gov.pt"),
         paragraphs=[
@@ -221,14 +228,26 @@ def confirmation_instructions(confirmation_link: str, **kwargs) -> MailMessage:
             MailCTA(_("Confirm email address"), confirmation_link),
             _("If you did not provide this email address, you can ignore this message."),
             # ParagraphWithLinks is the only way to put a link inside running
-            # text -- a plain paragraph is escaped, and MailCTA is a button on
-            # its own line, which would give this aside more weight than the
-            # confirmation it sits under.
-            ParagraphWithLinks(
-                _(
-                    "Need help? See the %(help_link)s page on dados.gov.pt.",
-                    help_link=Link(_("Help and contacts"), cdata_url("/ajuda-e-contactos")),
+            # HTML text -- a plain paragraph is escaped, and MailCTA is a
+            # button on its own line, which would give this aside more weight
+            # than the confirmation it sits under. ⚠️ The text/plain template
+            # has no branch for it and renders the label alone, so a reader on
+            # that version gets the page name without a way to reach it. That
+            # limitation is the template's and is shared by every
+            # ParagraphWithLinks in the codebase.
+            #
+            # Guarded because cdata_url returns None with no CDATA_BASE_URL
+            # configured, and an unguarded Link then renders href="None".
+            # Same shape as udata/core/legal/mails.py.
+            (
+                ParagraphWithLinks(
+                    _(
+                        "Need help? See the %(help_link)s page on dados.gov.pt.",
+                        help_link=Link(_("Help and contacts"), help_url),
+                    )
                 )
+                if help_url
+                else _("Need help? See the help and contacts page on dados.gov.pt.")
             ),
         ],
     )

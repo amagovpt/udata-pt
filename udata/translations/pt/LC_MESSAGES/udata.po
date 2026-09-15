@@ -2819,13 +2819,17 @@ msgstr "Confirmar endereço de e-mail"
 msgid "If you did not provide this email address, you can ignore this message."
 msgstr "Se não indicou este endereço de e-mail, pode ignorar esta mensagem."
 
+#: udata/auth/mails.py:262
+msgid "Need help? See the help and contacts page on dados.gov.pt."
+msgstr "Precisa de ajuda? Consulte a página de ajuda e contactos do dados.gov.pt."
+
 #: udata/auth/mails.py:255
 msgid "Need help? See the %(help_link)s page on dados.gov.pt."
 msgstr "Precisa de ajuda? Consulte a página %(help_link)s do dados.gov.pt."
 
 #: udata/auth/mails.py:256
 msgid "Help and contacts"
-msgstr "Ajuda e Contactos"
+msgstr "Ajuda e contactos"
 
 #: udata/auth/mails.py:113
 msgid "Your %(site)s account could not be linked"
@@ -2856,8 +2860,8 @@ msgid ""
 "and nobody gained access to it."
 msgstr ""
 "Se foi você, contacte o suporte para que as duas contas possam ser "
-"resolvidas em conjunto. Se não foi você, não é necessária nenhuma ação: a "
-"sua conta está intacta e ninguém teve acesso a ela."
+"tratadas em conjunto. Se não foi você, não é necessária nenhuma ação: a "
+"sua conta está intacta e ninguém obteve acesso a ela."
 
 #: udata/auth/mails.py:96
 msgid "Your %(site)s account already exists"

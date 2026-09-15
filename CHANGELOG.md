@@ -26,7 +26,19 @@
     print them twice.
   - The help line carries an inline link, which needed the one paragraph type that
     supports one; a button there would give an aside more weight than the
-    confirmation it sits under.
+    confirmation it sits under. ⚠️ The **text/plain** version of every mail renders
+    that paragraph without its URL — a template limitation shared by the whole
+    codebase, not introduced here — so that reader gets the page name and no way to
+    reach it.
+  - ⚠️ **French loses this mail's translation.** The old subject had a `fr` entry;
+    the new strings have only `pt`, so a French reader now receives it in English.
+    Consistent with the rest of the family, and named here rather than discovered
+    later.
+  - 🚩 **Left standing, and it contradicts this change's own reasoning:** the other
+    two notices still interpolate `SITE_TITLE` into their subject — the very thing
+    avoided here because in production it is the platform's full descriptive title.
+    Their subjects arrive unreadable. Out of scope for a ticket asked to translate
+    them, but it is the same defect.
 
 - **fix(auth): the address-taken notice stops giving advice its reader cannot follow**
   - It said *"sign in to that account the way you normally do, or use the account
