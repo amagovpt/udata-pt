@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **fix(saml): the audit line now describes the sign-in that actually happened**
+  - Both ACS routes wrote their `outcome=` line **before** handing control to the
+    login funnel. Two of the funnel's exits do not sign anyone in — a deleted
+    account is refused, an unconfirmed address is diverted — and by then the line
+    already said `success`. **Anyone counting successes counted those.**
+  - It stopped being harmless on 2026-09-14: until then the audit logger reached no
+    handler at all, so the wrong lines went nowhere. They reach the log file now.
+  - The line is emitted **by the funnel**, at whichever exit it reaches. One line per
+    request, at the point the outcome is known.
+  - 🔑 **No new vocabulary.** A deleted account is `rejected` (`deleted_account`),
+    alongside the `inactive_account` refusal it mirrors. A pending confirmation is
+    **not** a refusal — nobody was turned away, the citizen is sent on to finish
+    confirming, and the destination is the same `/migrate-account` the routes already
+    audit as `migration_pending`. The **reason** is what separates the cases.
+  - The five outcomes and the reasons that distinguish them are now written in the
+    emitter's own docstring. They had lived only in a test's prose, which is not where
+    a contract belongs.
+  - Four new tests, one per outcome, each fixing the log level explicitly — without
+    that, an "and never success" assertion passes over an empty capture. **One of them
+    covers `user_not_found`, which had no assertion anywhere in the tree** and is
+    precisely the line this change moves.
+  - ⚠️ **One trade, stated rather than hidden:** an exception inside the funnel now
+    leaves no line at all, where before the route had already written one. Emitting
+    earlier is what caused the bug, so the trade is deliberate.
+
 - **feat(auth): finish a CMD/eIDAS registration by linking the account you already had**
   - A citizen signing in with a digital identity for the first time gets a temporary
     account with a placeholder address and is held on the registration completion
