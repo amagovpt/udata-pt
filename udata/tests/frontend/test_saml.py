@@ -8322,3 +8322,25 @@ class SAMLFunnelAuditOutcomeTest(APITestCase):
             assert "reason=pending_email_confirmation" in lines[0], lines
             assert "outcome=success" not in lines[0], lines
             assert response.headers["Location"] == "http://localhost:3000/migrate-account"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_assertion_without_an_identity_audits_user_not_found_and_never_success(
+        self, mock_client_for
+    ):
+        """The outcome that changed emitter and had no test at all.
+
+        `user_not_found` had not a single assertion anywhere in the tree --
+        the only mention outside production code was prose in a docstring --
+        and it is precisely the line that moved from the route to the funnel.
+
+        Only the CMD route reaches it: the eIDAS route carries a guard of its
+        own that answers `missing_attributes` before the funnel is entered.
+        That divergence predates this change and is preserved, not fixed here.
+        """
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, first_name="Sem", last_name="Identidade")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=user_not_found" in lines[0], lines
+        assert "outcome=success" not in lines[0], lines
