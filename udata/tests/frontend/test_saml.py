@@ -4782,6 +4782,70 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert not second_placeholder.deleted
         assert not (second_placeholder.extras or {}).get("auth_nic")
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_association_mail_names_the_assertion_not_the_editable_profile(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The name in that mail is a security control, not decoration.
+
+        It goes to an address the requester TYPED, and it sits beside a
+        genuine portal link whose click hands the requester's identity to the
+        account that was clicked. So the one thing it must say truthfully is
+        who asked -- and a name read off the account document is not that: the
+        profile form lets any signed-in account rewrite its own name, with no
+        server-side guard keeping a pending account out of the API.
+
+        Reading the document would therefore let anyone with a government
+        identity place a few hundred characters of their own text inside a
+        message the portal sends to an address of their choosing. The wizard
+        avoids this by reading the assertion out of its own session record;
+        this path reads it out of the session the login funnel stored.
+        """
+        from flask import url_for
+
+        # The document already carries what the requester wrote into their own
+        # profile, which nothing on the server stops a pending account doing.
+        # Set BEFORE the sign-in rather than after: this suite keeps the
+        # logged-in user object in memory for the rest of the test, so an edit
+        # afterwards never reaches the view and the test would pass whether
+        # the fix were there or not.
+        UserFactory(
+            email="saml-deadbeef@autenticacao.gov.pt",
+            password=None,
+            extras={"auth_nic": _hash_nic("50607080")},
+            first_name="URGENT security notice",
+            last_name="call 800-000-000 now",
+        )
+        # A real CMD sign-in. The assertion says who they actually are, and it
+        # is what the funnel stores.
+        self._sso_with(mock_client_for, nic="50607080", first_name="Rita", last_name="Santos")
+
+        UserFactory(email="vitima@example.pt", password="S3cretPass!")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.post(
+                    url_for("security.change_email"),
+                    {
+                        "new_email": "vitima@example.pt",
+                        "new_email_confirm": "vitima@example.pt",
+                        "submit": True,
+                    },
+                    json=False,
+                ).status_code
+                == 302
+            )
+            body = " ".join(str(p) for p in mock_send.call_args[0][1].paragraphs)
+
+        # The link did go out -- this is the association path, not a fallback.
+        assert "/saml/migration/confirm-link/" in body
+        # Named by the assertion.
+        assert "Rita Santos" in body
+        # And nothing the requester wrote reached the mailbox.
+        assert "URGENT" not in body
+        assert "800-000-000" not in body
+
     def test_registration_link_click_refuses_when_placeholder_gained_content(self):
         """What the citizen did while the mail sat in the inbox still counts.
 

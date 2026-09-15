@@ -244,10 +244,17 @@ def change_email():
         # the free branch too costs a query and discloses nothing.
         from udata.auth.saml.saml_plugin.saml_govpt import _placeholder_owns_content
 
+        from udata.auth.saml.saml_plugin.saml_govpt import _has_linked_nic
+
         requester = current_user._get_current_object()
-        requester_owns_content = requester.has_placeholder_email and _placeholder_owns_content(
-            requester
-        )
+        # The same two conditions the association itself requires of the
+        # requester, so the refusal notice is only ever sent where an
+        # association was actually on the table. Without the identity check, a
+        # pending account with content but nothing to move would have the
+        # address's owner told that linking was refused over content, when no
+        # linking was ever possible.
+        requester_could_associate = requester.has_placeholder_email and _has_linked_nic(requester)
+        requester_owns_content = requester_could_associate and _placeholder_owns_content(requester)
 
         existing = find_user_by_email_ci(new_email)
         if existing and existing.id != current_user.id:

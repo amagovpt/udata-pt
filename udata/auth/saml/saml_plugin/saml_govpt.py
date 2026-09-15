@@ -1258,6 +1258,8 @@ def _handle_saml_user_login(
     doc_type=None,
     doc_nationality=None,
     asserted_email=None,
+    asserted_first_name=None,
+    asserted_last_name=None,
 ):
     """Handle login/redirect after SAML authentication.
 
@@ -1278,6 +1280,15 @@ def _handle_saml_user_login(
     email attribute at all -- which is why the completion screen can tell the
     two apart by the presence of the value alone, without being told the
     provider.
+
+    ``asserted_first_name`` and ``asserted_last_name`` are kept for the same
+    window and for a stricter reason. They name the requester in the mail the
+    completion screen can send, and that mail goes to an address the requester
+    typed. Reading those names off the account document instead would let
+    anyone signed in with a government identity put text of their own choosing
+    into a message the portal sends to an address of their choosing, since the
+    profile form lets an account rewrite its own name. The assertion is the
+    only source that is not the sender's to edit.
     """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
@@ -1459,6 +1470,16 @@ def _handle_saml_user_login(
         session["saml_asserted_email"] = asserted_email
     else:
         session.pop("saml_asserted_email", None)
+
+    # Kept and cleared on exactly the same terms, and never merged into the
+    # branch above: the names must survive an assertion that carried no email,
+    # which is every eIDAS sign-in and some CMD ones.
+    if user.has_placeholder_email:
+        session["saml_asserted_first_name"] = asserted_first_name
+        session["saml_asserted_last_name"] = asserted_last_name
+    else:
+        session.pop("saml_asserted_first_name", None)
+        session.pop("saml_asserted_last_name", None)
 
     if user.has_placeholder_email:
         return redirect(f"{frontend_url}/complete-registration")
@@ -2040,10 +2061,15 @@ def _placeholder_owns_content(user):
 
     This is the question the association asks before it offers to retire a
     placeholder, and the list is derived from one rule: what does
-    mark_as_deleted destroy irrecoverably? Everything it merely detaches, or
-    that the association carries across itself, is deliberately absent --
-    follows are moved rather than deleted, and the document survives as a soft
-    delete, so authored discussions keep their author.
+    mark_as_deleted destroy irrecoverably? Everything the association carries
+    across itself is deliberately absent -- follows are moved rather than
+    deleted, so having followed something is not a reason to refuse.
+
+    Authored discussions ARE a reason, though the retirement is a soft delete
+    and the messages survive: their author is rewritten to a deleted account,
+    so a conversation the citizen took part in stops being attributable to
+    them. That cannot be undone from outside, which is the test this list
+    applies.
 
     It reads only the requester's own account. Nothing here looks at the
     address that was submitted, which is why the caller may run it before the
@@ -2070,9 +2096,12 @@ def _placeholder_owns_content(user):
         return True
 
     for model in (Dataset, Reuse, Dataservice, CommunityResource, Topic, Page):
-        # Every Owned document, taken from the mixin rather than listed by
-        # eye: Topic and Page own exactly like the rest, and an enumeration
-        # written from memory is how they would be missed.
+        # Every subclass of the Owned mixin, checked against it rather than
+        # recalled -- Topic and Page own exactly like the rest, and are the two
+        # an enumeration written from memory drops. ContactPoint and
+        # HarvestSource are Owned too and are handled separately below, for
+        # reasons particular to each. If a new Owned document appears, it
+        # belongs in one of these lists.
         if model.objects(owner=user).first():
             return True
 
@@ -2163,12 +2192,27 @@ def _mail_registration_association_link(requester, target):
 
     from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
 
+    # From the session's assertion, NEVER from requester.first_name. The
+    # profile form lets any account rewrite its own name, and this name is
+    # interpolated into a mail sent to an address the requester typed -- so
+    # reading the document would hand a CMD-authenticated sender a few hundred
+    # characters of their own text inside a portal message, beside a genuine
+    # portal link. It is exactly the property _send_migration_link's docstring
+    # claims for itself ("it names the identity that asked"), and the wizard
+    # keeps it by reading the assertion out of its own session record.
+    #
+    # Absent means absent: a session predating this carries no names and the
+    # mail is sent without them, which is the same thing that happens when the
+    # assertion itself brought none.
+    first_name = session.get("saml_asserted_first_name")
+    last_name = session.get("saml_asserted_last_name")
+
     extras = requester.extras or {}
     token = _issue_migration_link(
         target,
         extras.get("auth_nic"),
-        requester.first_name,
-        requester.last_name,
+        first_name,
+        last_name,
         # Bare gets, never a default: the record must describe the identity
         # that actually signed in, and inventing a provider for an account
         # that predates the field would be a worse answer than none.
@@ -2180,7 +2224,7 @@ def _mail_registration_association_link(requester, target):
     target.extras[MIGRATION_LINK_SEND_COUNT] = tally
     target.save()
 
-    _send_migration_link(target, requester.first_name, requester.last_name, token)
+    _send_migration_link(target, first_name, last_name, token)
     current_app.logger.info(
         f"Registration association link sent to user {target.id} for pending user {requester.id}"
     )
@@ -2871,6 +2915,11 @@ def idp_initiated():
         # offering it there guarantees a rejection. Here the taken address is
         # the point: it is how the user reaches their own older account.
         asserted_email=user_email,
+        # From the assertion, never from the account document: these name the
+        # requester in a mail sent to an address the requester typed, and the
+        # profile form lets an account rewrite its own name.
+        asserted_first_name=first_name,
+        asserted_last_name=last_name,
     )
 
 
@@ -3370,7 +3419,12 @@ def idp_eidas_initiated():
     # non-string sentinel in edge cases; production values are str or None).
     session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
     return _handle_saml_user_login(
-        user, new_account=(status == "new"), provider=AUTH_PROVIDER_EIDAS
+        user,
+        new_account=(status == "new"),
+        provider=AUTH_PROVIDER_EIDAS,
+        # No asserted_email: the eIDAS Minimum Data Set has no such attribute.
+        asserted_first_name=first_name,
+        asserted_last_name=last_name,
     )
 
 
@@ -3761,14 +3815,22 @@ def _move_follows(placeholder, target):
     from udata.core.followers.models import Follow
 
     for follow in Follow.objects(follower=placeholder):
-        if Follow.objects(follower=target, following=follow.following, until=None).count():
+        # Users are followable, so the placeholder may have followed the very
+        # account it is about to merge into -- re-pointing that one would
+        # leave the target following itself, which nothing else in the product
+        # can produce and no screen expects.
+        if follow.following == target or Follow.objects(
+            follower=target, following=follow.following, until=None
+        ).count():
             follow.delete()
         else:
             follow.follower = target
             follow.save()
 
     for follow in Follow.objects(following=placeholder):
-        if Follow.objects(follower=follow.follower, following=target, until=None).count():
+        if follow.follower == target or Follow.objects(
+            follower=follow.follower, following=target, until=None
+        ).count():
             follow.delete()
         else:
             follow.following = target
