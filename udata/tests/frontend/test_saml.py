@@ -8214,3 +8214,111 @@ class SAMLAuditErrorOutcomeTest(APITestCase):
 
         line = captured.records[0].getMessage()
         assert "name_id_hash=-" in line, line
+
+
+class SAMLFunnelAuditOutcomeTest(APITestCase):
+    """The audit line must describe the exit the funnel actually reached.
+
+    The routes used to emit it themselves, *before* handing control to
+    `_handle_saml_user_login`. Two of the funnel's exits do not sign anyone
+    in -- a deleted account is refused, a pending confirmation is diverted --
+    and by then `outcome=success` had already been written. Anyone counting
+    successes counted those.
+
+    It stopped being theoretical on 2026-09-14: until LEDG-2371 the audit
+    logger reached no handler at all, so the wrong lines went nowhere. They
+    reach the log file now.
+
+    Every test here fixes the level explicitly. `assertLogs` without one
+    would let an "and never success" assertion pass over an empty capture,
+    which is the shape of mistake LEDG-2465 left written down.
+    """
+
+    NIC = "55443322"
+    PERSON_ID = "ES/PT/5544332211"
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def _eidas_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post(
+            "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_pending_confirmation_login_audits_migration_pending_and_never_success(
+        self, mock_client_for, mock_eidas_client_for
+    ):
+        """Diverted, not refused -- and the line has to say which.
+
+        The account was created by the wizard from an address its owner typed
+        and has not confirmed yet. The funnel sends them on to finish that,
+        and deliberately does not sign them in. Nobody was turned away, so
+        `rejected` would be wrong; `migration_pending` is the value the routes
+        already use for the very /migrate-account this exit redirects to, and
+        the reason is what separates it from the wizard's own two.
+
+        Driven through BOTH ACS routes: the exit is in the shared funnel, and
+        a fix applied to one route only would leave the other counting wrong.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import PENDING_EMAIL_CONFIRMATION
+
+        UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), PENDING_EMAIL_CONFIRMATION: True},
+        )
+        UserFactory(
+            confirmed_at=None,
+            extras={
+                "auth_nic": _hash_nic(self.PERSON_ID),
+                PENDING_EMAIL_CONFIRMATION: True,
+            },
+        )
+
+        for driver, client_mock, attrs in (
+            (
+                self._cmd_login,
+                mock_client_for,
+                {"nic": self.NIC, "first_name": "Rui", "last_name": "Neves"},
+            ),
+            (
+                self._eidas_login,
+                mock_eidas_client_for,
+                {
+                    "person_identifier": self.PERSON_ID,
+                    "given_name": "Rui",
+                    "family_name": "Neves",
+                },
+            ),
+        ):
+            with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+                response = driver(client_mock, **attrs)
+
+            lines = [record.getMessage() for record in captured.records]
+            assert len(lines) == 1, lines
+            assert "outcome=migration_pending" in lines[0], lines
+            assert "reason=pending_email_confirmation" in lines[0], lines
+            assert "outcome=success" not in lines[0], lines
+            assert response.headers["Location"] == "http://localhost:3000/migrate-account"
