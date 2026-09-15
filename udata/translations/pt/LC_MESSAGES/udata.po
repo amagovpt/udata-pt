@@ -2795,6 +2795,38 @@ msgstr ""
 "Se foi você, não precisa de fazer nada para manter a conta. Se não conseguir "
 "aceder a essa conta, contacte o suporte."
 
+#: udata/auth/mails.py:236
+msgid "Confirm your email on dados.gov.pt"
+msgstr "Confirme o seu e-mail no dados.gov.pt"
+
+#: udata/auth/mails.py:238
+msgid "This email address was provided for a dados.gov.pt account."
+msgstr "Este endereço de e-mail foi indicado para uma conta do dados.gov.pt."
+
+#: udata/auth/mails.py:240
+msgid ""
+"To confirm this address and link it to your account, select the button "
+"below."
+msgstr ""
+"Para confirmar este endereço e associá-lo à sua conta, selecione o botão "
+"abaixo."
+
+#: udata/auth/mails.py:247
+msgid "Confirm email address"
+msgstr "Confirmar endereço de e-mail"
+
+#: udata/auth/mails.py:248
+msgid "If you did not provide this email address, you can ignore this message."
+msgstr "Se não indicou este endereço de e-mail, pode ignorar esta mensagem."
+
+#: udata/auth/mails.py:255
+msgid "Need help? See the %(help_link)s page on dados.gov.pt."
+msgstr "Precisa de ajuda? Consulte a página %(help_link)s do dados.gov.pt."
+
+#: udata/auth/mails.py:256
+msgid "Help and contacts"
+msgstr "Ajuda e Contactos"
+
 #: udata/auth/mails.py:113
 msgid "Your %(site)s account could not be linked"
 msgstr "Não foi possível associar a sua conta %(site)s"

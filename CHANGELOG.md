@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **feat(auth): the confirm-email mail is written for the three flows that send it**
+  - It used to be two lines — *"Please confirm your email address"* and a button. It
+    now says what address it is about, what confirming does, what to do if you did
+    not ask for it, and where to get help.
+  - **Not "to finish registering".** The same mail serves an email change from the
+    profile, where that phrasing is false for somebody who registered years ago.
+  - **The site name is written out** rather than interpolated: `SITE_TITLE` in
+    production is the platform's full descriptive title, which would make the subject
+    line unreadable.
+  - 🔑 **No greeting and no sign-off in the body** — the mail frame already supplies
+    both for every message on the platform, so a paragraph repeating them would
+    print them twice.
+  - The help line carries an inline link, which needed the one paragraph type that
+    supports one; a button there would give an aside more weight than the
+    confirmation it sits under.
+
 - **fix(auth): the address-taken notice stops giving advice its reader cannot follow**
   - It said *"sign in to that account the way you normally do, or use the account
     recovery if you cannot"*. For the reader most likely to receive it — somebody

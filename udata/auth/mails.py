@@ -190,13 +190,46 @@ def address_taken_notice(**kwargs) -> MailMessage:
 
 
 def confirmation_instructions(confirmation_link: str, **kwargs) -> MailMessage:
+    """Ask the owner of an address to prove they can read it.
+
+    Reached by three flows and worded to be true in all of them: the
+    registration completion screen, an email change from the profile, and a
+    plain resend. An earlier draft opened with "to finish registering", which
+    reads as nonsense to somebody who finished registering years ago and is
+    only changing their address.
+
+    Carries no greeting and no sign-off. The mail frame supplies both, in
+    Portuguese, for every message on the platform -- repeating them here would
+    print them twice.
+
+    The site name is written out rather than interpolated from SITE_TITLE,
+    which in production is the platform's full descriptive title and would
+    make the subject line unreadable. reset_instructions does the same.
+    """
     from udata.i18n import lazy_gettext as _
+    from udata.mail import Link, ParagraphWithLinks
+    from udata.uris import cdata_url
 
     return MailMessage(
-        subject=_("Confirm your email address"),
+        subject=_("Confirm your email on dados.gov.pt"),
         paragraphs=[
-            _("Please confirm your email address."),
-            MailCTA(_("Confirm your email address"), confirmation_link),
+            _("This email address was provided for a dados.gov.pt account."),
+            _("To confirm this address and link it to your account, select the button below."),
+            # A msgid of its own rather than reusing the subject's: the welcome
+            # mail shares that string, and a CTA label wants the imperative
+            # ("Confirm email address"), not the sentence a subject line wants.
+            MailCTA(_("Confirm email address"), confirmation_link),
+            _("If you did not provide this email address, you can ignore this message."),
+            # ParagraphWithLinks is the only way to put a link inside running
+            # text -- a plain paragraph is escaped, and MailCTA is a button on
+            # its own line, which would give this aside more weight than the
+            # confirmation it sits under.
+            ParagraphWithLinks(
+                _(
+                    "Need help? See the %(help_link)s page on dados.gov.pt.",
+                    help_link=Link(_("Help and contacts"), cdata_url("/ajuda-e-contactos")),
+                )
+            ),
         ],
     )
 

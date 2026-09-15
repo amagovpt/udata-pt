@@ -291,6 +291,14 @@ class AuthMailPortugueseTranslationTest(APITestCase):
             "If you cannot access it, contact support."
         ),
         "If it was not you, no action is needed. Your account is untouched.",
+        # udata/auth/mails.py -- the confirm-email mail (LEDG-2350 copy)
+        "Confirm your email on dados.gov.pt",
+        "This email address was provided for a dados.gov.pt account.",
+        ("To confirm this address and link it to your account, select the button below."),
+        "Confirm email address",
+        "If you did not provide this email address, you can ignore this message.",
+        "Need help? See the %(help_link)s page on dados.gov.pt.",
+        "Help and contacts",
         # udata/auth/mails.py -- registration-association refusal.
         #
         # Absent from this list until 2026-09-15, and that absence is why the
@@ -365,6 +373,42 @@ class AuthMailPortugueseTranslationTest(APITestCase):
         rendered = [str(msg.subject)] + [str(p) for p in msg.paragraphs]
         english = [t for t in rendered if " the " in t or "account already exists" in t]
         assert not english, f"untranslated fragments in the notice: {english}"
+
+    @pytest.mark.options(DEFAULT_LANGUAGE="pt")
+    def test_confirmation_instructions_renders_the_approved_copy_in_portuguese(self):
+        """The mail every citizen completing a sign-in receives.
+
+        Three things it must not do, and each has a reason that is invisible
+        from the outside:
+
+        - **No greeting, no sign-off.** The mail frame supplies both for every
+          message on the platform. A paragraph repeating them prints them
+          twice, and nothing else in the test suite would notice.
+        - **Not "to finish registering".** The same mail serves an email
+          change from the profile, where that phrasing is false.
+        - **The site name written out.** SITE_TITLE in production is the
+          platform's full descriptive title; interpolating it would make the
+          subject line unreadable.
+        """
+        from udata.auth.mails import confirmation_instructions
+
+        msg = confirmation_instructions(confirmation_link="https://example.org/c/tok")
+        subject = str(msg.subject)
+        paragraphs = [str(p) for p in msg.paragraphs]
+        body = " ".join(paragraphs)
+
+        assert subject == "Confirme o seu e-mail no dados.gov.pt"
+        assert "registo" not in body, body
+        assert "Bom dia" not in body, body
+        assert "equipa" not in body.lower(), body
+
+        cta = [p for p in msg.paragraphs if getattr(p, "link", None)]
+        assert len(cta) == 1
+        assert cta[0].link == "https://example.org/c/tok"
+        assert str(cta[0].label) == "Confirmar endereço de e-mail"
+
+        english = [p for p in paragraphs if " the " in p]
+        assert not english, f"untranslated fragments: {english}"
 
     def test_address_taken_notice_prescribes_no_sign_in(self):
         """The notice must not tell its reader to sign in.
