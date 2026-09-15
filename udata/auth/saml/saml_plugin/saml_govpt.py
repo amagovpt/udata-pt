@@ -3819,18 +3819,20 @@ def _move_follows(placeholder, target):
         # account it is about to merge into -- re-pointing that one would
         # leave the target following itself, which nothing else in the product
         # can produce and no screen expects.
-        if follow.following == target or Follow.objects(
-            follower=target, following=follow.following, until=None
-        ).count():
+        if (
+            follow.following == target
+            or Follow.objects(follower=target, following=follow.following, until=None).count()
+        ):
             follow.delete()
         else:
             follow.follower = target
             follow.save()
 
     for follow in Follow.objects(following=placeholder):
-        if follow.follower == target or Follow.objects(
-            follower=follow.follower, following=target, until=None
-        ).count():
+        if (
+            follow.follower == target
+            or Follow.objects(follower=follow.follower, following=target, until=None).count()
+        ):
             follow.delete()
         else:
             follow.following = target
