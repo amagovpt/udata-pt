@@ -32,18 +32,6 @@ from udata.tests.helpers import (
 )
 from udata.utils import faker
 
-# Known failures owned by out-of-scope root causes. Each reason names the ticket that
-# owns the production bug; strict=True means a fix turns the XPASS red and forces the
-# marker to be removed by the same change.
-
-R6 = (
-    "LEDG-2337 pending. MembershipAcceptAPI.post (udata/core/organization/api.py:528-553) "
-    "lost the invitation-kind guard that MembershipRefuseAPI still has at :568-569, so an "
-    "organization admin can force-accept an invitation without the invitee consenting. "
-    "This is a production bug being recorded, not a stale test: when it is fixed this "
-    "starts passing and strict=True turns the XPASS red, forcing the marker out."
-)
-
 
 class OrganizationAPITest(PytestOnlyAPITestCase):
     def test_organization_api_list(self):
@@ -501,13 +489,111 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert request.refusal_comment is None
 
         # Accepting twice is deliberately idempotent: the endpoint returns the
-        # existing member with 200 instead of 409. Note that it also re-stamps
-        # status/handled_by/handled_on before that early return, so a second
-        # accept overwrites who handled the request and when; that audit-trail
-        # question is tracked separately, not asserted here.
+        # existing member with 200 instead of 409, and leaves the audit trail
+        # of the first acceptance alone. That preservation is asserted in
+        # test_accept_membership_twice_preserves_audit_trail.
         api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
         response = self.post(api_url)
         assert200(response)
+
+    def test_accept_membership_twice_preserves_audit_trail(self):
+        """A repeated accept must not rewrite who handled the request, nor when."""
+        user = self.login()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(user=applicant, comment="test")
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[membership_request]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        assert200(self.post(api_url))
+
+        organization.reload()
+        handled_by = organization.requests[0].handled_by
+        handled_on = organization.requests[0].handled_on
+        assert handled_by == user
+
+        # Second accept, same admin: the real-world shape of the bug.
+        with assert_not_emit(MembershipRequest.after_handle):
+            response = self.post(api_url)
+        assert200(response)
+
+        # The early return must marshal the existing member, not None: a null
+        # member marshals to a 200 full of nulls rather than raising, so only
+        # reading the body catches it.
+        assert response.json["user"]["id"] == str(applicant.id)
+        assert response.json["role"] == "editor"
+
+        organization.reload()
+        assert organization.requests[0].handled_by == handled_by
+        assert organization.requests[0].handled_on == handled_on
+        assert organization.requests[0].status == "accepted"
+        assert len(organization.members) == 2
+
+    def test_accept_membership_twice_preserves_another_admins_stamp(self):
+        """A second admin accepting an already accepted request keeps the first one's stamp."""
+        user = self.login()
+        other_admin = UserFactory()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(
+            user=applicant,
+            comment="test",
+            status="accepted",
+            handled_by=other_admin,
+            handled_on=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=applicant, role="editor")],
+            requests=[membership_request],
+        )
+        # Read the stamp back as stored: Mongo returns it naive.
+        organization.reload()
+        handled_on = organization.requests[0].handled_on
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        with assert_not_emit(MembershipRequest.after_handle):
+            response = self.post(api_url)
+        assert200(response)
+
+        assert response.json["user"]["id"] == str(applicant.id)
+        assert response.json["role"] == "editor"
+
+        organization.reload()
+        request = organization.requests[0]
+        assert request.handled_by == other_admin
+        assert request.handled_on == handled_on
+        assert request.status == "accepted"
+        assert len(organization.members) == 2
+
+    def test_accept_membership_restores_a_removed_member(self):
+        """An accepted request whose member was removed takes the normal path again."""
+        user = self.login()
+        other_admin = UserFactory()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(
+            user=applicant,
+            comment="test",
+            status="accepted",
+            handled_by=other_admin,
+            handled_on=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        # Accepted request, but the member was since removed: MemberAPI.delete
+        # pulls the member and leaves the request alone. The short-circuit must
+        # not swallow this — it would answer 200 with a null member.
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[membership_request]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        with assert_emit(MembershipRequest.after_handle):
+            response = self.post(api_url)
+        assert200(response)
+
+        assert response.json["user"]["id"] == str(applicant.id)
+
+        organization.reload()
+        assert organization.is_member(applicant)
+        assert organization.requests[0].handled_by == user
 
     def test_only_admin_can_accept_membership(self):
         user = self.login()
@@ -581,7 +667,6 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
         assert response.json["message"] == "Unknown membership request id"
 
-    @pytest.mark.xfail(strict=True, reason=R6)
     def test_accept_membership_rejects_invitation(self):
         """Test that accept_membership rejects invitations."""
         user = self.login()
@@ -600,6 +685,29 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
         organization.reload()
         assert organization.requests[0].status == "pending"
+        assert len(organization.members) == 1
+
+    def test_accept_membership_rejects_email_invitation(self):
+        """An invitation to an address with no account is refused too."""
+        user = self.login()
+        # The shape MemberInviteAPI actually stores for an unregistered
+        # address: no user, only an email. Accepting it used to append a
+        # Member with a null user.
+        invitation = MembershipRequest(
+            kind="invitation", user=None, email=faker.email(), created_by=user, role="editor"
+        )
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[invitation]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=invitation.id)
+        response = self.post(api_url)
+
+        assert400(response)
+
+        organization.reload()
+        assert organization.requests[0].status == "pending"
+        assert len(organization.members) == 1
 
     def test_refuse_membership_rejects_invitation(self):
         """Test that refuse_membership rejects invitations."""
