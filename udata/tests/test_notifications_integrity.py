@@ -183,13 +183,19 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
                 ),
             ).save()
 
-        assert Notification.objects.count() == 3
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while an orphan
+        # is still there, which is exactly what this test exists to catch.
+        assert len(list(Notification.objects)) == 3
 
         delete_discussions_for_subject(dataset)
 
         # Only the discussion hanging off the untouched subject survives, with its notification.
         assert Discussion.objects(subject=dataset).count() == 0
-        assert Notification.objects.count() == 1
+        for gone in discussions[:2]:
+            assert Notification.objects(details__discussion=gone).count() == 0
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == discussions[2]
 
     def test_discussion_notification_cleanup_on_dataset_purge(self):
@@ -240,12 +246,13 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
             ),
         ).save()
 
-        assert Notification.objects.count() == 3
+        assert len(list(Notification.objects)) == 3
 
         tasks.purge_datasets()
 
         assert Discussion.objects(subject=dataset).count() == 0
-        assert Notification.objects.count() == 1
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == kept_discussion
 
     def test_discussion_notification_cleanup_on_reuse_purge(self):
@@ -271,12 +278,13 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
                 ),
             ).save()
 
-        assert Notification.objects.count() == 2
+        assert len(list(Notification.objects)) == 2
 
         tasks.purge_reuses()
 
         assert Discussion.objects(subject=reuse).count() == 0
-        assert Notification.objects.count() == 1
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == kept_discussion
 
     def test_discussion_notification_cleanup_on_dataservice_purge(self):
@@ -304,12 +312,13 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
                 ),
             ).save()
 
-        assert Notification.objects.count() == 2
+        assert len(list(Notification.objects)) == 2
 
         tasks.purge_dataservices()
 
         assert Discussion.objects(subject=dataservice).count() == 0
-        assert Notification.objects.count() == 1
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == kept_discussion
 
     def test_multiple_notifications_cleanup(self):

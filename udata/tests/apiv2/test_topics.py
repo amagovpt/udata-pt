@@ -472,14 +472,17 @@ class TopicAPITest(APITestCase):
             ),
         ).save()
 
-        self.assertEqual(Notification.objects.count(), 1)
+        # `len(list(...))` rather than `.count()`: an unfiltered count goes through
+        # `estimated_document_count()`, which reads collection metadata and can be wrong.
+        self.assertEqual(len(list(Notification.objects)), 1)
 
         with self.api_user():
             response = self.delete(url_for("apiv2.topic", topic=topic))
         self.assertStatus(response, 204)
 
-        self.assertEqual(Discussion.objects.count(), 0)
-        self.assertEqual(Notification.objects.count(), 0)
+        self.assertEqual(Discussion.objects(subject=topic).count(), 0)
+        self.assertEqual(Notification.objects(details__discussion=discussion).count(), 0)
+        self.assertEqual(len(list(Notification.objects)), 0)
 
     def test_topic_api_delete_with_elements(self):
         """It should delete a topic with elements without raising DoesNotExist error"""
