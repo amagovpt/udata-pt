@@ -12,6 +12,7 @@ from udata.core.organization.notifications import (
     MembershipRequestNotificationDetails,
     NewBadgeNotificationDetails,
 )
+from udata.core.reuse.factories import ReuseFactory
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.features.notifications.models import Notification, NotificationQuerySet
 from udata.features.transfer.factories import TransferFactory
@@ -243,6 +244,37 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         tasks.purge_datasets()
 
         assert Discussion.objects(subject=dataset).count() == 0
+        assert Notification.objects.count() == 1
+        assert Notification.objects.first().details.discussion == kept_discussion
+
+    def test_discussion_notification_cleanup_on_reuse_purge(self):
+        """Test that purging a reuse leaves none of its discussions' notifications."""
+        from udata.core.reuse import tasks
+
+        user = UserFactory()
+        reuse = ReuseFactory(deleted=datetime.now(UTC))
+        kept_reuse = ReuseFactory()
+        discussion = DiscussionFactory(
+            user=user, subject=reuse, discussion=[MessageDiscussionFactory(posted_by=user)]
+        )
+        kept_discussion = DiscussionFactory(
+            user=user, subject=kept_reuse, discussion=[MessageDiscussionFactory(posted_by=user)]
+        )
+        for each in (discussion, kept_discussion):
+            Notification(
+                user=user,
+                details=DiscussionNotificationDetails(
+                    discussion=each,
+                    status=DiscussionStatus.NEW_DISCUSSION,
+                    message_id=each.discussion[0].id,
+                ),
+            ).save()
+
+        assert Notification.objects.count() == 2
+
+        tasks.purge_reuses()
+
+        assert Discussion.objects(subject=reuse).count() == 0
         assert Notification.objects.count() == 1
         assert Notification.objects.first().details.discussion == kept_discussion
 
