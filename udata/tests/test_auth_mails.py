@@ -283,6 +283,29 @@ class AuthMailPortugueseTranslationTest(APITestCase):
             "do, or use the account recovery if you cannot."
         ),
         "If it was not you, no action is needed. Your account is untouched.",
+        # udata/auth/mails.py -- registration-association refusal.
+        #
+        # Absent from this list until 2026-09-15, and that absence is why the
+        # mail shipped untranslated for a week: the notice was added AFTER the
+        # commit that translated its siblings and extended this guard, so
+        # nothing ever asked whether it had a translation. A list that pins
+        # "the set that was actually broken" only stays useful if it grows
+        # with the set.
+        "Your %(site)s account could not be linked",
+        (
+            "You received this email because someone signing in to %(site)s with a "
+            "digital identity asked to link it to the account that uses this address."
+        ),
+        (
+            "It was not linked. The temporary account created for that sign-in "
+            "already holds content of its own, and linking would have discarded it. "
+            "Nothing was changed on either account."
+        ),
+        (
+            "If it was you, contact support so the two accounts can be sorted out "
+            "together. If it was not you, no action is needed: your account is "
+            "untouched and nobody gained access to it."
+        ),
         # SAML plugin -- the account-linking mail the user received in English
         "Confirm linking a digital identity to your account",
         (
@@ -334,3 +357,27 @@ class AuthMailPortugueseTranslationTest(APITestCase):
         rendered = [str(msg.subject)] + [str(p) for p in msg.paragraphs]
         english = [t for t in rendered if " the " in t or "account already exists" in t]
         assert not english, f"untranslated fragments in the notice: {english}"
+
+    @pytest.mark.options(DEFAULT_LANGUAGE="pt")
+    def test_registration_association_refused_notice_renders_fully_in_portuguese(self):
+        """The same structural check, for the notice that had none.
+
+        This mail shipped in English for a week and nothing said so: gettext
+        returns the msgid when a catalogue has no entry, so it rendered
+        cleanly and read fine to anyone who reads English. Nobody reading it
+        in production did.
+
+        Also asserts what the notice must NOT have. It carries no link by
+        design -- there is nothing a link could do, because the refusal is
+        about content on the other account that only a person can resolve --
+        and a paragraph with a link would be the first sign that somebody
+        "helpfully" added an action here.
+        """
+        from udata.auth.mails import registration_association_refused_notice
+
+        msg = registration_association_refused_notice()
+        rendered = [str(msg.subject)] + [str(p) for p in msg.paragraphs]
+        english = [t for t in rendered if " the " in t or "could not be linked" in t]
+        assert not english, f"untranslated fragments in the refusal: {english}"
+
+        assert not [p for p in msg.paragraphs if getattr(p, "link", None)]

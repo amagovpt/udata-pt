@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **fix(auth): the registration-refusal email was going out in English**
+  - The notice that tells somebody their account could not be linked had **no entry
+    at all** in the Portuguese catalogue, so it shipped in English to every reader —
+    and production defaults to Portuguese.
+  - 🚩 **Nothing failed.** `gettext` returns the message id when a catalogue has no
+    entry, so the mail rendered cleanly and read fine to anyone who reads English.
+    Nobody reading it in production did.
+  - The cause is a gap in the guard, not in the translation: the test that pins
+    "every auth string has a Portuguese translation" lists them by hand, and this
+    notice was written **after** the commit that translated its siblings and
+    extended that list. A list pinning "the set that was actually broken" only
+    stays useful if it grows with the set — so the four strings are in it now,
+    with the reason written beside them.
+  - The notice also gains the structural check its sibling already had, plus an
+    assertion it carries **no link** — there is nothing a link could do here, and a
+    paragraph with one would be the first sign somebody added an action that cannot
+    help.
+
 - **fix(saml): the audit line now describes the sign-in that actually happened**
   - Both ACS routes wrote their `outcome=` line **before** handing control to the
     login funnel. Two of the funnel's exits do not sign anyone in — a deleted

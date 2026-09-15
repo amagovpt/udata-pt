@@ -2787,6 +2787,38 @@ msgstr "Eliminação da sua conta inativa em {site}"
 msgid "Your new email must be different than your previous email"
 msgstr "O seu novo e-mail tem de ser diferente do anterior"
 
+#: udata/auth/mails.py:113
+msgid "Your %(site)s account could not be linked"
+msgstr "Não foi possível associar a sua conta %(site)s"
+
+#: udata/auth/mails.py:116
+msgid ""
+"You received this email because someone signing in to %(site)s with a "
+"digital identity asked to link it to the account that uses this address."
+msgstr ""
+"Recebeu esta mensagem porque alguém que iniciou sessão no %(site)s com uma "
+"identidade digital pediu para a associar à conta que usa este endereço."
+
+#: udata/auth/mails.py:121
+msgid ""
+"It was not linked. The temporary account created for that sign-in already "
+"holds content of its own, and linking would have discarded it. Nothing was "
+"changed on either account."
+msgstr ""
+"A associação não foi feita. A conta temporária criada para esse início de "
+"sessão já tem conteúdo próprio, e a associação tê-lo-ia eliminado. Nada "
+"mudou em nenhuma das contas."
+
+#: udata/auth/mails.py:126
+msgid ""
+"If it was you, contact support so the two accounts can be sorted out "
+"together. If it was not you, no action is needed: your account is untouched "
+"and nobody gained access to it."
+msgstr ""
+"Se foi você, contacte o suporte para que as duas contas possam ser "
+"resolvidas em conjunto. Se não foi você, não é necessária nenhuma ação: a "
+"sua conta está intacta e ninguém teve acesso a ela."
+
 #: udata/auth/mails.py:96
 msgid "Your %(site)s account already exists"
 msgstr "A sua conta %(site)s já existe"
