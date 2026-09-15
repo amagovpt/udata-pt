@@ -559,6 +559,9 @@ class MembershipAcceptAPI(MembershipAPI):
         # are required: a request still pending against an existing member is a
         # first handling and is stamped below, and an accepted request whose
         # member was since removed still goes through the normal path.
+        # Trade-off: repeating the call used to double as a retry when the
+        # signal failed after the save, leaving notifications unhandled. That
+        # retry is gone; the receiver is where such a failure belongs.
         if membership_request.status == "accepted" and org.is_member(membership_request.user):
             return org.member(membership_request.user)
 

@@ -17,8 +17,12 @@
     pending invitations and pending join requests in one table with the same
     Accept button, without distinguishing them. Clicking Accept on an
     invitation row now fails instead of silently adding the member — which is
-    the point, and is already what Refuse does there. Giving those rows their
-    own action is a separate frontend change.
+    the point, and is already what Refuse does there.
+  - ⚠️ **That leaves an invitation row with no working action**, because the
+    cancel endpoint it should offer instead is not wired into the admin screen
+    at all. The row can only be resolved by the invitee accepting or refusing
+    it. Teaching that table to tell the two kinds apart, and to cancel an
+    invitation, is a separate frontend change and should follow closely.
   - **A repeated accept no longer rewrites who handled the request, or when.**
     Accepting an already accepted request stays idempotent and still answers
     200 with the existing member, but the request keeps the original
