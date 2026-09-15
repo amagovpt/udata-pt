@@ -8214,3 +8214,205 @@ class SAMLAuditErrorOutcomeTest(APITestCase):
 
         line = captured.records[0].getMessage()
         assert "name_id_hash=-" in line, line
+
+
+class SAMLFunnelAuditOutcomeTest(APITestCase):
+    """The audit line must describe the exit the funnel actually reached.
+
+    The routes used to emit it themselves, *before* handing control to
+    `_handle_saml_user_login`. Two of the funnel's exits do not sign anyone
+    in -- a deleted account is refused, a pending confirmation is diverted --
+    and by then `outcome=success` had already been written. Anyone counting
+    successes counted those.
+
+    It stopped being theoretical on 2026-09-14: until LEDG-2371 the audit
+    logger reached no handler at all, so the wrong lines went nowhere. They
+    reach the log file now.
+
+    Every test here fixes the level explicitly. `assertLogs` without one
+    would let an "and never success" assertion pass over an empty capture,
+    which is the shape of mistake LEDG-2465 left written down.
+    """
+
+    NIC = "55443322"
+    PERSON_ID = "ES/PT/5544332211"
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+
+    @pytest.fixture(autouse=True)
+    def _set_frontend_url(self, app):
+        app.config["CDATA_BASE_URL"] = "http://localhost:3000"
+
+    def _cmd_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post("/saml/sso", data={"SAMLResponse": encoded}, follow_redirects=False)
+
+    def _eidas_login(self, mock_client_for, **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return self.client.post(
+            "/saml/eidas/sso", data={"SAMLResponse": encoded}, follow_redirects=False
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_pending_confirmation_login_audits_migration_pending_and_never_success(
+        self, mock_client_for, mock_eidas_client_for
+    ):
+        """Diverted, not refused -- and the line has to say which.
+
+        The account was created by the wizard from an address its owner typed
+        and has not confirmed yet. The funnel sends them on to finish that,
+        and deliberately does not sign them in. Nobody was turned away, so
+        `rejected` would be wrong; `migration_pending` is the value the routes
+        already use for the very /migrate-account this exit redirects to, and
+        the reason is what separates it from the wizard's own two.
+
+        Driven through BOTH ACS routes: the exit is in the shared funnel, and
+        a fix applied to one route only would leave the other counting wrong.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import PENDING_EMAIL_CONFIRMATION
+
+        UserFactory(
+            confirmed_at=None,
+            extras={"auth_nic": _hash_nic(self.NIC), PENDING_EMAIL_CONFIRMATION: True},
+        )
+        UserFactory(
+            confirmed_at=None,
+            extras={
+                "auth_nic": _hash_nic(self.PERSON_ID),
+                PENDING_EMAIL_CONFIRMATION: True,
+            },
+        )
+
+        for driver, client_mock, attrs in (
+            (
+                self._cmd_login,
+                mock_client_for,
+                {"nic": self.NIC, "first_name": "Rui", "last_name": "Neves"},
+            ),
+            (
+                self._eidas_login,
+                mock_eidas_client_for,
+                {
+                    "person_identifier": self.PERSON_ID,
+                    "given_name": "Rui",
+                    "family_name": "Neves",
+                },
+            ),
+        ):
+            with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+                response = driver(client_mock, **attrs)
+
+            lines = [record.getMessage() for record in captured.records]
+            assert len(lines) == 1, lines
+            assert "outcome=migration_pending" in lines[0], lines
+            assert "reason=pending_email_confirmation" in lines[0], lines
+            assert "outcome=success" not in lines[0], lines
+            assert response.headers["Location"] == "http://localhost:3000/migrate-account"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_assertion_without_an_identity_audits_user_not_found_and_never_success(
+        self, mock_client_for
+    ):
+        """The outcome that changed emitter and had no test at all.
+
+        `user_not_found` had not a single assertion anywhere in the tree --
+        the only mention outside production code was prose in a docstring --
+        and it is precisely the line that moved from the route to the funnel.
+
+        Only the CMD route reaches it: the eIDAS route carries a guard of its
+        own that answers `missing_attributes` before the funnel is entered.
+        That divergence predates this change and is preserved, not fixed here.
+        """
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, first_name="Sem", last_name="Identidade")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=user_not_found" in lines[0], lines
+        assert "outcome=success" not in lines[0], lines
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_deleted_account_login_audits_rejected_and_never_success(self, mock_client_for):
+        """Refused, and audited as refused.
+
+        Reaching this exit at all takes THREE deviations from what
+        `mark_as_deleted` actually produces, and the third is the one that
+        matters: it also sets `active=False`, rewrites the address to a
+        synthetic form, and -- decisively -- sets `extras = None`. With the
+        extras gone the resolver never returns the account: the NIC rule
+        queries `extras.auth_nic`, the email rule queries the real address,
+        and the name rule filters deleted rows out. The request ends in
+        `no_match` and the wizard branch, nowhere near here.
+
+        So this models a row with a deletion date, still active, and with its
+        `auth_nic` intact -- drift, not the ordinary path. The exit is worth
+        auditing anyway: it is the one that would silently count a refusal as
+        a success if it ever were reached.
+        """
+        deleted = UserFactory(
+            active=True,
+            confirmed_at="2024-01-01",
+            deleted="2024-06-01",
+            extras={"auth_nic": _hash_nic(self.NIC)},
+        )
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Dias")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=rejected" in lines[0], lines
+        assert "reason=deleted_account" in lines[0], lines
+        assert "outcome=success" not in lines[0], lines
+
+        deleted.reload()
+        # Never signed in. A fresh account has no login_count at all, so the
+        # falsy check is the honest one -- `== 0` would be asserting a value
+        # the factory does not set.
+        assert not deleted.login_count
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_an_active_eidas_account_still_audits_exactly_one_success(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The control, for the route that did not have one.
+
+        Its CMD twin already exists. With the emission moved into the shared
+        funnel, a mistake there breaks both routes at once -- so the guard
+        against "refuse everyone and every assertion above passes" needs to
+        exist on both sides too.
+        """
+        active = UserFactory(
+            confirmed_at="2024-01-01", extras={"auth_nic": _hash_nic(self.PERSON_ID)}
+        )
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._eidas_login(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Nuno",
+                family_name="Faria",
+            )
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=success" in lines[0], lines
+        assert "kind=eidas" in lines[0], lines
+
+        active.reload()
+        assert active.login_count == 1

@@ -682,11 +682,36 @@ audit_logger = logging.getLogger("udata.auth.saml.audit")
 def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
     """Emit a structured SAML SSO audit log line.
 
-    One line per terminal decision (success/reject/error) so the SAML
-    authentication funnel can be traced post-hoc without correlating
-    multiple debug logs. ``name_id`` is hashed (HMAC-SHA256) so the raw
-    Subject identifier is never written to disk; this matches how it is
-    stored in ``user.extras.auth_nic``.
+    **Exactly one line per SSO callback request**, at the point where the
+    outcome is actually decided. That invariant is what makes the lines
+    countable: two lines double a sign-in, none hides it, and a line written
+    before the decision counts something that did not happen.
+
+    ⚠️ "per SSO callback" and not "per sign-in": the migration link click
+    (`migration_confirm_link`) establishes a session and emits nothing at
+    all. That gap predates this and is not closed here, but anyone counting
+    these lines to answer "how many people signed in" will undercount by the
+    number of people who arrived through an emailed link.
+
+    ``outcome`` is one of five values, and this list is the vocabulary --
+    anything counting these lines depends on it, so a sixth value is a
+    contract change, not an implementation detail:
+
+    - ``success``          -- a session was established
+    - ``rejected``         -- the sign-in was refused, fail-closed
+    - ``migration_pending`` -- not refused: the citizen was sent on to finish
+      something (the migration wizard, or a pending email confirmation). They
+      have a way forward, which is what separates this from ``rejected``
+    - ``user_not_found``   -- the assertion carried no identity to resolve
+    - ``error``            -- the request was malformed before any decision
+
+    ``reason`` is free text and is what distinguishes cases sharing an
+    outcome: ``inactive_account`` and ``deleted_account`` are both
+    ``rejected``; ``migration_candidate``/``no_match`` (the wizard) and
+    ``pending_email_confirmation`` (the funnel) are both ``migration_pending``.
+
+    ``name_id`` is hashed (HMAC-SHA256) so the raw Subject identifier is never
+    written to disk; this matches how it is stored in ``user.extras.auth_nic``.
     """
     name_id_hash = "-"
     if name_id:
@@ -1260,6 +1285,10 @@ def _handle_saml_user_login(
     asserted_email=None,
     asserted_first_name=None,
     asserted_last_name=None,
+    kind=None,
+    issuer=None,
+    name_id=None,
+    status=None,
 ):
     """Handle login/redirect after SAML authentication.
 
@@ -1280,6 +1309,16 @@ def _handle_saml_user_login(
     email attribute at all -- which is why the completion screen can tell the
     two apart by the presence of the value alone, without being told the
     provider.
+
+    ``kind``, ``issuer``, ``name_id`` and ``status`` exist so this function can
+    emit the audit line ITSELF, at each of its exits. The routes used to emit
+    ``success`` before calling here, which was a guess: two of the branches
+    below refuse or divert, and the line was already written. Only here is the
+    outcome actually known.
+
+    ``kind`` has no truthful default. An omitted one writes ``kind=None`` --
+    a missing value -- rather than silently claiming the sign-in was CMD,
+    which is the same class of mistake this placement fixes.
 
     ``asserted_first_name`` and ``asserted_last_name`` are kept for the same
     window and for a stricter reason. They name the requester in the mail the
@@ -1306,6 +1345,7 @@ def _handle_saml_user_login(
             f"(frontend_url={frontend_url!r})"
         )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
+        _audit_saml("user_not_found", kind, issuer=issuer, name_id=name_id, reason=status)
         # user is None only when the IdP response carried neither an email
         # nor a NIC/PersonIdentifier — expose it in the redirect for
         # browser-trace diagnosis (see _reject_saml_login).
@@ -1316,6 +1356,10 @@ def _handle_saml_user_login(
             f"[DEBUG] _handle_saml_user_login: user.deleted=True, email={user.email!r}"
         )
         do_flash(*get_message("DISABLED_ACCOUNT"))
+        # A refusal, and audited as one: nothing is written and no session is
+        # established. Same shape as inactive_account, which the routes refuse
+        # earlier -- the reason is what tells the two apart.
+        _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason="deleted_account")
         return redirect(frontend_url or "/")
 
     # An account created by the wizard from a self-declared email must not be
@@ -1340,6 +1384,17 @@ def _handle_saml_user_login(
             "email": user.email,
             "nic_hash": (user.extras or {}).get("auth_nic"),
         }
+        # NOT a refusal. Nobody was turned away: the citizen is sent on to
+        # finish confirming their address, and the destination is the very
+        # /migrate-account the routes already audit as migration_pending. The
+        # reason is what separates this from the wizard's own two reasons.
+        _audit_saml(
+            "migration_pending",
+            kind,
+            issuer=issuer,
+            name_id=name_id,
+            reason="pending_email_confirmation",
+        )
         return redirect(f"{frontend_url}/migrate-account")
 
     if requires_confirmation(user):
@@ -1444,6 +1499,19 @@ def _handle_saml_user_login(
     # address through migration_pending and let this user spend their send
     # budget.
     session.pop("saml_confirmation_pending", None)
+
+    # After the session exists, never before. Both remaining exits below are
+    # the same outcome -- one of them asks for an email first -- so the line
+    # belongs here rather than duplicated at each return.
+    #
+    # Emitted unconditionally although login_user can return False. That is
+    # safe only because BOTH ACS routes refuse an inactive account before
+    # entering here (LEDG-2465), and `active` is the only property that makes
+    # login_user refuse. The guarantee therefore lives in the routes, not on
+    # this line -- so if either guard ever moves, this becomes a success line
+    # for a session that was never established. Wrapping the emission in the
+    # `if` would be worse: the refusal would then produce no line at all.
+    _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=status)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts
     # created without a usable CMD email, or older ones from before this
@@ -2804,8 +2872,9 @@ def idp_initiated():
     # worse outcome than letting nobody in.
     #
     # Sits here, before the wizard branch, for the same reason as the guard
-    # below: nothing has been written yet, and the route's success audit line
-    # is never reached.
+    # below: nothing has been written yet, and the funnel -- which is what
+    # emits the terminal audit line -- is never entered, so this refusal is
+    # the only line the request produces.
     if status == "ambiguous_identity":
         return _reject_saml_login(
             "[SAML cmd] refused login for an identity claimed by more than one account",
@@ -2884,13 +2953,12 @@ def idp_initiated():
         )
         status = "new"
 
-    _audit_saml(
-        "success" if user else "user_not_found",
-        "cmd",
-        issuer=issuer,
-        name_id=name_id_value,
-        reason=status,
-    )
+    # No audit line here. It used to be emitted at this point, before the
+    # funnel had decided anything, so a login the funnel went on to refuse
+    # (deleted account) or divert (pending confirmation) was still counted as
+    # a success. The funnel emits it now, at whichever exit it actually
+    # reaches -- see _handle_saml_user_login.
+    #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
     session["saml_name_id"] = name_id_value
@@ -2902,6 +2970,12 @@ def idp_initiated():
         new_account=(status == "new"),
         provider=AUTH_PROVIDER_CMD,
         citizen_declared=_declared_citizen(),
+        # What the funnel needs to audit its own outcome, and which only this
+        # route knows.
+        kind="cmd",
+        issuer=issuer,
+        name_id=name_id_value,
+        status=status,
         # Only when the document was the identity. For a national the NIC won
         # in the composition above, so recording the document here would
         # describe something other than what auth_nic actually holds.
@@ -3405,13 +3479,9 @@ def idp_eidas_initiated():
             detail=identity_keys_csv,
         )
 
-    _audit_saml(
-        "success",
-        "eidas",
-        issuer=issuer,
-        name_id=name_id_value,
-        reason=status,
-    )
+    # No audit line here, for the same reason as the CMD route: the funnel is
+    # the only place that knows which exit it took.
+    #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
     session["saml_name_id"] = name_id_value
@@ -3422,6 +3492,10 @@ def idp_eidas_initiated():
         user,
         new_account=(status == "new"),
         provider=AUTH_PROVIDER_EIDAS,
+        kind="eidas",
+        issuer=issuer,
+        name_id=name_id_value,
+        status=status,
         # No asserted_email: the eIDAS Minimum Data Set has no such attribute.
         asserted_first_name=first_name,
         asserted_last_name=last_name,
