@@ -26,6 +26,10 @@
     way the cleanup stops running, a test says so.
   - Pre-existing orphaned notifications, if any were ever produced by another route, are
     not cleaned up here; that would need a migration.
+  - The `fix(discussions)` entry further down this section still says the bulk purges are
+    not covered and still leave orphans. That sentence is wrong, for the reason above. It
+    is left as written because the entry has already been promoted, and editing a
+    promoted line is what makes the same line diverge between environment branches.
 
 - **fix(organization): the membership accept endpoint no longer force-accepts invitations**
   - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
@@ -1155,15 +1159,9 @@
     `binary=False` stores the identical bytes, so old and new documents both match and no
     data migration is needed. The API is unaffected — a `UUIDField` still serializes to
     the same JSON string.
-  - This was originally written as covering deletion through the API only, on the
-    assumption that purging a dataset, reuse, dataservice or topic deletes its
-    discussions with a queryset that never instantiates a document and so never emits
-    the signal. That assumption is wrong: mongoengine's `QuerySet.delete()` falls back
-    to per-document deletes whenever a `pre_delete`/`post_delete` receiver is registered
-    for the model, and `Discussion` has two -- one from `REPORTABLE_MODELS`, one from its
-    search adapter. The bulk purges
-    were covered all along. The `refactor(discussions)` entry at the top of this section
-    makes that no longer a coincidence.
+  - This covers deletion through the API. Purging a dataset, reuse, dataservice or topic
+    deletes its discussions with a queryset, which never instantiates a document and so
+    never emits the signal; that path still leaves orphans and needs its own change.
   - The cleanup receivers keep the `try`/`except` — the signals arrive after the delete
     has already happened, so raising would turn a completed `DELETE` into a 500 — but they
     log with `log.exception`, and so does the backfill migration. A swallowed traceback is
