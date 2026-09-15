@@ -14,12 +14,13 @@ from udata.core.badges import tasks as badge_tasks
 from udata.core.constants import HVD
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.constants import INSPIRE
+from udata.core.discussions.actions import delete_discussions_for_subject
 from udata.core.organization.assignment import Assignment
 from udata.core.organization.constants import CERTIFIED, PUBLIC_SERVICE
 from udata.core.organization.models import Organization
 from udata.core.pages.models import Page
 from udata.harvest.models import HarvestJob
-from udata.models import Activity, Discussion, Follow, TopicElement, Transfer
+from udata.models import Activity, Follow, TopicElement, Transfer
 from udata.mongo.document import UDataDocument as Document
 from udata.storage.s3 import store_bytes
 from udata.tasks import job
@@ -46,7 +47,7 @@ def purge_datasets(self):
         # Remove followers
         Follow.objects(following=dataset).delete()
         # Remove discussions
-        Discussion.objects(subject=dataset).delete()
+        delete_discussions_for_subject(dataset)
         # Remove activity
         Activity.objects(related_to=dataset).delete()
         # Remove topics' related dataset

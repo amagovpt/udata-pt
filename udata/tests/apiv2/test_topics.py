@@ -3,7 +3,9 @@ from flask import url_for
 
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import DatasetFactory
+from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
 from udata.core.discussions.models import Discussion
+from udata.core.discussions.notifications import DiscussionNotificationDetails, DiscussionStatus
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.organization.models import Member
 from udata.core.reuse.factories import ReuseFactory
@@ -20,6 +22,7 @@ from udata.core.topic.factories import (
 )
 from udata.core.topic.models import Topic, TopicElement
 from udata.core.user.factories import UserFactory
+from udata.features.notifications.models import Notification
 from udata.i18n import _
 from udata.tests.api import APITestCase
 from udata.tests.api.test_datasets_api import SAMPLE_GEOM
@@ -450,6 +453,36 @@ class TopicAPITest(APITestCase):
 
         self.assertEqual(Topic.objects.count(), 0)
         self.assertEqual(Discussion.objects.count(), 0)
+
+    def test_topic_api_delete_cleans_discussion_notifications(self):
+        """It should leave no notification behind the discussions it deletes"""
+        owner = self.login()
+        topic = TopicFactory(owner=owner)
+        # Built through the factory rather than the API: posting a discussion would
+        # emit on_new_discussion and produce notifications of its own.
+        discussion = DiscussionFactory(
+            user=owner, subject=topic, discussion=[MessageDiscussionFactory(posted_by=owner)]
+        )
+        Notification(
+            user=owner,
+            details=DiscussionNotificationDetails(
+                discussion=discussion,
+                status=DiscussionStatus.NEW_DISCUSSION,
+                message_id=discussion.discussion[0].id,
+            ),
+        ).save()
+
+        # `len(list(...))` rather than `.count()`: an unfiltered count goes through
+        # `estimated_document_count()`, which reads collection metadata and can be wrong.
+        self.assertEqual(len(list(Notification.objects)), 1)
+
+        with self.api_user():
+            response = self.delete(url_for("apiv2.topic", topic=topic))
+        self.assertStatus(response, 204)
+
+        self.assertEqual(Discussion.objects(subject=topic).count(), 0)
+        self.assertEqual(Notification.objects(details__discussion=discussion).count(), 0)
+        self.assertEqual(len(list(Notification.objects)), 0)
 
     def test_topic_api_delete_with_elements(self):
         """It should delete a topic with elements without raising DoesNotExist error"""

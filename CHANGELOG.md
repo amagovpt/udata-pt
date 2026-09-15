@@ -70,6 +70,34 @@
     assertion it carries **no link** — there is nothing a link could do here, and a
     paragraph with one would be the first sign somebody added an action that cannot
     help.
+- **refactor(discussions): stop the purge paths' notification cleanup from being a coincidence**
+  - The four places that delete a subject's discussions in bulk — the dataset, reuse and
+    dataservice purge jobs, and `DELETE /api/2/topics/<topic>/` — were reported as leaving
+    orphaned notifications behind, on the grounds that a `QuerySet.delete()` never
+    instantiates a document and so never reaches the `Discussion.delete()` override that
+    emits `on_discussion_deleted`. They were not. Mongoengine's `QuerySet.delete()` falls
+    back to deleting document by document whenever a `pre_delete`/`post_delete` receiver
+    is registered for the model, and two unrelated modules register one for `Discussion`:
+    `udata.core.reports`, because it is in `REPORTABLE_MODELS`, and `udata.search`,
+    because it has a search adapter. The override does run, the signal is emitted, and
+    the notifications were already being cleaned up.
+  - That is worth nothing as a guarantee. The correctness of the notification cleanup
+    rested on two registrations that exist for reasons having nothing to do with
+    notifications, and it needed only one of them to survive. Removing both -- or, later,
+    the last one standing -- would have reintroduced the orphans silently, in four places
+    at once, with nothing in the code to warn whoever did it.
+  - The four paths now go through a single `delete_discussions_for_subject()` helper that
+    deletes each discussion explicitly, so the cleanup no longer depends on that
+    coincidence, and a future fifth caller has something to copy.
+  - Five tests cover the helper and the four paths. They are green on both sides of this
+    change and are not claimed to prove a fix: they lock the behaviour, so that whichever
+    way the cleanup stops running, a test says so.
+  - Pre-existing orphaned notifications, if any were ever produced by another route, are
+    not cleaned up here; that would need a migration.
+  - The `fix(discussions)` entry further down this section still says the bulk purges are
+    not covered and still leave orphans. That sentence is wrong, for the reason above. It
+    is left as written because the entry has already been promoted, and editing a
+    promoted line is what makes the same line diverge between environment branches.
 
 - **fix(saml): the audit line now describes the sign-in that actually happened**
   - Both ACS routes wrote their `outcome=` line **before** handing control to the
@@ -132,6 +160,7 @@
     registering another way, or changes identity.
   - Works with the migration wizard switched off — this path is not the wizard, and
     the citizens who need it are held on a screen the wizard cannot help with.
+
 - **fix(organization): the membership accept endpoint no longer force-accepts invitations**
   - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
     *join* — the organization side of the flow. An invitation travels the other
