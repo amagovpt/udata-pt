@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **fix(auth): the address-taken notice stops giving advice its reader cannot follow**
+  - It said *"sign in to that account the way you normally do, or use the account
+    recovery if you cannot"*. For the reader most likely to receive it — somebody
+    held on the registration completion screen — **signing in is exactly what they
+    cannot do** until that screen lets them through. The account may also be a SAML
+    one with no usable password at all.
+  - It now says nothing is needed to keep the account, and points at support for
+    anyone who cannot reach it. No step that assumes a capability the reader may
+    not have.
+  - The old wording stays in use by the migration wizard's sibling notice, where the
+    advice **is** sound: that reader is not held anywhere, and the paragraph after it
+    tells them what to do.
+
 - **fix(auth): the registration-refusal email was going out in English**
   - The notice that tells somebody their account could not be linked had **no entry
     at all** in the Portuguese catalogue, so it shipped in English to every reader —

@@ -278,9 +278,17 @@ class AuthMailPortugueseTranslationTest(APITestCase):
             "address on %(site)s. It already belongs to an account, so nothing "
             "was created and nothing changed."
         ),
+        # Still pinned although address_taken_notice stopped using it: the
+        # SAML wizard's sibling notice still does, and there the advice is
+        # sound -- that reader is not held on a screen and the next paragraph
+        # tells them what to do.
         (
             "If it was you, sign in to that account the way you normally "
             "do, or use the account recovery if you cannot."
+        ),
+        (
+            "If it was you, nothing further is needed to keep the account. "
+            "If you cannot access it, contact support."
         ),
         "If it was not you, no action is needed. Your account is untouched.",
         # udata/auth/mails.py -- registration-association refusal.
@@ -357,6 +365,27 @@ class AuthMailPortugueseTranslationTest(APITestCase):
         rendered = [str(msg.subject)] + [str(p) for p in msg.paragraphs]
         english = [t for t in rendered if " the " in t or "account already exists" in t]
         assert not english, f"untranslated fragments in the notice: {english}"
+
+    def test_address_taken_notice_prescribes_no_sign_in(self):
+        """The notice must not tell its reader to sign in.
+
+        It used to: "sign in to that account the way you normally do". That is
+        impossible advice for the reader most likely to get this mail --
+        somebody held on the registration completion screen, who cannot sign
+        in anywhere until that screen lets them through. The account may also
+        be a SAML one with no usable password at all.
+
+        Asserted on the English source rather than the translation, so the
+        check survives a retranslation, and paired with the no-link assertion
+        because both are properties the docstring argues for and neither is
+        visible from the outside.
+        """
+        from udata.auth.mails import address_taken_notice
+
+        msg = address_taken_notice()
+        rendered = " ".join(str(p) for p in msg.paragraphs)
+        assert "sign in" not in rendered.lower(), rendered
+        assert not [p for p in msg.paragraphs if getattr(p, "link", None)]
 
     @pytest.mark.options(DEFAULT_LANGUAGE="pt")
     def test_registration_association_refused_notice_renders_fully_in_portuguese(self):

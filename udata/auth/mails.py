@@ -94,12 +94,11 @@ def welcome_existing(recovery_link: str, **kwargs) -> MailMessage:
 def registration_association_refused_notice(**kwargs) -> MailMessage:
     """Tell the owner their account could not be associated, and what to do.
 
-    The sibling notice cannot serve this case. Its one actionable line is
-    "sign in to that account the way you normally do", which is impossible
-    advice for the person who triggers this: they are held on the registration
-    completion screen and cannot sign in anywhere until it lets them through.
-    Its docstring declines to prescribe a step because it cannot know the
-    case; here the case is known, so this one says it.
+    The sibling notice cannot serve this case. It is deliberately vague about
+    what to do, because it cannot know which case it is in: the address may
+    have been named by a stranger, by the owner themselves, or by a pending
+    registration. Here the case IS known -- a registration was refused over
+    content on the temporary account -- so this one names the step.
 
     Carries no link, for the same reason as its sibling and one more: there is
     nothing a link could do. The association was refused because the temporary
@@ -146,10 +145,14 @@ def address_taken_notice(**kwargs) -> MailMessage:
 
     Deliberately carries no link of any kind. A confirmation link here would
     act on an account the requesting session has proved nothing about, and
-    would be a way to spray confirmation mail at any address on demand. It also
-    prescribes no particular next step: the account may have been created
-    through SAML and have no usable password, so "use your password" would be
-    impossible advice.
+    would be a way to spray confirmation mail at any address on demand.
+
+    It also prescribes no step that assumes the recipient can sign in. It used
+    to say "sign in to that account the way you normally do", which is
+    impossible advice for the reader most likely to receive this: somebody
+    held on the registration completion screen, who cannot sign in anywhere
+    until that screen lets them through. The account may also have been
+    created through SAML and have no usable password at all.
 
     This is now the FALLBACK of that branch rather than all of it. A caller
     still completing a government-identity registration is mailed an
@@ -178,8 +181,8 @@ def address_taken_notice(**kwargs) -> MailMessage:
                 site=site,
             ),
             _(
-                "If it was you, sign in to that account the way you normally "
-                "do, or use the account recovery if you cannot."
+                "If it was you, nothing further is needed to keep the account. "
+                "If you cannot access it, contact support."
             ),
             _("If it was not you, no action is needed. Your account is untouched."),
         ],

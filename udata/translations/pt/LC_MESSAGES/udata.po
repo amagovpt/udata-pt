@@ -2787,6 +2787,14 @@ msgstr "Eliminação da sua conta inativa em {site}"
 msgid "Your new email must be different than your previous email"
 msgstr "O seu novo e-mail tem de ser diferente do anterior"
 
+#: udata/auth/mails.py:178
+msgid ""
+"If it was you, nothing further is needed to keep the account. If you cannot "
+"access it, contact support."
+msgstr ""
+"Se foi você, não precisa de fazer nada para manter a conta. Se não conseguir "
+"aceder a essa conta, contacte o suporte."
+
 #: udata/auth/mails.py:113
 msgid "Your %(site)s account could not be linked"
 msgstr "Não foi possível associar a sua conta %(site)s"
