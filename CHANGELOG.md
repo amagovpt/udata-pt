@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **test(saml): the account-linking mail's security properties are now held by a test**
+  - That mail's own docstring calls its body a security control: the wizard reaches an
+    account having proved nothing about it, so the mail is what stands between a
+    request nobody made and an identity bound to somebody else's account.
+  - Two properties carry that weight — it **names who asked**, and it **says plainly
+    not to open the link** if you did not start this — and **nothing held either of
+    them**. Anyone shortening the copy could have dropped both and left every test in
+    the file green.
+  - No text changed. The test is the change.
+
 - **feat(auth): the confirm-email mail is written for the three flows that send it**
   - It used to be two lines — *"Please confirm your email address"* and a button. It
     now says what address it is about, what confirming does, what to do if you did
