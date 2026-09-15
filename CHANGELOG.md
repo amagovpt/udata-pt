@@ -31,6 +31,68 @@
     is left as written because the entry has already been promoted, and editing a
     promoted line is what makes the same line diverge between environment branches.
 
+- **fix(saml): the audit line now describes the sign-in that actually happened**
+  - Both ACS routes wrote their `outcome=` line **before** handing control to the
+    login funnel. Two of the funnel's exits do not sign anyone in — a deleted
+    account is refused, an unconfirmed address is diverted — and by then the line
+    already said `success`. **Anyone counting successes counted those.**
+  - It stopped being harmless on 2026-09-14: until then the audit logger reached no
+    handler at all, so the wrong lines went nowhere. They reach the log file now.
+  - The line is emitted **by the funnel**, at whichever exit it reaches. One line per
+    request, at the point the outcome is known.
+  - 🔑 **No new vocabulary.** A deleted account is `rejected` (`deleted_account`),
+    alongside the `inactive_account` refusal it mirrors. A pending confirmation is
+    **not** a refusal — nobody was turned away, the citizen is sent on to finish
+    confirming, and the destination is the same `/migrate-account` the routes already
+    audit as `migration_pending`. The **reason** is what separates the cases.
+  - The five outcomes and the reasons that distinguish them are now written in the
+    emitter's own docstring. They had lived only in a test's prose, which is not where
+    a contract belongs.
+  - Four new tests, one per outcome, each fixing the log level explicitly — without
+    that, an "and never success" assertion passes over an empty capture. **One of them
+    covers `user_not_found`, which had no assertion anywhere in the tree** and is
+    precisely the line this change moves.
+  - ⚠️ **One trade, stated rather than hidden:** an exception inside the funnel now
+    leaves no line at all, where before the route had already written one. Emitting
+    earlier is what caused the bug, so the trade is deliberate.
+
+- **feat(auth): finish a CMD/eIDAS registration by linking the account you already had**
+  - A citizen signing in with a digital identity for the first time gets a temporary
+    account with a placeholder address and is held on the registration completion
+    screen until they provide a real one. If the address they provide is the one on
+    the account they already had, there was nowhere to go: the address is taken, so
+    the screen mailed a silent notice and the citizen stayed stuck — unable to finish
+    registering and unable to reach their own account. It was the most reported
+    problem of this review.
+  - That branch now mails an **association link** to the address's owner. Clicking it
+    moves the identity onto the older account and retires the temporary one, so the
+    next sign-in lands where the citizen expects. The link is a different instrument
+    from the confirmation link the branch still refuses to issue: it grants the
+    requesting session nothing and does nothing until the mailbox's owner opens it.
+  - **The screen stays one field.** The taken/free distinction is decided on the
+    server and shows up only in what is mailed; the browser is answered identically
+    either way, so the enumeration oracle this flow was built without stays closed —
+    now pinned for the new branches too.
+  - **The address the CMD asserted is offered back as a prefill.** It is captured in
+    the login funnel, so accounts created before this existed get it on their next
+    sign-in rather than needing a backfill. eIDAS never supplies one — its Minimum
+    Data Set has no email attribute — so that field is simply empty there.
+  - ⚠️ **When the temporary account already holds work, the association is refused**
+    rather than moving content between accounts, and the owner is told by a mail
+    written for that case. What counts as work is derived from what retiring an
+    account destroys irrecoverably; follows are moved across instead, since the
+    person is the same.
+  - 🚩 **The three writes are ordered so failures stay recoverable.** The identity
+    leaves the temporary account before it is bound to the older one: the reverse
+    order has a window where one identity sits on two accounts, which the login
+    lookup refuses outright, locking the citizen out of both. This way a failure
+    leaves it on neither, and the next sign-in puts that right by itself.
+  - The link is re-checked at the click, not trusted from when it was issued: an
+    inbox can hold it for hours while the account acquires work, finishes
+    registering another way, or changes identity.
+  - Works with the migration wizard switched off — this path is not the wizard, and
+    the citizens who need it are held on a screen the wizard cannot help with.
+
 - **fix(organization): the membership accept endpoint no longer force-accepts invitations**
   - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
     *join* — the organization side of the flow. An invitation travels the other
