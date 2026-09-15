@@ -8344,3 +8344,46 @@ class SAMLFunnelAuditOutcomeTest(APITestCase):
         assert len(lines) == 1, lines
         assert "outcome=user_not_found" in lines[0], lines
         assert "outcome=success" not in lines[0], lines
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_deleted_account_login_audits_rejected_and_never_success(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Refused, and audited as refused.
+
+        Reaching this exit at all takes THREE deviations from what
+        `mark_as_deleted` actually produces, and the third is the one that
+        matters: it also sets `active=False`, rewrites the address to a
+        synthetic form, and -- decisively -- sets `extras = None`. With the
+        extras gone the resolver never returns the account: the NIC rule
+        queries `extras.auth_nic`, the email rule queries the real address,
+        and the name rule filters deleted rows out. The request ends in
+        `no_match` and the wizard branch, nowhere near here.
+
+        So this models a row with a deletion date, still active, and with its
+        `auth_nic` intact -- drift, not the ordinary path. The exit is worth
+        auditing anyway: it is the one that would silently count a refusal as
+        a success if it ever were reached.
+        """
+        deleted = UserFactory(
+            active=True,
+            confirmed_at="2024-01-01",
+            deleted="2024-06-01",
+            extras={"auth_nic": _hash_nic(self.NIC)},
+        )
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_login(mock_client_for, nic=self.NIC, first_name="Ana", last_name="Dias")
+
+        lines = [record.getMessage() for record in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=rejected" in lines[0], lines
+        assert "reason=deleted_account" in lines[0], lines
+        assert "outcome=success" not in lines[0], lines
+
+        deleted.reload()
+        # Never signed in. A fresh account has no login_count at all, so the
+        # falsy check is the honest one -- `== 0` would be asserting a value
+        # the factory does not set.
+        assert not deleted.login_count
