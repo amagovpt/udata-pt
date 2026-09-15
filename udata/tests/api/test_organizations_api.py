@@ -32,18 +32,6 @@ from udata.tests.helpers import (
 )
 from udata.utils import faker
 
-# Known failures owned by out-of-scope root causes. Each reason names the ticket that
-# owns the production bug; strict=True means a fix turns the XPASS red and forces the
-# marker to be removed by the same change.
-
-R6 = (
-    "LEDG-2337 pending. MembershipAcceptAPI.post (udata/core/organization/api.py:528-553) "
-    "lost the invitation-kind guard that MembershipRefuseAPI still has at :568-569, so an "
-    "organization admin can force-accept an invitation without the invitee consenting. "
-    "This is a production bug being recorded, not a stale test: when it is fixed this "
-    "starts passing and strict=True turns the XPASS red, forcing the marker out."
-)
-
 
 class OrganizationAPITest(PytestOnlyAPITestCase):
     def test_organization_api_list(self):
@@ -581,7 +569,6 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
         assert response.json["message"] == "Unknown membership request id"
 
-    @pytest.mark.xfail(strict=True, reason=R6)
     def test_accept_membership_rejects_invitation(self):
         """Test that accept_membership rejects invitations."""
         user = self.login()

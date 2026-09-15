@@ -537,11 +537,20 @@ class MembershipAPI(API):
 class MembershipAcceptAPI(MembershipAPI):
     @api.secure
     @api.doc("accept_membership", **common_doc)
+    @api.response(400, "Use the cancel endpoint for invitations")
     @api.marshal_with(member_fields)
     def post(self, org, id):
         """Accept user membership to a given organization."""
         org.permissions["members"].test()
         membership_request = self.get_or_404(org, id)
+
+        # This endpoint approves a request to join, so it is the organization
+        # side of the flow. An invitation travels the other way and only the
+        # invitee may accept it, through /me/org_invitations/<id>/accept/;
+        # without this guard an admin could add someone who consented to
+        # nothing. MembershipRefuseAPI keeps the symmetric check.
+        if membership_request.kind == "invitation":
+            api.abort(400, _("Use the cancel endpoint for invitations"))
 
         membership_request.status = "accepted"
         membership_request.handled_by = current_user._get_current_object()
