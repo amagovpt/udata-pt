@@ -4,6 +4,7 @@ from unittest import mock
 
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.discussions.factories import DiscussionFactory, MessageDiscussionFactory
+from udata.core.discussions.models import Discussion
 from udata.core.discussions.notifications import DiscussionNotificationDetails, DiscussionStatus
 from udata.core.organization.constants import CERTIFIED
 from udata.core.organization.factories import OrganizationFactory
@@ -156,6 +157,38 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
 
         # Verify notifications are cleaned up (via purge function)
         assert Notification.objects.count() == 0
+
+    def test_delete_discussions_for_subject_cleans_notifications(self):
+        """Test that the shared helper cleans up the notifications it deletes discussions for."""
+        from udata.core.discussions.actions import delete_discussions_for_subject
+
+        user = UserFactory()
+        dataset = DatasetFactory()
+        other_dataset = DatasetFactory()
+        discussions = [
+            DiscussionFactory(
+                user=user, subject=subject, discussion=[MessageDiscussionFactory(posted_by=user)]
+            )
+            for subject in (dataset, dataset, other_dataset)
+        ]
+        for discussion in discussions:
+            Notification(
+                user=user,
+                details=DiscussionNotificationDetails(
+                    discussion=discussion,
+                    status=DiscussionStatus.NEW_DISCUSSION,
+                    message_id=discussion.discussion[0].id,
+                ),
+            ).save()
+
+        assert Notification.objects.count() == 3
+
+        delete_discussions_for_subject(dataset)
+
+        # Only the discussion hanging off the untouched subject survives, with its notification.
+        assert Discussion.objects(subject=dataset).count() == 0
+        assert Notification.objects.count() == 1
+        assert Notification.objects.first().details.discussion == discussions[2]
 
     def test_multiple_notifications_cleanup(self):
         """Test that multiple notifications are cleaned up correctly."""
