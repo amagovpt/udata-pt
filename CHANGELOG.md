@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **refactor(discussions): stop the purge paths' notification cleanup from being a coincidence**
+  - The four places that delete a subject's discussions in bulk — the dataset, reuse and
+    dataservice purge jobs, and `DELETE /api/2/topics/<topic>/` — were reported as leaving
+    orphaned notifications behind, on the grounds that a `QuerySet.delete()` never
+    instantiates a document and so never reaches the `Discussion.delete()` override that
+    emits `on_discussion_deleted`. They were not. Mongoengine's `QuerySet.delete()` falls
+    back to deleting document by document whenever a `pre_delete`/`post_delete` receiver
+    is registered for the model, and two unrelated modules register one for `Discussion`:
+    `udata.core.reports`, because it is in `REPORTABLE_MODELS`, and `udata.search`,
+    because it has a search adapter. The override does run, the signal is emitted, and
+    the notifications were already being cleaned up.
+  - That is worth nothing as a guarantee. The correctness of the notification cleanup
+    rested on two registrations that exist for reasons having nothing to do with
+    notifications, and it needed only one of them to survive. Removing both -- or, later,
+    the last one standing -- would have reintroduced the orphans silently, in four places
+    at once, with nothing in the code to warn whoever did it.
+  - The four paths now go through a single `delete_discussions_for_subject()` helper that
+    deletes each discussion explicitly, so the cleanup no longer depends on that
+    coincidence, and a future fifth caller has something to copy.
+  - Five tests cover the helper and the four paths. They are green on both sides of this
+    change and are not claimed to prove a fix: they lock the behaviour, so that whichever
+    way the cleanup stops running, a test says so.
+  - Pre-existing orphaned notifications, if any were ever produced by another route, are
+    not cleaned up here; that would need a migration.
+
 - **fix(organization): the membership accept endpoint no longer force-accepts invitations**
   - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
     *join* — the organization side of the flow. An invitation travels the other
@@ -1130,9 +1155,15 @@
     `binary=False` stores the identical bytes, so old and new documents both match and no
     data migration is needed. The API is unaffected — a `UUIDField` still serializes to
     the same JSON string.
-  - This covers deletion through the API. Purging a dataset, reuse, dataservice or topic
-    deletes its discussions with a queryset, which never instantiates a document and so
-    never emits the signal; that path still leaves orphans and needs its own change.
+  - This was originally written as covering deletion through the API only, on the
+    assumption that purging a dataset, reuse, dataservice or topic deletes its
+    discussions with a queryset that never instantiates a document and so never emits
+    the signal. That assumption is wrong: mongoengine's `QuerySet.delete()` falls back
+    to per-document deletes whenever a `pre_delete`/`post_delete` receiver is registered
+    for the model, and `Discussion` has two -- one from `REPORTABLE_MODELS`, one from its
+    search adapter. The bulk purges
+    were covered all along. The `refactor(discussions)` entry at the top of this section
+    makes that no longer a coincidence.
   - The cleanup receivers keep the `try`/`except` — the signals arrive after the delete
     has already happened, so raising would turn a completed `DELETE` into a 500 — but they
     log with `log.exception`, and so does the backfill migration. A swallowed traceback is
