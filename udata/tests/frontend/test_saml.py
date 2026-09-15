@@ -4636,7 +4636,7 @@ class SAMLMigrationLinkClickTest(APITestCase):
             UserFactory(
                 email=placeholder_email,
                 password=None,
-                extras={"auth_nic": _hash_nic(nic)},
+                extras={"auth_nic": _hash_nic(nic), "auth_provider": "cmd"},
                 first_name="Rita",
                 last_name="Santos",
             )
@@ -4714,6 +4714,37 @@ class SAMLMigrationLinkClickTest(APITestCase):
         # account it happened to be made from.
         assert Follow.objects(follower=target, following=followed).count() == 1
         assert Follow.objects(follower=placeholder).count() == 0
+
+        # How the citizen signs in travels with the identity. Without it the
+        # older account would hold a linked NIC and no record of which provider
+        # proved it -- and nothing downstream could tell a CMD account from an
+        # eIDAS one afterwards.
+        assert target.extras["auth_provider"] == "cmd"
+
+        # --- and the same thing with the wizard OPEN ---
+        #
+        # The flag is dispensed for this origin, which is a statement about
+        # both of its states: the association must behave identically whether
+        # the wizard is running or not, or "dispensed" would really mean
+        # "only works when the wizard is shut".
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        third_placeholder, third_target, third_token = self._issue_association_link(
+            target_email="ana.old@example.pt",
+            nic="70605040",
+            placeholder_email="saml-feedface@autenticacao.gov.pt",
+        )
+        with self.app.test_client() as fresh:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
+                response = fresh.get(f"/saml/migration/confirm-link/{third_token}")
+                mock_login.assert_called_once()
+                assert mock_login.call_args[0][0].id == third_target.id
+        assert response.headers["Location"] == "http://localhost:3000"
+        third_target.reload()
+        assert third_target.extras["auth_nic"] == _hash_nic("70605040")
+        assert third_target.extras["auth_provider"] == "cmd"
+        third_placeholder.reload()
+        assert third_placeholder.deleted
+        assert User.objects(extras__auth_nic=_hash_nic("70605040")).count() == 1
 
         # --- and the reason the identity leaves the placeholder FIRST ---
         #
