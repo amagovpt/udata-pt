@@ -1011,6 +1011,38 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         assert "connection error" in mock_warning.call_args[0][0].lower()
         mock_exception.assert_not_called()
 
+    def test_harvest_log_lines_do_not_carry_the_source_password(self, rmock, mocker):
+        """A source URL may legitimately carry `user:password@`, and the log
+        lines that print it reach the server's log files, which the Sentry
+        `before_send` does not protect (LEDG-2501).
+
+        The connection error is given a message holding the URL because that
+        is what a real `requests` failure does -- without it the assertion on
+        the warning line would pass whether or not it redacts.
+        """
+        url = f"http://harvestuser:sup3rs3cr3t@{TEST_DOMAIN}/test.jsonld"
+        # Registered with the credentials in it: `requests` leaves the userinfo
+        # in the prepared URL, so that is the request the adapter sees.
+        rmock.get(
+            url,
+            exc=requests.exceptions.ConnectionError(f"Failed to establish a connection to {url}"),
+        )
+
+        source = HarvestSourceFactory(backend="dcat", url=url, organization=OrganizationFactory())
+
+        mock_debug = mocker.patch("udata.harvest.backends.base.log.debug")
+        mock_warning = mocker.patch("udata.harvest.backends.base.log.warning")
+
+        actions.run(source)
+
+        logged = " ".join(
+            str(call) for call in mock_debug.call_args_list + mock_warning.call_args_list
+        )
+        assert "sup3rs3cr3t" not in logged
+        assert "harvestuser" not in logged
+        # Still says the source carried credentials, and still names the host.
+        assert "http://***@data.test.org" in logged
+
     def test_preview_does_not_create_contact_points(self, rmock):
         """Preview should not create ContactPoints in DB."""
         from udata.core.contact_point.models import ContactPoint
