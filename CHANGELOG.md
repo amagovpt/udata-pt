@@ -25,6 +25,76 @@
     The consent screen offers the document attributes to a national too; whether the
     assertion arrives with them filled in is not known for either population. Under the
     pessimistic reading of the flag the blast radius is unknown, not one group.
+- **fix(harvest): odspt and maaf no longer publish the source URL password in resource URLs and remote ids**
+  - This is the item the previous entry left standing. `URLS_ALLOW_CREDENTIALS`
+    is true, so a source that needs basic auth is configured as
+    `https://user:password@host` — and two backends built **published data** out
+    of it. `odspt` derived `Dataset.resources[].url` and `extras["ods:url"]`;
+    `maaf` used the descriptor URL as `HarvestItem.remote_id`, which the first
+    `save_job()` persists before the metadata supplies the real one, so a failed
+    item kept it.
+  - 🔑 **The worst consumer is the portal itself.** `/r/<id>` redirects to
+    `resource.url` or streams it as an attachment — so the download proxy was
+    fetching the file **authenticated with somebody else's credentials** and
+    handing it to an anonymous caller. That is the argument for the decision
+    below, more than the listing that exposes the string.
+  - 🔑 **The decision: redact, and accept that the link stops downloading.** A
+    link that only works because it carries somebody else's password is the
+    defect, not a feature — an anonymous reader is not supposed to hold the
+    credentials. The alternatives were weighed and rejected: refusing to harvest
+    a credentialed source would produce empty datasets in silence, and moving
+    the credentials out of the URL is a new feature with no consumer asking for
+    it, which would still need this redaction for a URL somebody types by hand.
+  - **Nobody pays that cost today.** An inventory against a production-scale
+    restore (23,080 datasets, 46 harvest sources, data through August 2026)
+    found one `odspt` source and no `maaf` source, neither carrying credentials,
+    and not one affected resource URL, `ods:url` or `remote_id`. The fix is
+    preventive. ⚠️ The restore is not the live database, which is why the
+    migration logs the live source counts rather than leaving the caveat open.
+  - **What made `odspt` tractable is an asymmetry:** `api_url` is the only
+    request the backend makes and the only consumer that needs the credentials
+    back. `public_source_url` redacts the rest; `download_url` and `export_url`
+    derive from `explore_url` and inherit it.
+  - **`maaf` inverts the relationship instead:** the `remote_id` is built from
+    the redacted URL and the credentialed one travels as a kwarg, which
+    `process_dataset` forwards without storing. Redacting at serialization
+    instead would have left the password in Mongo and needed three call sites
+    rather than one — unlike errors and logs, where neither half was redundant,
+    here the second would be.
+  - **Redacting a URL now splits it instead of pattern-matching it.** The
+    free-text helper has to stop at the RFC 3986 authority alphabet, because in
+    prose it cannot tell where a URL ends — but `udata.uris` accepts any run of
+    non-space characters as userinfo, so a password holding `{`, `|`, `^`, `"`,
+    `<`, `>` or a backtick went straight through it. The same regex also
+    rewrites `https://host/files//report@2026.csv`, a legitimate resource URL,
+    into something broken. `redact_url_credentials_in_url` splits the URL and
+    replaces the authority, which is exact in both directions; the free-text
+    helper keeps the error messages and log lines it was written for.
+  - A migration redacts what is already stored, writing only the individual
+    fields that change and pinning each one to the value it read — `resources`
+    is not append-only, so an editor deleting one between the read and the write
+    would otherwise shift the redaction onto a different resource. ⚠️ **It does
+    not un-leak anything**: a credential that was publicly readable is
+    compromised, and the remedy is to rotate it at the remote source. It is
+    expected to be a no-op, and its counters are the inventory of the live
+    database.
+  - ⚠️ **If those counters come back non-zero**, two follow-ups are not
+    automatic: the search index keeps its own copy of `extras` and of the
+    `harvest` sub-document, so the touched datasets need reindexing; and a
+    harvest that ran between the code deploy and the migration would have
+    appended a second, redacted copy of every ODS resource, because `odspt`
+    matches resources by URL and never prunes. Run `udata db upgrade` before
+    restarting the workers and neither applies.
+  - 🚩 **Still standing.** From the previous entry: the `$name, $url` text index
+    that lets a caller confirm a guessed credential via `?q=`, and the raw URL
+    interpolated into `log.warning` / `log.exception`, which belongs in
+    `udata/sentry.py` because every `requests` exception shares it. **And one
+    this work found:** the `ckan` backend builds `Dataset.harvest.remote_url`
+    out of the source URL (`ckan/harvesters.py`, inherited by `ckanpt`), which
+    is the same defect in a field that is more public and longer-lived than
+    either of the two fixed here — it is on every dataset, not on a job that
+    gets purged. It needs its own change and its own migration field; no live
+    source carries credentials today, so it is preventive there too.
 
 - **fix(harvest): a harvest source URL no longer publishes its own password**
   - `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth is

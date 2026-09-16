@@ -5,6 +5,7 @@ import pytest
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.maaf import MaafBackend
+from ..models import HarvestJob
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -75,3 +76,64 @@ class MaafResourceIdentityTest(PytestOnlyDBTestCase):
 
         assert resource_urls(REMOTE_ID) == [CSV_URL]
         assert resource_ids(REMOTE_ID) == [csv_id]
+
+
+CREDENTIALED_MAAF_URL = "https://harvestuser:sup3rs3cr3t@example.pt/maaf/"
+CREDENTIALED_DESCRIPTOR_URL = "https://harvestuser:sup3rs3cr3t@example.pt/maaf/dataset.xml"
+REDACTED_DESCRIPTOR_URL = "https://***@example.pt/maaf/dataset.xml"
+# `inner_harvest` skips the first link as the parent directory.
+INDEX_HTML = (
+    "<ul><li><a href='../'>Parent</a></li><li><a href='dataset.xml'>dataset.xml</a></li></ul>"
+)
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["maaf"])
+class MaafCredentialedSourceTest(PytestOnlyDBTestCase):
+    """The descriptor URL is the item's `remote_id`, and `remote_id` is public.
+
+    `URLS_ALLOW_CREDENTIALS` is true, so a MAAF source may carry
+    `user:password@`; `urljoin` then puts it on every descriptor URL. The first
+    `save_job()` persists that as the `remote_id` before the metadata supplies
+    the real one, so a failed item keeps it -- and `item_fields` /
+    `error_item_fields` serialize `remote_id` on routes with no session
+    (LEDG-2500).
+
+    These run the real `inner_harvest`, unlike the resource identity tests
+    above, because the line under test is the one that builds the `remote_id`.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(backend="maaf", url=CREDENTIALED_MAAF_URL)
+
+    def test_failed_item_remote_id_carries_no_credentials(self, rmock):
+        rmock.get(CREDENTIALED_MAAF_URL, text=INDEX_HTML)
+        rmock.get(CREDENTIALED_DESCRIPTOR_URL, status_code=500)
+
+        job = MaafBackend(self._source()).harvest()
+
+        assert [item.status for item in job.items] == ["failed"]
+        assert job.items[0].remote_id == REDACTED_DESCRIPTOR_URL
+        assert "sup3rs3cr3t" not in job.items[0].remote_id
+        # What the first `save_job()` wrote is what an anonymous caller reads,
+        # so assert on the reloaded document and not just the in-memory item.
+        stored = HarvestJob.objects.get(id=job.id)
+        assert stored.items[0].remote_id == REDACTED_DESCRIPTOR_URL
+
+    def test_fetch_still_uses_the_credentialed_url(self, rmock, monkeypatch):
+        rmock.get(CREDENTIALED_MAAF_URL, text=INDEX_HTML)
+        rmock.get(CREDENTIALED_DESCRIPTOR_URL, text="<not-parsed/>")
+        monkeypatch.setattr(MaafBackend, "parse_xml", lambda self, xml: {"metadata": _metadata([])})
+
+        job = MaafBackend(self._source()).harvest()
+
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        # Redacting what is published must not cost the fetch its credentials.
+        # Asserted on the descriptor request specifically: the index request is
+        # credentialed whatever this code does, so `any(...)` over the whole
+        # history would pass even if the descriptor were fetched redacted.
+        assert job.items[0].remote_id == REMOTE_ID
+        descriptors = [r for r in rmock.request_history if r.url.endswith("dataset.xml")]
+        assert descriptors, [r.url for r in rmock.request_history]
+        assert all("harvestuser" in request.url for request in descriptors)

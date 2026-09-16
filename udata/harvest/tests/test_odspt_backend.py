@@ -89,3 +89,85 @@ class OdsBackendPTOrganizationTest(PytestOnlyDBTestCase):
         assert [item.status for item in job.items] == ["done"]
         assert Organization.objects(acronym="brand-new-org").count() == 1
         assert job.items[0].dataset.organization.acronym == "brand-new-org"
+
+
+CREDENTIALED_ODS_URL = "https://harvestuser:sup3rs3cr3t@transparencia.example.pt"
+CREDENTIALED_SEARCH_URL = "{0}/api/datasets/1.0/search/".format(CREDENTIALED_ODS_URL)
+REDACTED_ODS_URL = "https://***@transparencia.example.pt"
+
+
+def _ods_payload_with_attachment(publisher):
+    """The same minimal payload, plus one attachment to exercise `extra_file_url`."""
+    payload = _ods_payload(publisher)
+    payload["datasets"][0]["attachments"] = [
+        {
+            "id": "att-1",
+            "title": "Notice",
+            "description": "A note",
+            "mimetype": "application/pdf",
+            "url": "odsfile://notice.pdf",
+        }
+    ]
+    return payload
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["odspt"])
+class OdsBackendPTCredentialedSourceTest(PytestOnlyDBTestCase):
+    """A source URL carrying `user:password@` must not reach what is published.
+
+    `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth really
+    is configured that way. The resource URLs and `extras["ods:url"]` this
+    backend derives from it are read without a session, and `/r/<id>` would
+    even fetch the file with those credentials on an anonymous caller's behalf
+    (LEDG-2500).
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(
+            backend="odspt", url=CREDENTIALED_ODS_URL, organization=None, owner=None
+        )
+
+    def test_public_urls_carry_no_credentials_while_the_fetch_keeps_them(self, rmock):
+        # Registered on the credentialed URL on purpose: `requests` keeps the
+        # userinfo in the prepared URL and `requests_mock` matches the whole
+        # netloc, so a plain registration would not match the real request.
+        rmock.get(CREDENTIALED_SEARCH_URL, json=_ods_payload_with_attachment("brand-new-org"))
+
+        job = OdsBackendPT(self._source()).harvest()
+
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        dataset = job.items[0].dataset
+        assert dataset.resources, "the payload should have produced resources"
+        for resource in dataset.resources:
+            assert "sup3rs3cr3t" not in resource.url
+            assert "harvestuser" not in resource.url
+            assert resource.url.startswith(REDACTED_ODS_URL)
+        assert dataset.extras["ods:url"] == "{0}/explore/dataset/ods-dataset/".format(
+            REDACTED_ODS_URL
+        )
+        # The attachment goes through `extra_file_url`, a different code path
+        # from the exports, so assert it was actually among them.
+        assert any(
+            resource.url.startswith("{0}/api/datasets/1.0/".format(REDACTED_ODS_URL))
+            for resource in dataset.resources
+        )
+        # The harvest itself still authenticates: redacting what is published
+        # must not cost the fetch its credentials. Asserted non-vacuously --
+        # `all(...)` over an empty history would pass on its own.
+        assert rmock.request_history
+        assert all("harvestuser" in request.url for request in rmock.request_history)
+
+    def test_reharvest_matches_resources_by_their_redacted_url(self, rmock):
+        """`get_resource` matches on the stored URL, which is now the redacted one."""
+        rmock.get(CREDENTIALED_SEARCH_URL, json=_ods_payload_with_attachment("brand-new-org"))
+        source = self._source()
+
+        first = OdsBackendPT(source).harvest()
+        before = [(resource.id, resource.url) for resource in first.items[0].dataset.resources]
+
+        second = OdsBackendPT(source).harvest()
+        after = [(resource.id, resource.url) for resource in second.items[0].dataset.resources]
+
+        assert after == before
