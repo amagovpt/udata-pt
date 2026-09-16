@@ -22,6 +22,22 @@
     right design for a portal that needs basic auth. This one does not: nobody uses it, so
     it would be a new feature with no consumer. Rejecting is the small, definitive change
     the inventory allows.
+  - **The rule is `udata.uris`'s own reading, not a second opinion.** The field rejects
+    exactly what `uris.validate(url, credentials=False)` would, judged by the same
+    `URL_REGEX` group. Judging on `urlsplit` instead -- the first attempt -- left a hole
+    precisely where the two parsers disagree: `urlsplit` cuts the fragment and the query
+    off before the netloc, so `https://user:pa#ss@host/x` shows it no `@` at all, while
+    `URL_REGEX` reads `user:pa#ss@` as credentials and lets the value be stored. A password
+    holding a `#`, a `?` or a `/` got through -- and since every redaction downstream shares
+    `urlsplit`'s blind spot, it was then served in full rather than masked: the guard and
+    its safety net failed together instead of in layers. The cost of the wider reading is
+    that an `@` in the path or the query is refused too; none of the 49 production sources
+    carries an `@` anywhere in its URL.
+  - Two more channels the same URL leaked through are closed here: the `url` served to a
+    reader without `edit` now goes through the URL-shaped redaction instead of the free-text
+    one, which let a password holding `"`, `{`, `<` or `|` through whole; and
+    `udata harvest create`, which writes past the form, no longer prints the credentials to
+    the log -- running it needs a shell, reading the log file does not.
   - **The rejection is local to the harvest source URL.** `URLS_ALLOW_CREDENTIALS` stays
     true: `udata.uris.validate` reads it for every URL in the portal -- a user or
     organization website, a dataset schema url, a resource url a publisher typed, an RDF
@@ -42,9 +58,13 @@
   - ⚠️ **Operational: run `udata db migrate` before restarting web and workers.** MongoDB
     allows one text index per collection and refuses to create the new one beside the old,
     so a process running the new code against an un-migrated database raises
-    `IndexOptionsConflict` the first time it touches `harvest_source` -- a hard failure, not
-    a degraded search. The same holds in reverse for a process on the old code started
-    after the migration.
+    `IndexOptionsConflict` the first time it touches `harvest_source`. That failure hides
+    itself, which is why it is worth stating plainly: mongoengine caches the collection
+    *before* creating the indexes, so the error happens **once** and the process then
+    serves normally -- over the old index, with the `?q=<password>` oracle still open and
+    with the indexes `ensure_indexes` had not reached yet, `slug` (unique) among them,
+    missing. A single unexplained 500 is the only symptom. The same holds in reverse for a
+    process on the old code started after the migration.
   - ⚠️ **A legacy source with credentials keeps harvesting, but can no longer be saved**
     without removing them: the PUT revalidates the stored URL, so even an edit that does
     not touch it -- deactivating the source, say -- is refused until the URL is cleaned.

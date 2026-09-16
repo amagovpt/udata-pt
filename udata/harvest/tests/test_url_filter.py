@@ -174,6 +174,20 @@ class CheckHarvestURLCredentialsTest:
             "https://user:pass@[2001:db8::1]:8080/x",
             # Leading whitespace must not smuggle credentials past the check.
             "  https://user:pass@data.example.com/x  ",
+            # A password holding a `#`, a `?` or a `/`. `urlsplit` cuts the
+            # fragment, the query and the path off before the netloc, so it
+            # reports no `@` at all for these -- while `udata.uris.URL_REGEX`,
+            # which decides whether the value is stored, reads them as
+            # credentials. Judging on `urlsplit` alone stored the password and
+            # served it in full, because every redaction shares that blind spot.
+            "https://harvestuser:sup3r#s3cr3t@www.ine.pt/feed.xml",
+            "https://harvestuser:sup3r?s3cr3t@www.ine.pt/feed.xml",
+            "https://harvestuser:sup3r/s3cr3t@www.ine.pt/feed.xml",
+            # `URL_REGEX` reads an `@` in the path or the query as userinfo
+            # too, and it is the parser that decides what gets stored. The
+            # field follows it rather than keeping a second opinion.
+            "https://www.ine.pt/files/report@2026.csv",
+            "https://www.ine.pt/search?contact=admin@example.com",
         ],
     )
     def test_rejects_userinfo(self, url):
@@ -184,11 +198,8 @@ class CheckHarvestURLCredentialsTest:
         "url",
         [
             "https://www.ine.pt/broken.xml",
-            # An `@` outside the authority is not userinfo: rejecting these
-            # would refuse URLs that carry no credentials at all.
-            "https://www.ine.pt/files/report@2026.csv",
-            "https://www.ine.pt/search?contact=admin@example.com",
-            "https://www.ine.pt/x#admin@example.com",
+            "https://www.ine.pt:8443/broken.xml",
+            "//www.ine.pt/broken.xml",
             "",
             None,
         ],

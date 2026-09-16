@@ -8,8 +8,11 @@ so `?q=<password>` returned the source carrying that password -- a confirmation
 oracle for anyone who had guessed one. The model now indexes `name` alone, but
 MongoDB allows a single text index per collection and refuses to create the new
 one next to the old (`IndexOptionsConflict`), so the old one has to be dropped
-here: without this migration, the first access to `harvest_source` in a process
-running the new code raises `OperationFailure`, not a degraded search.
+here. Skipping this migration fails in a way that hides itself: mongoengine
+caches the collection *before* it calls `ensure_indexes`, so the first access
+raises once and every later one succeeds -- against the old index, with the
+`?q=<password>` oracle still open, and with whatever indexes `ensure_indexes`
+had not reached yet (`slug`, unique, among them) never created.
 
 The sources that already store credentials are reported, never rewritten.
 Stripping the userinfo of a stored URL breaks that source's harvest with a 401
@@ -54,7 +57,9 @@ def _drop_url_text_index(db):
             collection.drop_index(name)
             log.info("Dropped text index `%s` covering url.", name)
         except OperationFailure:
-            log.info("Index `%s` could not be dropped?", name, exc_info=True)
+            # The next step will then fail to create the new index, and the
+            # collection keeps serving searches over the URL: loud, not info.
+            log.error("Index `%s` could not be dropped.", name, exc_info=True)
 
     # Rebuild explicitly rather than through a read like
     # `2025-11-13-delete-user-email-index.py` does: `_get_collection` only calls
@@ -96,5 +101,8 @@ def _report_credentialed_sources(db):
 
 
 def migrate(db):
-    _drop_url_text_index(db)
+    # The report runs first on purpose: it is the half that cannot fail, and
+    # dropping the index can (`ensure_indexes` re-raises), which would
+    # otherwise take the audit down with it.
     _report_credentialed_sources(db)
+    _drop_url_text_index(db)

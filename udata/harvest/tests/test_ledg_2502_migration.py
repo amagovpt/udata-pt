@@ -41,6 +41,8 @@ class DropHarvestSourceURLTextIndexMigrationTest(PytestOnlyDBTestCase):
         new `name_text` is already there and MongoDB would refuse the old one
         next to it.
         """
+        from udata.models import Harvest
+
         collection = get_db().harvest_source
         collection.drop_indexes()
         collection.create_index(
@@ -48,6 +50,13 @@ class DropHarvestSourceURLTextIndexMigrationTest(PytestOnlyDBTestCase):
             weights={"name": 10, "url": 5},
             default_language="french",
         )
+        yield
+        # Put the model's own indexes back even when the test failed before
+        # `migrate` could. `drop_db` never touches indexes, and the collection
+        # is cached per process, so a failure here would otherwise strip the
+        # unique `slug` index for every test that runs after it in this worker.
+        collection.drop_indexes()
+        Harvest.ensure_indexes()
 
     def test_url_text_index_is_replaced_by_name_only(self):
         collection = get_db().harvest_source

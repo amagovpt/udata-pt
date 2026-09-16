@@ -23,7 +23,7 @@ from .models import (
     HarvestJob,
     HarvestSource,
 )
-from .url_filter import redact_url_credentials
+from .url_filter import redact_url_credentials, redact_url_credentials_in_url
 
 ns = api.namespace("harvest", "Harvest related operations")
 
@@ -239,7 +239,7 @@ source_fields = api.model(
         "url": fields.String(
             attribute=lambda s: s.url
             if s.permissions["edit"].can()
-            else redact_url_credentials(s.url),
+            else redact_url_credentials_in_url(s.url),
             description="The source base URL",
             required=True,
         ),
