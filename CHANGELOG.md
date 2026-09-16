@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **fix(sentry): URL credentials no longer reach Sentry, nor the log lines that printed them**
+  - A harvest source URL may legitimately carry `user:password@`, and every `requests`
+    exception raised over one embeds it in its message. An earlier change kept that out of
+    the API; nothing kept it out of **Sentry**, which has a DSN configured in production,
+    nor out of the server's own **log files**.
+  - 🔑 **The scrubber walks the whole event instead of a list of keys**, and that is the
+    point of it. The four places the leak was first noticed --
+    `logentry.message`, `logentry.params`, `exception.values[].value`, `request.url` --
+    are not where the secret actually survives: it also sits in `logentry.formatted`,
+    which is *the string Sentry displays*, and in
+    `exception.values[].stacktrace.frames[].vars`, because `include_local_variables`
+    defaults to true. Measured on the real exception: the password appears **twice** in an
+    event the enumerated fix would have called clean. `request.data` leaks it too -- the
+    harvest source create and preview endpoints take the URL in the body, and the body is
+    attached regardless of `send_default_pii`. A walk also covers whatever the SDK adds
+    next.
+  - `request.url` is the one special case, redacted by **splitting** rather than by the
+    free-text regex: the regex cannot tell where a URL ends in prose, so it would reach
+    past the authority and rewrite a legitimate `@` in a path.
+  - An event the scrubber cannot process is **dropped, not sent**. Losing one report costs
+    visibility; letting one through costs the credential.
+  - ⚠️ Not the SDK's `EventScrubber`, which matches *key names* (`password`, `secret`) and
+    would see nothing here -- the secret is inside the value of an ordinarily-named key.
+  - **Decision on the harvest `log.*` calls: they redact at the source too, and this is the
+    line that was drawn.** The scrubber protects Sentry only; the server's log files keep
+    whatever the calls write. The start line of a harvest and the INE one printed a
+    credentialed URL *literally, on every run, with no exception involved*, so those and the
+    three that interpolate a `requests` exception now redact before logging. **Left
+    uncovered on purpose:** the traceback `logging` attaches to `log.exception`, where the
+    URL travels outside the message -- redacting that on disk would need a
+    `logging.Filter` on the root logger of every process, a new mechanism. In Sentry those
+    frames *are* covered, by the walk above.
+  - The redaction helpers **stay** in `udata/harvest/url_filter.py`. Moving them to
+    `udata/utils.py` was considered and rejected: the isolation argument does not hold
+    (`udata/harvest/__init__.py` is two lines, and `udata/core/dataset/download_proxy.py`
+    already imports from that module from outside the harvest package), so what remained
+    was tidiness -- not worth rewriting the import of nine files, two of them migrations
+    that have already run, inside a security fix that has to be promoted and possibly
+    reverted on its own.
+  - ⚠️ **This undoes nothing.** Credentials already in Sentry or in old log files are still
+    there; rotating the credential at the source is the only remediation for those.
+
 - **fix(saml): a foreign citizen is recognised again -- the document type arrives punctuated**
   - autenticacao.gov sends `DocType` as **`TR:`**, with a trailing colon, and not `TR`.
     The gate compared the raw value against the four accepted types, never matched, and
