@@ -7796,6 +7796,51 @@ class SAMLForeignIdentifierCompositionTest(APITestCase):
         assert _compose_foreign_identifier("CC", "PT", "123456") is None
         assert _compose_foreign_identifier("BI", "PT", "123456") is None
 
+    def test_trailing_punctuation_is_the_same_document_type(self):
+        """The defect LEDG-2506 exists for, measured against a real foreign CMD.
+
+        autenticacao.gov sends "TR:" and not "TR". The gate compared the raw
+        value, never matched, and the composition returned None -- so no
+        foreign citizen was ever recognised and every login minted another
+        account. The trailing colon must name the same type as no colon.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("TR:", "PT", "123456") == _compose_foreign_identifier(
+            "TR", "PT", "123456"
+        )
+
+    def test_the_composition_is_unchanged_for_an_already_clean_type(self):
+        """🚨 The freeze, restated against the fix that touches its input.
+
+        Normalising before the gate is only safe because it is a no-op on every
+        accepted type -- none of the four carries a trailing separator. If this
+        ever fails, an identifier that already resolves an account has changed
+        and every foreign citizen registered under it is locked out.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MDC_FOREIGN_DOC_TYPES,
+            _compose_foreign_identifier,
+        )
+
+        for doc_type in MDC_FOREIGN_DOC_TYPES:
+            assert (
+                _compose_foreign_identifier(doc_type, "PT", "123456") == f"MDC/{doc_type}/PT/123456"
+            )
+
+    def test_normalisation_does_not_widen_the_accepted_set(self):
+        """The trap: a rule that stripped every non-letter would fold "T:R"
+        into "TR" and admit a type the gate exists to refuse. Only a TRAILING
+        run is removed, so an interior separator still rejects, and a type that
+        is not one of the four still rejects once its punctuation is gone."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("T:R", "PT", "123456") is None
+        assert _compose_foreign_identifier("TR1", "PT", "123456") is None
+        assert _compose_foreign_identifier("XTR", "PT", "123456") is None
+        assert _compose_foreign_identifier("CC:", "PT", "123456") is None
+        assert _compose_foreign_identifier(":TR", "PT", "123456") is None
+
 
 class SAMLRequestedAttributesTest(APITestCase):
     """What the CMD AuthnRequest asks the IdP for.
@@ -7940,6 +7985,55 @@ class SAMLForeignCitizenLoginTest(APITestCase):
         assert len(list(User.objects)) == before + 1, "a second account was minted"
         assert ids[0] == ids[1] == ids[2], "the later logins did not find the first account"
         assert created.extras["auth_nic"] == hash_nic("MDC/TR/PT/X9912345")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_two_logins_with_a_punctuated_doc_type_produce_one_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """What autenticacao.gov actually sends, end to end (LEDG-2506).
+
+        The same invariant as the test above, but with the type as it really
+        arrives -- "TR:" and not "TR". Measured in DEV against a real foreign
+        CMD: two sign-ins produced two accounts, neither carrying an identity,
+        and extras recorded the raw "TR:".
+
+        The stored type is asserted as well as the identity, and that is the
+        half only the extraction can deliver: the composer normalises its own
+        input, so the identifier would compose even without this change -- the
+        value the funnel writes to extras would not, and the counting would go
+        on treating "TR" and "TR:" as two different document types.
+        """
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        before = len(list(User.objects))
+
+        ids = []
+        for _ in range(2):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_login(
+                    mock_client_for,
+                    email="ines@example.pt",
+                    first_name="Ines",
+                    last_name="Matos",
+                    doc_type="TR:",
+                    doc_nationality="PT",
+                    doc_number="X9912345",
+                )
+            created = User.objects(email="ines@example.pt").first()
+            assert created is not None
+            ids.append(created.id)
+
+        assert len(list(User.objects)) == before + 1, "a second account was minted"
+        assert ids[0] == ids[1], "the second login did not find the first account"
+        assert created.extras["auth_nic"] == hash_nic("MDC/TR/PT/X9912345"), (
+            "the punctuated type composed a different identity than the clean one"
+        )
+        assert created.extras["auth_doc_type"] == "TR", (
+            "extras stored the raw value, so counting sees two document types"
+        )
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
