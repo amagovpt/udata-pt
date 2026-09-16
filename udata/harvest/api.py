@@ -23,19 +23,31 @@ from .models import (
     HarvestJob,
     HarvestSource,
 )
+from .url_filter import redact_url_credentials
 
 ns = api.namespace("harvest", "Harvest related operations")
 
 
+# Both fields are redacted on the way out as well as on the way in
+# (`HarvestError.clean`). The preview runs the backend with `dryrun=True`, so
+# it never saves and `clean()` never runs, yet `preview_job_fields` and
+# `preview_item_fields` are clones of these models and serialize the very same
+# errors. Gating `details` behind the admin permission is authorization, not
+# secrecy: it decides who may read the traceback, not whether the traceback
+# still carries a password (LEDG-2477).
 error_fields = api.model(
     "HarvestError",
     {
         "created_at": fields.ISODateTime(
             description="The error creation date", required=True, readonly=True
         ),
-        "message": fields.String(description="The error short message", required=True),
+        "message": fields.String(
+            attribute=lambda o: redact_url_credentials(o.message),
+            description="The error short message",
+            required=True,
+        ),
         "details": fields.Raw(
-            attribute=lambda o: o.details if admin_permission else None,
+            attribute=lambda o: redact_url_credentials(o.details) if admin_permission else None,
             description="Optional details (only for super-admins)",
             readonly=True,
         ),
