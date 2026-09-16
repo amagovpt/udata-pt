@@ -2,6 +2,7 @@ import pytest
 
 from ..url_filter import (
     HarvestURLForbidden,
+    check_harvest_url,
     check_harvest_url_credentials,
     redact_url_credentials,
     redact_url_credentials_in_url,
@@ -194,3 +195,17 @@ class CheckHarvestURLCredentialsTest:
     )
     def test_accepts_urls_without_userinfo(self, url):
         assert check_harvest_url_credentials(url) is None
+
+    def test_defers_on_a_url_it_cannot_parse(self):
+        """An unparseable value is left to `check_harvest_url`, not scanned.
+
+        Scanning it with the free-text regex would only change the rejection
+        message -- `urlparse` fails on the same input, so `check_harvest_url`
+        rejects it as an invalid source URL immediately after -- and the scan
+        is quadratic over a value the caller controls.
+        """
+        unparseable = "//]/" + "a" * 64 + "@"
+
+        assert check_harvest_url_credentials(unparseable) is None
+        with pytest.raises(HarvestURLForbidden):
+            check_harvest_url(unparseable)

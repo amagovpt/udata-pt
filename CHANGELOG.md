@@ -45,14 +45,21 @@
     `IndexOptionsConflict` the first time it touches `harvest_source` -- a hard failure, not
     a degraded search. The same holds in reverse for a process on the old code started
     after the migration.
-  - ⚠️ **A legacy source with credentials keeps harvesting, but can no longer be edited**
-    without removing them: the PUT revalidates the stored URL. That is the migration path,
-    and with the inventory at zero it affects nobody today.
-  - ⚠️ **A future source needing basic auth now has no route.** `user:password@` in the URL
-    was the *only* authentication channel a harvest source had -- `requests` extracts it
-    and applies basic auth; there is no header, token or config field for it. Designing the
-    write-only field is the work that would unblock such a source, and it was deliberately
-    not done here.
+  - ⚠️ **A legacy source with credentials keeps harvesting, but can no longer be saved**
+    without removing them: the PUT revalidates the stored URL, so even an edit that does
+    not touch it -- deactivating the source, say -- is refused until the URL is cleaned.
+    That is the migration path, and with the inventory at zero it affects nobody today.
+  - ⚠️ **Rolling the release back needs the old index recreated by hand.** Old code calls
+    `ensure_indexes` for `$name, $url` and MongoDB refuses it next to `name_text`, so a
+    revert without that step fails the same way an un-migrated upgrade does.
+  - ⚠️ **A future source needing HTTP basic auth now has no route.** `user:password@` in
+    the URL was the only channel for it -- `requests` extracts it and authenticates; there
+    is no header or dedicated field. Designing the write-only field is the work that would
+    unblock such a source, and it was deliberately not done here. The one adjacent channel
+    that does exist is not a substitute and is worse: the `ckan`, `dkan` and `ckanpt`
+    backends read `config["apikey"]` into an `Authorization` header, and `config` is
+    serialized raw to anonymous callers on the same routes -- never redacted, unlike `url`.
+    Closing that is a separate ticket, not something to route people towards.
   - ⚠️ Unchanged on purpose: the fetch-time guard, which would otherwise break legacy
     harvests in silence, and `udata harvest create`, which bypasses the form -- whoever runs
     it has a shell and could write to the database anyway.

@@ -197,11 +197,11 @@ def check_harvest_url_credentials(url: str) -> None:
     try:
         netloc = urlsplit(url.strip()).netloc
     except ValueError:
-        # Not parseable as a URL. `udata.uris.validate` will reject it anyway,
-        # but reject it here too rather than let an unexpected shape through
-        # the one check that is about the secret.
-        if _URL_USERINFO_RE.search(url):
-            raise HarvestURLForbidden(_("Credentials in URL are not allowed"))
+        # Not parseable as a URL, so there is no authority to judge. Nothing is
+        # waved through: `check_harvest_url` runs next on the same value and
+        # `urlparse` fails on it too, which rejects it as an invalid source
+        # URL. Falling back to `_URL_USERINFO_RE` here would only change that
+        # message, and would run a quadratic scan over caller-supplied input.
         return
     if "@" in netloc:
         raise HarvestURLForbidden(_("Credentials in URL are not allowed"))

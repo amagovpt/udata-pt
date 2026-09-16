@@ -25,7 +25,6 @@ An inventory of production found none, so the expected output is a zero.
 import logging
 from urllib.parse import urlsplit
 
-from mongoengine.connection import get_db
 from pymongo.errors import OperationFailure
 
 from udata.models import Harvest as HarvestSource
@@ -45,7 +44,7 @@ def _drop_url_text_index(db):
     fixed, and a database that acquired the index by another route would be
     missed by a name lookup.
     """
-    collection = get_db().harvest_source
+    collection = db.harvest_source
 
     for name, spec in collection.index_information().items():
         weights = spec.get("weights") or {}
