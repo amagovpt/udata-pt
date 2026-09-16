@@ -473,6 +473,29 @@ class SiteCsvExportsTest(APITestCase):
             self.assertIn(str(harvest.id), ids)
         self.assertNotIn(str(hidden_harvest.id), ids)
 
+    def test_harvest_csv_redacts_url_credentials(self):
+        """The CSV export must not publish the credentials of every source.
+
+        This route needs no session, and with the export feature on the same
+        adapter produces a public downloadable resource -- so a raw url column
+        hands out every source password at once, with no id and no failed
+        harvest required (LEDG-2477).
+        """
+        self.app.config["EXPORT_CSV_MODELS"] = []
+        HarvestSource.objects.create(
+            backend="factory",
+            name="credentialed",
+            url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            organization=OrganizationFactory(),
+        )
+
+        response = self.get(url_for("api.site_harvests_csv"))
+        self.assert200(response)
+
+        body = response.data.decode("utf8")
+        assert "sup3rs3cr3t" not in body
+        assert "https://***@www.ine.pt/broken.xml" in body
+
     @pytest.mark.usefixtures("instance_path")
     def test_harvest_csv_w_export_csv_feature(self):
         # no export generated, 404
