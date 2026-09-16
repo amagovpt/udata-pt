@@ -138,13 +138,21 @@ class Site(WithMetrics, Document):
     def count_discussions(self):
         from udata.models import Discussion
 
-        self.metrics["discussions"] = Discussion.objects.count()
+        # `count_documents({})` rather than an unfiltered `.count()`: mongoengine routes
+        # a count with no filter to `estimated_document_count()`, which reads collection
+        # metadata and can be wrong in either direction. Every other metric on this model
+        # is filtered and therefore already exact; these two were the exceptions, and a
+        # published metric is not a place to trade correctness for speed.
+        self.metrics["discussions"] = Discussion._get_collection().count_documents({})
         self.save()
 
     def count_harvesters(self):
         from udata.harvest.models import HarvestSource
 
-        self.metrics["harvesters"] = HarvestSource.objects().count()
+        # Exact for the same reason as `count_discussions`. Counts every source,
+        # deleted ones included, which is what this metric has always reported --
+        # `HarvestSourceQuerySet.visible()` would silently change its meaning.
+        self.metrics["harvesters"] = HarvestSource._get_collection().count_documents({})
         self.save()
 
     def count_max_dataset_followers(self):

@@ -92,7 +92,11 @@ class DatasetTasksTest(PytestOnlyDBTestCase):
         community_resource1.save()
 
         tasks.purge_datasets()
-        assert CommunityResource.objects.count() == 0
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        assert len(list(CommunityResource.objects)) == 0
 
     @pytest.mark.usefixtures("instance_path")
     def test_export_csv(self, app):

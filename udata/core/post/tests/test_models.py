@@ -12,7 +12,11 @@ class PostTest(PytestOnlyDBTestCase):
         page = PageFactory()
         post = PostFactory(body_type="blocs", content_as_page=page)
 
-        assert Page.objects().count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        assert len(list(Page.objects())) == 1
 
         with pytest.raises(mongoengine.errors.OperationError):
             page.delete()
@@ -21,4 +25,5 @@ class PostTest(PytestOnlyDBTestCase):
         post.delete()
         page.delete()
 
-        assert Page.objects().count() == 0
+        assert Page.objects(id=page.id).count() == 0
+        assert len(list(Page.objects())) == 0

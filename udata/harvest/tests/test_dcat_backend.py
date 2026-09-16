@@ -403,7 +403,11 @@ class DcatBackendTest(PytestOnlyDBTestCase):
 
         actions.run(source)
 
-        assert Dataset.objects.count() == 2
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a harvest that created too many or too
+        # few documents could go unnoticed.
+        assert len(list(Dataset.objects)) == 2
         assert HarvestJob.objects.first().status == "done"
 
     def test_harvest_spatial(self, rmock):
@@ -1018,7 +1022,7 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         org = OrganizationFactory()
         source = HarvestSourceFactory(backend="dcat", url=url, organization=org)
 
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
         job = actions.preview(source)
 
@@ -1026,10 +1030,10 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         assert len(job.items) == 4
 
         # No ContactPoints should have been created in the database
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
         # No datasets should have been created either
-        assert Dataset.objects.count() == 0
+        assert len(list(Dataset.objects)) == 0
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["csw*"])

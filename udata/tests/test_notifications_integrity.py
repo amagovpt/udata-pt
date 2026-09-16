@@ -47,14 +47,19 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         notification.save()
 
         # Verify notification exists
-        assert Notification.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while an orphan
+        # is still there, which is exactly what this test exists to catch.
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == discussion
 
         # Delete the discussion
         discussion.delete()
 
         # Verify notification is cleaned up
-        assert Notification.objects.count() == 0
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_transfer_notification_cleanup_on_transfer_delete(self):
         """Test that notifications are cleaned up when a transfer is deleted."""
@@ -69,15 +74,18 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         )
 
         # Verify notification exists (automatically created by factory)
-        assert Notification.objects.count() == 1
+        assert len(list(Notification.objects)) == 1
         notification = Notification.objects.first()
         assert notification.user == recipient
 
         # Delete the transfer
         transfer.delete()
 
-        # Verify notification is cleaned up
-        assert Notification.objects.count() == 0
+        # Verify notification is cleaned up. The transfer notification details carry
+        # `transfer_owner`/`transfer_recipient`, not the transfer itself, so the
+        # filtered count names the recipient the assertion above already pinned down.
+        assert Notification.objects(user=recipient).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_harvest_source_notification_cleanup_on_source_delete(self):
         """Test that notifications are cleaned up when a harvest source is deleted."""
@@ -93,7 +101,7 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         notification.save()
 
         # Verify notification exists
-        assert Notification.objects.count() == 1
+        assert len(list(Notification.objects)) == 1
 
         # Delete the harvest source
         from udata.harvest.actions import delete_source
@@ -101,7 +109,8 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         delete_source(source)
 
         # Verify notification is cleaned up (via signal)
-        assert Notification.objects.count() == 0
+        assert Notification.objects(details__source=source).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_harvest_source_notification_cleanup_on_source_purge(self):
         """Test that notifications are cleaned up when a harvest source is purged."""
@@ -119,7 +128,7 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         notification.save()
 
         # Verify notification exists
-        assert Notification.objects.count() == 1
+        assert len(list(Notification.objects)) == 1
 
         # Mark source as deleted and purge it
         from udata.harvest.actions import delete_source, purge_sources
@@ -128,7 +137,8 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         purge_sources()
 
         # Verify notification is cleaned up (via purge function)
-        assert Notification.objects.count() == 0
+        assert Notification.objects(details__source=source).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_organization_notification_cleanup_on_organization_purge(self):
         """Test that notifications are cleaned up when an organization is purged."""
@@ -152,13 +162,14 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         ).save()
 
         # Verify notifications exist
-        assert Notification.objects.count() == 2
+        assert len(list(Notification.objects)) == 2
 
         # Purge the deleted organization
         tasks.purge_organizations()
 
         # Verify notifications are cleaned up (via purge function)
-        assert Notification.objects.count() == 0
+        assert Notification.objects.with_organization_in_details(org).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_delete_discussions_for_subject_cleans_notifications(self):
         """Test that the shared helper cleans up the notifications it deletes discussions for."""
@@ -354,20 +365,25 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         notification2.save()
 
         # Verify both notifications exist
-        assert Notification.objects.count() == 2
+        assert len(list(Notification.objects)) == 2
 
         # Delete one discussion
         discussion1.delete()
 
-        # Verify only one notification is cleaned up
-        assert Notification.objects.count() == 1
+        # Verify only one notification is cleaned up. This is the one place where the
+        # filtered count earns its keep: the total stays at 1, so it alone would not
+        # tell us *which* notification survived.
+        assert Notification.objects(details__discussion=discussion1).count() == 0
+        assert Notification.objects(details__discussion=discussion2).count() == 1
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == discussion2
 
         # Delete the second discussion
         discussion2.delete()
 
         # Verify all notifications are cleaned up
-        assert Notification.objects.count() == 0
+        assert Notification.objects(details__discussion=discussion2).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_discussion_notification_survives_message_delete(self):
         """Test that notifications are not broken when referenced messages are deleted."""
@@ -387,12 +403,13 @@ class NotificationIntegrityTest(PytestOnlyDBTestCase):
         )
         notification.save()
 
-        assert Notification.objects.count() == 1
+        assert len(list(Notification.objects)) == 1
         assert Notification.objects.first().details.discussion == discussion
 
         discussion.remove_message(1)
 
-        assert Notification.objects.count() == 0
+        assert Notification.objects(details__discussion=discussion).count() == 0
+        assert len(list(Notification.objects)) == 0
 
     def test_discussion_cleanup_failure_logs_traceback(self, caplog):
         """Test that a cleanup that fails to delete logs its traceback"""

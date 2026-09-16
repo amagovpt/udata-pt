@@ -74,7 +74,10 @@ class MembershipRequestNotificationTest(DBTestCase):
         org.add_membership_request(request)
         org.add_membership_request(request)
 
-        assert Notification.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a duplicate would slip through.
+        assert len(list(Notification.objects)) == 1
 
     def test_multiple_requests_create_separate_notifications(self):
         """Multiple requests from different users create separate notifications"""

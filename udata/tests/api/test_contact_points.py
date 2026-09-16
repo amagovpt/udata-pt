@@ -55,7 +55,11 @@ class ContactPointAPITest(APITestCase):
         }
         response = self.post(url_for("api.contact_points"), data=data)
         assert201(response)
-        assert ContactPoint.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        assert len(list(ContactPoint.objects)) == 1
 
         contact_point = ContactPoint.objects.first()
         assert contact_point.owner.id == user.id
@@ -65,23 +69,23 @@ class ContactPointAPITest(APITestCase):
         data = {"name": faker.word(), "contact_form": faker.url(), "role": "contact"}
         response = self.post(url_for("api.contact_points"), data=data)
         assert201(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
 
         data = {"name": faker.word(), "email": faker.email(), "role": "contact"}
         response = self.post(url_for("api.contact_points"), data=data)
         assert201(response)
-        assert ContactPoint.objects.count() == 2
+        assert len(list(ContactPoint.objects)) == 2
 
     def test_contact_point_duplicate_creation(self):
         self.login()
         data = {"name": faker.word(), "contact_form": faker.url(), "role": "contact"}
         response = self.post(url_for("api.contact_points"), data=data)
         assert201(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
 
         response = self.post(url_for("api.contact_points"), data=data)
         assert200(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
 
     def test_contact_point_for_different_org(self):
         user = self.login()
@@ -96,11 +100,11 @@ class ContactPointAPITest(APITestCase):
         }
         response = self.post(url_for("api.contact_points"), data=data)
         assert201(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
 
         response = self.post(url_for("api.contact_points"), data=data)
         assert200(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
 
         contact_point = ContactPoint.objects.first()
         assert contact_point.owner is None
@@ -110,14 +114,14 @@ class ContactPointAPITest(APITestCase):
         data["organization"] = str(org_b.id)
         response = self.post(url_for("api.contact_points"), data=data)
         assert400(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
 
         org_b.members = [Member(user=user, role="editor")]
         org_b.save()
 
         response = self.post(url_for("api.contact_points"), data=data)
         assert201(response)
-        assert ContactPoint.objects.count() == 2
+        assert len(list(ContactPoint.objects)) == 2
 
     def test_contact_point_api_invalid_email(self):
         self.login()
@@ -125,7 +129,7 @@ class ContactPointAPITest(APITestCase):
         response = self.post(url_for("api.contact_points"), data=data)
         assert400(response)
         assert "email" in response.json["errors"]
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
     def test_contact_point_missing_contact_information(self):
         self.login()
@@ -135,7 +139,7 @@ class ContactPointAPITest(APITestCase):
         assert response.json["message"] == _(
             "At least an email or a contact form is required for a contact point"
         )
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
     def test_contact_point_missing_role(self):
         self.login()
@@ -146,7 +150,7 @@ class ContactPointAPITest(APITestCase):
             response.json["message"]
             == "ValidationError (ContactPoint:None) (Field is required: ['role'])"
         )
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
     def test_contact_point_no_need_for_email_for_role_other_than_contact(self):
         self.login()
@@ -155,7 +159,7 @@ class ContactPointAPITest(APITestCase):
             data = {"name": faker.word(), "role": role}
             response = self.post(url_for("api.contact_points"), data=data)
             assert201(response)
-            assert ContactPoint.objects.count() == index + 1
+            assert len(list(ContactPoint.objects)) == index + 1
 
     def test_contact_point_api_update(self):
         user = self.login()
@@ -166,7 +170,7 @@ class ContactPointAPITest(APITestCase):
         data["email"] = "new.email@newdomain.com"
         response = self.put(url_for("api.contact_point", contact_point=contact_point), data)
         assert200(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
         assert ContactPoint.objects.first().email == "new.email@newdomain.com"
 
     def test_contact_point_api_update_to_existing_contact_point(self):
@@ -177,7 +181,7 @@ class ContactPointAPITest(APITestCase):
         data_b = contact_point_b.to_dict()
         response = self.put(url_for("api.contact_point", contact_point=contact_point_a), data_b)
         assert400(response)
-        assert ContactPoint.objects.count() == 2
+        assert len(list(ContactPoint.objects)) == 2
 
         contact_point_a.reload()
         assert contact_point_a.email == "a@example.org"
@@ -190,7 +194,7 @@ class ContactPointAPITest(APITestCase):
         data["email"] = "new.email@newdomain.com"
         response = self.put(url_for("api.contact_point", contact_point=contact_point), data)
         assert403(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
         assert ContactPoint.objects.first().email == contact_point.email
 
     def test_contact_point_api_delete(self):
@@ -200,7 +204,8 @@ class ContactPointAPITest(APITestCase):
         contact_point = ContactPointFactory(organization=org)
         response = self.delete(url_for("api.contact_point", contact_point=contact_point))
         assert204(response)
-        assert ContactPoint.objects.count() == 0
+        assert ContactPoint.objects(id=contact_point.id).count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
     def test_contact_point_roles_list(self):
         """It should fetch the contact point roles list from the API"""
@@ -214,4 +219,4 @@ class ContactPointAPITest(APITestCase):
         contact_point = ContactPointFactory(organization=org)
         response = self.delete(url_for("api.contact_point", contact_point=contact_point))
         assert403(response)
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1

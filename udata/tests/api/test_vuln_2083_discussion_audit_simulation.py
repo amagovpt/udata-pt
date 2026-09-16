@@ -56,7 +56,11 @@ class VULN2083DiscussionAuditSimulationTest(APITestCase):
         """
         self.login()
         dataset = DatasetFactory()
-        before = Discussion.objects.count()
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        before = len(list(Discussion.objects))
 
         responses = []
         for i in range(100):
@@ -84,7 +88,7 @@ class VULN2083DiscussionAuditSimulationTest(APITestCase):
         self.assertGreaterEqual(throttled, 90, f"only {throttled} requests were throttled")
 
         # Database state — the audit produced 99 rows; we should see at most 3.
-        persisted = Discussion.objects.count() - before
+        persisted = len(list(Discussion.objects)) - before
         self.assertLessEqual(persisted, 3, f"persisted {persisted} discussions (audit produced 99)")
 
     # ------------------------------------------------------------------

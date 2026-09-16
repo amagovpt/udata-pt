@@ -282,7 +282,7 @@ class TopicsListAPITest(APITestCase):
         self.login()
         response = self.post(url_for("apiv2.topics_list"), data)
         self.assert201(response)
-        self.assertEqual(Topic.objects.count(), 1)
+        self.assertEqual(len(list(Topic.objects)), 1)
         topic = Topic.objects.first()
         for element in data["elements"]:
             assert element["element"]["id"] in (
@@ -322,7 +322,7 @@ class TopicsListAPITest(APITestCase):
         data["organization"] = str(org.id)
         response = self.post(url_for("apiv2.topics_list"), data)
         self.assert201(response)
-        self.assertEqual(Topic.objects.count(), 1)
+        self.assertEqual(len(list(Topic.objects)), 1)
 
         topic = Topic.objects.first()
         assert topic.owner is None
@@ -339,7 +339,7 @@ class TopicsListAPITest(APITestCase):
         self.login()
         response = self.post(url_for("apiv2.topics_list"), data)
         self.assert201(response)
-        self.assertEqual(Topic.objects.count(), 1)
+        self.assertEqual(len(list(Topic.objects)), 1)
         topic = Topic.objects.first()
         self.assertEqual([str(z) for z in topic.spatial.zones], [paca.id])
         self.assertEqual(topic.spatial.granularity, granularity)
@@ -354,7 +354,7 @@ class TopicsListAPITest(APITestCase):
         self.login()
         response = self.post(url_for("apiv2.topics_list"), data)
         self.assert201(response)
-        self.assertEqual(Topic.objects.count(), 1)
+        self.assertEqual(len(list(Topic.objects)), 1)
         topic = Topic.objects.first()
         self.assertEqual(topic.spatial.geom, SAMPLE_GEOM)
         self.assertEqual(topic.spatial.granularity, granularity)
@@ -369,7 +369,7 @@ class TopicAPITest(APITestCase):
         data["description"] = "new description"
         response = self.put(url_for("apiv2.topic", topic=topic), data)
         self.assert200(response)
-        self.assertEqual(Topic.objects.count(), 1)
+        self.assertEqual(len(list(Topic.objects)), 1)
         topic = Topic.objects.first()
         self.assertEqual(topic.description, "new description")
         self.assertGreater(topic.last_modified, topic.created_at)
@@ -451,8 +451,10 @@ class TopicAPITest(APITestCase):
             response = self.delete(url_for("apiv2.topic", topic=topic))
         self.assertStatus(response, 204)
 
-        self.assertEqual(Topic.objects.count(), 0)
-        self.assertEqual(Discussion.objects.count(), 0)
+        self.assertEqual(Topic.objects(id=topic.id).count(), 0)
+        self.assertEqual(Discussion.objects(subject=topic).count(), 0)
+        self.assertEqual(len(list(Topic.objects)), 0)
+        self.assertEqual(len(list(Discussion.objects)), 0)
 
     def test_topic_api_delete_cleans_discussion_notifications(self):
         """It should leave no notification behind the discussions it deletes"""
@@ -494,8 +496,10 @@ class TopicAPITest(APITestCase):
         self.assertStatus(response, 204)
 
         # Verify both topic and elements are deleted
-        self.assertEqual(Topic.objects.count(), 0)
-        self.assertEqual(TopicElement.objects.count(), 0)
+        self.assertEqual(Topic.objects(id=topic.id).count(), 0)
+        self.assertEqual(TopicElement.objects(topic=topic).count(), 0)
+        self.assertEqual(len(list(Topic.objects)), 0)
+        self.assertEqual(len(list(TopicElement.objects)), 0)
 
     def test_topic_api_delete_perm(self):
         """It should not delete a topic from the API"""

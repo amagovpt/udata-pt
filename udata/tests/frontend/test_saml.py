@@ -498,7 +498,13 @@ class SAMLAutoRegistrationTest(APITestCase):
         from udata.core.user.models import User
 
         with self.app.app_context():
-            users_before = User.objects.count()
+            # `len(list(...))` rather than `.count()`, here and in every other
+            # before/after pair in this file: mongoengine routes an *unfiltered* count
+            # to `estimated_document_count()`, which reads collection metadata and can
+            # be wrong in either direction. With both sides estimated, a drift between
+            # them fails a correct test, and an account created by mistake can hide
+            # behind a compensating drift -- which is what these pairs exist to catch.
+            users_before = len(list(User.objects))
             user, status = _find_or_create_saml_user(
                 user_email="saml_new@example.com",
                 user_nic="12345678",
@@ -508,7 +514,7 @@ class SAMLAutoRegistrationTest(APITestCase):
 
             assert status == "no_match"
             assert user is None
-            assert User.objects.count() == users_before
+            assert len(list(User.objects)) == users_before
 
     def test_finds_existing_user_by_email(self):
         """An email match never logs in nor auto-links — the existing
@@ -784,7 +790,7 @@ class SAMLSSOCallbackTest(APITestCase):
             last_name="Silva",
         )
 
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._post_saml_response(xml)
@@ -792,7 +798,7 @@ class SAMLSSOCallbackTest(APITestCase):
 
         assert response.status_code == 302
         assert "/migrate-account" in response.headers["Location"]
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
 
         # The identity travels in the session for the wizard to use, flagged
         # as matching nothing so it opens straight on the email step.
@@ -1530,7 +1536,7 @@ class SAMLEidasSSOTest(APITestCase):
         and a session. The attributes travel in the session for it to use."""
         from udata.core.user.models import User
 
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
@@ -1545,7 +1551,7 @@ class SAMLEidasSSOTest(APITestCase):
         # ?no_email=true is the pre-existing marker for "the IdP brought no
         # email address"; the wizard base URL is what matters here.
         assert response.headers["Location"].startswith("http://localhost:3000/migrate-account")
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
 
         with self.client.session_transaction() as sess:
             pending = sess["saml_migration_pending"]
@@ -1568,7 +1574,7 @@ class SAMLEidasSSOTest(APITestCase):
             extras={"auth_nic": _hash_nic(self.PERSON_ID)},
             confirmed_at="2024-01-01",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
@@ -1581,7 +1587,7 @@ class SAMLEidasSSOTest(APITestCase):
             assert mock_login.call_count == 1
             assert mock_login.call_args[0][0].id == existing.id
 
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         # Still holding the placeholder → forced back to the page.
         assert response.status_code == 302
         assert response.headers["Location"] == "http://localhost:3000/complete-registration"
@@ -1899,7 +1905,7 @@ class SAMLAccountLinkingTest(APITestCase):
                 confirmed_at=datetime(2024, 1, 1),
             )
             original_password_hash = existing.password
-            users_before = User.objects.count()
+            users_before = len(list(User.objects))
 
             user, status = _find_or_create_saml_user(
                 user_email="cidadao@example.pt",
@@ -1911,7 +1917,7 @@ class SAMLAccountLinkingTest(APITestCase):
             # The existing account is the candidate — no new account.
             assert status == "migration_candidate"
             assert user.id == existing.id
-            assert User.objects.count() == users_before
+            assert len(list(User.objects)) == users_before
 
             # Nothing was linked or changed — ownership not proven yet.
             existing.reload()
@@ -1971,7 +1977,7 @@ class SAMLAccountLinkingTest(APITestCase):
                 first_name="Pedro",
                 last_name="Almeida",
             )
-            users_before = User.objects.count()
+            users_before = len(list(User.objects))
 
             # CMD returns NIC + name but no email; the NIC was never
             # linked before, so only the name lookup can match.
@@ -1984,7 +1990,7 @@ class SAMLAccountLinkingTest(APITestCase):
 
             assert status == "migration_candidate"
             assert user.id == existing.id  # single candidate, case-insensitive
-            assert User.objects.count() == users_before
+            assert len(list(User.objects)) == users_before
 
             # Nothing was linked yet — ownership not proven.
             existing.reload()
@@ -2024,7 +2030,7 @@ class SAMLAccountLinkingTest(APITestCase):
         with self.app.app_context():
             first = UserFactory(first_name="Maria", last_name="Sousa")
             second = UserFactory(first_name="Maria", last_name="Sousa")
-            users_before = User.objects.count()
+            users_before = len(list(User.objects))
 
             user, status = _find_or_create_saml_user(
                 user_email=None,
@@ -2035,7 +2041,7 @@ class SAMLAccountLinkingTest(APITestCase):
 
             assert status == "migration_candidate"
             assert user is None  # ambiguous: no candidate pre-selected
-            assert User.objects.count() == users_before
+            assert len(list(User.objects)) == users_before
             first.reload()
             second.reload()
             assert not (first.extras or {}).get("auth_nic")
@@ -2121,7 +2127,7 @@ class SAMLAccountLinkingTest(APITestCase):
             )
             assert status == "existing_saml"
             assert user.id == existing.id
-            assert User.objects.count() == 1
+            assert len(list(User.objects)) == 1
 
 
 class SAMLStaleNicRelinkTest(APITestCase):
@@ -2403,7 +2409,7 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Pedro",
             last_name="Almeida",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
@@ -2416,7 +2422,7 @@ class SAMLMigrationWizardTest(APITestCase):
 
         assert response.status_code == 302
         assert "/migrate-account" in response.headers["Location"]
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
 
@@ -2449,7 +2455,7 @@ class SAMLMigrationWizardTest(APITestCase):
         original_password_hash = existing.password
         org = OrganizationFactory(members=[Member(user=existing, role="admin")])
         dataset = DatasetFactory(owner=existing)
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         # CMD login with a different email and matching name → wizard.
         response = self._sso_with(
@@ -2467,7 +2473,7 @@ class SAMLMigrationWizardTest(APITestCase):
         assert response.status_code == 200
         assert response.json["sent"] is True
 
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         existing.reload()
         assert existing.extras.get("auth_nic") == _hash_nic("87654321")
         # Password kept: both login methods remain available.
@@ -2845,7 +2851,7 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Rita",
             last_name="Gomes",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         for payload, status, error in (
             ({}, 400, "email_required"),
@@ -2858,7 +2864,7 @@ class SAMLMigrationWizardTest(APITestCase):
             # The wizard session survives, and nothing was created.
             with self.client.session_transaction() as sess:
                 assert sess.get("saml_migration_pending") is not None
-            assert User.objects.count() == users_before
+            assert len(list(User.objects)) == users_before
 
         # Correcting the address still works after the rejections.
         response = self.client.post("/saml/migration/skip", json={"email": "rita.fixed@example.pt"})
@@ -2969,7 +2975,7 @@ class SAMLMigrationWizardTest(APITestCase):
             confirmed_at=datetime(2024, 1, 1),
         )
         original_password_hash = existing.password
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._sso_with(
@@ -2995,7 +3001,7 @@ class SAMLMigrationWizardTest(APITestCase):
         response = self._confirm_by_password("default@example.pt", "S3cretPass!")
         assert response.status_code == 200
 
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         existing.reload()
         assert existing.extras.get("auth_nic") == _hash_nic("12121212")
         assert existing.password == original_password_hash
@@ -3163,13 +3169,13 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Maria",
             last_name="Sousa",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         response = self.client.post("/saml/migration/skip", json={"email": "MARIA@example.pt"})
         # The answer says nothing about the address; the property this test
         # guards is what did NOT happen behind it.
         assert response.status_code == 200
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         # Exactly one account still answers to that address.
         assert User.objects(email__iexact="maria@example.pt").count() == 1
         assert User.objects(email__iexact="maria@example.pt").first().id == victim.id
@@ -3207,7 +3213,7 @@ class SAMLMigrationWizardTest(APITestCase):
         with self.client.session_transaction() as sess:
             assert sess["saml_migration_pending"]["no_match"] is True
             assert sess["saml_migration_pending"]["legacy_user_id"] is None
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         # Typed in a different casing, which only resolves because the lookup
         # is case-insensitive.
@@ -3221,7 +3227,7 @@ class SAMLMigrationWizardTest(APITestCase):
 
         # Nothing was created, nothing was linked, and the record backing any
         # validation link was not touched.
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
         assert "migration_link_pending" not in (existing.extras or {})
@@ -3261,7 +3267,7 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Joana",
             last_name="Pinto",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         # 1. CMD brings a different address and a name that does not match.
         response = self._sso_with(
@@ -3283,7 +3289,7 @@ class SAMLMigrationWizardTest(APITestCase):
         # Still nothing linked, and nothing created.
         existing.reload()
         assert not (existing.extras or {}).get("auth_nic")
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
 
         # 2b. So they come back and authenticate again, which is the cost of
         #     the answer being generic.
@@ -3323,7 +3329,7 @@ class SAMLMigrationWizardTest(APITestCase):
         assert response.status_code == 302
         assert "flash=" not in response.headers["Location"]
 
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         existing.reload()
         assert existing.extras.get("auth_nic") == _hash_nic("55555555")
 
@@ -4019,7 +4025,7 @@ class SAMLMigrationWizardTest(APITestCase):
         )
         with self.client.session_transaction() as sess:
             assert sess["saml_migration_pending"]["legacy_user_id"] is None
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         # One wizard session per probe: the skip now ends the session on every
         # exit, so a shared one would fail on "No pending migration" for a
@@ -4039,7 +4045,7 @@ class SAMLMigrationWizardTest(APITestCase):
 
             # Nothing created for the caller, and nothing written on the
             # account that happens to hold the address.
-            assert User.objects.count() == users_before, account.email
+            assert len(list(User.objects)) == users_before, account.email
             account.reload()
             assert not (account.extras or {}).get("migration_link_pending"), account.email
 
@@ -4090,7 +4096,7 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Claudia",
             last_name="Faria",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         self._sso_with(
             mock_client_for,
@@ -4104,7 +4110,7 @@ class SAMLMigrationWizardTest(APITestCase):
         assert response.status_code == 200
         assert response.json["sent"] is True
 
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         existing.reload()
         assert existing.extras.get("auth_nic") == _hash_nic("52525252")
 
@@ -4215,7 +4221,7 @@ class SAMLMigrationWizardTest(APITestCase):
             ).status_code
             == 200
         )
-        users_after_first = User.objects.count()
+        users_after_first = len(list(User.objects))
 
         # Replay: put the pre-skip state back and try another address.
         with self.client.session_transaction() as sess:
@@ -4226,7 +4232,7 @@ class SAMLMigrationWizardTest(APITestCase):
         # No second account: the pending one had its address corrected, which
         # is what keeps a typo (or an SMTP failure mid-request) from bricking
         # the identity for good.
-        assert User.objects.count() == users_after_first
+        assert len(list(User.objects)) == users_after_first
         assert User.objects(email="vera.a@example.pt").first() is None
         corrected = User.objects(email="vera.b@example.pt").first()
         assert corrected is not None
@@ -4368,12 +4374,12 @@ class SAMLMigrationWizardTest(APITestCase):
             first_name="Bruno",
             last_name="Silva",
         )
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         response = self.client.post("/saml/migration/skip", json={"email": "bruno.novo@example.pt"})
         assert response.status_code == 400
         assert response.json["error"] == "nic_required"
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
@@ -4392,7 +4398,7 @@ class SAMLMigrationWizardTest(APITestCase):
                 first_name="Pedro",
                 last_name="Almeida",
             )
-            users_before = User.objects.count()
+            users_before = len(list(User.objects))
 
             with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
                 response = self._sso_with(
@@ -4410,7 +4416,7 @@ class SAMLMigrationWizardTest(APITestCase):
             # the user is sent to complete registration instead of the
             # cmd_new_account homepage banner.
             assert response.headers["Location"].endswith("/complete-registration")
-            assert User.objects.count() == users_before + 1
+            assert len(list(User.objects)) == users_before + 1
             existing.reload()
             assert not (existing.extras or {}).get("auth_nic")
         finally:
@@ -7690,7 +7696,7 @@ class SAMLCaseVariantAddressTest(APITestCase):
 
         self.app.config["MIGRATION_MODE_ENABLED"] = True
         owner = UserFactory(email="Maria@example.pt", confirmed_at="2024-01-01")
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as mock_login:
             response = self._cmd_login(
@@ -7704,7 +7710,7 @@ class SAMLCaseVariantAddressTest(APITestCase):
 
         assert response.status_code == 302
         assert "/migrate-account" in response.headers["Location"]
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
         owner.reload()
         assert not (owner.extras or {}).get("auth_nic")
 
@@ -7915,7 +7921,7 @@ class SAMLForeignCitizenLoginTest(APITestCase):
         from udata.core.user.nic import hash_nic
 
         self.app.config["MIGRATION_MODE_ENABLED"] = False
-        before = User.objects.count()
+        before = len(list(User.objects))
 
         ids = []
         for _ in range(3):
@@ -7931,7 +7937,7 @@ class SAMLForeignCitizenLoginTest(APITestCase):
             assert created is not None
             ids.append(created.id)
 
-        assert User.objects.count() == before + 1, "a second account was minted"
+        assert len(list(User.objects)) == before + 1, "a second account was minted"
         assert ids[0] == ids[1] == ids[2], "the later logins did not find the first account"
         assert created.extras["auth_nic"] == hash_nic("MDC/TR/PT/X9912345")
 
@@ -8138,7 +8144,7 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         from udata.core.user.nic import hash_nic
 
         self.app.config["MIGRATION_MODE_ENABLED"] = True
-        users_before = User.objects.count()
+        users_before = len(list(User.objects))
 
         # 1. First sign-in: nothing matches, so the wizard takes over and no
         #    account is created yet.
@@ -8147,7 +8153,7 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         )
         assert response.status_code == 302
         assert "/migrate-account" in response.headers["Location"]
-        assert User.objects.count() == users_before
+        assert len(list(User.objects)) == users_before
 
         # The composed identity travels in the session, not a NIC.
         with self.client.session_transaction() as sess:
@@ -8174,10 +8180,10 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         #    blocked until the link is clicked -- that guard belongs to another
         #    ticket and asserting a session here would be asserting its absence
         #    of bugs, not this one's.
-        users_after_creation = User.objects.count()
+        users_after_creation = len(list(User.objects))
         self._cmd_login(mock_client_for, first_name="Gabriel", last_name="Costa", **self.DOC)
 
-        assert User.objects.count() == users_after_creation, "a second account was minted"
+        assert len(list(User.objects)) == users_after_creation, "a second account was minted"
         assert User.objects(email="gabriel@example.pt").count() == 1
         still = User.objects(email="gabriel@example.pt").first()
         assert still.id == created.id

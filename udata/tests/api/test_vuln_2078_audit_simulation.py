@@ -130,7 +130,11 @@ class VULN2078AuditSimulationTest(APITestCase):
     def test_vector_2_dataset_mass_creation_is_blocked(self):
         """POST /api/1/datasets/ replayed 100×."""
         self.login()
-        before = Dataset.objects.count()
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        before = len(list(Dataset.objects))
 
         responses = []
         for i in range(100):
@@ -146,13 +150,13 @@ class VULN2078AuditSimulationTest(APITestCase):
         success = dist.get(201, 0)
         self.assertLessEqual(success, 5, f"too many datasets created ({success})")
         self.assertGreaterEqual(dist.get(429, 0), 90)
-        self.assertLessEqual(Dataset.objects.count() - before, 5)
+        self.assertLessEqual(len(list(Dataset.objects)) - before, 5)
 
     def test_vector_2_reuse_mass_creation_is_blocked(self):
         """POST /api/1/reuses/ replayed 100×."""
         self.login()
         dataset = DatasetFactory()
-        before = Reuse.objects.count()
+        before = len(list(Reuse.objects))
 
         responses = []
         for i in range(100):
@@ -171,7 +175,7 @@ class VULN2078AuditSimulationTest(APITestCase):
         success = dist.get(201, 0)
         self.assertLessEqual(success, 5, f"too many reuses created ({success})")
         self.assertGreaterEqual(dist.get(429, 0), 90)
-        self.assertLessEqual(Reuse.objects.count() - before, 5)
+        self.assertLessEqual(len(list(Reuse.objects)) - before, 5)
 
     def test_vector_2_organization_mass_creation_is_blocked(self):
         """POST /api/1/organizations/ replayed 100×.
@@ -180,7 +184,7 @@ class VULN2078AuditSimulationTest(APITestCase):
         the first 2 should succeed inside the per-minute window.
         """
         self.login()
-        before = Organization.objects.count()
+        before = len(list(Organization.objects))
 
         responses = []
         for i in range(100):
@@ -197,13 +201,13 @@ class VULN2078AuditSimulationTest(APITestCase):
         # HEAVY_CREATE_LIMIT is 2/min — only 2 should pass.
         self.assertLessEqual(success, 2, f"too many organizations created ({success})")
         self.assertGreaterEqual(dist.get(429, 0), 95)
-        self.assertLessEqual(Organization.objects.count() - before, 2)
+        self.assertLessEqual(len(list(Organization.objects)) - before, 2)
 
     def test_vector_2_discussion_mass_creation_is_blocked(self):
         """POST /api/1/discussions/ replayed 100×."""
         self.login()
         dataset = DatasetFactory()
-        before = Discussion.objects.count()
+        before = len(list(Discussion.objects))
 
         responses = []
         for i in range(100):
@@ -220,7 +224,7 @@ class VULN2078AuditSimulationTest(APITestCase):
         success = dist.get(201, 0)
         self.assertLessEqual(success, 5, f"too many discussions created ({success})")
         self.assertGreaterEqual(dist.get(429, 0), 90)
-        self.assertLessEqual(Discussion.objects.count() - before, 5)
+        self.assertLessEqual(len(list(Discussion.objects)) - before, 5)
 
     # ------------------------------------------------------------------
     # Vector 3 — per-user keying (rotating-IP bypass attempt)
