@@ -4,6 +4,7 @@ from udata.core.dataset.factories import (
     HiddenDatasetFactory,
     OrganizationFactory,
 )
+from udata.core.discussions.factories import DiscussionFactory
 from udata.core.organization.constants import PUBLIC_SERVICE
 from udata.core.reuse.factories import VisibleReuseFactory
 from udata.core.site.factories import SiteFactory
@@ -73,3 +74,12 @@ class SiteMetricTest(PytestOnlyDBTestCase):
         site.count_harvesters()
 
         assert site.get_metrics()["harvesters"] == len(sources)
+
+    def test_discussions_metric(self, app):
+        site = SiteFactory.create(id=app.config["SITE_ID"])
+        dataset = DatasetFactory()
+        discussions = [DiscussionFactory(subject=dataset) for _ in range(10)]
+
+        site.count_discussions()
+
+        assert site.get_metrics()["discussions"] == len(discussions)
