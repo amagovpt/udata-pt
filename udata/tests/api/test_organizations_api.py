@@ -114,7 +114,11 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         user = self.login()
         response = self.post(url_for("api.organizations"), data)
         assert201(response)
-        assert Organization.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        assert len(list(Organization.objects)) == 1
 
         org = Organization.objects.first()
         member = org.member(user)
@@ -131,7 +135,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.organization", org=org), data)
         assert200(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects.first().description == "new description"
 
     def test_organization_api_update_badges(self):
@@ -192,7 +196,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         data["business_number_id"] = "13002526500013"
         response = self.put(url_for("api.organization", org=org), data)
         assert200(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects.first().business_number_id == "13002526500013"
 
     def test_organization_api_update_business_number_id_failing(self):
@@ -238,7 +242,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         self.login()
         response = self.put(url_for("api.organization", org=org), data)
         assert403(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects.first().description == org.description
 
     def test_organization_api_delete(self):
@@ -248,7 +252,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         org = OrganizationFactory(members=[member])
         response = self.delete(url_for("api.organization", org=org))
         assert204(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects[0].deleted is not None
 
     def test_organization_api_delete_deleted(self):
@@ -266,7 +270,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         org = OrganizationFactory(members=[member])
         response = self.delete(url_for("api.organization", org=org))
         assert403(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects[0].deleted is None
 
     def test_organization_api_delete_as_non_member_forbidden(self):
@@ -275,7 +279,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         org = OrganizationFactory()
         response = self.delete(url_for("api.organization", org=org))
         assert403(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects[0].deleted is None
 
 

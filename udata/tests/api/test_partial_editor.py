@@ -106,7 +106,11 @@ class PartialEditorDatasetAPITest(APITestCase):
         data["organization"] = str(self.org.id)
         response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 3)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        self.assertEqual(len(list(Dataset.objects)), 3)
 
         created_dataset = Dataset.objects.get(id=response.json["id"])
         self.assertTrue(
