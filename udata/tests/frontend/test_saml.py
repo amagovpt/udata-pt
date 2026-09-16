@@ -7796,6 +7796,51 @@ class SAMLForeignIdentifierCompositionTest(APITestCase):
         assert _compose_foreign_identifier("CC", "PT", "123456") is None
         assert _compose_foreign_identifier("BI", "PT", "123456") is None
 
+    def test_trailing_punctuation_is_the_same_document_type(self):
+        """The defect LEDG-2506 exists for, measured against a real foreign CMD.
+
+        autenticacao.gov sends "TR:" and not "TR". The gate compared the raw
+        value, never matched, and the composition returned None -- so no
+        foreign citizen was ever recognised and every login minted another
+        account. The trailing colon must name the same type as no colon.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("TR:", "PT", "123456") == _compose_foreign_identifier(
+            "TR", "PT", "123456"
+        )
+
+    def test_the_composition_is_unchanged_for_an_already_clean_type(self):
+        """🚨 The freeze, restated against the fix that touches its input.
+
+        Normalising before the gate is only safe because it is a no-op on every
+        accepted type -- none of the four carries a trailing separator. If this
+        ever fails, an identifier that already resolves an account has changed
+        and every foreign citizen registered under it is locked out.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            MDC_FOREIGN_DOC_TYPES,
+            _compose_foreign_identifier,
+        )
+
+        for doc_type in MDC_FOREIGN_DOC_TYPES:
+            assert (
+                _compose_foreign_identifier(doc_type, "PT", "123456") == f"MDC/{doc_type}/PT/123456"
+            )
+
+    def test_normalisation_does_not_widen_the_accepted_set(self):
+        """The trap: a rule that stripped every non-letter would fold "T:R"
+        into "TR" and admit a type the gate exists to refuse. Only a TRAILING
+        run is removed, so an interior separator still rejects, and a type that
+        is not one of the four still rejects once its punctuation is gone."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _compose_foreign_identifier
+
+        assert _compose_foreign_identifier("T:R", "PT", "123456") is None
+        assert _compose_foreign_identifier("TR1", "PT", "123456") is None
+        assert _compose_foreign_identifier("XTR", "PT", "123456") is None
+        assert _compose_foreign_identifier("CC:", "PT", "123456") is None
+        assert _compose_foreign_identifier(":TR", "PT", "123456") is None
+
 
 class SAMLRequestedAttributesTest(APITestCase):
     """What the CMD AuthnRequest asks the IdP for.

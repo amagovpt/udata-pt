@@ -447,6 +447,35 @@ MDC_ATTR_DOC_NUMBER = "http://interop.gov.pt/MDC/Cidadao/DocNumber"
 # their own account, which is the one thing this ticket must not do.
 MDC_FOREIGN_DOC_TYPES = frozenset({"TR", "PAS", "CR", "DR"})
 
+# autenticacao.gov sends the type with a trailing colon -- "TR:" and not "TR"
+# -- which is what kept every foreign citizen from being recognised: the gate
+# above compared the raw value against the set and never matched, the
+# composition returned None, and the login fell through to the email branches.
+# Measured against a real foreign CMD, and stored that way in extras.
+_DOC_TYPE_TRAILING_SEPARATORS = re.compile(r"[\s:;.,]+$")
+
+
+def _normalize_doc_type(doc_type):
+    """Clean a DocType attribute before it is compared or stored.
+
+    ⚠️ This runs BEFORE the gate, never inside the composition -- the
+    pre-image is frozen (see _compose_foreign_identifier). For any of the four
+    accepted types the result is the input, byte for byte, because none of them
+    carries a trailing separator: the change is additive, turning values that
+    used to compose nothing into values that compose, and never altering an
+    identifier that already resolves an account.
+
+    Only a TRAILING run of separators is removed, and deliberately nothing
+    else. A rule that stripped every non-letter would fold "T:R" into "TR" and
+    admit a type the gate is there to refuse; this one cannot, because it never
+    touches a letter, a digit or an interior character. The only strings whose
+    classification changes are "<candidate><trailing separators>". Leading
+    punctuation has never been observed and is left alone for the same reason.
+    """
+    if not doc_type:
+        return doc_type
+    return _DOC_TYPE_TRAILING_SEPARATORS.sub("", doc_type.strip().upper())
+
 
 def _compose_foreign_identifier(doc_type, doc_nationality, doc_number):
     """Build the identity string for a foreign citizen, from their document.
@@ -496,10 +525,15 @@ def _compose_foreign_identifier(doc_type, doc_nationality, doc_number):
     Returns None when any attribute is missing or the type is not a foreign
     one, so the caller falls through to the existing email/name branches
     instead of minting an identity from half an answer.
+
+    The type is normalised by ``_normalize_doc_type`` BEFORE the gate, which is
+    the only place a fix may touch: normalising the input can admit values that
+    used to compose nothing, but it can never change an identifier that already
+    resolves an account. Normalising anything INSIDE the f-string below would.
     """
     if not (doc_type and doc_nationality and doc_number):
         return None
-    doc_type = doc_type.strip().upper()
+    doc_type = _normalize_doc_type(doc_type)
     if doc_type not in MDC_FOREIGN_DOC_TYPES:
         return None
     # Upper-cased, including the number. The eIDAS PersonIdentifier is passed
