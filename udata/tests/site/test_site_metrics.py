@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import (
     DatasetFactory,
@@ -70,6 +72,10 @@ class SiteMetricTest(PytestOnlyDBTestCase):
     def test_harvesters_metric(self, app):
         site = SiteFactory.create(id=app.config["SITE_ID"])
         sources = [HarvestSourceFactory() for i in range(10)]
+        # A deleted source still counts. Without this one the metric could be narrowed
+        # to `HarvestSourceQuerySet.visible()` and the test would stay green, so it is
+        # what pins the meaning the counting method is not allowed to change.
+        sources.append(HarvestSourceFactory(deleted=datetime.now(UTC)))
 
         site.count_harvesters()
 

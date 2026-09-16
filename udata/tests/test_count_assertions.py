@@ -38,30 +38,40 @@ from pathlib import Path
 
 import udata
 
-# Three shapes, all unfiltered and all routed to `estimated_document_count()`:
+# Every unfiltered shape, all routed to `estimated_document_count()`:
 #     Model.objects.count()
 #     Model.objects().count()
-#     Model.objects.all().count() / Model.objects.filter().count()
-# A filtered call -- `Model.objects(field=x).count()` -- does not match, because
-# the parentheses are required to be empty.
-UNFILTERED_COUNT = re.compile(r"\.objects(\(\))?(\.(all|filter)\(\))?\.count\(\)")
+#     Model.objects.all().count() / .filter() / .no_cache() / .order_by(...)
+# and any chain of those. A filtered call -- `Model.objects(field=x).count()` --
+# does not match, because the first parentheses are required to be empty.
+#
+# What this cannot catch, because it reads text and not syntax: a queryset held
+# in a variable and counted later (`qs = M.objects` ... `qs.count()`), and a
+# `.count()` wrapped onto its own line. Neither exists in the tree today.
+UNFILTERED_COUNT = re.compile(
+    r"\.objects(\(\))?(\.(all|filter|no_cache)\(\)|\.order_by\([^)]*\))*\.count\(\)"
+)
 
-# `udata/core/avatars/test_avatar_api.py` is the only test module that does not
-# live in a `tests/` directory, so it is named explicitly. Selecting every
-# `test_*.py` instead would be wrong: `test_migrations.py` writes
-# `udata/migrations/test_migration_temp.py` at runtime and deletes it in its
-# teardown, so a tree walk racing that test would pick up a file that is gone by
-# the time it is read.
-EXTRA_TEST_MODULES = ("core/avatars/test_avatar_api.py",)
+# What counts as a test module is pytest's definition, from `pyproject.toml`
+# (`python_files = ["test_*.py"]`), plus everything under a `tests/` directory --
+# not a hand-maintained list, which goes stale the first time someone adds a
+# module outside `tests/` (`udata/core/avatars/test_avatar_api.py` is already one).
+#
+# `udata/migrations/` is excluded deliberately: `test_migrations.py` writes
+# `udata/migrations/test_migration_temp.py` at runtime and removes it in its
+# teardown, so under `-n 4` a walk racing that test would match a file that is
+# gone by the time it is read. The `FileNotFoundError` below is the second belt.
+EXCLUDED_DIRS = ("migrations",)
 
 
 def _test_sources():
     root = Path(udata.__file__).parent
-    for path in sorted(root.glob("**/tests/**/*.py")):
-        yield path
-    for relative in EXTRA_TEST_MODULES:
-        path = root / relative
-        if path.exists():
+    seen = set()
+    for path in sorted(list(root.glob("**/tests/**/*.py")) + list(root.rglob("test_*.py"))):
+        if any(part in EXCLUDED_DIRS for part in path.relative_to(root).parts):
+            continue
+        if path not in seen:
+            seen.add(path)
             yield path
 
 
