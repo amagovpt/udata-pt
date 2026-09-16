@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **fix(auth): a citizen can no longer sign in with no way of being recognised**
+  - The four attributes that identify a citizen — civil ID, and the document's type,
+    nationality and number — were asked for as **optional**, and autenticacao.gov lists
+    an optional attribute **with a checkbox the citizen can clear**.
+  - 🚨 **Cleared, the assertion carries no identifier at all.** Nothing links the person
+    to an account, so a **new one is minted on every sign-in**. Measured: one person,
+    one CMD, **three accounts** in two afternoons — and in one of them they gave their
+    real email on the completion screen and the account was still not linked.
+  - All four are now required, which removes the checkboxes. **No logic changed**: the
+    resolver already prefers the civil ID when it is there and composes from the
+    document when it is not, so nationals keep resolving by civil ID exactly as before.
+  - 🚩 **This is the third value this flag has held in three weeks**, so the reasoning is
+    now written beside it. The claim it replaces — that requiring an attribute makes the
+    IdP refuse whoever lacks it — was never observed. What was observed: tst ran with
+    the civil ID required for **two and a half weeks**, with sign-ins working throughout.
+  - ⚠️ **That window covers the civil ID and covers nationals.** It does not cover the
+    three document attributes, which did not exist then. And nobody holds all four —
+    they are alternatives — so a check against a real CMD, **national and foreign**, is a
+    condition of promotion, not of merge: no automated test can reach the IdP.
+
 - **fix(harvest): a harvest source URL no longer publishes its own password**
   - `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth is
     configured as `https://user:password@host/path` — and the portal accepted

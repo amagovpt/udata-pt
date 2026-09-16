@@ -2517,16 +2517,31 @@ def sp_initiated():
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
-            # Optional, not required: isRequired tells the IdP the sign-in
-            # cannot proceed without the attribute, and a foreign citizen has
-            # no NIC to give. Demanding it is what shuts them out today. The
-            # IdP still sends it whenever it exists -- the flag governs the
-            # failure, not the supply -- and an assertion that arrives without
-            # one already falls through to the existing branches.
+            # Required, and this is the third value this flag has held in
+            # three weeks -- so the reasoning is written down rather than left
+            # to be re-derived.
+            #
+            # What isRequired actually governs is the CONSENT SCREEN. Marked
+            # optional, autenticacao.gov lists the attribute under "Dados
+            # Opcionais" with a checkbox the citizen can clear; marked
+            # required, the checkbox is gone. It was the checkboxes that
+            # produced the defect: with all four cleared the assertion carries
+            # no identifier at all, nothing links the person to an account,
+            # and a new one is minted on every sign-in. Measured on 2026-09-15
+            # and 16: one person, one CMD, three accounts.
+            #
+            # A previous comment here claimed isRequired makes the IdP refuse
+            # a citizen who lacks the attribute, and that requiring the NIC is
+            # what shuts foreigners out. That was never observed. What WAS
+            # observed: tst ran with the NIC required from 2026-08-27 to
+            # 09-14 -- two and a half weeks, with CMD sign-ins working
+            # throughout. That window covers the NIC and covers nationals; it
+            # does not cover the three document attributes below, which did
+            # not exist then.
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_FIRST_NAME,
@@ -2538,23 +2553,37 @@ def sp_initiated():
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
-            # The foreign citizen's document. Optional for the mirror-image
-            # reason: a national's CMD may not carry these at all, and asking
-            # for them as required would trade one excluded group for another.
+            # The foreign citizen's document, required for the same reason as
+            # the NIC: a checkbox on any of the three is a way to arrive with
+            # no identity.
+            #
+            # 🚨 The identifier composition needs ALL THREE or none -- it
+            # returns None unless type, nationality and number are all present
+            # -- so leaving any one of them optional leaves the hole open.
+            #
+            # ⚠️ And note what nobody has: the FOUR together. The NIC and this
+            # trio are alternatives by construction, and the composer returns
+            # None for a Cartao de Cidadao. So if the pessimistic reading of
+            # isRequired were right -- that the IdP refuses whoever lacks the
+            # attribute -- this would exclude nationals too, not just
+            # foreigners. Unlike the NIC, no window of tst ever ran with these
+            # required, so that reading is untested here. It is what the
+            # validation against a real CMD, national AND foreign, has to
+            # settle before this leaves tst.
             RequestedAttribute(
                 name=MDC_ATTR_DOC_TYPE,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_DOC_NATIONALITY,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_DOC_NUMBER,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
         ]
     )
