@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- **fix(harvest): a harvest source URL no longer accepts credentials**
+  - The three changes before this one redacted `user:password@` everywhere it reached a
+    reader -- the API, the CSV export, harvest errors and logs, derived resource URLs,
+    Sentry -- but none of them touched the cause: the portal still accepted a source URL
+    with credentials in it. Storing a password in a field that is indexed and serialized by
+    half a dozen paths is fragile by construction; each of those fixes closed one path, and
+    any new serialization reopened the problem.
+  - 📋 **The inventory that decided this.** Every harvest source in production, deleted ones
+    included, read through the public API: **49 sources, 44 active, zero carrying userinfo
+    in the URL**, and zero `config` keys shaped like a credential (only `filters` and
+    `features`). The reading is trustworthy because production still serializes `url`
+    verbatim -- the redaction is not deployed there yet, so nothing was masked. It matches
+    the earlier count taken against a production-scale restore. The credentialed source in
+    the original report was built for the proof of concept; no live source authenticates
+    this way.
+  - **Decision: reject, rather than move the credentials to a write-only field.** A field
+    that is never serialized nor indexed, composed into the request at fetch time, is the
+    right design for a portal that needs basic auth. This one does not: nobody uses it, so
+    it would be a new feature with no consumer. Rejecting is the small, definitive change
+    the inventory allows.
+  - **The rejection is local to the harvest source URL.** `URLS_ALLOW_CREDENTIALS` stays
+    true: `udata.uris.validate` reads it for every URL in the portal -- a user or
+    organization website, a dataset schema url, a resource url a publisher typed, an RDF
+    URI -- and turning it off would reject all of those to fix one field. It is also not
+    `uris.validate(url, credentials=False)`, which would be one line: that composes the
+    rejected URL into the error text, so the 400 body would repeat the password back.
+  - **`url` is out of the text index, and the confirmation oracle is closed.** The index
+    covered `$name, $url` while the sources route accepts `q`, so `?q=<password>` returned
+    the source carrying it -- which the two previous entries both recorded as a residue
+    they were leaving standing. It no longer stands. The index is kept over `name` alone;
+    the frontend never sent `q` to that route, so no search anyone uses is lost.
+  - **The migration reports; it does not rewrite.** Stripping the userinfo from a stored
+    URL would break that source's harvest with a 401 that nobody decided, and destroy the
+    only copy of the credential its owner would need to reconfigure it. After the rejection
+    and the index change, a stored credential is a working-source problem rather than an
+    exposure, so the migration names each source -- id, slug, host, never the URL -- and
+    leaves the decision to the operator. In production the list is empty.
+  - ⚠️ **Operational: run `udata db migrate` before restarting web and workers.** MongoDB
+    allows one text index per collection and refuses to create the new one beside the old,
+    so a process running the new code against an un-migrated database raises
+    `IndexOptionsConflict` the first time it touches `harvest_source` -- a hard failure, not
+    a degraded search. The same holds in reverse for a process on the old code started
+    after the migration.
+  - ⚠️ **A legacy source with credentials keeps harvesting, but can no longer be edited**
+    without removing them: the PUT revalidates the stored URL. That is the migration path,
+    and with the inventory at zero it affects nobody today.
+  - ⚠️ **A future source needing basic auth now has no route.** `user:password@` in the URL
+    was the *only* authentication channel a harvest source had -- `requests` extracts it
+    and applies basic auth; there is no header, token or config field for it. Designing the
+    write-only field is the work that would unblock such a source, and it was deliberately
+    not done here.
+  - ⚠️ Unchanged on purpose: the fetch-time guard, which would otherwise break legacy
+    harvests in silence, and `udata harvest create`, which bypasses the form -- whoever runs
+    it has a shell and could write to the database anyway.
+
 - **fix(sentry): URL credentials no longer reach Sentry, nor the log lines that printed them**
   - A harvest source URL may legitimately carry `user:password@`, and every `requests`
     exception raised over one embeds it in its message. An earlier change kept that out of
