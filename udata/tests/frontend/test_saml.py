@@ -1012,7 +1012,10 @@ class SAMLSSOCallbackTest(APITestCase):
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_with_only_email(self, mock_client_for, mock_requires_conf):
-        """autenticacao.gov may return only email (NIC is optional). Without a
+        """autenticacao.gov may return only email. The NIC is asked for as
+        required since LEDG-2503, but required governs the consent screen, not
+        what the IdP holds -- an assertion can still arrive without one, which
+        is what this covers. Without a
         match the identity goes to the wizard; no_match stays false because
         there is no NIC, so the wizard offers the search branch rather than
         account creation (an account with no auth_nic could confirm itself)."""
@@ -7822,7 +7825,7 @@ class SAMLRequestedAttributesTest(APITestCase):
         return found
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_cmd_authn_request_asks_document_attributes_and_optional_nic(self, mock_client_for):
+    def test_cmd_authn_request_requires_every_identifier_attribute(self, mock_client_for):
         from udata.auth.saml.saml_plugin.saml_govpt import (
             MDC_ATTR_DOC_NATIONALITY,
             MDC_ATTR_DOC_NUMBER,
@@ -7835,21 +7838,45 @@ class SAMLRequestedAttributesTest(APITestCase):
 
         requested = self._requested_attributes(mock_client_for)
 
-        # The three that identify a foreign citizen's document are now asked
-        # for -- without them the assertion carries no identity at all.
-        for attribute in (MDC_ATTR_DOC_TYPE, MDC_ATTR_DOC_NATIONALITY, MDC_ATTR_DOC_NUMBER):
+        # Every attribute that can identify the citizen is REQUIRED, and the
+        # reason is the consent screen rather than the assertion.
+        #
+        # These assertions used to say "False", and the comment beside them
+        # said that marking the NIC required is what excludes a foreigner, and
+        # that nothing about a national's consent screen changed. Both were
+        # wrong, and the second is what did the damage: autenticacao.gov lists
+        # an optional attribute under "Dados Opcionais" WITH A CHECKBOX. With
+        # all four cleared the assertion carries no identifier, nothing links
+        # the person to an account, and a new one is minted on every sign-in.
+        # Measured 2026-09-15/16: one person, one CMD, three accounts.
+        #
+        # The claim that required makes the IdP refuse was never observed.
+        # What was: tst ran with the NIC required from 2026-08-27 to 09-14,
+        # with CMD sign-ins working. That covers the NIC and nationals, and
+        # not the three document attributes -- which is why the ticket makes
+        # a real-IdP check, national AND foreign, a condition of promotion.
+        for attribute in (
+            MDC_ATTR_NIC,
+            MDC_ATTR_DOC_TYPE,
+            MDC_ATTR_DOC_NATIONALITY,
+            MDC_ATTR_DOC_NUMBER,
+        ):
             assert attribute in requested, f"{attribute} is not requested"
-            assert requested[attribute] == "False"
+            assert requested[attribute] == "True", f"{attribute} is still optional"
 
-        # And the NIC is no longer demanded: isRequired tells the IdP the
-        # sign-in cannot proceed without it, which is what excludes a foreigner.
-        assert requested[MDC_ATTR_NIC] == "False"
-
-        # Everything else is untouched. Email and the names stay required, so
-        # nothing about a national's consent screen changes here.
+        # Email and the names were already required and stay that way.
         assert requested[MDC_ATTR_EMAIL] == "True"
         assert requested[MDC_ATTR_FIRST_NAME] == "True"
         assert requested[MDC_ATTR_LAST_NAME] == "True"
+
+        # Nothing is left optional at all. Every attribute in this list
+        # identifies the citizen, so a checkbox on any of them is a way to
+        # arrive with no identity -- hence the assertion is on the whole set
+        # rather than on the four named above, and it also catches a flag left
+        # off entirely. An attribute that is legitimately optional would
+        # belong somewhere this assertion does not reach.
+        optional = [name for name, required in requested.items() if required != "True"]
+        assert not optional, f"still optional, so still declinable: {optional}"
 
 
 class SAMLForeignCitizenLoginTest(APITestCase):
