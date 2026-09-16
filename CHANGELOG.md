@@ -38,15 +38,40 @@
     instead would have left the password in Mongo and needed three call sites
     rather than one — unlike errors and logs, where neither half was redundant,
     here the second would be.
+  - **Redacting a URL now splits it instead of pattern-matching it.** The
+    free-text helper has to stop at the RFC 3986 authority alphabet, because in
+    prose it cannot tell where a URL ends — but `udata.uris` accepts any run of
+    non-space characters as userinfo, so a password holding `{`, `|`, `^`, `"`,
+    `<`, `>` or a backtick went straight through it. The same regex also
+    rewrites `https://host/files//report@2026.csv`, a legitimate resource URL,
+    into something broken. `redact_url_credentials_in_url` splits the URL and
+    replaces the authority, which is exact in both directions; the free-text
+    helper keeps the error messages and log lines it was written for.
   - A migration redacts what is already stored, writing only the individual
-    fields that change. ⚠️ **It does not un-leak anything**: a credential that
-    was publicly readable is compromised, and the remedy is to rotate it at the
-    remote source. It is expected to be a no-op, and its counters are the
-    inventory of the live database.
-  - 🚩 **Still standing, unchanged from the previous entry:** the `$name, $url`
-    text index that lets a caller confirm a guessed credential via `?q=`, and
-    the raw URL interpolated into `log.warning` / `log.exception`, which belongs
-    in `udata/sentry.py` because every `requests` exception shares it.
+    fields that change and pinning each one to the value it read — `resources`
+    is not append-only, so an editor deleting one between the read and the write
+    would otherwise shift the redaction onto a different resource. ⚠️ **It does
+    not un-leak anything**: a credential that was publicly readable is
+    compromised, and the remedy is to rotate it at the remote source. It is
+    expected to be a no-op, and its counters are the inventory of the live
+    database.
+  - ⚠️ **If those counters come back non-zero**, two follow-ups are not
+    automatic: the search index keeps its own copy of `extras` and of the
+    `harvest` sub-document, so the touched datasets need reindexing; and a
+    harvest that ran between the code deploy and the migration would have
+    appended a second, redacted copy of every ODS resource, because `odspt`
+    matches resources by URL and never prunes. Run `udata db upgrade` before
+    restarting the workers and neither applies.
+  - 🚩 **Still standing.** From the previous entry: the `$name, $url` text index
+    that lets a caller confirm a guessed credential via `?q=`, and the raw URL
+    interpolated into `log.warning` / `log.exception`, which belongs in
+    `udata/sentry.py` because every `requests` exception shares it. **And one
+    this work found:** the `ckan` backend builds `Dataset.harvest.remote_url`
+    out of the source URL (`ckan/harvesters.py`, inherited by `ckanpt`), which
+    is the same defect in a field that is more public and longer-lived than
+    either of the two fixed here — it is on every dataset, not on a job that
+    gets purged. It needs its own change and its own migration field; no live
+    source carries credentials today, so it is preventive there too.
 
 - **fix(harvest): a harvest source URL no longer publishes its own password**
   - `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth is

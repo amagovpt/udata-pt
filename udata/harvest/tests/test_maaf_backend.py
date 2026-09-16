@@ -130,5 +130,10 @@ class MaafCredentialedSourceTest(PytestOnlyDBTestCase):
             error.message for item in job.items for error in item.errors
         ]
         # Redacting what is published must not cost the fetch its credentials.
+        # Asserted on the descriptor request specifically: the index request is
+        # credentialed whatever this code does, so `any(...)` over the whole
+        # history would pass even if the descriptor were fetched redacted.
         assert job.items[0].remote_id == REMOTE_ID
-        assert any("harvestuser" in request.url for request in rmock.request_history)
+        descriptors = [r for r in rmock.request_history if r.url.endswith("dataset.xml")]
+        assert descriptors, [r.url for r in rmock.request_history]
+        assert all("harvestuser" in request.url for request in descriptors)

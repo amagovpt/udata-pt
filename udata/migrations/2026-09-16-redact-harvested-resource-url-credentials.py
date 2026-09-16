@@ -30,7 +30,11 @@ database does not replace telling the source owners.
 
 Only the individual fields that change are written, never a whole `resources`
 or `items` array: a harvest -- or an editor -- writing at the same time would
-otherwise have its work overwritten by the stale copy read here.
+otherwise have its work overwritten by the stale copy read here. Each write is
+also pinned to the values just read, because `resources` is not append-only:
+without that, a resource deleted between the read and the write would shift the
+indices and send the redacted value to the wrong element. A concurrent write
+makes the update a no-op, and re-running redacts whatever it skipped.
 
 Idempotent: a second run selects the same documents, finds nothing to change
 and writes nothing.
@@ -38,12 +42,12 @@ and writes nothing.
 
 import logging
 
-from udata.harvest.url_filter import redact_url_credentials
+from udata.harvest.url_filter import redact_url_credentials_in_url
 
 log = logging.getLogger(__name__)
 
 # Deliberately wider than the redaction itself: this only picks candidate
-# documents, and `redact_url_credentials` decides what actually changes.
+# documents, and `redact_url_credentials_in_url` decides what actually changes.
 USERINFO_PATTERN = "//[^/?#\\s]*@"
 
 # The marker `odspt` writes on every dataset it harvests. Scoping to it matters:
@@ -83,21 +87,31 @@ def _redact_ods_datasets(db):
     datasets = 0
     for dataset in db.dataset.find(query, no_cursor_timeout=True):
         updates = {}
+        seen = {}
 
         for index, resource in enumerate(dataset.get("resources") or []):
             before = resource.get("url")
-            after = redact_url_credentials(before)
+            after = redact_url_credentials_in_url(before)
             if after != before:
                 updates[f"resources.{index}.url"] = after
+                seen[f"resources.{index}.url"] = before
 
         before = (dataset.get("extras") or {}).get("ods:url")
-        after = redact_url_credentials(before)
+        after = redact_url_credentials_in_url(before)
         if after != before:
             updates[ODS_MARKER] = after
+            seen[ODS_MARKER] = before
 
         if updates:
-            db.dataset.update_one({"_id": dataset["_id"]}, {"$set": updates})
-            datasets += 1
+            # Pin every field to the value just read. `dataset.resources` is not
+            # append-only -- an editor deleting a resource shifts the rest -- so
+            # a bare indexed `$set` could land on a different resource, or even
+            # create a stub element past the end of a shortened array. Pinned,
+            # a concurrent write makes this a no-op instead; re-running fixes it.
+            guard = {"_id": dataset["_id"]}
+            guard.update(seen)
+            if db.dataset.update_one(guard, {"$set": updates}).modified_count:
+                datasets += 1
 
     log.info("Redacted %s dataset(s).", datasets)
 
@@ -113,15 +127,19 @@ def _redact_item_remote_ids(db):
     jobs = 0
     for job in db.harvest_job.find(query, no_cursor_timeout=True):
         updates = {}
+        seen = {}
         for index, item in enumerate(job.get("items") or []):
             before = item.get("remote_id")
-            after = redact_url_credentials(before)
+            after = redact_url_credentials_in_url(before)
             if after != before:
                 updates[f"items.{index}.remote_id"] = after
+                seen[f"items.{index}.remote_id"] = before
 
         if updates:
-            db.harvest_job.update_one({"_id": job["_id"]}, {"$set": updates})
-            jobs += 1
+            guard = {"_id": job["_id"]}
+            guard.update(seen)
+            if db.harvest_job.update_one(guard, {"$set": updates}).modified_count:
+                jobs += 1
 
     log.info("Redacted %s harvest job(s).", jobs)
 

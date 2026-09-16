@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from flask import current_app
 
@@ -122,3 +122,40 @@ def redact_url_credentials(text: str | None) -> str | None:
     if not text or "@" not in text:
         return text
     return _URL_USERINFO_RE.sub(r"\1***@", text)
+
+
+def redact_url_credentials_in_url(url: str | None) -> str | None:
+    r"""Replace the userinfo of `url` with `***`. For input that IS a URL.
+
+    The counterpart of `redact_url_credentials` for a field whose whole value
+    is a URL -- a resource URL, a harvest item remote id -- rather than prose
+    with a URL somewhere inside it. Splitting is both stricter and safer there,
+    in the two directions the regex cannot be:
+
+    - It redacts userinfo the regex misses. `udata.uris.URL_REGEX` accepts
+      `\S+(?::\S*)?@`, so this portal really accepts (and `requests` really
+      sends) a password holding `{`, `|`, `^`, `"`, `<`, `>` or a backtick --
+      none of which are in the RFC 3986 authority alphabet the free-text regex
+      has to stop at, because in prose it cannot tell where the URL ends.
+    - It never reaches past the authority. `https://host/files//report@2026.csv`
+      is a legitimate URL that the regex rewrites into `//***@2026.csv`, which
+      would corrupt a resource nobody asked us to touch.
+
+    Falls back to the free-text redaction when the value does not parse as a
+    URL, so an unexpected shape is still redacted rather than passed through.
+
+    Pure and idempotent; returns `None` and `""` unchanged.
+    """
+    if not url or "@" not in url:
+        return url
+    try:
+        parts = urlsplit(url)
+        netloc = parts.netloc
+    except ValueError:
+        return redact_url_credentials(url)
+    if "@" not in netloc:
+        # A URL whose only `@` is in the path, the query or the fragment.
+        return url
+    # `rpartition` so that a password holding an unencoded `@` goes whole.
+    _, _, host = netloc.rpartition("@")
+    return urlunsplit(parts._replace(netloc=f"***@{host}"))

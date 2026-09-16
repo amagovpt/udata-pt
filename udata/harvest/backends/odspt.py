@@ -9,7 +9,7 @@ from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
 from udata.harvest.models import HarvestItem
-from udata.harvest.url_filter import redact_url_credentials
+from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.i18n import gettext as _
 from udata.models import License, Organization, Resource
 from udata.utils import get_by
@@ -114,7 +114,7 @@ class OdsBackendPT(BaseBackend):
         `URL_REGEX`; were `URLS_ALLOW_CREDENTIALS` ever turned off, these
         resources would stop validating and this is where to look.
         """
-        return redact_url_credentials(self.source_url)
+        return redact_url_credentials_in_url(self.source_url)
 
     @property
     def api_url(self):

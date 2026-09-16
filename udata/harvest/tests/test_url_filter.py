@@ -1,6 +1,6 @@
 import pytest
 
-from ..url_filter import redact_url_credentials
+from ..url_filter import redact_url_credentials, redact_url_credentials_in_url
 
 
 class RedactURLCredentialsTest:
@@ -67,3 +67,77 @@ class RedactURLCredentialsTest:
         """A long message without a match must not hang the save path."""
         text = "https://" + "a" * 20000 + "/x"
         assert redact_url_credentials(text) == text
+
+
+class RedactURLCredentialsInURLTest:
+    """`redact_url_credentials_in_url` removes the userinfo of a value that IS a URL.
+
+    Resource URLs and harvest item remote ids are whole URLs, not prose, and
+    splitting them is both stricter and safer than the free-text regex can
+    afford to be (LEDG-2500).
+    """
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # The shapes the free-text regex also handles.
+            (
+                "https://harvestuser:sup3rs3cr3t@transparencia.example.pt/explore/",
+                "https://***@transparencia.example.pt/explore/",
+            ),
+            # An API token used as the username, with no password at all.
+            ("https://t0ken@host.pt/x", "https://***@host.pt/x"),
+            # A password holding an unencoded `@`: the whole userinfo goes.
+            ("https://u:p@ss@host.pt/x", "https://***@host.pt/x"),
+            # `udata.uris` accepts a scheme-relative URL, so one can be stored.
+            ("//u:p@host.pt/x", "//***@host.pt/x"),
+            ("https://u:p@[2001:db8::1]:8080/x", "https://***@[2001:db8::1]:8080/x"),
+            # No credentials: unchanged, including a bare host and a real
+            # ODS export URL with its query string.
+            ("https://transparencia.example.pt", "https://transparencia.example.pt"),
+            (
+                "https://t.pt/explore/dataset/x/download?format=csv&timezone=Europe/Berlin",
+                "https://t.pt/explore/dataset/x/download?format=csv&timezone=Europe/Berlin",
+            ),
+            # Idempotent: a second pass must not redact the marker again.
+            ("https://***@host.pt/x", "https://***@host.pt/x"),
+            (None, None),
+            ("", ""),
+        ],
+    )
+    def test_userinfo_is_redacted(self, url, expected):
+        assert redact_url_credentials_in_url(url) == expected
+
+    @pytest.mark.parametrize(
+        "password",
+        # Every one of these is accepted by `udata.uris.URL_REGEX`, whose
+        # userinfo group is a run of non-space characters, and sent by
+        # `requests` as basic
+        # auth -- but none is in the RFC 3986 authority alphabet the free-text
+        # regex has to stop at. They are common in generated passwords.
+        ["S3cr3t{x}", "S3cr3t|x", "S3cr3t^x", "S3cr3t<x>", 'S3"cr3t', "S3`cr3t"],
+    )
+    def test_a_password_outside_the_authority_alphabet_is_still_redacted(self, password):
+        url = f"https://api:{password}@transparencia.example.pt/explore/"
+
+        redacted = redact_url_credentials_in_url(url)
+
+        assert redacted == "https://***@transparencia.example.pt/explore/"
+        assert password not in redacted
+        # The free-text regex is the one that cannot reach these, which is why
+        # a URL-shaped value must not be handed to it.
+        assert redact_url_credentials(url) == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # `//` inside a path, followed by a filename holding `@`. A real
+            # URL a publisher may have on a resource, which the free-text
+            # regex rewrites into `//***@2026.csv` and destroys.
+            "https://host.pt/files//report@2026.csv",
+            "https://host.pt/redirect?to=https://a@b.pt",
+            "https://host.pt/contact#mail@host.pt",
+        ],
+    )
+    def test_an_at_outside_the_authority_is_left_alone(self, url):
+        assert redact_url_credentials_in_url(url) == url

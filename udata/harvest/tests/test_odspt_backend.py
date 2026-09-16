@@ -154,7 +154,9 @@ class OdsBackendPTCredentialedSourceTest(PytestOnlyDBTestCase):
             for resource in dataset.resources
         )
         # The harvest itself still authenticates: redacting what is published
-        # must not cost the fetch its credentials.
+        # must not cost the fetch its credentials. Asserted non-vacuously --
+        # `all(...)` over an empty history would pass on its own.
+        assert rmock.request_history
         assert all("harvestuser" in request.url for request in rmock.request_history)
 
     def test_reharvest_matches_resources_by_their_redacted_url(self, rmock):

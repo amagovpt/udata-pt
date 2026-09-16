@@ -19,7 +19,7 @@ from udata.harvest.filters import (
     to_date,
 )
 from udata.harvest.models import HarvestItem
-from udata.harvest.url_filter import redact_url_credentials
+from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.models import Checksum, License, SpatialCoverage
 from udata.mongo.datetime_fields import DateRange
 from udata.utils import get_by
@@ -159,16 +159,18 @@ class MaafBackend(BaseBackend):
                     # copied onto `item.kwargs`, which `item_fields` serializes
                     # as raw JSON on a route with no session (LEDG-2500).
                     url = urljoin(directory, href)
-                    self.process_dataset(redact_url_credentials(url), url=url)
+                    self.process_dataset(redact_url_credentials_in_url(url), url=url)
                     if self.has_reached_max_items():
                         return
                 else:
                     log.debug("Skip %s", href)
 
     def inner_process_dataset(self, item: HarvestItem, **kwargs):
-        # `**kwargs` rather than a positional `url`: `process_dataset` may be
-        # called with the descriptor URL as the sole argument, and the fallback
-        # is what keeps that usable.
+        # `inner_harvest` always passes `url`; the fallback is for the callers
+        # that do not, which today means `process_dataset(descriptor_url)` with
+        # the URL as its sole argument -- the shape the shared id-stability
+        # harness uses. That path has no separate `remote_id` to redact, so
+        # reading it back is correct rather than a silent second behaviour.
         response = self.get(kwargs.get("url") or item.remote_id)
         xml = self.parse_xml(response.content)
         metadata = xml["metadata"]
