@@ -24,6 +24,13 @@
     has one now.
   - A guard test walks the test tree and fails if an unfiltered count reappears, so
     this stays fixed rather than being fixed once.
+  - 🚩 **And the paginated `total` was estimated too** -- the root cause behind most of
+    the instability. `Pagination.total` came from an unfiltered `QuerySet.count()`, and
+    it is what every paginated API response reports as `total`, with `pages`,
+    `next_page` and `previous_page` derived from it, so an estimate could truncate a
+    listing. A filtered listing was always exact; an unfiltered one is reachable in
+    production -- `GET /api/1/reports/` paginates a bare `Report.objects`. Only that
+    previously-estimated path changes.
   - ⚠️ **Measured, not assumed**: three full-suite runs on unmodified code, same
     machine, databases dropped before each -- 11 failures, then 0, then 0, with the
     failing set differing between runs. Four of the five failures named in the red run
