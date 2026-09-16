@@ -26,7 +26,7 @@ from ..models import (
     archive_harvested_dataset,
 )
 from ..signals import after_harvest_job, before_harvest_job
-from ..url_filter import HarvestURLForbidden, check_harvest_url
+from ..url_filter import HarvestURLForbidden, check_harvest_url, redact_url_credentials
 
 log = logging.getLogger(__name__)
 
@@ -466,7 +466,12 @@ class BaseBackend(object):
         harvest.domain = self.source.domain
 
         harvest.source_id = str(self.source.id)
-        harvest.source_url = str(self.source.url)
+        # This is denormalized onto the dataservice, and Dataservice.harvest is
+        # readable without a session, so every dataservice listing would hand
+        # out the source URL. URLS_ALLOW_CREDENTIALS lets that URL carry
+        # user:password@, and nothing here ever needs the credentials back --
+        # the HTTP calls use self.source.url (LEDG-2477).
+        harvest.source_url = redact_url_credentials(str(self.source.url))
 
         harvest.remote_id = remote_id
         harvest.last_update = datetime.now(UTC)
