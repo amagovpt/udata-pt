@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix(tests): the suite was running against the development MongoDB, and that is what made it flaky**
+  - `pytest -n 4 --dist loadscope` failed intermittently: the failing tests **changed every
+    run**, spanned modules with nothing in common, and **all passed when run alone**. 13 such
+    failures on a clean `develop`. It had already forced the push gate to be overridden once.
+  - 🚩 **The cause was not shared state, ordering, or concurrency** -- the three hypotheses on
+    record. Every failure was the same exception, in unrelated workers at the same moment:
+    `pymongo.errors.AutoReconnect: connection closed`. The MongoDB the suite used had **109
+    seconds of uptime against a 280-second run**: it restarted underneath it.
+  - The suite defaulted to the **development** stack's MongoDB, which runs under
+    `restart: unless-stopped` and comes back whenever that stack is brought up. This repository
+    already declares a dedicated instance in `docker-compose.test.yml` -- the suite now points
+    there, and the worker databases are created on it instead.
+  - 🔑 **A wrong address used to hang rather than fail.** `MONGODB_CONNECT` is False and nothing
+    set `serverSelectionTimeoutMS`, so each attempt waited PyMongo's 30-second default, per
+    test, across ~3500 tests. There is now an explicit liveness check before collection: 4
+    seconds and a message naming the command that fixes it, measured against a closed port.
+  - Also fixed: **without** `-n`, nothing was set at all and the address was derived from
+    `settings.Defaults.MONGODB_HOST` -- the development database again, by another route.
+  - Both CI pipelines follow the new default. No test was disabled, marked `xfail` or made
+    tolerant: nothing under `udata/tests` changed except this plugin's own configuration.
+
 - **fix(sentry): URL credentials no longer reach Sentry, nor the log lines that printed them**
   - A harvest source URL may legitimately carry `user:password@`, and every `requests`
     exception raised over one embeds it in its message. An earlier change kept that out of

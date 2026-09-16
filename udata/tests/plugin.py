@@ -2,7 +2,11 @@ import os
 
 import pytest
 
-DEFAULT_TEST_MONGO_PREFIX = "mongodb://localhost:27017/udata_test"
+# 27019 is what docker-compose.test.yml publishes for `udata-mongodb-test`, the
+# instance this repository declares for running tests. NOT 27017: that is the
+# development stack's MongoDB, and pointing the suite there is what LEDG-2489
+# was about -- see the comment in pytest_configure below.
+DEFAULT_TEST_MONGO_PREFIX = "mongodb://localhost:27019/udata_test"
 
 # Short on purpose: this is a liveness check, not a query. The point is to
 # answer in seconds instead of inheriting the 30-second default.
@@ -12,6 +16,21 @@ PREFLIGHT_TIMEOUT_MS = 3000
 def pytest_configure(config):
     # Each xdist worker gets its own MongoDB database to avoid conflicts
     # when tests drop/recreate the database.
+    #
+    # 🚩 The database this points AT is load-bearing, and getting it wrong does
+    # not look like a configuration problem -- it looks like a flaky suite.
+    # Until LEDG-2489 the default was the development stack's MongoDB, which
+    # runs under `restart: unless-stopped` and comes back whenever that stack is
+    # brought up. A restart mid-run closes every open connection, so whichever
+    # tests happened to be running die with `pymongo.errors.AutoReconnect:
+    # connection closed` -- different tests each time, in modules with nothing
+    # in common, all passing when run alone. That reads exactly like shared
+    # state between workers, and it is not: it is the server going away.
+    #
+    # So: a spread of AutoReconnect failures across unrelated modules is test
+    # infrastructure, not a regression. Check that the test containers are up
+    # (`docker compose -f docker-compose.test.yml up -d`) before reading the
+    # list as a list of broken tests.
     #
     # UDATA_TEST_MONGO_PREFIX extends that isolation past a single run. `_clean_db` truncates
     # every collection before each test, so two runs sharing a database name wipe each
@@ -31,9 +50,12 @@ def pytest_configure(config):
     if workerinput is not None:
         worker_id = workerinput["workerid"]
         settings.Testing.MONGODB_HOST_TEST = f"{prefix or DEFAULT_TEST_MONGO_PREFIX}_{worker_id}"
-    elif prefix:
+    else:
         # Without xdist there is no worker to distinguish, so the prefix is the whole name.
-        settings.Testing.MONGODB_HOST_TEST = prefix
+        # The default applies here too, and that is a fix rather than tidiness: left unset,
+        # build_test_config (udata/mongo/__init__.py) derives the address from
+        # settings.Defaults.MONGODB_HOST -- the development database again, by another route.
+        settings.Testing.MONGODB_HOST_TEST = prefix or DEFAULT_TEST_MONGO_PREFIX
 
 
 def _require_test_mongo(uri):
