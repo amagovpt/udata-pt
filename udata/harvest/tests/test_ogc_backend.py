@@ -237,7 +237,11 @@ class OGCBackendContactPointTest(PytestOnlyDBTestCase):
         job = OGCBackend(self._source(), dryrun=True).harvest()
 
         assert [item.status for item in job.items] == ["done"]
-        assert ContactPoint.objects.count() == 0
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a harvest that created too many or too
+        # few documents could go unnoticed.
+        assert len(list(ContactPoint.objects)) == 0
         assert job.items[0].dataset.contact_points == []
 
     def test_preview_reuses_an_existing_contact_point(self, rmock):
@@ -286,5 +290,5 @@ class OGCBackendContactPointTest(PytestOnlyDBTestCase):
         job = OGCBackend(self._source()).harvest()
 
         assert [item.status for item in job.items] == ["done"]
-        assert ContactPoint.objects.count() == 1
+        assert len(list(ContactPoint.objects)) == 1
         assert job.items[0].dataset.contact_points[0].email == "geo@example.pt"
