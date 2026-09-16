@@ -23,6 +23,7 @@ from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
 from udata.utils import safe_unicode
 
+from ..url_filter import redact_url_credentials
 from .tools.harvester_utils import normalize_url_slashes, sync_resources
 
 
@@ -972,7 +973,12 @@ class INEBackend(BaseBackend):
                         h_item = HarvestItem(
                             remote_id=remote_id,
                             status=item_status,
-                            errors=[HarvestError(message=safe_unicode(e)[:500])],
+                            # Redact before truncating: a cut landing inside the
+                            # userinfo would leave a prefix of the password that
+                            # the constructor can no longer recognise as one.
+                            errors=[
+                                HarvestError(message=redact_url_credentials(safe_unicode(e))[:500])
+                            ],
                         )
                         # Kept so the job links to the dataset in conflict; the
                         # message names the other owner, not the record.

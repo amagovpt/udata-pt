@@ -637,6 +637,38 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         assert all(item.status == "done" for item in job2.items)
         assert Dataset.objects.count() == 2
 
+    def test_harvest_error_message_has_no_url_credentials(self):
+        """A failed harvest must not persist the source URL password.
+
+        `URLS_ALLOW_CREDENTIALS` lets a source URL carry `user:password@`, and
+        the text of a `requests` exception embeds the URL of the request that
+        failed. The harvest job is readable without a session, so that
+        password used to be served to anonymous callers (LEDG-2477).
+
+        The exception raised here is the one from the ticket's proof of
+        concept -- an `HTTPError` out of `raise_for_status()`, which lands in
+        the generic `except` of `harvest()`, not in the connection-error
+        branch that `test_dcat_backend` already covers.
+        """
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+
+        class FailingBackend(FakeBackend):
+            def inner_harvest(self):
+                raise requests.exceptions.HTTPError(f"500 Server Error: None for url: {url}")
+
+        source = HarvestSourceFactory(url=url, organization=OrganizationFactory())
+
+        job = FailingBackend(source).harvest()
+        job.reload()
+
+        assert job.status == "failed"
+        assert len(job.errors) == 1
+        error = job.errors[0]
+        assert "sup3rs3cr3t" not in error.message
+        assert "harvestuser" not in error.message
+        assert "https://***@www.ine.pt/broken.xml" in error.message
+        assert "sup3rs3cr3t" not in (error.details or "")
+
 
 class BaseBackendValidateTest(PytestOnlyDBTestCase):
     @pytest.fixture

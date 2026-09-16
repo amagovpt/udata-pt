@@ -23,10 +23,16 @@ from ..models import (
     VALIDATION_REFUSED,
     HarvestError,
     HarvestItem,
+    HarvestLog,
     HarvestSource,
     HarvestSourceValidation,
 )
-from .factories import HarvestJobFactory, HarvestSourceFactory, MockBackendsMixin
+from .factories import (
+    HarvestJobFactory,
+    HarvestSourceFactory,
+    MockBackendsMixin,
+    mock_initialize,
+)
 
 log = logging.getLogger(__name__)
 
@@ -792,6 +798,153 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         assert error_item["remote_id"] == "4"
         assert error_item["errors"][0]["message"] == "boom"
         assert error_item["dataset"]["id"] == str(failed_ds.id)
+
+    def test_list_jobs_anonymous_hides_url_credentials(self):
+        """The jobs list builds its dicts by hand, so it needs its own redaction.
+
+        `JobsAPI.get` projects the documents in an aggregation instead of
+        marshalling them, so it never passes through `error_fields` -- and it
+        is the endpoint that serves what the INE backend writes with a
+        queryset update (LEDG-2477).
+        """
+        source = HarvestSourceFactory()
+        HarvestJobFactory(
+            source=source,
+            items=[
+                HarvestItem(
+                    remote_id="1",
+                    status="failed",
+                    errors=[
+                        HarvestError(
+                            message=(
+                                "500 Server Error: None for url: "
+                                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                            )
+                        )
+                    ],
+                )
+            ],
+        )
+
+        response = self.get(url_for("api.harvest_jobs", source=source))
+        assert200(response)
+
+        message = response.json["data"][0]["error_items"][0]["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
+
+    def test_get_job_anonymous_hides_url_credentials_in_logs(self):
+        """The captured log lines carry the same exception text as the errors."""
+        job = HarvestJobFactory(
+            items=[
+                HarvestItem(
+                    remote_id="1",
+                    status="failed",
+                    logs=[
+                        HarvestLog(
+                            level="ERROR",
+                            message=(
+                                "Error while processing 1 : 401 Client Error: "
+                                "Unauthorized for url: "
+                                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                            ),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        response = self.get(url_for("api.harvest_job", ident=str(job.id)))
+        assert200(response)
+
+        message = response.json["items"][0]["logs"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
+
+    def test_get_source_anonymous_redacts_url_credentials(self):
+        """Neither source route may hand the URL password to a reader.
+
+        Both are open to anonymous callers and `source_fields` serialized the
+        URL verbatim, so the credentials of a basic-auth source were public
+        without a failed harvest and without knowing any id (LEDG-2477).
+        """
+        source = HarvestSourceFactory(url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml")
+        redacted = "https://***@www.ine.pt/broken.xml"
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["url"] == redacted
+
+        response = self.get(url_for("api.harvest_sources"))
+        assert200(response)
+        listed = next(s for s in response.json["data"] if s["id"] == str(source.id))
+        assert listed["url"] == redacted
+
+    def test_get_source_owner_sees_full_url(self):
+        """Whoever may rewrite the URL still needs to read it whole."""
+        user = self.login()
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+        source = HarvestSourceFactory(url=url, owner=user)
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["url"] == url
+
+    def test_get_job_anonymous_hides_url_credentials(self):
+        """Reading a job without a session must not disclose the source password.
+
+        The job endpoint has no `@api.secure` and `details` is the only field
+        gated behind the admin permission, so `message` used to hand the
+        credentials of the source URL to any anonymous caller (LEDG-2477).
+        """
+        job = HarvestJobFactory(
+            errors=[
+                HarvestError(
+                    message=(
+                        "500 Server Error: None for url: "
+                        "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                    )
+                )
+            ]
+        )
+
+        response = self.get(url_for("api.harvest_job", ident=str(job.id)))
+        assert200(response)
+
+        message = response.json["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "harvestuser" not in message
+        assert message == ("500 Server Error: None for url: https://***@www.ine.pt/broken.xml")
+
+    def test_preview_error_hides_url_credentials(self):
+        """The preview never saves, so only the serialization can redact it.
+
+        `save_job()`/`end_job()` are no-ops when `dryrun` is set, so
+        `HarvestError.clean()` never runs on this path -- yet the preview
+        models are clones of the job models and serialize the same errors, to
+        an audience that includes organization editors.
+        """
+        user = self.login()
+        source = HarvestSourceFactory(
+            backend="factory",
+            owner=user,
+            url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+        )
+
+        def init(self):
+            raise ValueError(
+                "500 Server Error: None for url: "
+                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+            )
+
+        with mock_initialize.connected_to(init):
+            response = self.get(url_for("api.preview_harvest_source", source=source))
+
+        assert200(response)
+        assert response.json["status"] == "failed"
+        message = response.json["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
 
     def test_get_source_permissions_as_anonymous(self):
         """It should return all permissions as False for anonymous users"""

@@ -199,6 +199,32 @@ class DcatBackendTest(PytestOnlyDBTestCase):
             == "https://data.paris2024.org/api/explore/v2.1/console"
         )
 
+    def test_dataservice_source_url_has_no_credentials(self, rmock):
+        """The source URL denormalized onto a dataservice must carry no password.
+
+        Dataservice.harvest is readable without a session, so a credentialed
+        source URL copied verbatim would be handed out by every dataservice
+        listing -- no failed harvest needed (LEDG-2477).
+        """
+        rmock.get("https://example.com/schemas", json=ResourceSchemaMockData.get_mock_data())
+
+        filename = "bnodes.xml"
+        url = mock_dcat(rmock, filename)
+        scheme, _, rest = url.partition("://")
+        credentialed_url = f"{scheme}://harvestuser:sup3rs3cr3t@{rest}"
+        with open(os.path.join(DCAT_FILES_DIR, filename)) as dcatfile:
+            rmock.get(credentialed_url, text=dcatfile.read())
+        org = OrganizationFactory()
+        source = HarvestSourceFactory(backend="dcat", url=credentialed_url, organization=org)
+
+        actions.run(source)
+
+        dataservice = Dataservice.objects.first()
+        assert dataservice is not None
+        assert "sup3rs3cr3t" not in dataservice.harvest.source_url
+        assert "harvestuser" not in dataservice.harvest.source_url
+        assert dataservice.harvest.source_url == f"{scheme}://***@{rest}"
+
     def test_harvest_dataservices_keep_attached_associated_datasets(self, rmock):
         """It should update the existing list of dataservice.datasets and not overwrite existing ones"""
 
