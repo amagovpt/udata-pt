@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- **fix(tests): counts that tests assert on are now exact, not estimated**
+  - mongoengine routes a `QuerySet.count()` with **no filter** to
+    `estimated_document_count()`, which reads WiredTiger's collection metadata
+    instead of counting. That metadata drifts in **both** directions in databases
+    produced by ordinary suite runs.
+  - 🚨 **The dangerous direction is the false green**: `assert X.objects.count() == 0`
+    passes with a document still in the collection, so a test written precisely to
+    catch an orphan reports success with the orphan there. The other direction fails
+    a correct test for no reason.
+  - All **240** such assertions across **32** test files now use `len(list(Model.objects))`
+    for a genuine total, or a **filtered** `Model.objects(field=value).count()` -- which
+    goes through `count_documents()` and is exact -- where the test can name what it
+    expects gone. No expected number was changed anywhere; only how it is counted.
+  - 🚩 **Two production counts were also wrong.** `Site.count_discussions` and
+    `Site.count_harvesters` computed a **persisted, published metric** from an
+    unfiltered count. They were the only two of the ten site metrics not already
+    filtered, and are now exact via `count_documents({})`, which counts on the server
+    without loading the documents. They still count every document, deleted sources
+    included -- the meaning is unchanged. `count_discussions` had no test at all; it
+    has one now.
+  - A guard test walks the test tree and fails if an unfiltered count reappears, so
+    this stays fixed rather than being fixed once.
+  - 🚩 **And the paginated `total` was estimated too** -- the root cause behind most of
+    the instability. `Pagination.total` came from an unfiltered `QuerySet.count()`, and
+    it is what every paginated API response reports as `total`, with `pages`,
+    `next_page` and `previous_page` derived from it, so an estimate could truncate a
+    listing. A filtered listing was always exact; an unfiltered one is reachable in
+    production -- `GET /api/1/reports/` paginates a bare `Report.objects`. Only that
+    previously-estimated path changes.
+  - ⚠️ **Measured, not assumed**: three full-suite runs on unmodified code, same
+    machine, databases dropped before each -- 11 failures, then 0, then 0, with the
+    failing set differing between runs. Four of the five failures named in the red run
+    were in files this change converts; the fifth was the site-metric one above.
+
 - **fix(auth): a citizen can no longer sign in with no way of being recognised**
   - The four attributes that identify a citizen — civil ID, and the document's type,
     nationality and number — were asked for as **optional**, and autenticacao.gov lists

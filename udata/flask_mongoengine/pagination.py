@@ -14,7 +14,16 @@ class Pagination(object):
         self.per_page = per_page
 
         if isinstance(iterable, QuerySet):
-            self.total = iterable.count()
+            # `count_documents` rather than `QuerySet.count()`: mongoengine routes a
+            # count with **no filter** to `estimated_document_count()`, which reads
+            # collection metadata instead of counting and drifts in either direction.
+            # `total` is reported by every paginated API response and `pages`,
+            # `next_page` and `previous_page` are derived from it, so an estimate can
+            # truncate a listing. `_query` is the queryset's already-resolved filter
+            # (`{}` when there is none), so a listing that already filtered went
+            # through `count_documents` before and is unchanged -- only the
+            # previously-estimated, unfiltered case behaves differently.
+            self.total = iterable._collection.count_documents(iterable._query)
         else:
             self.total = len(iterable)
 

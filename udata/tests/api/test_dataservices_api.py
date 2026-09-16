@@ -150,7 +150,11 @@ class DataserviceAPITest(APITestCase):
             },
         )
         self.assert201(response)
-        self.assertEqual(Dataservice.objects.count(), 1)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        self.assertEqual(len(list(Dataservice.objects)), 1)
 
         dataservice = Dataservice.objects.first()
 
@@ -269,7 +273,7 @@ class DataserviceAPITest(APITestCase):
         response = self.delete(url_for("api.dataservice", dataservice=dataservice))
         self.assert204(response)
 
-        self.assertEqual(Dataservice.objects.count(), 1)
+        self.assertEqual(len(list(Dataservice.objects)), 1)
 
         dataservice.reload()
         self.assertEqual(dataservice.title, "Updated title")
@@ -393,7 +397,7 @@ class DataserviceAPITest(APITestCase):
             },
         )
 
-        self.assertEqual(Dataservice.objects.count(), 4)
+        self.assertEqual(len(list(Dataservice.objects)), 4)
 
         # Login with a distinct user, without visibility on the private dataservice
         self.login(UserFactory())
@@ -548,7 +552,7 @@ class DataserviceAPITest(APITestCase):
             {"title": "X", "base_api_url": "https://example.org", "organization": org.id},
         )
         self.assert201(response)
-        self.assertEqual(Dataservice.objects.count(), 1)
+        self.assertEqual(len(list(Dataservice.objects)), 1)
 
     def test_dataservice_api_create_with_validation_error(self):
         user = self.login()
@@ -561,7 +565,7 @@ class DataserviceAPITest(APITestCase):
             },
         )
         self.assert400(response)
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
     def test_dataservice_api_create_with_unkwown_license(self):
         user = self.login()
@@ -577,7 +581,7 @@ class DataserviceAPITest(APITestCase):
         )
         self.assert400(response)
         self.assertEqual(response.json["errors"]["license"], "Unknown reference 'unwkown-license'")
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
     def test_dataservice_api_create_with_unkwown_contact_point(self):
         user = self.login()
@@ -597,7 +601,7 @@ class DataserviceAPITest(APITestCase):
             response.json["errors"]["contact_points"],
             "Unknown reference '66212433e42ab56639ad516e'",
         )
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
     def test_dataservice_api_create_with_custom_user_or_org(self):
         other = UserFactory()
@@ -619,7 +623,7 @@ class DataserviceAPITest(APITestCase):
         self.assert400(response)
         print(response.json)
         self.assertEqual(response.json["errors"]["owner"], _("You can only set yourself as owner"))
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
         response = self.post(
             url_for("api.dataservices"),
@@ -633,7 +637,7 @@ class DataserviceAPITest(APITestCase):
         self.assertEqual(
             response.json["errors"]["organization"], _("Permission denied for this organization")
         )
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
         # Personal (owner) publishing is no longer allowed (LEDG-2190).
         response = self.post(
@@ -645,7 +649,7 @@ class DataserviceAPITest(APITestCase):
             },
         )
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
         # An organization without the public-service badge is rejected.
         response = self.post(
@@ -657,7 +661,7 @@ class DataserviceAPITest(APITestCase):
             },
         )
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
         # An organization the user belongs to and carrying the public-service
         # badge is accepted, and the owner is never kept alongside it.
@@ -700,7 +704,7 @@ class DataserviceAPITest(APITestCase):
             },
         )
         self.assert400(response)
-        self.assertEqual(Dataservice.objects.count(), 0)
+        self.assertEqual(len(list(Dataservice.objects)), 0)
 
     def test_dataservice_api_multiple_conditions_for_a_role(self):
         """It shouldn't update the dataservice with multiple conditions for the same role"""
@@ -723,7 +727,7 @@ class DataserviceAPITest(APITestCase):
         ]
         response = self.patch(url_for("api.dataservice", dataservice=dataservice), data)
         self.assert400(response)
-        self.assertEqual(Dataservice.objects.count(), 1)
+        self.assertEqual(len(list(Dataservice.objects)), 1)
 
     def test_dataservice_api_update_org(self):
         """It shouldn't update the dataservice org"""
@@ -739,7 +743,7 @@ class DataserviceAPITest(APITestCase):
         data["organization"] = {"id": new_org.id}
         response = self.patch(url_for("api.dataservice", dataservice=dataservice), data)
         self.assert400(response)
-        self.assertEqual(Dataservice.objects.count(), 1)
+        self.assertEqual(len(list(Dataservice.objects)), 1)
         self.assertNotEqual(Dataservice.objects.first().organization.id, new_org.id)
 
         self.login(AdminFactory())
@@ -747,7 +751,7 @@ class DataserviceAPITest(APITestCase):
         data["organization"] = {"id": new_org.id}
         response = self.patch(url_for("api.dataservice", dataservice=dataservice), data)
         self.assert200(response)
-        self.assertEqual(Dataservice.objects.count(), 1)
+        self.assertEqual(len(list(Dataservice.objects)), 1)
         self.assertEqual(Dataservice.objects.first().organization.id, new_org.id)
 
 

@@ -222,7 +222,11 @@ class DatasetAPITest(APITestCase):
         restricted_dataset = DatasetFactory(access_type=AccessType.RESTRICTED)
         frequency_dataset = DatasetFactory(frequency=UpdateFrequency.MONTHLY)
 
-        total_datasets = Dataset.objects().count()
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        total_datasets = len(list(Dataset.objects()))
 
         # no filter
         response = self.get(url_for("api.datasets"))
@@ -679,7 +683,7 @@ class DatasetAPITest(APITestCase):
         self.login()
         response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.owner, self.user)
@@ -695,7 +699,7 @@ class DatasetAPITest(APITestCase):
 
         response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.organization, org)
@@ -712,7 +716,7 @@ class DatasetAPITest(APITestCase):
         data["organization"] = str(org.id)
         response = self.post(url_for("api.datasets"), data)
         self.assert400(response)
-        self.assertEqual(Dataset.objects.count(), 0)
+        self.assertEqual(len(list(Dataset.objects)), 0)
 
     def test_dataset_api_create_tags(self):
         """It should create a dataset from the API with tags"""
@@ -721,7 +725,7 @@ class DatasetAPITest(APITestCase):
         with self.api_user():
             response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.tags, sorted(data["tags"]))
 
@@ -751,7 +755,7 @@ class DatasetAPITest(APITestCase):
         with self.api_user():
             response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.tags, ["aaa-bbb-u"])
 
@@ -769,7 +773,7 @@ class DatasetAPITest(APITestCase):
         with self.api_user():
             response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.extras["integer"], 42)
@@ -785,7 +789,7 @@ class DatasetAPITest(APITestCase):
         with self.api_user():
             response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(len(dataset.resources), 3)
@@ -809,7 +813,7 @@ class DatasetAPITest(APITestCase):
         with self.api_user():
             response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.spatial.geom, SAMPLE_GEOM)
@@ -822,7 +826,7 @@ class DatasetAPITest(APITestCase):
         data["spatial"] = {"geom": {"type": "Point", "coordinates": {}}}
         response = self.post(url_for("api.datasets"), data)
         self.assert400(response)
-        self.assertEqual(Dataset.objects.count(), 0)
+        self.assertEqual(len(list(Dataset.objects)), 0)
         # Verify error is properly captured in form validation errors
         self.assertIn("errors", response.json)
         self.assertIn("spatial", response.json["errors"])
@@ -846,7 +850,7 @@ class DatasetAPITest(APITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().description, "new description")
 
     def test_dataset_api_update_with_null_frequency(self):
@@ -858,7 +862,7 @@ class DatasetAPITest(APITestCase):
         data["tags"] = ["test"]
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().frequency, None)
 
     def test_dataset_api_update_valid_frequency(self):
@@ -869,7 +873,7 @@ class DatasetAPITest(APITestCase):
         data["frequency"] = "monthly"
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().frequency, UpdateFrequency.MONTHLY)
 
     def test_dataset_api_update_invalid_frequency(self):
@@ -882,14 +886,14 @@ class DatasetAPITest(APITestCase):
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert400(response)
         self.assertEqual(response.json.get("message"), "'1' is not a valid UpdateFrequency")
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().frequency, UpdateFrequency.ANNUAL)
 
         data["frequency"] = "foo"  # valid type but invalid term
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert400(response)
         self.assertEqual(response.json.get("message"), "'foo' is not a valid UpdateFrequency")
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().frequency, UpdateFrequency.ANNUAL)
 
     def test_cannot_modify_dataset_id(self):
@@ -918,7 +922,7 @@ class DatasetAPITest(APITestCase):
         data["organization"] = {"id": new_org.id}
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert400(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertNotEqual(Dataset.objects.first().organization.id, new_org.id)
 
         self.login(AdminFactory())
@@ -926,7 +930,7 @@ class DatasetAPITest(APITestCase):
         data["organization"] = {"id": new_org.id}
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().organization.id, new_org.id)
 
     def test_dataset_api_update_with_resources(self):
@@ -938,7 +942,7 @@ class DatasetAPITest(APITestCase):
         data["resources"].append(ResourceFactory.as_dict())
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(len(dataset.resources), initial_length + 1)
@@ -1004,7 +1008,7 @@ class DatasetAPITest(APITestCase):
         data["description"] = faker.sentence()
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset.reload()
         self.assertEqual(dataset.description, data["description"])
@@ -1022,7 +1026,7 @@ class DatasetAPITest(APITestCase):
         }
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.extras["integer"], 42)
@@ -1048,7 +1052,7 @@ class DatasetAPITest(APITestCase):
         del data["extras"]
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.extras["integer"], 42)
@@ -1074,7 +1078,7 @@ class DatasetAPITest(APITestCase):
         data["extras"] = {}
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert200(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
 
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.extras, {})
@@ -1087,7 +1091,7 @@ class DatasetAPITest(APITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.dataset", dataset=dataset), data)
         self.assert410(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertEqual(Dataset.objects.first().description, dataset.description)
 
     def test_update_temporal_coverage(self):
@@ -1196,7 +1200,7 @@ class DatasetAPITest(APITestCase):
         response = self.delete(url_for("api.dataset", dataset=dataset))
 
         self.assertStatus(response, 204)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         self.assertIsNotNone(Dataset.objects[0].deleted)
 
         # Login with a distinct user, without visibility on the deleted dataset
@@ -2577,7 +2581,7 @@ class CommunityResourceAPITest(APITestCase):
             json=False,
         )
         self.assert201(response)
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
         community_resource = CommunityResource.objects.first()
         self.assertEqual(community_resource.dataset, dataset)
 
@@ -2596,7 +2600,7 @@ class CommunityResourceAPITest(APITestCase):
         self.assertEqual(data["title"], "test.txt")
         response = self.put(url_for("api.community_resource", community=resource_id), data)
         self.assertStatus(response, 200)
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
         community_resource = CommunityResource.objects.first()
         self.assertEqual(community_resource.owner, self.user)
         self.assertIsNone(community_resource.organization)
@@ -2618,7 +2622,7 @@ class CommunityResourceAPITest(APITestCase):
         data["organization"] = str(org.id)
         response = self.put(url_for("api.community_resource", community=resource_id), data)
         self.assertStatus(response, 200)
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
         community_resource = CommunityResource.objects.first()
         self.assertEqual(community_resource.organization, org)
         self.assertIsNone(community_resource.owner)
@@ -2631,7 +2635,7 @@ class CommunityResourceAPITest(APITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.community_resource", community=community_resource), data)
         self.assert200(response)
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
         self.assertEqual(CommunityResource.objects.first().description, "new description")
 
     def test_community_resource_api_update_w_previous_owner(self):
@@ -2662,7 +2666,7 @@ class CommunityResourceAPITest(APITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.community_resource", community=community_resource), data)
         self.assert200(response)
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
         self.assertEqual(CommunityResource.objects.first().description, "new description")
         self.assertTrue(CommunityResource.objects.first().url.endswith("test.txt"))
 
@@ -2705,7 +2709,7 @@ class CommunityResourceAPITest(APITestCase):
         data = json.loads(response.data)
         self.assertEqual(data["title"], attrs["title"])
         self.assertEqual(data["url"], attrs["url"])
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
         community_resource = CommunityResource.objects.first()
         self.assertEqual(community_resource.dataset, dataset)
         self.assertEqual(community_resource.owner, user)
@@ -2736,7 +2740,7 @@ class CommunityResourceAPITest(APITestCase):
         data = json.loads(response.data)
         self.assertIn("errors", data)
         self.assertIn("dataset", data["errors"])
-        self.assertEqual(CommunityResource.objects.count(), 0)
+        self.assertEqual(len(list(CommunityResource.objects)), 0)
 
     def test_community_resource_api_create_remote_needs_real_dataset(self):
         """
@@ -2751,7 +2755,7 @@ class CommunityResourceAPITest(APITestCase):
         data = json.loads(response.data)
         self.assertIn("errors", data)
         self.assertIn("dataset", data["errors"])
-        self.assertEqual(CommunityResource.objects.count(), 0)
+        self.assertEqual(len(list(CommunityResource.objects)), 0)
 
     def test_community_resource_api_delete(self):
         dataset = DatasetFactory()
@@ -2770,12 +2774,13 @@ class CommunityResourceAPITest(APITestCase):
 
         response = self.put(url_for("api.community_resource", community=resource_id), data)
         self.assertStatus(response, 200)
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
 
         response = self.delete(url_for("api.community_resource", community=resource_id))
         self.assertStatus(response, 204)
 
-        self.assertEqual(CommunityResource.objects.count(), 0)
+        self.assertEqual(CommunityResource.objects(id=resource_id).count(), 0)
+        self.assertEqual(len(list(CommunityResource.objects)), 0)
         self.assertEqual(list(storages.resources.list_files()), [])
 
     def test_community_resource_api_create_remote_dedupes_recent_duplicates(self):
@@ -2803,7 +2808,7 @@ class CommunityResourceAPITest(APITestCase):
         self.assertStatus(response, 409)
 
         # Only the first resource was persisted.
-        self.assertEqual(CommunityResource.objects.count(), 1)
+        self.assertEqual(len(list(CommunityResource.objects)), 1)
 
     def test_community_resource_api_create_remote_rate_limited(self):
         """Mass-submission of remote community resources is throttled per user.
@@ -2836,7 +2841,7 @@ class CommunityResourceAPITest(APITestCase):
         self.assertStatus(response, 429)
 
         # No extra resource was persisted.
-        self.assertEqual(CommunityResource.objects.count(), 5)
+        self.assertEqual(len(list(CommunityResource.objects)), 5)
 
 
 class ResourcesTypesAPITest(APITestCase):

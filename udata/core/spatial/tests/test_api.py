@@ -267,7 +267,11 @@ class DatasetsSpatialAPITest(APITestCase):
         self.login()
         response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        self.assertEqual(len(list(Dataset.objects)), 1)
         dataset = Dataset.objects.first()
         self.assertEqual([str(z) for z in dataset.spatial.zones], [paca.id])
         self.assertEqual(dataset.spatial.geom, None)
@@ -283,7 +287,7 @@ class DatasetsSpatialAPITest(APITestCase):
         self.login()
         response = self.post(url_for("api.datasets"), data)
         self.assert201(response)
-        self.assertEqual(Dataset.objects.count(), 1)
+        self.assertEqual(len(list(Dataset.objects)), 1)
         dataset = Dataset.objects.first()
         self.assertEqual(dataset.spatial.zones, [])
         self.assertEqual(dataset.spatial.geom, SAMPLE_GEOM)
@@ -303,4 +307,4 @@ class DatasetsSpatialAPITest(APITestCase):
 
         response = self.post(url_for("api.datasets"), data)
         self.assert400(response)
-        self.assertEqual(Dataset.objects.count(), 0)
+        self.assertEqual(len(list(Dataset.objects)), 0)
