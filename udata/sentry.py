@@ -5,6 +5,7 @@ import warnings
 from werkzeug.exceptions import HTTPException
 
 from udata.core.storages.api import UploadProgress
+from udata.harvest.url_filter import redact_url_credentials, redact_url_credentials_in_url
 from udata.utils import get_udata_version
 
 from .app import UDataApp
@@ -22,6 +23,96 @@ ERROR_PARSE_DSN_MSG = "Unable to parse Sentry DSN"
 
 # Controlled exceptions that Sentry should ignore
 IGNORED_EXCEPTIONS = HTTPException, PermissionDenied, UploadProgress
+
+# How deep `_redact_in_place` follows an event before giving up. Sentry events
+# are shallow (the deepest real nesting is
+# `exception.values[].stacktrace.frames[].vars`, which is 6), so this is not a
+# tuning knob: it is what makes the walk unable to raise `RecursionError` on a
+# pathological payload, which matters because a `before_send` that raises
+# drops the event.
+_MAX_SCRUB_DEPTH = 20
+
+
+def _redact_in_place(node, depth: int = 0):
+    """Redact URL credentials in every string reachable from `node`."""
+    if depth > _MAX_SCRUB_DEPTH:
+        return node
+    if isinstance(node, str):
+        return redact_url_credentials(node)
+    if isinstance(node, dict):
+        # Rebinding existing keys does not resize the dict, so iterating it
+        # while assigning is safe.
+        for key, value in node.items():
+            node[key] = _redact_in_place(value, depth + 1)
+        return node
+    if isinstance(node, list):
+        for index, value in enumerate(node):
+            node[index] = _redact_in_place(value, depth + 1)
+        return node
+    if isinstance(node, tuple):
+        # `logentry.params` is `record.args`, which is a tuple for `%s`-style
+        # logging. Tuples are immutable, so this one is rebuilt and handed
+        # back to the caller, which rebinds it into its parent.
+        return tuple(_redact_in_place(value, depth + 1) for value in node)
+    return node
+
+
+def scrub_url_credentials(event, hint):
+    """Strip `user:password@` from every URL in an event before it is sent.
+
+    A harvest source URL may legitimately carry credentials
+    (`URLS_ALLOW_CREDENTIALS`), and any `requests` exception raised over one
+    embeds it in its message. LEDG-2477 kept that out of the API; this keeps it
+    out of Sentry.
+
+    It walks the whole event rather than the handful of keys where the secret
+    was first noticed, because enumerating keys is what failed before: the
+    obvious four (`logentry.message`, `logentry.params`,
+    `exception.values[].value`, `request.url`) leave the password in
+    `logentry.formatted` -- the string Sentry actually displays -- and in
+    `exception.values[].stacktrace.frames[].vars`, since
+    `include_local_variables` defaults to true. `request.data` leaks it too:
+    the harvest source create and preview endpoints take the URL in the request
+    body, and the body is attached regardless of `send_default_pii`. A walk
+    covers those, plus breadcrumbs, `extra` and whatever the SDK adds next.
+    `redact_url_credentials` is a no-op on any string without an `@`, so the
+    cost is the traversal, not the regex.
+
+    This is not the SDK's `EventScrubber`, which matches *key names*
+    (`password`, `secret`) and would see nothing here: the secret is inside the
+    value of an ordinarily-named key.
+
+    Scope, decided in LEDG-2501 and recorded in the CHANGELOG: this protects
+    Sentry only. The harvest log calls that put the URL in their own message
+    redact it at the source, so the on-disk logs are covered there. What stays
+    uncovered on disk is the traceback `logging` attaches to `log.exception` --
+    redacting that would need a `logging.Filter` on the root logger of every
+    process. In Sentry those frames are covered here.
+    """
+    try:
+        request = event.get("request") if isinstance(event, dict) else None
+        raw_url = None
+        if isinstance(request, dict) and isinstance(request.get("url"), str):
+            # Taken out before the walk, not fixed up after it: this value is
+            # known to be a whole URL, and the free-text regex has to stop at
+            # the RFC 3986 authority alphabet, so it would rewrite a legitimate
+            # `/files//report@2026.csv` path. Splitting never reaches past the
+            # authority. Once the prose regex has run, that damage cannot be
+            # undone.
+            raw_url = request.pop("url")
+
+        _redact_in_place(event)
+
+        if raw_url is not None:
+            request["url"] = redact_url_credentials_in_url(raw_url)
+        return event
+    except Exception:
+        # Dropping the event is the deliberate choice: losing one report costs
+        # visibility, letting one through unredacted costs the credential.
+        # `warning` and not `error` on purpose -- LoggingIntegration turns an
+        # ERROR into an event, which would come straight back through here.
+        log.warning("Dropping a Sentry event: scrubbing its URL credentials failed")
+        return None
 
 
 def public_dsn(dsn: str) -> str | None:
@@ -63,6 +154,7 @@ def init_app(app: UDataApp):
             dsn=app.config["SENTRY_PUBLIC_DSN"],
             integrations=[FlaskIntegration(), CeleryIntegration()],
             ignore_errors=list(exceptions),
+            before_send=scrub_url_credentials,
             release=f"udata@{get_udata_version()}",
             environment=app.config.get("SITE_ID", None),
             # Set traces_sample_rate to 1.0 to capture 100%
