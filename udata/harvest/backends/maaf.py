@@ -19,6 +19,7 @@ from udata.harvest.filters import (
     to_date,
 )
 from udata.harvest.models import HarvestItem
+from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.models import Checksum, License, SpatialCoverage
 from udata.mongo.datetime_fields import DateRange
 from udata.utils import get_by
@@ -148,16 +149,29 @@ class MaafBackend(BaseBackend):
                 if href.endswith("/"):
                     directories.append(urljoin(directory, href))
                 elif href.lower().endswith(".xml"):
-                    # We use the URL as `remote_id` for now, we'll be replace at
-                    # the beginning of the process
-                    self.process_dataset(urljoin(directory, href))
+                    # The descriptor URL is the `remote_id` until the metadata
+                    # supplies the real one, and `process_dataset` persists it
+                    # before we ever get there -- so a failed item keeps it.
+                    # `remote_id` is served to anonymous callers, so what goes
+                    # in is the redacted URL; the credentialed one travels as a
+                    # kwarg, which `process_dataset` forwards without storing.
+                    # That kwarg carries the source password: it must never be
+                    # copied onto `item.kwargs`, which `item_fields` serializes
+                    # as raw JSON on a route with no session (LEDG-2500).
+                    url = urljoin(directory, href)
+                    self.process_dataset(redact_url_credentials_in_url(url), url=url)
                     if self.has_reached_max_items():
                         return
                 else:
                     log.debug("Skip %s", href)
 
-    def inner_process_dataset(self, item: HarvestItem):
-        response = self.get(item.remote_id)
+    def inner_process_dataset(self, item: HarvestItem, **kwargs):
+        # `inner_harvest` always passes `url`; the fallback is for the callers
+        # that do not, which today means `process_dataset(descriptor_url)` with
+        # the URL as its sole argument -- the shape the shared id-stability
+        # harness uses. That path has no separate `remote_id` to redact, so
+        # reading it back is correct rather than a silent second behaviour.
+        response = self.get(kwargs.get("url") or item.remote_id)
         xml = self.parse_xml(response.content)
         metadata = xml["metadata"]
 
