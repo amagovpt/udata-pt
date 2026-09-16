@@ -4,7 +4,7 @@ import sys
 import pytest
 import requests
 
-from udata.sentry import init_app, scrub_url_credentials
+from udata.sentry import _MAX_SCRUB_DEPTH, init_app, scrub_url_credentials
 from udata.tests import PytestOnlyTestCase
 
 # The proof of concept from LEDG-2477: a harvest source whose URL legitimately
@@ -24,6 +24,14 @@ def raise_requests_error():
     response.status_code = 500
     response.url = CREDENTIALED_URL
     response.raise_for_status()
+
+
+def _nested_deeper_than_the_walk_follows():
+    """An event nested past `_MAX_SCRUB_DEPTH`, with the secret at the bottom."""
+    node = CREDENTIALED_URL
+    for _ in range(_MAX_SCRUB_DEPTH + 2):
+        node = {"nested": node}
+    return node
 
 
 class ScrubURLCredentialsTest:
@@ -65,7 +73,9 @@ class ScrubURLCredentialsTest:
             "logentry": {
                 "message": "Starting harvesting %s",
                 "formatted": f"Starting harvesting {CREDENTIALED_URL}",
-                "params": (CREDENTIALED_URL,),
+                # A list, not a tuple: the SDK serializes every sequence
+                # before `before_send`, so this is the shape that arrives.
+                "params": [CREDENTIALED_URL],
             }
         }
 
@@ -76,7 +86,7 @@ class ScrubURLCredentialsTest:
             result["logentry"]["formatted"]
             == "Starting harvesting https://***@www.ine.pt/broken.xml"
         )
-        assert result["logentry"]["params"] == ("https://***@www.ine.pt/broken.xml",)
+        assert result["logentry"]["params"] == ["https://***@www.ine.pt/broken.xml"]
 
     @pytest.mark.parametrize(
         "params",
@@ -87,7 +97,10 @@ class ScrubURLCredentialsTest:
         ],
     )
     def test_params_are_redacted_whatever_shape_record_args_took(self, params):
-        """`record.args` is a tuple for `%s`, a dict for `%(name)s`."""
+        """`record.args` is a tuple for `%s` and a dict for `%(name)s`. The SDK
+        turns the tuple into a list on its way here; the tuple case is kept
+        because the walk accepts one and nothing should depend on which
+        arrives."""
         result = scrub_url_credentials({"logentry": {"params": params}}, {})
 
         assert PASSWORD not in json.dumps(result)
@@ -126,15 +139,49 @@ class ScrubURLCredentialsTest:
 
         assert PASSWORD not in json.dumps(scrub_url_credentials(event, {}))
 
-    def test_request_url_is_split_not_matched_as_prose(self):
-        """`request.url` is known to be a whole URL, so it is redacted by
-        splitting. The free-text regex would reach past the authority and
-        rewrite a legitimate `@` in the path (LEDG-2500, `d46f5c4d8`)."""
-        event = {"request": {"url": "https://data.gov.pt/files//report@2026.csv"}}
+    @pytest.mark.parametrize(
+        "build_event",
+        [
+            lambda url: {"request": {"url": url}},
+            lambda url: {"request": {"headers": {"Referer": url}}},
+            lambda url: {"breadcrumbs": {"values": [{"data": {"url": url}}]}},
+            lambda url: {"contexts": {"trace": {"data": {"url": url}}}},
+        ],
+        ids=["request.url", "request.headers.Referer", "breadcrumb.data.url", "span.data.url"],
+    )
+    def test_a_url_valued_key_is_split_not_matched_as_prose(self, build_event):
+        """A value that is a whole URL is redacted by splitting, wherever it
+        sits. The free-text regex has to stop at the RFC 3986 authority
+        alphabet, so it would reach past the authority and rewrite a legitimate
+        `@` in the path, claiming credentials that were never there
+        (LEDG-2500, `d46f5c4d8`)."""
+        legitimate = "https://data.gov.pt/files//report@2026.csv"
 
-        result = scrub_url_credentials(event, {})
+        scrubbed = json.dumps(scrub_url_credentials(build_event(legitimate), {}))
 
-        assert result["request"]["url"] == "https://data.gov.pt/files//report@2026.csv"
+        assert legitimate in scrubbed
+        assert "***" not in scrubbed
+
+    @pytest.mark.parametrize(
+        "build_event",
+        [
+            lambda url: {"request": {"url": url}},
+            lambda url: {"request": {"headers": {"Referer": url}}},
+            lambda url: {"breadcrumbs": {"values": [{"data": {"url": url}}]}},
+            lambda url: {"contexts": {"trace": {"data": {"url": url}}}},
+        ],
+        ids=["request.url", "request.headers.Referer", "breadcrumb.data.url", "span.data.url"],
+    )
+    def test_a_credentialed_url_valued_key_is_redacted_wherever_it_sits(self, build_event):
+        assert PASSWORD not in json.dumps(scrub_url_credentials(build_event(CREDENTIALED_URL), {}))
+
+    def test_a_url_valued_key_holding_prose_still_gets_redacted(self):
+        """`extra` and breadcrumb data are filled by callers, so a key named
+        `url` may hold prose after all. Splitting prose finds no `@` in the
+        netloc and would return it untouched -- a silent failure to redact."""
+        event = {"extra": {"url": f"failed to fetch {CREDENTIALED_URL} twice"}}
+
+        assert PASSWORD not in json.dumps(scrub_url_credentials(event, {}))
 
     def test_a_credentialed_request_url_is_still_redacted(self):
         event = {"request": {"url": CREDENTIALED_URL}}
@@ -158,15 +205,23 @@ class ScrubURLCredentialsTest:
         A `before_send` that raises drops the event."""
         assert scrub_url_credentials(event, {}) is not None
 
-    def test_an_event_it_cannot_scrub_is_dropped_rather_than_sent(self):
+    @pytest.mark.parametrize(
+        "event",
+        [
+            # Not a mapping: nothing to walk, so nothing was scrubbed.
+            ["an event the scrubber does not understand"],
+            None,
+            # Nested deeper than the walk follows. The SDK caps databag
+            # depth far below this, so it is the unreachable case being
+            # pinned: the subtree must not travel unscrubbed.
+            _nested_deeper_than_the_walk_follows(),
+        ],
+        ids=["not-a-mapping", "none", "deeper-than-the-walk-follows"],
+    )
+    def test_an_event_it_cannot_scrub_is_dropped_rather_than_sent(self, event):
         """Losing one report costs visibility; letting one through costs the
         credential."""
-
-        class Exploding(dict):
-            def get(self, *args, **kwargs):
-                raise RuntimeError("boom")
-
-        assert scrub_url_credentials(Exploding(), {}) is None
+        assert scrub_url_credentials(event, {}) is None
 
 
 class SentryInitAppTest(PytestOnlyTestCase):
@@ -180,3 +235,6 @@ class SentryInitAppTest(PytestOnlyTestCase):
         init_app(self.app)
 
         assert init.call_args.kwargs["before_send"] is scrub_url_credentials
+        # `before_send` is never called for transactions, and
+        # `traces_sample_rate` means there is one per request and per task.
+        assert init.call_args.kwargs["before_send_transaction"] is scrub_url_credentials

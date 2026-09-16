@@ -1016,9 +1016,12 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         lines that print it reach the server's log files, which the Sentry
         `before_send` does not protect (LEDG-2501).
 
-        The connection error is given a message holding the URL because that
-        is what a real `requests` failure does -- without it the assertion on
-        the warning line would pass whether or not it redacts.
+        The connection error is given a message holding the whole URL so that
+        the assertion on the warning line means something: without it, it would
+        pass whether or not the line redacts. urllib3 formats its own
+        `ConnectionError` with host and path only, but `HTTPError` from
+        `raise_for_status` does carry the userinfo, since it interpolates
+        `response.url`.
         """
         url = f"http://harvestuser:sup3rs3cr3t@{TEST_DOMAIN}/test.jsonld"
         # Registered with the credentials in it: `requests` leaves the userinfo

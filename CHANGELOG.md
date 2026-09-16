@@ -18,9 +18,16 @@
     harvest source create and preview endpoints take the URL in the body, and the body is
     attached regardless of `send_default_pii`. A walk also covers whatever the SDK adds
     next.
-  - `request.url` is the one special case, redacted by **splitting** rather than by the
+  - A value that *is* a whole URL -- `request.url`, `Referer`, `Origin`, `Location`, the
+    `url` of a breadcrumb or a span -- is redacted by **splitting** rather than by the
     free-text regex: the regex cannot tell where a URL ends in prose, so it would reach
-    past the authority and rewrite a legitimate `@` in a path.
+    past the authority and rewrite a legitimate
+    `https://data.gov.pt/files//report@2026.csv` into `//***@2026.csv`, claiming
+    credentials that were never there. A key that turns out to hold prose after all falls
+    back to the regex, because splitting prose finds no `@` in the netloc and would return
+    it unredacted.
+  - Transactions get the same scrubber. `before_send` is never called for them, and
+    `traces_sample_rate` is 1.0, so every request and every harvest task produces one.
   - An event the scrubber cannot process is **dropped, not sent**. Losing one report costs
     visibility; letting one through costs the credential.
   - ⚠️ Not the SDK's `EventScrubber`, which matches *key names* (`password`, `secret`) and
