@@ -2875,7 +2875,15 @@ def idp_initiated():
             user_nic = _first_value(identity, MDC_ATTR_NIC)
             first_name = _first_value(identity, MDC_ATTR_FIRST_NAME)
             last_name = _first_value(identity, MDC_ATTR_LAST_NAME)
-            doc_type = _first_value(identity, MDC_ATTR_DOC_TYPE)
+            # Normalised HERE and not inside _first_value: that extractor is
+            # shared, and the eIDAS route reads the PersonIdentifier through
+            # it -- a value hashed by the same function and as frozen as the
+            # composition below. Trimming punctuation there would unmatch
+            # eIDAS accounts already registered. Normalising at this single
+            # assignment feeds both consumers the clean type: the identifier
+            # composed below, and extras.auth_doc_type written by the funnel,
+            # which the counting reads (and which stored "TR:" until now).
+            doc_type = _normalize_doc_type(_first_value(identity, MDC_ATTR_DOC_TYPE))
             doc_nationality = _first_value(identity, MDC_ATTR_DOC_NATIONALITY)
             doc_number = _first_value(identity, MDC_ATTR_DOC_NUMBER)
             current_app.logger.warning(

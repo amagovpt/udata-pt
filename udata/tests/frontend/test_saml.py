@@ -7988,6 +7988,55 @@ class SAMLForeignCitizenLoginTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_two_logins_with_a_punctuated_doc_type_produce_one_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """What autenticacao.gov actually sends, end to end (LEDG-2506).
+
+        The same invariant as the test above, but with the type as it really
+        arrives -- "TR:" and not "TR". Measured in DEV against a real foreign
+        CMD: two sign-ins produced two accounts, neither carrying an identity,
+        and extras recorded the raw "TR:".
+
+        The stored type is asserted as well as the identity, and that is the
+        half only the extraction can deliver: the composer normalises its own
+        input, so the identifier would compose even without this change -- the
+        value the funnel writes to extras would not, and the counting would go
+        on treating "TR" and "TR:" as two different document types.
+        """
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        before = len(list(User.objects))
+
+        ids = []
+        for _ in range(2):
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_login(
+                    mock_client_for,
+                    email="ines@example.pt",
+                    first_name="Ines",
+                    last_name="Matos",
+                    doc_type="TR:",
+                    doc_nationality="PT",
+                    doc_number="X9912345",
+                )
+            created = User.objects(email="ines@example.pt").first()
+            assert created is not None
+            ids.append(created.id)
+
+        assert len(list(User.objects)) == before + 1, "a second account was minted"
+        assert ids[0] == ids[1], "the second login did not find the first account"
+        assert created.extras["auth_nic"] == hash_nic("MDC/TR/PT/X9912345"), (
+            "the punctuated type composed a different identity than the clean one"
+        )
+        assert created.extras["auth_doc_type"] == "TR", (
+            "extras stored the raw value, so counting sees two document types"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_a_national_with_a_nic_is_unaffected(self, mock_client_for, _mock_confirm):
         """The non-regression that matters most.
 

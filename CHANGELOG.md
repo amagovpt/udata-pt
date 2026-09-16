@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **fix(saml): a foreign citizen is recognised again -- the document type arrives punctuated**
+  - autenticacao.gov sends `DocType` as **`TR:`**, with a trailing colon, and not `TR`.
+    The gate compared the raw value against the four accepted types, never matched, and
+    the identifier composition returned nothing -- so **no foreign citizen was ever
+    recognised**: every sign-in minted another account, and `extras` recorded the raw
+    `TR:`. Measured in DEV against a real foreign CMD.
+  - 🚨 **The composition itself is untouched.** It is the pre-image of a one-way HMAC and
+    the digest is the key logins resolve accounts by, so the fix normalises the **input**
+    instead. That is safe only because it is a no-op on all four accepted types -- none
+    carries a trailing separator -- which means an identifier that already resolves an
+    account cannot change. A test asserts exactly that.
+  - Only a **trailing run** of separators is removed, never an interior character. A rule
+    that stripped every non-letter would fold `T:R` into `TR` and admit a type the gate
+    exists to refuse; `T:R`, `TR1`, `XTR`, `CC:` and `:TR` all still reject.
+  - Normalised at the **extraction**, not inside the shared `_first_value`: the eIDAS route
+    reads its `PersonIdentifier` through that same extractor, and trimming punctuation
+    there would unmatch eIDAS accounts already registered. The single assignment feeds
+    both consumers -- the identifier, and the document type stored for counting.
+  - A migration cleans the punctuated values already stored. It never touches the stored
+    identity, and writes through the collection rather than the document, because saving a
+    `User` re-sanitises names on any write path.
+
 - **fix(tests): counts that tests assert on are now exact, not estimated**
   - mongoengine routes a `QuerySet.count()` with **no filter** to
     `estimated_document_count()`, which reads WiredTiger's collection metadata
