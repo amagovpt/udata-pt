@@ -24,6 +24,8 @@ from udata.models import Dataset
 from udata.mongo.document import UDataDocument as Document
 from udata.mongo.slug_fields import SlugField
 
+from .url_filter import redact_url_credentials
+
 log = logging.getLogger(__name__)
 
 HARVEST_FREQUENCIES = OrderedDict(
@@ -69,6 +71,27 @@ class HarvestError(EmbeddedDocument):
     created_at = DateTimeField(default=lambda: datetime.now(UTC), required=True)
     message = StringField()
     details = StringField()
+
+    def clean(self):
+        """Strip URL credentials before the error is persisted.
+
+        Both fields are built from an exception raised by `requests`, whose
+        text embeds the URL of the failed request. `URLS_ALLOW_CREDENTIALS`
+        lets a source URL carry `user:password@`, and a harvest job is
+        readable without a session, so the password would be served to
+        anonymous callers (LEDG-2477).
+
+        Redacting here rather than at each `HarvestError(...)` call site
+        covers every backend at once, including future ones -- `ine.py` shows
+        how easily a new call site forgets a per-site guard. Mongoengine runs
+        `clean()` on embedded documents nested in a `ListField`, so this
+        applies to `HarvestJob.errors` and to `HarvestItem.errors` alike. It
+        does NOT run on a `save(validate=False)`, and nothing runs at all on
+        the dryrun (preview) path, which never saves -- hence the matching
+        redaction on the API serialization side.
+        """
+        self.message = redact_url_credentials(self.message)
+        self.details = redact_url_credentials(self.details)
 
 
 class HarvestLog(EmbeddedDocument):
