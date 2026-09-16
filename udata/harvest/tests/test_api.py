@@ -106,6 +106,31 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         assert len(response.json["data"]) == 1
         assert response.json["data"][0]["id"] == str(source.id)
 
+    def test_list_sources_search_does_not_match_url(self):
+        """Searching must not confirm a credential stored in a source URL.
+
+        The text index used to cover `$url`, so `?q=<password>` on this public
+        route returned the source carrying it: not a disclosure, but a way for
+        someone who had guessed a credential to confirm it (LEDG-2502).
+        """
+        source = HarvestSourceFactory(
+            name="Fonte legada",
+            url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+        )
+
+        response = self.get(url_for("api.harvest_sources", q="sup3rs3cr3t"))
+        assert200(response)
+        assert response.json["data"] == []
+
+        response = self.get(url_for("api.harvest_sources", q="ine.pt"))
+        assert200(response)
+        assert response.json["data"] == []
+
+        # Searching by name still works -- the index is kept, minus the URL.
+        response = self.get(url_for("api.harvest_sources", q="legada"))
+        assert200(response)
+        assert [s["id"] for s in response.json["data"]] == [str(source.id)]
+
     def test_list_sources_paginate(self):
         total = 25
         page_size = 20
