@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **fix(harvest): a harvest source URL no longer publishes its own password**
+  - `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth is
+    configured as `https://user:password@host/path` — and the portal accepted
+    exactly that. Everything derived from such a URL was then served verbatim
+    to callers **without a session**, because the harvest reads have no
+    `@api.secure`.
+  - Three separate channels carried it. The text of a `requests` exception
+    embeds the URL of the failed request, and it went straight into
+    `HarvestError.message` — the case that was reported. The source URL was
+    also copied onto every harvested dataservice, so `GET /dataservices/`
+    handed the password out **in a listing, with no id and no failed harvest
+    needed**. And `source_fields` serialized `url` as plain text on both public
+    source routes.
+  - 🔑 **The rule is now "whoever may rewrite the URL reads it whole; nobody
+    else does."** The gate is the one that already guards `PUT`, so owners,
+    organization admins and sysadmins are unaffected, and no client can
+    round-trip the mask back into the record. **Organization editors lose
+    access** — they cannot edit a source, so they do not need its credentials.
+  - Errors are redacted **twice**: in `HarvestError.clean()` on the way into
+    the database, and in `error_fields` on the way out. The second is not
+    redundant — the preview runs the backend in dryrun and never saves, so
+    nothing on the write path runs for it, yet it serializes the same errors.
+    Redacting at both ends is the same shape as the harvest SSRF guard, which
+    checks the URL in the form and again in the backend.
+  - A migration redacts what is already stored. ⚠️ **It does not un-leak
+    anything**: a credential that was publicly readable is compromised, and the
+    real remedy is to rotate it at the remote source. Cleaning the database
+    does not replace telling the source owners.
+  - 🚩 **Left standing, and named rather than discovered later:** `HarvestSource`
+    has a text index over `$name, $url` and the sources route accepts `q`, so a
+    caller who already guessed a credential can still confirm it. That is a
+    confirmation oracle, not a disclosure. Likewise the `log.warning` /
+    `log.exception` calls in the harvest backends still interpolate the raw URL
+    into internal logs and Sentry — the same defect, but every `requests`
+    exception in the application shares it, so it belongs in `udata/sentry.py`
+    and not here.
+
 - **test(saml): the account-linking mail's security properties are now held by a test**
   - That mail's own docstring calls its body a security control: the wizard reaches an
     account having proved nothing about it, so the mail is what stands between a

@@ -427,7 +427,29 @@ class SourceAPI(API):
     @api.doc("get_harvest_source")
     @api.marshal_with(source_fields)
     def get(self, source: HarvestSource):
-        """Get a single source given an ID or a slug"""
+        """Get a single source given an ID or a slug.
+
+        Deliberately readable without a session, like the rest of the harvest
+        reads -- which sources feed an open data portal is public information,
+        it is the contract the frontend and upstream udata are built on, and
+        `test_get_source_permissions_as_anonymous` draws that anonymous 200
+        explicitly.
+
+        What makes it safe is that no secret reaches the payload, not that
+        nobody is looking: `url` is redacted for anyone without `edit`,
+        `HarvestError` is redacted on save and again on serialization, and the
+        source URL copied onto harvested dataservices is redacted at the copy.
+        `@api.secure` would not have replaced any of that -- it only demands an
+        account, and anyone can create one, so a registered reader would have
+        seen exactly what an anonymous one did.
+
+        One residue is known and accepted: `HarvestSource` carries a text index
+        over `$name, $url` and this namespace accepts `q`, so a caller who
+        already guessed a credential can still confirm it (`?q=<password>`
+        returns the source). That is a confirmation oracle, not a disclosure.
+
+        See LEDG-2477.
+        """
         return source
 
     @api.secure
@@ -743,7 +765,16 @@ class JobAPI(API):
     @api.expect(parser)
     @api.marshal_with(job_fields)
     def get(self, ident):
-        """Get a single job given an ID"""
+        """Get a single job given an ID.
+
+        Readable without a session by the same decision as the source reads --
+        see `SourceAPI.get`, which records it in full. The errors served here
+        are redacted twice over: `HarvestError.clean` on the way into the
+        database, and `error_fields` on the way out, which is what covers the
+        preview, where nothing is ever saved.
+
+        See LEDG-2477.
+        """
         return actions.get_job(ident)
 
 
