@@ -80,13 +80,24 @@ def check_harvest_url(url: str) -> None:
         )
 
 
-# `scheme://` followed by userinfo terminated by `@`. Per RFC 3986 section 3.2.1
-# the userinfo component cannot contain `/`, `?`, `#` or whitespace unless
-# percent-encoded, so `[^/?#\s]*` cannot run past the end of one URL into the
-# next. Being greedy, it also handles an unencoded `@` inside a password
-# (`user:p@ss@host` -> `***@host`). There is no nested quantifier, so matching
-# stays linear.
-_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^/?#\s]*@")
+# The authority of a URL, up to the `@` that ends its userinfo. The scheme is
+# optional because `udata.uris.validate` accepts a scheme-relative URL
+# (`//user:pass@host/x`), so a source really can be stored in that shape.
+#
+# The character class is the authority alphabet of RFC 3986 (unreserved,
+# percent-encoded, sub-delims, `:`, `@`, and the brackets of an IPv6 literal).
+# It deliberately stops at a quote, an angle bracket or a brace: harvest error
+# messages carry raw JSON and whole CSW XML documents, where a URL is followed
+# immediately -- with no space -- by another field that may hold an email
+# address. A looser class would swallow everything in between and print a
+# `***@` marker for a source that has no credentials at all.
+#
+# `@` is inside the class on purpose: being greedy, the match then ends at the
+# LAST `@` of the authority, which is what redacts a password containing an
+# unencoded `@`. There is no nested quantifier, so matching stays linear.
+_URL_USERINFO_RE = re.compile(
+    r"(?i)((?:[a-z][a-z0-9+.\-]*:)?//)[A-Za-z0-9\-._~%!$&'()*+,;=:@\[\]]*@"
+)
 
 
 def redact_url_credentials(text: str | None) -> str | None:
@@ -104,6 +115,9 @@ def redact_url_credentials(text: str | None) -> str | None:
 
     Pure and idempotent; returns `None` and `""` unchanged.
     """
-    if not text:
+    # Runs on every harvest error of every item, and a failing INE harvest
+    # saves the job once per item over thousands of items, so the common case
+    # -- a message with no `@` in it at all -- must not pay for the scan.
+    if not text or "@" not in text:
         return text
     return _URL_USERINFO_RE.sub(r"\1***@", text)

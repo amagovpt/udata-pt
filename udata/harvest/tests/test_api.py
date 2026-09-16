@@ -23,6 +23,7 @@ from ..models import (
     VALIDATION_REFUSED,
     HarvestError,
     HarvestItem,
+    HarvestLog,
     HarvestSource,
     HarvestSourceValidation,
 )
@@ -797,6 +798,68 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         assert error_item["remote_id"] == "4"
         assert error_item["errors"][0]["message"] == "boom"
         assert error_item["dataset"]["id"] == str(failed_ds.id)
+
+    def test_list_jobs_anonymous_hides_url_credentials(self):
+        """The jobs list builds its dicts by hand, so it needs its own redaction.
+
+        `JobsAPI.get` projects the documents in an aggregation instead of
+        marshalling them, so it never passes through `error_fields` -- and it
+        is the endpoint that serves what the INE backend writes with a
+        queryset update (LEDG-2477).
+        """
+        source = HarvestSourceFactory()
+        HarvestJobFactory(
+            source=source,
+            items=[
+                HarvestItem(
+                    remote_id="1",
+                    status="failed",
+                    errors=[
+                        HarvestError(
+                            message=(
+                                "500 Server Error: None for url: "
+                                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                            )
+                        )
+                    ],
+                )
+            ],
+        )
+
+        response = self.get(url_for("api.harvest_jobs", source=source))
+        assert200(response)
+
+        message = response.json["data"][0]["error_items"][0]["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
+
+    def test_get_job_anonymous_hides_url_credentials_in_logs(self):
+        """The captured log lines carry the same exception text as the errors."""
+        job = HarvestJobFactory(
+            items=[
+                HarvestItem(
+                    remote_id="1",
+                    status="failed",
+                    logs=[
+                        HarvestLog(
+                            level="ERROR",
+                            message=(
+                                "Error while processing 1 : 401 Client Error: "
+                                "Unauthorized for url: "
+                                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                            ),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        response = self.get(url_for("api.harvest_job", ident=str(job.id)))
+        assert200(response)
+
+        message = response.json["items"][0]["logs"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
 
     def test_get_source_anonymous_redacts_url_credentials(self):
         """Neither source route may hand the URL password to a reader.

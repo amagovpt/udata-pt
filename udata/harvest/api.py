@@ -59,7 +59,12 @@ log_fields = api.model(
     "HarvestError",
     {
         "level": fields.String(required=True),
-        "message": fields.String(required=True),
+        # Captured from the application logger while an item is processed, and
+        # the line logged just before a failure carries the same exception text
+        # as the error itself (LEDG-2477).
+        "message": fields.String(
+            attribute=lambda o: redact_url_credentials(o.message), required=True
+        ),
     },
 )
 
@@ -121,6 +126,10 @@ item_counts_fields = api.model(
     | {"total": fields.Integer(description="Total number of items")},
 )
 
+# The jobs list does not marshal documents: it projects them in an aggregation
+# and `_serialize_light_job` builds the dicts by hand, so the redaction that
+# `error_fields` applies has to be repeated there -- this model only describes
+# the shape for the API documentation (LEDG-2477).
 error_light_fields = api.model(
     "HarvestErrorLight",
     {
@@ -436,17 +445,22 @@ class SourceAPI(API):
         explicitly.
 
         What makes it safe is that no secret reaches the payload, not that
-        nobody is looking: `url` is redacted for anyone without `edit`,
-        `HarvestError` is redacted on save and again on serialization, and the
-        source URL copied onto harvested dataservices is redacted at the copy.
+        nobody is looking: `url` is redacted here and in `harvests.csv` for
+        anyone without `edit`, `HarvestError` and `HarvestLog` are redacted as
+        they are built and again as they are serialized, and the source URL
+        copied onto harvested dataservices is redacted at the copy.
         `@api.secure` would not have replaced any of that -- it only demands an
         account, and anyone can create one, so a registered reader would have
         seen exactly what an anonymous one did.
 
-        One residue is known and accepted: `HarvestSource` carries a text index
-        over `$name, $url` and this namespace accepts `q`, so a caller who
-        already guessed a credential can still confirm it (`?q=<password>`
-        returns the source). That is a confirmation oracle, not a disclosure.
+        Two residues are known and accepted. `HarvestSource` carries a text
+        index over `$name, $url` and this namespace accepts `q`, so a caller
+        who already guessed a credential can still confirm it
+        (`?q=<password>` returns the source) -- a confirmation oracle, not a
+        disclosure. And `odspt` and `maaf` build public dataset resource URLs
+        and remote ids out of the source URL, which is the same defect in a
+        place where redacting would break a working download link; it needs
+        its own decision and its own ticket.
 
         See LEDG-2477.
         """
@@ -641,7 +655,10 @@ def _serialize_light_job(doc, dataset_map, source_id, show_details):
 
     def _errors(raw):
         return [
-            {"message": e.get("message"), "details": e.get("details") if show_details else None}
+            {
+                "message": redact_url_credentials(e.get("message")),
+                "details": redact_url_credentials(e.get("details")) if show_details else None,
+            }
             for e in (raw or [])
         ]
 
@@ -768,10 +785,12 @@ class JobAPI(API):
         """Get a single job given an ID.
 
         Readable without a session by the same decision as the source reads --
-        see `SourceAPI.get`, which records it in full. The errors served here
-        are redacted twice over: `HarvestError.clean` on the way into the
-        database, and `error_fields` on the way out, which is what covers the
-        preview, where nothing is ever saved.
+        see `SourceAPI.get`, which records it in full. The errors and captured
+        logs served here are redacted twice over: in their constructors on the
+        way into the database, and in `error_fields`/`log_fields` on the way
+        out, which is what covers the preview, where nothing is ever saved.
+        The jobs list is the one route that marshals neither, so
+        `_serialize_light_job` repeats the redaction by hand.
 
         See LEDG-2477.
         """
