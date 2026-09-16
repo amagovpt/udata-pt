@@ -798,6 +798,35 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         assert error_item["errors"][0]["message"] == "boom"
         assert error_item["dataset"]["id"] == str(failed_ds.id)
 
+    def test_get_source_anonymous_redacts_url_credentials(self):
+        """Neither source route may hand the URL password to a reader.
+
+        Both are open to anonymous callers and `source_fields` serialized the
+        URL verbatim, so the credentials of a basic-auth source were public
+        without a failed harvest and without knowing any id (LEDG-2477).
+        """
+        source = HarvestSourceFactory(url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml")
+        redacted = "https://***@www.ine.pt/broken.xml"
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["url"] == redacted
+
+        response = self.get(url_for("api.harvest_sources"))
+        assert200(response)
+        listed = next(s for s in response.json["data"] if s["id"] == str(source.id))
+        assert listed["url"] == redacted
+
+    def test_get_source_owner_sees_full_url(self):
+        """Whoever may rewrite the URL still needs to read it whole."""
+        user = self.login()
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+        source = HarvestSourceFactory(url=url, owner=user)
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["url"] == url
+
     def test_get_job_anonymous_hides_url_credentials(self):
         """Reading a job without a session must not disclose the source password.
 
