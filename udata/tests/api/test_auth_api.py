@@ -703,7 +703,11 @@ class APIAuthTest(PytestOnlyAPITestCase):
             access_token="other-access-token",
             refresh_token="other-refresh-token",
         )
-        tokens_count = OAuth2Token.objects.count()
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        tokens_count = len(list(OAuth2Token.objects))
 
         response = self.post(
             url_for("oauth.token"),
@@ -724,7 +728,7 @@ class APIAuthTest(PytestOnlyAPITestCase):
         token_same_user_not_refreshed.reload()
         other_token.reload()
 
-        assert tokens_count == OAuth2Token.objects.count()  # No new token created.
+        assert tokens_count == len(list(OAuth2Token.objects))  # No new token created.
 
         # The access token has been refreshed.
         assert token_to_be_refreshed.access_token != "access-token"

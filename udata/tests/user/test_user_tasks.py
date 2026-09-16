@@ -136,7 +136,11 @@ class UserTasksTest(APITestCase):
         self.assertEqual(len(mails), 0)
 
         # Assert user hasn't been deleted and won't be deleted
-        self.assertEqual(User.objects().count(), 1)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        self.assertEqual(len(list(User.objects())), 1)
         user = User.objects().first()
         self.assertEqual(user, inactive_user_that_logged_in_since_notification)
         self.assertIsNone(user.inactive_deletion_notified_at)

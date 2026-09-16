@@ -24,7 +24,11 @@ class OrganizationTasksTest(APITestCase):
         response = self.post(url_for("api.contact_points"), data)
         self.assert201(response)
 
-        self.assertEqual(ContactPoint.objects().count(), 1)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        self.assertEqual(len(list(ContactPoint.objects())), 1)
 
         resources = [ResourceFactory() for _ in range(2)]
         dataset = DatasetFactory(resources=resources, organization=org)
@@ -74,7 +78,8 @@ class OrganizationTasksTest(APITestCase):
         self.assertEqual(list(storages.avatars.list_files()), [])
 
         # Check organization's contact points are deleted
-        self.assertEqual(ContactPoint.objects().count(), 0)
+        self.assertEqual(ContactPoint.objects(organization=org).count(), 0)
+        self.assertEqual(len(list(ContactPoint.objects())), 0)
 
         dataset = Dataset.objects(id=dataset.id).first()
         self.assertIsNone(dataset.organization)
