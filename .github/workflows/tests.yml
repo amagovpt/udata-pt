@@ -21,7 +21,11 @@ jobs:
       mongo:
         image: mongo:7.0.28
         ports:
-          - 27017:27017
+          # 27019 on the runner, because that is where the suite looks by
+          # default (udata/tests/plugin.py). The container still listens on
+          # 27017 -- only the published port moves. Service containers are
+          # isolated per job on an ephemeral runner, so nothing collides.
+          - 27019:27017
       redis:
         image: redis:7-alpine
         ports:

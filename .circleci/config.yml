@@ -37,6 +37,12 @@ jobs:
     environment:
       BASH_ENV: /root/.bashrc
       UDATA_TEST_SEARCH_INTEGRATION: "1"
+      # The suite defaults to 27019, the port docker-compose.test.yml publishes
+      # for the dedicated test MongoDB. Here there is nothing to publish: the
+      # secondary containers above share the primary's network and answer on
+      # localhost at their native port, and this executor has no way to remap
+      # one. So the address is given explicitly instead.
+      UDATA_TEST_MONGO_PREFIX: "mongodb://localhost:27017/udata_test"
     steps:
       - checkout
       - run:
