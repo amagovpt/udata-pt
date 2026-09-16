@@ -453,16 +453,19 @@ class SourceAPI(API):
         account, and anyone can create one, so a registered reader would have
         seen exactly what an anonymous one did.
 
-        Two residues are known and accepted. `HarvestSource` carries a text
+        One residue is known and accepted: `HarvestSource` carries a text
         index over `$name, $url` and this namespace accepts `q`, so a caller
         who already guessed a credential can still confirm it
         (`?q=<password>` returns the source) -- a confirmation oracle, not a
-        disclosure. And `odspt` and `maaf` build public dataset resource URLs
-        and remote ids out of the source URL, which is the same defect in a
-        place where redacting would break a working download link; it needs
-        its own decision and its own ticket.
+        disclosure.
 
-        See LEDG-2477.
+        `odspt` and `maaf` used to build public dataset resource URLs and
+        remote ids out of the source URL, which is the same defect in a place
+        where redacting breaks a working download link. That was settled by
+        redacting anyway: a link that only works because it carries somebody
+        else's password is the defect, not a feature.
+
+        See LEDG-2477 and LEDG-2500.
         """
         return source
 

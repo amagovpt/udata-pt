@@ -25,7 +25,8 @@ This module also owns `redact_url_credentials()`, the counterpart concern:
 `URLS_ALLOW_CREDENTIALS` is true, so a harvest source URL may legitimately
 carry `user:password@`. Anything derived from such a URL that is later served
 -- a harvest error message, the source url copied onto a harvested
-dataservice -- must have that userinfo removed first. See LEDG-2477.
+dataservice, a resource URL or a remote id a backend builds out of it -- must
+have that userinfo removed first. See LEDG-2477 and LEDG-2500.
 """
 
 from __future__ import annotations
