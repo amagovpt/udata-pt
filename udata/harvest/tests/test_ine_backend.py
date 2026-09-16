@@ -777,3 +777,31 @@ class INESlugAndEscapingTest(PytestOnlyDBTestCase):
         assert "xpid=INE&amp;xpgid=" in dataset.description
         # `remote_url` is stored raw — it is a URL, not rendered content.
         assert dataset.harvest.remote_url.startswith("https://www.ine.pt/xportal/xmain?xpid=INE&")
+
+
+class INEHarvestLogCredentialsTest(PytestOnlyDBTestCase):
+    """The INE start line prints the source URL on every harvest (LEDG-2501).
+
+    `INEBackend` also goes through `BaseBackend.harvest`, so a credentialed
+    source used to print the password twice per run; the other line is pinned
+    in `test_dcat_backend.py`.
+    """
+
+    def test_harvest_start_log_line_does_not_carry_the_source_password(self, mocker):
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/ine/xml_indic.jsp?opc=2&lang=PT"
+        source = HarvestSourceFactory(backend="ine", url=url)
+        backend = INEBackend(source)
+
+        # `_log` is an instance attribute, not a module-level logger, so it is
+        # patched on the instance. The harvest is cut short right after the
+        # line under test.
+        backend._log = mocker.Mock()
+        mocker.patch.object(INEBackend, "_fetch_hvd_ids", side_effect=RuntimeError("stop here"))
+
+        with pytest.raises(RuntimeError):
+            backend._inner_harvest()
+
+        logged = " ".join(str(call) for call in backend._log.info.call_args_list)
+        assert "sup3rs3cr3t" not in logged
+        assert "harvestuser" not in logged
+        assert "https://***@www.ine.pt" in logged

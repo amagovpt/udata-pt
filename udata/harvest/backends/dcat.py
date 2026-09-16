@@ -26,6 +26,7 @@ from udata.rdf import (
 )
 from udata.storage.s3 import store_as_json
 
+from ..url_filter import redact_url_credentials_in_url
 from .base import BaseBackend, HarvestExtraConfig, HarvestFeature
 
 log = logging.getLogger(__name__)
@@ -398,7 +399,10 @@ class BaseCswDcatBackend(DcatBackend, ABC):
             if r := self.xpath_proc.evaluate("/csw:GetRecordsResponse/csw:SearchResults"):
                 search_results = r.head
             else:
-                log.error(f"No search results found for {url} on page {page_number}")
+                log.error(
+                    f"No search results found for {redact_url_credentials_in_url(url)} "
+                    f"on page {page_number}"
+                )
                 return
 
             for result in search_results.children:
