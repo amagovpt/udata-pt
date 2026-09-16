@@ -4,22 +4,34 @@ from udata.i18n import lazy_gettext as _
 from udata.utils import safe_unicode
 
 from .models import VALIDATION_REFUSED, VALIDATION_STATES
-from .url_filter import HarvestURLForbidden, check_harvest_url
+from .url_filter import (
+    HarvestURLForbidden,
+    check_harvest_url,
+    check_harvest_url_credentials,
+)
 
 __all__ = "HarvestSourceForm", "HarvestSourceValidationForm"
 
 
 class HarvestURLField(fields.URLField):
-    """`URLField` that gates the hostname against the harvest deny/allow list
-    BEFORE the parent `pre_validate` triggers DNS resolution.
+    """`URLField` that gates a harvest source URL twice before the parent
+    `pre_validate` triggers DNS resolution.
 
-    Prevents the out-of-band DNS leak from VULN-2084 — a denied hostname
-    never reaches `socket.getaddrinfo`.
+    - The hostname, against the harvest deny/allow list. Prevents the
+      out-of-band DNS leak from VULN-2084 — a denied hostname never reaches
+      `socket.getaddrinfo`.
+    - The userinfo: a source URL may no longer carry `user:password@`
+      (LEDG-2502). The check is local to this field rather than a change to
+      `URLS_ALLOW_CREDENTIALS`, which governs every URL in the portal.
+
+    Credentials are checked first: of the two, it is the message the caller can
+    act on. Both are pure, so the order costs nothing.
     """
 
     def pre_validate(self, form):
         if self.data:
             try:
+                check_harvest_url_credentials(self.data)
                 check_harvest_url(self.data)
             except HarvestURLForbidden as e:
                 raise validators.ValidationError(str(e))

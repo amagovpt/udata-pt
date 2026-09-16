@@ -11,6 +11,7 @@ from udata.core.dataset.factories import DatasetFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.harvest.backends import get_enabled_backends
+from udata.i18n import gettext
 from udata.models import Member, PeriodicTask
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.tests.helpers import assert200, assert201, assert204, assert400, assert403, assert404
@@ -392,6 +393,108 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
 
         source = response.json
         assert source["config"] == {"custom": "value"}
+
+    def test_create_source_rejects_url_credentials(self):
+        """A source URL may no longer carry `user:password@` (LEDG-2502).
+
+        LEDG-2477 redacted the userinfo everywhere it reached a reader, but the
+        portal kept accepting it, so every new serialization path reopened the
+        problem. An inventory of production found no source using basic auth in
+        its URL, so the field rejects it instead.
+        """
+        self.login()
+        data = {
+            "name": faker.word(),
+            "url": "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            "backend": "factory",
+        }
+
+        response = self.post(url_for("api.harvest_sources"), data)
+
+        assert400(response)
+        # Asserted through `gettext` rather than against English: the suite
+        # runs in the default locale, and the message is deliberately the msgid
+        # `udata.uris` already uses, which is translated for pt and fr.
+        with self.app.test_request_context():
+            expected = str(gettext("Credentials in URL are not allowed"))
+        assert response.json["errors"]["url"] == [expected]
+        # The rejection must not repeat the secret back to the caller, which is
+        # why this is not `uris.validate(url, credentials=False)`: that one
+        # composes `Invalid URL "{url}": {reason}`.
+        assert "sup3rs3cr3t" not in str(response.json)
+        assert HarvestSource.objects(url__contains="sup3rs3cr3t").count() == 0
+
+    def test_update_source_rejects_url_credentials_until_removed(self):
+        """A source stored before the rejection cannot be saved as it is.
+
+        This is the migration path for legacy sources: the PUT revalidates the
+        URL, so editing one forces its credentials out. Harvesting it keeps
+        working until someone does — the fetch guard is deliberately unchanged,
+        because rejecting there would break a live harvest in silence.
+        """
+        user = self.login()
+        source = HarvestSourceFactory(
+            owner=user, url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+        )
+        api_url = url_for("api.harvest_source", source=source)
+
+        data = {
+            "name": source.name,
+            "description": source.description,
+            "url": "https://harvestuser:sup3rs3cr3t@www.ine.pt/feed.xml",
+            "backend": "factory",
+        }
+        response = self.put(api_url, data)
+        assert400(response)
+        assert "sup3rs3cr3t" not in str(response.json)
+
+        data["url"] = "https://www.ine.pt/feed.xml"
+        response = self.put(api_url, data)
+        assert200(response)
+        source.reload()
+        assert source.url == "https://www.ine.pt/feed.xml"
+
+    def test_create_source_accepts_at_outside_the_authority(self):
+        """An `@` outside the authority is not userinfo and stays accepted.
+
+        Rejecting on the mere presence of an `@` would be the same over-reach
+        the free-text redaction had to avoid. The query string is where this is
+        observable through the form: `udata.uris.URL_REGEX` independently
+        refuses an `@` in the path (it reads what follows as the domain), so
+        that shape never reaches this check -- it is covered in the unit test
+        of the guard itself.
+        """
+        self.login()
+        data = {
+            "name": faker.word(),
+            "url": "https://www.ine.pt/feed?contact=admin@example.com",
+            "backend": "factory",
+        }
+
+        response = self.post(url_for("api.harvest_sources"), data)
+
+        assert201(response)
+
+    def test_preview_source_rejects_url_credentials(self):
+        """The preview route validates the same form, so it rejects too.
+
+        It is the route the backoffice calls before saving, so a payload that
+        the create would refuse must not be previewable either.
+        """
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        data = {
+            "name": faker.word(),
+            "url": "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            "backend": "factory",
+            "organization": str(org.id),
+        }
+
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
+
+        assert400(response)
+        assert "sup3rs3cr3t" not in str(response.json)
 
     def test_update_source(self):
         """It should update a source if owner or orga admin"""

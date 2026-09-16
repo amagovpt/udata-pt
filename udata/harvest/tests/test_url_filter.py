@@ -1,6 +1,11 @@
 import pytest
 
-from ..url_filter import redact_url_credentials, redact_url_credentials_in_url
+from ..url_filter import (
+    HarvestURLForbidden,
+    check_harvest_url_credentials,
+    redact_url_credentials,
+    redact_url_credentials_in_url,
+)
 
 
 class RedactURLCredentialsTest:
@@ -141,3 +146,51 @@ class RedactURLCredentialsInURLTest:
     )
     def test_an_at_outside_the_authority_is_left_alone(self, url):
         assert redact_url_credentials_in_url(url) == url
+
+
+class CheckHarvestURLCredentialsTest:
+    """`check_harvest_url_credentials` rejects a source URL carrying userinfo.
+
+    The counterpart of the redaction: LEDG-2477 hid the credentials from
+    readers, this refuses to store new ones at all (LEDG-2502).
+
+    These are pure functions tested without an app context, so the assertions
+    are on the exception type, not on the lazy-translated message — the API
+    tests, which have a request context, are where the text is asserted.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            # A username on its own: in many services the token IS the user.
+            "https://s3cr3t-token@api.example.com/feed",
+            # An unencoded `@` in the password, and a scheme-relative URL --
+            # both shapes `udata.uris.validate` accepts, so both are storable.
+            "https://user:p@ss@data.example.com/x",
+            "//user:pass@data.example.com/x",
+            "HTTPS://USER:PASS@DATA.EXAMPLE.COM/x",
+            "https://user:pass@[2001:db8::1]:8080/x",
+            # Leading whitespace must not smuggle credentials past the check.
+            "  https://user:pass@data.example.com/x  ",
+        ],
+    )
+    def test_rejects_userinfo(self, url):
+        with pytest.raises(HarvestURLForbidden):
+            check_harvest_url_credentials(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.ine.pt/broken.xml",
+            # An `@` outside the authority is not userinfo: rejecting these
+            # would refuse URLs that carry no credentials at all.
+            "https://www.ine.pt/files/report@2026.csv",
+            "https://www.ine.pt/search?contact=admin@example.com",
+            "https://www.ine.pt/x#admin@example.com",
+            "",
+            None,
+        ],
+    )
+    def test_accepts_urls_without_userinfo(self, url):
+        assert check_harvest_url_credentials(url) is None
