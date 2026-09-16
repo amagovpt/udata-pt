@@ -2517,9 +2517,9 @@ def sp_initiated():
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
-            # Required, and this is the third value this flag has held in
-            # three weeks -- so the reasoning is written down rather than left
-            # to be re-derived.
+            # Required, and this flag has now changed three times in three
+            # weeks (False, True, False, True) -- so the reasoning is written
+            # down rather than left to be re-derived a fourth time.
             #
             # What isRequired actually governs is the CONSENT SCREEN. Marked
             # optional, autenticacao.gov lists the attribute under "Dados
@@ -2533,11 +2533,16 @@ def sp_initiated():
             # A previous comment here claimed isRequired makes the IdP refuse
             # a citizen who lacks the attribute, and that requiring the NIC is
             # what shuts foreigners out. That was never observed. What WAS
-            # observed: tst ran with the NIC required from 2026-08-27 to
-            # 09-14 -- two and a half weeks, with CMD sign-ins working
+            # observed: tst ran with the NIC required from late August until
+            # 2026-09-14 -- two and a half weeks, with CMD sign-ins working
             # throughout. That window covers the NIC and covers nationals; it
             # does not cover the three document attributes below, which did
             # not exist then.
+            #
+            # That the required form has NO checkbox is read off the contrast
+            # with that window rather than observed directly, and it is the
+            # premise the whole change rests on -- so it carries the same
+            # qualifier as everything else here.
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
@@ -2561,15 +2566,28 @@ def sp_initiated():
             # returns None unless type, nationality and number are all present
             # -- so leaving any one of them optional leaves the hole open.
             #
-            # ⚠️ And note what nobody has: the FOUR together. The NIC and this
-            # trio are alternatives by construction, and the composer returns
-            # None for a Cartao de Cidadao. So if the pessimistic reading of
-            # isRequired were right -- that the IdP refuses whoever lacks the
-            # attribute -- this would exclude nationals too, not just
-            # foreigners. Unlike the NIC, no window of tst ever ran with these
-            # required, so that reading is untested here. It is what the
-            # validation against a real CMD, national AND foreign, has to
-            # settle before this leaves tst.
+            # ⚠️ And the risk here is NOT only to foreigners, which is the
+            # easy thing to assume. What is actually known:
+            #
+            # - the consent screen OFFERS these three to a national (observed
+            #   2026-09-16), so a national plausibly supplies them;
+            # - whether the assertion arrives with them filled in is NOT
+            #   known, for either population;
+            # - unlike the NIC, no window of tst ever ran with these required,
+            #   so the pessimistic reading of isRequired is untested for them.
+            #
+            # Careful not to argue from the wrong end: the composer returns
+            # None for a Cartao de Cidadao, but that is about what WE do with
+            # the answer, not about what the IdP supplies. A national sending
+            # DocType=CC has supplied the attribute; we simply decline to
+            # build an identifier from it. Reading the composer as proof that
+            # nationals lack the attribute would be exactly the kind of
+            # supposition-stated-as-fact this change exists to remove.
+            #
+            # ⇒ Which is why the validation against a real CMD has to cover a
+            # national AND a foreigner before this leaves tst. The blast
+            # radius under the pessimistic reading is unknown, not bounded to
+            # one group.
             RequestedAttribute(
                 name=MDC_ATTR_DOC_TYPE,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",

@@ -1012,7 +1012,10 @@ class SAMLSSOCallbackTest(APITestCase):
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_sso_callback_with_only_email(self, mock_client_for, mock_requires_conf):
-        """autenticacao.gov may return only email (NIC is optional). Without a
+        """autenticacao.gov may return only email. The NIC is asked for as
+        required since LEDG-2503, but required governs the consent screen, not
+        what the IdP holds -- an assertion can still arrive without one, which
+        is what this covers. Without a
         match the identity goes to the wizard; no_match stays false because
         there is no NIC, so the wizard offers the search branch rather than
         account creation (an account with no auth_nic could confirm itself)."""
@@ -7866,9 +7869,12 @@ class SAMLRequestedAttributesTest(APITestCase):
         assert requested[MDC_ATTR_FIRST_NAME] == "True"
         assert requested[MDC_ATTR_LAST_NAME] == "True"
 
-        # Nothing is left optional at all: a single checkbox anywhere in this
-        # list is a way to arrive with no identity, so the assertion is on the
-        # whole set rather than on the four named above.
+        # Nothing is left optional at all. Every attribute in this list
+        # identifies the citizen, so a checkbox on any of them is a way to
+        # arrive with no identity -- hence the assertion is on the whole set
+        # rather than on the four named above, and it also catches a flag left
+        # off entirely. An attribute that is legitimately optional would
+        # belong somewhere this assertion does not reach.
         optional = [name for name, required in requested.items() if required != "True"]
         assert not optional, f"still optional, so still declinable: {optional}"
 
