@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **fix(harvest): the CKAN family no longer builds a dataset's public remote URL on a credentialed source URL**
+  - `URLS_ALLOW_CREDENTIALS` lets a harvest source URL carry `user:password@`, and
+    `CkanBackend.dataset_url()` built on it with `urljoin`, which keeps the userinfo. Its
+    result becomes `Dataset.harvest.remote_url`. `ckanpt` and `dkan` inherit the method,
+    so all three backends leaked.
+  - 🔑 **The previous inventory was incomplete, and this is the channel it missed.** The
+    earlier pass concluded that only `odspt` and `maaf` derived published data from the
+    source URL. `Dataset.harvest.remote_url` is worse than either: it is a field of
+    *every* dataset, not only the ones an audit thinks to look at; it is served without a
+    session by the dataset API, the public dataset CSV and the RDF `dcat:landingPage`; it
+    is copied onto `HarvestItem.remote_url`, which the harvest job API serializes
+    unauthenticated; and, unlike a harvest job, it is never purged.
+  - The fix draws the fetch/published line **in the backend itself**, the way the ODS one
+    does: a new `public_source_url` property holds the redacted URL, `dataset_url()` builds
+    on it, and `action_url()`/`get_status()` stay on the raw value because they are the
+    requests this backend makes. The harvest keeps authenticating; only what is written to
+    a document is redacted. Leaving the line implicit is what let two inventories miss it.
+  - A migration cleans `dataset.harvest.remote_url` and the `harvest_job.items[].remote_url`
+    copies already written, with the same per-field guarded writes as the previous one, so a
+    harvest running concurrently is not overwritten. **It runs unscoped**, unlike the ODS
+    pass: that one needed a marker because a publisher may legitimately type a credentialed
+    URL on a resource of their own, whereas nothing but a harvester writes `dataset.harvest`.
+  - **Decision on `dataset.harvest.remote_id`: counted, not rewritten.** The question was
+    worth asking, since the previous migration redacted `harvest_job.items[].remote_id`, but
+    no writer derives a dataset's remote id from the source URL -- the CKAN family uses the
+    package name and then its id, and `maaf` replaces it before the dataset is saved.
+    Rewriting it would break the match `get_dataset` makes on it, for no leak. The migration
+    logs a count so the answer comes from live data; a non-zero one is a new ticket.
+  - **Still standing:** `CkanPTBackend.source_label()` falls back to the source URL when a
+    source has no name. Unreachable through the API today, because the harvest source form
+    requires a name, so it is left for its own change rather than widening this one.
+  - Inventory against a production-scale restore (23,080 datasets, 46 harvest sources):
+    **no source of any backend carries `@` in its URL**, so nothing is exposed today and the
+    migration is expected to be a no-op. It exists so the invariant holds for whatever is
+    written between that restore and the deploy.
+  - ⚠️ **None of this un-leaks anything.** A credential that was publicly readable is
+    compromised and has to be rotated at the remote source.
+
 - **fix(sentry): URL credentials no longer reach Sentry, nor the log lines that printed them**
   - A harvest source URL may legitimately carry `user:password@`, and every `requests`
     exception raised over one embeds it in its message. An earlier change kept that out of
