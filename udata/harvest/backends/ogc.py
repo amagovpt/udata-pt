@@ -296,7 +296,7 @@ class OGCBackend(BaseBackend):
         The source names its two item downloads after itself - "Items as
         GeoJSON" - which says nothing about the data once the resource is read
         outside the collection it came from. They are renamed after the dataset
-        instead, so "Items as GeoJSON" on "Rede Clicavel" reads "Rede Clicavel
+        instead, so "Items as GeoJSON" on "Rede Ciclável" reads "Rede Ciclável
         como GeoJSON" (LEDG-2512). Every other label, the collection schema
         included, is published exactly as the source wrote it.
         """

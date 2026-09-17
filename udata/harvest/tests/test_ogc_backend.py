@@ -395,11 +395,11 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
             _distribution(ITEMS_JSONLD_URL, "application/ld+json", "Items as RDF (GeoJSON-LD)"),
         ]
 
-        dataset = self._harvest(rmock, source, distributions, name="Rede Clicável")
+        dataset = self._harvest(rmock, source, distributions, name="Rede Ciclável")
 
         assert [(r.title, r.format, r.url) for r in dataset.resources] == [
-            ("Rede Clicável como GeoJSON", "GeoJSON", GEOJSON_URL),
-            ("Rede Clicável como RDF (GeoJSON-LD)", "JSON-LD", ITEMS_JSONLD_URL),
+            ("Rede Ciclável como GeoJSON", "GeoJSON", GEOJSON_URL),
+            ("Rede Ciclável como RDF (GeoJSON-LD)", "JSON-LD", ITEMS_JSONLD_URL),
         ]
 
     def test_schema_keeps_its_label(self, rmock):
@@ -408,7 +408,7 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
             _distribution(SCHEMA_URL, "application/schema+json", "Schema of collection in JSON")
         ]
 
-        dataset = self._harvest(rmock, source, distributions, name="Rede Clicável")
+        dataset = self._harvest(rmock, source, distributions, name="Rede Ciclável")
 
         assert [(r.title, r.format, r.url) for r in dataset.resources] == [
             ("Schema of collection in JSON", "SCHEMA+JSON", SCHEMA_URL)
@@ -440,7 +440,7 @@ TML_SCHEMA_URL = (
 )
 
 
-def _tml_item(title="Rede Clicável"):
+def _tml_item(title="Rede Ciclável"):
     """One real TML collection, recorded from the source, under a given title.
 
     Recorded rather than transcribed: a hand-written copy of thirteen
@@ -458,7 +458,7 @@ def _tml_item(title="Rede Clicável"):
 class OGCTMLPayloadTest(PytestOnlyDBTestCase):
     """The selection and the renaming, read against the source's own payload."""
 
-    def _harvest(self, rmock, source, title="Rede Clicável"):
+    def _harvest(self, rmock, source, title="Rede Ciclável"):
         rmock.get(OGC_URL, text=_ogc_payload([_tml_item(title)]))
         job = OGCBackend(source).harvest()
         assert [item.status for item in job.items] == ["done"]
@@ -478,8 +478,8 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
 
         assert [(r.title, r.format, r.url) for r in dataset.resources] == [
             ("Schema of collection in JSON", "SCHEMA+JSON", TML_SCHEMA_URL),
-            ("Rede Clicável como GeoJSON", "GeoJSON", TML_ITEMS_GEOJSON_URL),
-            ("Rede Clicável como RDF (GeoJSON-LD)", "JSON-LD", TML_ITEMS_JSONLD_URL),
+            ("Rede Ciclável como GeoJSON", "GeoJSON", TML_ITEMS_GEOJSON_URL),
+            ("Rede Ciclável como RDF (GeoJSON-LD)", "JSON-LD", TML_ITEMS_JSONLD_URL),
         ]
 
     def test_first_harvest_after_deploy_drops_four_and_keeps_three_ids(self, rmock):
