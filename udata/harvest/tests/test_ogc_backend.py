@@ -363,3 +363,29 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, source, distributions)
 
         assert [r.url for r in dataset.resources] == [GEOJSON_URL]
+
+    def test_items_as_is_renamed_after_the_dataset(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(GEOJSON_URL, "application/geo+json", "Items as GeoJSON"),
+            _distribution(ITEMS_JSONLD_URL, "application/ld+json", "Items as RDF (GeoJSON-LD)"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions, name="Rede Clicável")
+
+        assert [(r.title, r.format, r.url) for r in dataset.resources] == [
+            ("Rede Clicável como GeoJSON", "GeoJSON", GEOJSON_URL),
+            ("Rede Clicável como RDF (GeoJSON-LD)", "JSON-LD", ITEMS_JSONLD_URL),
+        ]
+
+    def test_schema_keeps_its_label(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(SCHEMA_URL, "application/schema+json", "Schema of collection in JSON")
+        ]
+
+        dataset = self._harvest(rmock, source, distributions, name="Rede Clicável")
+
+        assert [(r.title, r.format, r.url) for r in dataset.resources] == [
+            ("Schema of collection in JSON", "SCHEMA+JSON", SCHEMA_URL)
+        ]

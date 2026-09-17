@@ -171,8 +171,7 @@ class OGCBackend(BaseBackend):
                             url.split(".")[-1] if "." in url.split("/")[-1] else "unknown"
                         )
 
-                    # Use link title or create a descriptive title
-                    resource_title = dist.get("description") or dist.get("name") or "Resource"
+                    resource_title = self._resource_title(label, item_data["title"])
 
                     resources.append(
                         {
@@ -270,6 +269,20 @@ class OGCBackend(BaseBackend):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return ""
+
+    def _resource_title(self, label: str, dataset_title: str) -> str:
+        """The title a catalogued distribution is published under.
+
+        The source names its two item downloads after itself - "Items as
+        GeoJSON" - which says nothing about the data once the resource is read
+        outside the collection it came from. They are renamed after the dataset
+        instead, so "Items as GeoJSON" on "Rede Clicavel" reads "Rede Clicavel
+        como GeoJSON" (LEDG-2512). Every other label, the collection schema
+        included, is published exactly as the source wrote it.
+        """
+        if label.startswith(ITEMS_AS_PREFIX):
+            return f"{dataset_title} como {label[len(ITEMS_AS_PREFIX) :]}"
+        return label or "Resource"
 
     def _is_target_distribution(self, label: str) -> bool:
         """Whether a distribution is one of the three the portal catalogues."""

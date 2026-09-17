@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix(harvest): the OGC backend catalogues three distributions per dataset, not seven**
+  - The TML source publishes thirteen distributions per collection. Six are HTML and were
+    already dropped, but the other seven all became resources, so every harvested dataset
+    carried four downloads nobody asked for -- the server landing page, the collection
+    document as JSON and as JSON-LD, and the queryables -- next to the three that matter:
+    the two item downloads and the collection schema.
+  - **The label is resolved once and drives both the selection and the title.** Reading them
+    from different fields is exactly how this would have failed quietly: the source leaves
+    `name` unset on all 2418 of its distributions and puts the label in `description`, so a
+    check written against `name` would have matched nothing, left all 186 datasets without a
+    single resource, and still reported the harvest as successful.
+  - **The MIME filter keeps running first.** The source also publishes an "Items as HTML"
+    distribution, which carries the prefix the selection looks for; checking the label before
+    the format would catalogue it and leave four resources instead of three.
+  - **The two item downloads are renamed after the dataset.** "Items as GeoJSON" says nothing
+    about the data once the resource is read outside its collection, so it is published as
+    "<dataset title> como GeoJSON". The collection schema keeps the label the source gave it.
+  - The four dropped resources lose their `/api/1/datasets/r/<id>` permalink, which is the
+    point of the change. The three that stay keep theirs: `sync_resources` matches on URL, so
+    renaming a resource refreshes the existing object rather than minting a new id.
+
 - **fix(saml): the document was only recorded on the login AFTER the one that created the account**
   - `extras` holds four keys for an authenticated citizen: the identity, the provider, the
     document type and the document nationality. Until now **only the login funnel wrote the last
