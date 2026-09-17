@@ -1713,6 +1713,56 @@ class SAMLEidasSSOTest(APITestCase):
         assert existing.extras["auth_eidas_origin_country"] == "ES"
         assert existing.extras["auth_nic"] == _hash_nic(self.PERSON_ID)
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_nic_shaped_identifier_via_eidas_route_writes_no_country(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """🚩 The eIDAS route accepts a NIC — its extraction tries the MDC
+        attribute FIRST — and a NIC carries no country at all.
+
+        The sign-in must work exactly as before and the key must be ABSENT,
+        not present and null: a null would be indistinguishable from a country
+        we failed to read, and counting it as anything would turn a gap in the
+        data into a population figure.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(mock_client_for, nic="87654321", given_name="Rita", family_name="Nunes")
+
+        created = User.objects(extras__auth_nic=_hash_nic("87654321")).first()
+        assert created is not None, "the sign-in itself must be untouched"
+        assert "auth_eidas_origin_country" not in (created.extras or {})
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_an_unexpected_identifier_shape_still_signs_in_without_a_country(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The shape is a RECOMMENDATION of the eIDAS profile, not a guarantee.
+
+        We have one real sample. A member state emitting something else must
+        still get its citizens in — the country is the thing that is allowed
+        to be missing, never the sign-in — and the digest must be exactly what
+        it would have been before any of this.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        odd = "cz/pt/lowercase-is-not-the-recommended-shape"
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(
+                mock_client_for, person_identifier=odd, given_name="Jan", family_name="Novák"
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic(odd)).first()
+        assert created is not None, "an unrecognised shape must never cost a sign-in"
+        assert "auth_eidas_origin_country" not in (created.extras or {})
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_eidas_name_match_redirects_to_migration_wizard(self, mock_client_for):
         """A homonym account without a linked identity becomes a wizard
