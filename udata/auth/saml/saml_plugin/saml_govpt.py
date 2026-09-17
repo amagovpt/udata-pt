@@ -1029,6 +1029,11 @@ REGISTRATION_ASSOCIATION_REFUSED_FLASH = "registration_association_refused"
 MIGRATION_LINK_ORIGIN = "origin"
 MIGRATION_LINK_ORIGIN_REGISTRATION = "complete_registration"
 MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
+# The verified document, carried to a click that has no session to read it out
+# of. Named like the keys above rather than reusing the extras key names: this
+# is the record's own vocabulary, and the two are free to diverge.
+MIGRATION_LINK_DOC_TYPE = "doc_type"
+MIGRATION_LINK_DOC_NATIONALITY = "doc_nationality"
 
 
 def _declared_citizen():
@@ -1795,6 +1800,8 @@ def _issue_migration_link(
     *,
     provider=None,
     citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
     origin=None,
     placeholder_id=None,
 ):
@@ -1837,6 +1844,14 @@ def _issue_migration_link(
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_ORIGIN] = origin
     if placeholder_id:
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_PLACEHOLDER_ID] = str(placeholder_id)
+    # Same rule, and the same reason: the click arrives with no session at all,
+    # so the record is the only thing that knows. A record issued before these
+    # keys existed simply has none, and the consuming side reads them with a
+    # bare get so that absent stays absent rather than becoming a written null.
+    if doc_type:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_TYPE] = doc_type
+    if doc_nationality:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_NATIONALITY] = doc_nationality
 
     # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
     # outstanding sessions (LEDG-2134), and a password reset rotates it too,
@@ -1847,7 +1862,15 @@ def _issue_migration_link(
 
 
 def _link_identity_and_login(
-    user, nic_hash, first_name, last_name, *, provider=None, citizen_declared=None
+    user,
+    nic_hash,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Bind the authenticated identity to ``user`` and start its session.
 
@@ -1863,7 +1886,12 @@ def _link_identity_and_login(
     Recorded under the same rule as everywhere else — only when there is one to
     record.
     """
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     if not user.extras:
         user.extras = {}
@@ -1873,6 +1901,14 @@ def _link_identity_and_login(
         user.extras[AUTH_PROVIDER] = provider
     if citizen_declared:
         user.extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # Not guarded, unlike the funnel's write of the same two keys: the save
+    # below IS the link, and must fail the operation if it fails. Recording
+    # what identified the person is part of completing that link, not
+    # bookkeeping alongside it.
+    if doc_type:
+        user.extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        user.extras[AUTH_DOC_NATIONALITY] = doc_nationality
     if first_name:
         user.first_name = first_name.title()
     if last_name:
@@ -2447,6 +2483,10 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
         # completes without inventing a provider for it.
         provider=pending.get("saml_provider"),
         citizen_declared=_declared_citizen(),
+        # Bare gets, like the provider above: a session opened before these
+        # keys existed names no document, and none is invented for it.
+        doc_type=pending.get("saml_doc_type"),
+        doc_nationality=pending.get("saml_doc_nationality"),
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
@@ -4143,6 +4183,8 @@ def migration_confirm_link(token):
         # issued before either field existed simply has none.
         provider=record.get("provider"),
         citizen_declared=record.get("citizen_declared"),
+        doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
+        doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
     )
     current_app.logger.info(f"Migration completed by validation link for user {user.id}")
 

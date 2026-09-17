@@ -6260,6 +6260,60 @@ class SAMLAuthProviderWizardTest(APITestCase):
         legacy.reload()
         assert legacy.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_validation_link_records_the_document_with_no_session(
+        self, mock_client_for, mock_send
+    ):
+        """LEDG-2508, in the shape of the provider test above.
+
+        The click has no session, so the document has to have travelled in the
+        record written when the link was issued. Clicked from a fresh client to
+        make that real rather than incidental.
+
+        A foreign citizen, because that is who has a document instead of a NIC
+        — and the type arrives punctuated, so this pins that what is stored is
+        the normalised value.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy = UserFactory(
+            email="tomas@example.pt",
+            password="S3cretPass!",
+            first_name="Tomas",
+            last_name="Vieira",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            first_name="Tomas",
+            last_name="Vieira",
+            doc_type="CR:",
+            doc_nationality="PT",
+            doc_number="CR5544332",
+        )
+        proof = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": legacy.email, "password": "S3cretPass!"},
+        )
+        assert proof.status_code == 200
+
+        # The record carries it before the click, which is the whole point.
+        legacy.reload()
+        record = legacy.extras[MIGRATION_LINK_PENDING]
+        assert record["doc_type"] == "CR", "the record carried the raw value"
+        assert record["doc_nationality"] == "PT"
+
+        fresh = self.app.test_client()
+        assert (
+            fresh.get(f"/saml/migration/confirm-link/{self._mailed_token(mock_send)}").status_code
+            == 302
+        )
+
+        legacy.reload()
+        assert legacy.extras["auth_doc_type"] == "CR"
+        assert legacy.extras["auth_doc_nationality"] == "PT"
+
 
 class SAMLDeclaredCitizenTypeTest(APITestCase):
     """`extras.auth_citizen_declared` holds what the citizen said on the login
