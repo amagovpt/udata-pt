@@ -692,3 +692,80 @@ class CkanBackendEdgeCasesTest(PytestOnlyDBTestCase):
             },
             **kwargs,
         }
+
+
+CREDENTIALED_CKAN_URL = "http://harvestuser:sup3rs3cr3t@localhost:5000"
+REDACTED_CKAN_URL = "http://***@localhost:5000"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ckan"])
+class CkanBackendCredentialedSourceTest(PytestOnlyDBTestCase):
+    """A source URL carrying `user:password@` must not reach what is published.
+
+    `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth really
+    is configured that way. `dataset_url` derives `Dataset.harvest.remote_url`
+    from it, and that field is served without a session by the dataset API, the
+    public dataset CSV and the RDF `dcat:landingPage`, and is copied onto
+    `HarvestItem.remote_url`, which the harvest job API serializes too
+    (LEDG-2504).
+    """
+
+    def test_remote_url_carries_no_credentials_while_the_fetch_keeps_them(self, rmock):
+        api_url = "{}/api/3/action/".format(CREDENTIALED_CKAN_URL)
+        name = faker.unique_string()
+        # No `url` key in the payload: the `data["url"]` override would
+        # otherwise decide `remote_url` and `dataset_url` would never be read.
+        result = ckan_package(
+            {
+                "name": name,
+                "title": faker.sentence(),
+                "notes": faker.paragraph(),
+                "resources": [
+                    {
+                        "position": 0,
+                        "name": faker.word(),
+                        "description": faker.sentence(),
+                        "format": "csv",
+                        "mimetype": "text/csv",
+                        "size": 42,
+                        "hash": faker.md5(),
+                        "url": faker.unique_url(),
+                    }
+                ],
+            }
+        )
+        source = HarvestSourceFactory(backend="ckan", url=CREDENTIALED_CKAN_URL)
+        # Registered on the credentialed URL on purpose: `requests` keeps the
+        # userinfo in the prepared URL and `requests_mock` matches the whole
+        # netloc, so a plain registration would not match the real request.
+        rmock.get(
+            "{}package_list".format(api_url),
+            json={"success": True, "result": [name]},
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+        rmock.get(
+            "{}package_show".format(api_url),
+            json=result,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+
+        actions.run(source)
+        source.reload()
+
+        job = source.get_last_job()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        dataset = dataset_for(result)
+        assert dataset.harvest.remote_url == "{0}/dataset/{1}".format(REDACTED_CKAN_URL, name)
+        assert "sup3rs3cr3t" not in dataset.harvest.remote_url
+        assert "harvestuser" not in dataset.harvest.remote_url
+        # The job item is what the unauthenticated harvest job API serializes.
+        assert job.items[0].remote_url == dataset.harvest.remote_url
+        # The harvest itself still authenticates: redacting what is published
+        # must not cost the fetch its credentials. Asserted non-vacuously --
+        # `all(...)` over an empty history would pass on its own.
+        assert rmock.request_history
+        assert all("harvestuser" in request.url for request in rmock.request_history)

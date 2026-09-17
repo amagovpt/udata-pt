@@ -14,6 +14,7 @@ from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.exceptions import HarvestException, HarvestSkipException
 from udata.harvest.models import HarvestItem
+from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.i18n import lazy_gettext as _
 from udata.models import GeoZone, License, Resource, SpatialCoverage
 from udata.mongo.datetime_fields import DateRange
@@ -44,13 +45,44 @@ class CkanBackend(BaseBackend):
             headers["Authorization"] = self.config["apikey"]
         return headers
 
+    @property
+    def public_source_url(self):
+        """The source URL with any userinfo replaced by `***`.
+
+        `URLS_ALLOW_CREDENTIALS` is true, so `self.source.url` may be
+        `https://user:password@host/path`. Only `action_url` and `get_status`
+        may be built on the raw value: those are the requests this backend
+        makes, and the only place that needs the credentials back. Everything
+        derived from the source URL that ends up on a document -- today
+        `dataset_url`, whose result becomes `Dataset.harvest.remote_url` --
+        must go through this property instead. See LEDG-2504.
+
+        `Dataset.harvest.remote_url` is served to callers without a session by
+        the dataset API, the public dataset CSV and the RDF `dcat:landingPage`,
+        and is copied onto `HarvestItem.remote_url`, which the harvest job API
+        serializes unauthenticated. A credentialed source would otherwise hand
+        its password to every one of those readers.
+
+        `udata.uris.validate` still accepts the redacted form, because `***@`
+        matches the userinfo group of `URL_REGEX`; were `URLS_ALLOW_CREDENTIALS`
+        ever turned off, these URLs would stop validating and this is where to
+        look.
+        """
+        return redact_url_credentials_in_url(self.source.url)
+
     def action_url(self, endpoint):
+        """Build a CKAN action API URL on the raw, credentialed source URL.
+
+        This is the only URL this backend requests (with `get_status`), so it
+        is the only one that keeps the credentials. Anything published is built
+        on `public_source_url`.
+        """
         path = "/".join(["api/3/action", endpoint])
         return urljoin(self.source.url, path)
 
     def dataset_url(self, name):
         path = "/".join(["dataset", name])
-        return urljoin(self.source.url, path)
+        return urljoin(self.public_source_url, path)
 
     def get_action(self, endpoint, fix=False, **kwargs):
         url = self.action_url(endpoint)
