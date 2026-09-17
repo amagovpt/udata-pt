@@ -6718,6 +6718,7 @@ class SAMLAuthProviderWizardTest(APITestCase):
         click moves the identity, and must move the country with it.
         """
         from flask import url_for
+
         from udata.core.user.models import User
 
         self.app.config["MIGRATION_MODE_ENABLED"] = False
