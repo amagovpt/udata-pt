@@ -857,7 +857,15 @@ def _idp_status_rejection(raw_saml_response, kind):
 
 
 def _create_saml_user(
-    user_email, user_nic, first_name, last_name, *, provider=None, citizen_declared=None
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Create a new account from SAML attributes (scenario 4).
 
@@ -895,7 +903,12 @@ def _create_saml_user(
             f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
         )
 
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -913,6 +926,16 @@ def _create_saml_user(
         extras[AUTH_PROVIDER] = provider
     if citizen_declared:
         extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # The verified counterpart of the declared type. Recorded HERE and not only
+    # by the funnel, which already writes them a few lines later in this same
+    # request: the funnel's write is guarded bookkeeping that swallows its own
+    # failure on purpose, because it must not cost a sign-in. Written into the
+    # insert instead, they cannot be lost silently -- and the paths that do not
+    # reach the funnel at all (the wizard) now have somewhere to put them.
+    if doc_type:
+        extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        extras[AUTH_DOC_NATIONALITY] = doc_nationality
     if extras:
         user_data["extras"] = extras
 
@@ -1025,7 +1048,15 @@ def _declared_citizen():
 
 
 def _create_pending_saml_user(
-    user_email, user_nic, first_name, last_name, *, provider=None, citizen_declared=None
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Create an account from a user-declared email, left unconfirmed.
 
@@ -1043,13 +1074,26 @@ def _create_pending_saml_user(
     ``citizen_declared`` reaches here the same way, from the session key the
     login route set after allowlisting it. Same rule, same reason.
     """
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     extras = {"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True}
     if provider:
         extras[AUTH_PROVIDER] = provider
     if citizen_declared:
         extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # This is the path the wizard creates through, and the one the funnel never
+    # sees: the route that calls it returns JSON, and the confirmation that
+    # follows is flask_security's. Without these two the account is born
+    # without its document and only gains it on a sign-in that may never come.
+    if doc_type:
+        extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        extras[AUTH_DOC_NATIONALITY] = doc_nationality
 
     # No datastore.commit() here: create_user already wrote the document, and
     # commit() is a no-op under MongoEngine anyway. Nothing is assigned after
@@ -3067,6 +3111,12 @@ def idp_initiated():
             last_name,
             provider=AUTH_PROVIDER_CMD,
             citizen_declared=_declared_citizen(),
+            # Same guard as everywhere else: only when the document WAS the
+            # identity. The funnel below writes these too, in this same
+            # request -- but its write is guarded and swallows failure, so
+            # recording them in the insert is what makes them durable.
+            doc_type=None if user_nic else doc_type,
+            doc_nationality=None if user_nic else doc_nationality,
         )
         status = "new"
 
@@ -4339,6 +4389,12 @@ def migration_skip():
             # session names no provider, and none is invented for it.
             provider=pending.get("saml_provider"),
             citizen_declared=_declared_citizen(),
+            # Bare gets for the same reason: a session opened before these
+            # keys existed names no document, and none is invented for it.
+            # This is the path the funnel never sees, so if they are not read
+            # here the account is created without them.
+            doc_type=pending.get("saml_doc_type"),
+            doc_nationality=pending.get("saml_doc_nationality"),
         )
 
     send_confirmation_instructions(user)

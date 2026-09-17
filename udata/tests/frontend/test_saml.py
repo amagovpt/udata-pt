@@ -8349,6 +8349,49 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         assert pending["saml_doc_type"] is None
         assert pending["saml_doc_nationality"] is None
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_created_account_carries_the_document(self, mock_client_for, _mock_confirm):
+        """LEDG-2508: the account the wizard creates must hold its document.
+
+        🚩 This is the case the funnel cannot cover, and the reason the ticket
+        exists. The skip route creates the account and returns JSON; the login
+        funnel -- the only writer of these two keys until now -- never runs in
+        that request. Before this change the account was created with an
+        identity and a provider and nothing else, and stayed that way until a
+        later sign-in that may never happen.
+
+        The type arrives punctuated, so this also pins that what is stored is
+        the normalised value and not what the IdP sent.
+        """
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        self._cmd_login(
+            mock_client_for,
+            first_name="Gabriel",
+            last_name="Costa",
+            doc_type="PAS:",
+            doc_nationality="BR",
+            doc_number="BR7788991",
+        )
+        created_response = self.client.post(
+            "/saml/migration/skip", json={"email": "gabriel-doc@example.pt"}
+        )
+        assert created_response.status_code == 200
+
+        created = User.objects(email="gabriel-doc@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_doc_type"] == "PAS", (
+            "the wizard created the account without its document type"
+        )
+        assert created.extras["auth_doc_nationality"] == "BR"
+        assert created.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991"), (
+            "the stored identity must not have moved"
+        )
+
 
 class SAMLAuditLoggerLevelTest(APITestCase):
     """That the audit line reaches a handler at all — which it did not.
