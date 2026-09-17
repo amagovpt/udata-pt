@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **fix(harvest): the OGC backend catalogues three distributions per dataset, not seven**
+  - The TML source publishes thirteen distributions per collection. Six are HTML and were
+    already dropped, but the other seven all became resources, so every harvested dataset
+    carried four downloads nobody asked for -- the server landing page, the collection
+    document as JSON and as JSON-LD, and the queryables -- next to the three that matter:
+    the two item downloads and the collection schema.
+  - **The label is resolved once and drives both the selection and the title.** Reading them
+    from different fields is exactly how this would have failed quietly: the source leaves
+    `name` unset on all 2418 of its distributions and puts the label in `description`, so a
+    check written against `name` would have matched nothing, left all 186 datasets without a
+    single resource, and still reported the harvest as successful.
+  - **The MIME filter keeps running first.** The source also publishes an "Items as HTML"
+    distribution, which carries the prefix the selection looks for; checking the label before
+    the format would catalogue it and leave four resources instead of three.
+  - **The two item downloads are renamed after the dataset.** "Items as GeoJSON" says nothing
+    about the data once the resource is read outside its collection, so it is published as
+    "<dataset title> como GeoJSON". The collection schema keeps the label the source gave it.
+  - **An upstream rename is logged rather than absorbed.** The labels belong to the source,
+    so if it renames them every distribution is dropped, the dataset is left without
+    resources and the job still reports success. A dataset that matches nothing now logs a
+    warning naming the labels it was offered, so the cause is in the log before a user
+    reports the missing downloads.
+  - The four dropped resources lose their `/api/1/datasets/r/<id>` permalink, which is the
+    point of the change. The three that stay keep theirs: `sync_resources` matches on URL, so
+    renaming a resource refreshes the existing object rather than minting a new id.
+
 - **feat(saml): the member state that asserted an eIDAS identity is now recorded**
   - The eIDAS profile recommends the PersonIdentifier be shaped
     `<origin>/<destination>/<id>`, so a Czech citizen signing in here arrives as `CZ/PT/<uuid>`.
