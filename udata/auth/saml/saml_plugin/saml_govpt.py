@@ -562,6 +562,44 @@ EIDAS_ATTR_FAMILY_NAME = "http://eidas.europa.eu/attributes/naturalperson/Curren
 # The MDC/Cidadao URIs are in no map, which is why they stay as raw URIs
 # (allow_unknown_attributes) and the CMD lookups match while URI-based eIDAS
 # lookups do not. Extraction must therefore try both forms.
+# The shape the eIDAS profile recommends for a PersonIdentifier. Matched whole,
+# and deliberately without stripping, upper-casing or any other tidying: the
+# country has to describe the identifier EXACTLY as it is hashed, and anything
+# else would be guessing.
+_EIDAS_PERSON_IDENTIFIER_SHAPE = re.compile(r"([A-Z]{2})/[A-Z]{2}/.+")
+
+
+def _eidas_origin_country(identifier):
+    """The member state that asserted this identity, or None.
+
+    Read-only over the identifier: this NEVER modifies it, because the
+    identifier is the pre-image of the one-way digest every sign-in resolves
+    accounts by. The country is extracted beside it, never instead of it.
+
+    🚩 The shape is a RECOMMENDATION of the eIDAS profile, not a guarantee, and
+    we have exactly one real sample to go on. So the rule is deliberately
+    strict and everything that does not match returns None rather than a guess:
+
+      - a NIC (digits only), which the eIDAS route accepts
+      - "MDC/..." -- three letters, so a foreign citizen's CMD identifier
+        cannot be mistaken for a country code
+      - lower case, a missing id segment, surrounding whitespace
+
+    In every one of those the sign-in proceeds untouched; only the country is
+    absent. A member state that turns out to emit a different shape gets no
+    country until someone decides what that shape means -- admitting a form
+    later is trivial, and telling two forms apart afterwards is not.
+
+    It also leaves alone the invariant _find_or_create_saml_user documents:
+    nothing here adds a fourth identity format, and this pattern cannot match
+    either of the other two.
+    """
+    if not identifier:
+        return None
+    match = _EIDAS_PERSON_IDENTIFIER_SHAPE.fullmatch(identifier)
+    return match.group(1) if match else None
+
+
 EIDAS_FRIENDLY_PERSON_IDENTIFIER = "PersonIdentifier"
 EIDAS_FRIENDLY_GIVEN_NAME = "FirstName"
 EIDAS_FRIENDLY_FAMILY_NAME = "FamilyName"
@@ -866,6 +904,7 @@ def _create_saml_user(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Create a new account from SAML attributes (scenario 4).
 
@@ -907,6 +946,7 @@ def _create_saml_user(
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -936,6 +976,12 @@ def _create_saml_user(
         extras[AUTH_DOC_TYPE] = doc_type
     if doc_nationality:
         extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    # A DIFFERENT thing from the nationality above, which is why it is a
+    # different key: that one is printed on a document and is forced to "PT" on
+    # residence permits, this one is the member state whose node asserted the
+    # identity. See the comment on the constant.
+    if eidas_country:
+        extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
     if extras:
         user_data["extras"] = extras
 
@@ -1034,6 +1080,7 @@ MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
 # is the record's own vocabulary, and the two are free to diverge.
 MIGRATION_LINK_DOC_TYPE = "doc_type"
 MIGRATION_LINK_DOC_NATIONALITY = "doc_nationality"
+MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY = "eidas_origin_country"
 
 
 def _declared_citizen():
@@ -1062,6 +1109,7 @@ def _create_pending_saml_user(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Create an account from a user-declared email, left unconfirmed.
 
@@ -1083,6 +1131,7 @@ def _create_pending_saml_user(
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -1099,6 +1148,11 @@ def _create_pending_saml_user(
         extras[AUTH_DOC_TYPE] = doc_type
     if doc_nationality:
         extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    # The wizard is the path the funnel never sees: the route that calls
+    # this returns JSON. Without it the country is gone by the time an
+    # account exists, and there is nothing to recover it from.
+    if eidas_country:
+        extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
 
     # No datastore.commit() here: create_user already wrote the document, and
     # commit() is a no-op under MongoEngine anyway. Nothing is assigned after
@@ -1365,6 +1419,7 @@ def _handle_saml_user_login(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
     asserted_email=None,
     asserted_first_name=None,
     asserted_last_name=None,
@@ -1530,11 +1585,12 @@ def _handle_saml_user_login(
     # (Not the same call as the mail sends that deliberately re-raise: there,
     # swallowing made a failure the user cared about look successful. Here the
     # outcome the user came for still happens.)
-    if provider or citizen_declared or doc_type or doc_nationality:
+    if provider or citizen_declared or doc_type or doc_nationality or eidas_country:
         from udata.core.user.constants import (
             AUTH_CITIZEN_DECLARED,
             AUTH_DOC_NATIONALITY,
             AUTH_DOC_TYPE,
+            AUTH_EIDAS_ORIGIN_COUNTRY,
             AUTH_PROVIDER,
         )
 
@@ -1552,6 +1608,12 @@ def _handle_saml_user_login(
             incoming[AUTH_DOC_TYPE] = doc_type
         if doc_nationality:
             incoming[AUTH_DOC_NATIONALITY] = doc_nationality
+        # The one and only way an account that predates this key ever gains it.
+        # There is no backfill -- the identifier survives solely as the digest
+        # -- so an older account gets its country when its OWN owner signs in
+        # again, and never otherwise. Same semantics as the provider above.
+        if eidas_country:
+            incoming[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
 
         # Only what actually differs, so a repeat login is not a repeat write,
         # and one save for both keys rather than one each.
@@ -1656,6 +1718,7 @@ def _handle_migration_redirect(
     provider="cmd",
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Store SAML data in session and redirect to migration page.
 
@@ -1698,6 +1761,10 @@ def _handle_migration_redirect(
         # shape. Two explicit keys cost two short strings in a signed cookie.
         "saml_doc_type": doc_type,
         "saml_doc_nationality": doc_nationality,
+        # Carried for the same reason, and for the path that needs it most:
+        # the wizard creates its account outside any login funnel, so without
+        # this the country is simply gone by the time there is an account.
+        "saml_eidas_origin_country": eidas_country,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -1802,6 +1869,7 @@ def _issue_migration_link(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
     origin=None,
     placeholder_id=None,
 ):
@@ -1852,6 +1920,8 @@ def _issue_migration_link(
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_TYPE] = doc_type
     if doc_nationality:
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_NATIONALITY] = doc_nationality
+    if eidas_country:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY] = eidas_country
 
     # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
     # outstanding sessions (LEDG-2134), and a password reset rotates it too,
@@ -1871,6 +1941,7 @@ def _link_identity_and_login(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Bind the authenticated identity to ``user`` and start its session.
 
@@ -1890,6 +1961,7 @@ def _link_identity_and_login(
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -1909,6 +1981,8 @@ def _link_identity_and_login(
         user.extras[AUTH_DOC_TYPE] = doc_type
     if doc_nationality:
         user.extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    if eidas_country:
+        user.extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
     if first_name:
         user.first_name = first_name.title()
     if last_name:
@@ -2398,6 +2472,7 @@ def _mail_registration_association_link(requester, target):
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -2434,6 +2509,7 @@ def _mail_registration_association_link(requester, target):
         # provider: a placeholder created before this field existed has none.
         doc_type=extras.get(AUTH_DOC_TYPE),
         doc_nationality=extras.get(AUTH_DOC_NATIONALITY),
+        eidas_country=extras.get(AUTH_EIDAS_ORIGIN_COUNTRY),
         origin=MIGRATION_LINK_ORIGIN_REGISTRATION,
         placeholder_id=requester.id,
     )
@@ -2499,6 +2575,7 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
         # keys existed names no document, and none is invented for it.
         doc_type=pending.get("saml_doc_type"),
         doc_nationality=pending.get("saml_doc_nationality"),
+        eidas_country=pending.get("saml_eidas_origin_country"),
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
@@ -3421,6 +3498,7 @@ def idp_eidas_initiated():
     user_nic = None
     first_name = None
     last_name = None
+    eidas_country = None
     authn_response = None
 
     raw_saml_response = request.form.get("SAMLResponse")
@@ -3573,9 +3651,16 @@ def idp_eidas_initiated():
                 id_source = "eidas-friendly"
             else:
                 id_source = None
+            # Read beside the identifier, never instead of it: what goes into
+            # the digest below is `user_nic` verbatim. Named in the log because
+            # a member state is not personal data -- the identifier itself
+            # stays masked -- and because a country that comes back None here
+            # is the only way a shape we did not anticipate becomes visible.
+            eidas_country = _eidas_origin_country(user_nic)
             current_app.logger.info(
                 f"eIDAS atributos via pysaml2: email={user_email}, "
                 f"id={'***' if user_nic else None} (source={id_source}), "
+                f"origin_country={eidas_country}, "
                 f"nome={first_name} {last_name}, "
                 f"identity_keys={list(identity.keys())}, "
                 f"name_id_format={name_id_format!r}"
@@ -3674,12 +3759,18 @@ def idp_eidas_initiated():
                 last_name,
                 no_match=(status == "no_match"),
                 provider="eidas",
+                eidas_country=eidas_country,
             )
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
         # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(
-            user_email, user_nic, first_name, last_name, provider=AUTH_PROVIDER_EIDAS
+            user_email,
+            user_nic,
+            first_name,
+            last_name,
+            provider=AUTH_PROVIDER_EIDAS,
+            eidas_country=eidas_country,
         )
         status = "new"
 
@@ -3711,6 +3802,7 @@ def idp_eidas_initiated():
         user,
         new_account=(status == "new"),
         provider=AUTH_PROVIDER_EIDAS,
+        eidas_country=eidas_country,
         kind="eidas",
         issuer=issuer,
         name_id=name_id_value,
@@ -4056,6 +4148,7 @@ def _complete_registration_association(target, record):
         citizen_declared=record.get("citizen_declared"),
         doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
         doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
+        eidas_country=record.get(MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY),
     )
 
     if placeholder:
@@ -4199,6 +4292,7 @@ def migration_confirm_link(token):
         citizen_declared=record.get("citizen_declared"),
         doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
         doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
+        eidas_country=record.get(MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY),
     )
     current_app.logger.info(f"Migration completed by validation link for user {user.id}")
 
@@ -4451,6 +4545,7 @@ def migration_skip():
             # here the account is created without them.
             doc_type=pending.get("saml_doc_type"),
             doc_nationality=pending.get("saml_doc_nationality"),
+            eidas_country=pending.get("saml_eidas_origin_country"),
         )
 
     send_confirmation_instructions(user)
