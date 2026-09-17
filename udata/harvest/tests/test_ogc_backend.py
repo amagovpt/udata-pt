@@ -1,7 +1,9 @@
 import json
+import os
 
 import pytest
 
+from udata.core.dataset.models import Resource
 from udata.core.organization.factories import OrganizationFactory
 from udata.models import ContactPoint, Dataset
 from udata.tests.api import PytestOnlyDBTestCase
@@ -388,4 +390,115 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
 
         assert [(r.title, r.format, r.url) for r in dataset.resources] == [
             ("Schema of collection in JSON", "SCHEMA+JSON", SCHEMA_URL)
+        ]
+
+
+TML_COLLECTION = os.path.join(os.path.dirname(__file__), "ogc", "tml_collection.jsonld")
+
+# The seven the backend used to catalogue, in source order. The four that are
+# dropped come first so the assertions below read as "these go, those stay".
+TML_DROPPED_URLS = [
+    "https://geoportal.tmlmobilidade.pt/ogc-api?f=json",
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento?f=json",
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento?f=jsonld",
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/"
+    "cml_ciclovia_estacionamento/queryables?f=json",
+]
+TML_ITEMS_GEOJSON_URL = (
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/"
+    "cml_ciclovia_estacionamento/items?f=json"
+)
+TML_ITEMS_JSONLD_URL = (
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/"
+    "cml_ciclovia_estacionamento/items?f=jsonld"
+)
+TML_SCHEMA_URL = (
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/"
+    "cml_ciclovia_estacionamento/schema?f=json"
+)
+
+
+def _tml_item(title="Rede Clicável"):
+    """One real TML collection, recorded from the source, under a given title.
+
+    Recorded rather than transcribed: a hand-written copy of thirteen
+    distributions can agree with wrong code precisely in the `description`
+    field the selection reads.
+    """
+    with open(TML_COLLECTION, encoding="utf-8") as recorded:
+        collection = json.load(recorded)
+    collection["@id"] = "a"
+    collection["name"] = title
+    return collection
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCTMLPayloadTest(PytestOnlyDBTestCase):
+    """The selection and the renaming, read against the source's own payload."""
+
+    def _harvest(self, rmock, source, title="Rede Clicável"):
+        rmock.get(OGC_URL, text=_ogc_payload([_tml_item(title)]))
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_the_recorded_collection_still_has_thirteen_distributions(self):
+        """The fixture is only evidence while it matches what was recorded."""
+        item = _tml_item()
+
+        assert len(item["distribution"]) == 13
+        assert all(dist.get("name") is None for dist in item["distribution"])
+
+    def test_tml_payload_yields_the_three_expected_resources(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+
+        dataset = self._harvest(rmock, source)
+
+        assert [(r.title, r.format, r.url) for r in dataset.resources] == [
+            ("Schema of collection in JSON", "SCHEMA+JSON", TML_SCHEMA_URL),
+            ("Rede Clicável como GeoJSON", "GeoJSON", TML_ITEMS_GEOJSON_URL),
+            ("Rede Clicável como RDF (GeoJSON-LD)", "JSON-LD", TML_ITEMS_JSONLD_URL),
+        ]
+
+    def test_first_harvest_after_deploy_drops_four_and_keeps_three_ids(self, rmock):
+        """The transition the datasets in production actually go through.
+
+        They already hold the seven resources the old code created, so the run
+        that matters is the second one: four permalinks go, and the three that
+        stay have to be the same resources, not new ones wearing new ids.
+        """
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+        # Seed the four the old code also created. `filetype="remote"` is the
+        # value the backend writes; left at the `Resource` default of "file"
+        # they would read as portal uploads and be preserved on purpose.
+        for url in TML_DROPPED_URLS:
+            dataset.resources.append(Resource(title="Old", url=url, filetype="remote"))
+        dataset.save()
+        dataset.reload()
+        assert len(dataset.resources) == 7
+        kept_ids = {r.url: r.id for r in dataset.resources if r.url not in TML_DROPPED_URLS}
+
+        dataset = self._harvest(rmock, source)
+
+        assert [r.url for r in dataset.resources] == [
+            TML_SCHEMA_URL,
+            TML_ITEMS_GEOJSON_URL,
+            TML_ITEMS_JSONLD_URL,
+        ]
+        assert {r.url: r.id for r in dataset.resources} == kept_ids
+
+    def test_a_manual_upload_survives_the_transition(self, rmock):
+        """Resources uploaded on the portal never belonged to the harvester."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+        dataset.resources.append(
+            Resource(title="Ficheiro carregado à mão", url=CSV_URL, filetype="file")
+        )
+        dataset.save()
+
+        dataset = self._harvest(rmock, source)
+
+        assert [r.title for r in dataset.resources if r.filetype == "file"] == [
+            "Ficheiro carregado à mão"
         ]

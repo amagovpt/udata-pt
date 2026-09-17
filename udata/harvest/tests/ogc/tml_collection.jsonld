@@ -1,0 +1,118 @@
+{
+  "@type": "Dataset",
+  "@id": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento",
+  "name": "Estacionamento para Velocípedes",
+  "description": "Serviço de mapa de área de zonamento de mobilidade em Lisboa. Map service of mobility zoning area in Lisbon.",
+  "license": "https://creativecommons.org/licenses/by/4.0/",
+  "keywords": [
+    "Portugal",
+    "Lisboa",
+    "Ciclovia",
+    "TML"
+  ],
+  "spatial": [
+    {
+      "@type": "Place",
+      "geo": {
+        "@type": "GeoShape",
+        "box": "-9.4972,38.4194 -8.4575,39.0792"
+      }
+    }
+  ],
+  "temporalCoverage": "None/None",
+  "url": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento",
+  "distribution": [
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geodados-cml.hub.arcgis.com/search",
+      "encodingFormat": "text/html",
+      "description": "Fonte de Dados",
+      "inLanguage": "pt-PT",
+      "author": "author"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api?f=json",
+      "encodingFormat": "application/json",
+      "description": "The landing page of this server as JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api?f=html",
+      "encodingFormat": "text/html",
+      "description": "The landing page of this server as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento?f=json",
+      "encodingFormat": "application/json",
+      "description": "This document as JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento?f=jsonld",
+      "encodingFormat": "application/ld+json",
+      "description": "This document as RDF (JSON-LD)",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento?f=html",
+      "encodingFormat": "text/html",
+      "description": "This document as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/schema?f=json",
+      "encodingFormat": "application/schema+json",
+      "description": "Schema of collection in JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/schema?f=html",
+      "encodingFormat": "text/html",
+      "description": "Schema of collection in HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/queryables?f=json",
+      "encodingFormat": "application/schema+json",
+      "description": "Queryables for this collection as JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/queryables?f=html",
+      "encodingFormat": "text/html",
+      "description": "Queryables for this collection as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/items?f=json",
+      "encodingFormat": "application/geo+json",
+      "description": "Items as GeoJSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/items?f=jsonld",
+      "encodingFormat": "application/ld+json",
+      "description": "Items as RDF (GeoJSON-LD)",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento/items?f=html",
+      "encodingFormat": "text/html",
+      "description": "Items as HTML",
+      "inLanguage": "en-US"
+    }
+  ]
+}
