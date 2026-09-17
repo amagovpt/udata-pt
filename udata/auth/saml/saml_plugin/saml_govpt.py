@@ -2394,7 +2394,12 @@ def _mail_registration_association_link(requester, target):
     if not allowed:
         return False
 
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     # From the session's assertion, NEVER from requester.first_name. The
     # profile form lets any account rewrite its own name, and this name is
@@ -2422,6 +2427,13 @@ def _mail_registration_association_link(requester, target):
         # that predates the field would be a worse answer than none.
         provider=extras.get(AUTH_PROVIDER),
         citizen_declared=extras.get(AUTH_CITIZEN_DECLARED),
+        # Read from the requester -- the placeholder -- and not the session,
+        # unlike the names above. These are not interpolated into any mail:
+        # they describe the identity, and the requester is where the sign-in
+        # that minted it wrote them. Bare gets for the same reason as the
+        # provider: a placeholder created before this field existed has none.
+        doc_type=extras.get(AUTH_DOC_TYPE),
+        doc_nationality=extras.get(AUTH_DOC_NATIONALITY),
         origin=MIGRATION_LINK_ORIGIN_REGISTRATION,
         placeholder_id=requester.id,
     )
@@ -4042,6 +4054,8 @@ def _complete_registration_association(target, record):
         record.get("last_name"),
         provider=record.get("provider"),
         citizen_declared=record.get("citizen_declared"),
+        doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
+        doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
     )
 
     if placeholder:

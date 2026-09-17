@@ -4910,6 +4910,72 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert "URGENT" not in body
         assert "800-000-000" not in body
 
+    def test_the_association_click_records_the_document_on_the_target(self):
+        """LEDG-2508: the account the association lands on keeps the document.
+
+        A foreign citizen is held on the completion screen behind a
+        placeholder, and gives an address that already belongs to an account
+        of theirs. The click moves the identity onto that older account -- and
+        until now moved ONLY the identity, leaving the older account described
+        as having no document at all.
+
+        The document is read from the placeholder rather than the session,
+        unlike the names in that mail: it is not interpolated into anything,
+        and the placeholder is where the sign-in that minted the identity
+        wrote it. The placeholder is built with those keys here for the same
+        reason the helper builds the identity by hand -- what puts them there
+        in a real sign-in is proved by its own test.
+        """
+        from flask import url_for
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self.login(
+            UserFactory(
+                email="saml-cafe1234@autenticacao.gov.pt",
+                password=None,
+                extras={
+                    "auth_nic": _hash_nic("MDC/DR/PT/DR9081726"),
+                    "auth_provider": "cmd",
+                    "auth_doc_type": "DR",
+                    "auth_doc_nationality": "PT",
+                },
+                first_name="Nuno",
+                last_name="Barros",
+            )
+        )
+        target = UserFactory(
+            email="nuno-antigo@example.pt",
+            password="S3cretPass!",
+            first_name="Nuno",
+            last_name="Barros",
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.post(
+                    url_for("security.change_email"),
+                    {
+                        "new_email": target.email,
+                        "new_email_confirm": target.email,
+                        "submit": True,
+                    },
+                    json=False,
+                ).status_code
+                == 302
+            )
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        fresh = self.app.test_client()
+        assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+
+        target.reload()
+        assert target.extras["auth_doc_type"] == "DR", (
+            "the association moved the identity but left the document behind"
+        )
+        assert target.extras["auth_doc_nationality"] == "PT"
+
     def test_registration_link_click_refuses_when_placeholder_gained_content(self):
         """What the citizen did while the mail sat in the inbox still counts.
 
