@@ -21,12 +21,17 @@ The same `check_harvest_url()` helper is reused inside the backend fetch
 path as a defense-in-depth check against DNS rebinding (URL passed form
 validation but the hostname resolves elsewhere at fetch time).
 
-This module also owns `redact_url_credentials()`, the counterpart concern:
-`URLS_ALLOW_CREDENTIALS` is true, so a harvest source URL may legitimately
-carry `user:password@`. Anything derived from such a URL that is later served
+This module also owns the credentials concern, in two halves.
+`check_harvest_url_credentials()` rejects a NEW harvest source URL that carries
+`user:password@` (LEDG-2502); `URLS_ALLOW_CREDENTIALS` stays true, because it
+governs every URL in the portal and only this field needed closing.
+
+`redact_url_credentials()` and its `_in_url` variant remain for everything the
+rejection cannot reach: a URL stored before it, and anything derived from one
 -- a harvest error message, the source url copied onto a harvested
-dataservice, a resource URL or a remote id a backend builds out of it -- must
-have that userinfo removed first. See LEDG-2477 and LEDG-2500.
+dataservice, a resource URL or a remote id a backend builds out of it -- which
+must have that userinfo removed before it is served. See LEDG-2477 and
+LEDG-2500.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 from flask import current_app
 
 from udata.i18n import lazy_gettext as _
+from udata.uris import URL_REGEX
 
 
 class HarvestURLForbidden(ValueError):
@@ -159,3 +165,68 @@ def redact_url_credentials_in_url(url: str | None) -> str | None:
     # `rpartition` so that a password holding an unencoded `@` goes whole.
     _, _, host = netloc.rpartition("@")
     return urlunsplit(parts._replace(netloc=f"***@{host}"))
+
+
+def check_harvest_url_credentials(url: str) -> None:
+    """Raise `HarvestURLForbidden` if the URL carries userinfo (`user:pass@`).
+
+    The counterpart of `check_harvest_url` for the other half of the URL: that
+    one gates the host, this one gates what precedes it. Both are pure, both
+    run before `udata.uris.validate` resolves anything.
+
+    `URLS_ALLOW_CREDENTIALS` stays true — it is read by `udata.uris.validate`
+    for every URL in the portal (a user or organization website, a dataset
+    schema url, a resource url, an RDF URI), and turning it off would reject
+    those too. The decision here is scoped to the one field that made storing a
+    password a problem: a harvest source URL is indexed and serialized by
+    several paths, and LEDG-2477 had to close them one by one. See LEDG-2502.
+
+    Not `udata.uris.validate(url, credentials=False)`, which would be shorter:
+    `udata.uris.error` composes `Invalid URL "{url}": {reason}`, so the 400 body
+    would repeat the password back. The caller typed it, but a validation error
+    is no place to echo it.
+
+    The whole userinfo is rejected, username alone included: in many services
+    the username *is* the secret (an API token used as the basic-auth user).
+
+    The rule is `udata.uris`'s own: this rejects exactly what
+    `uris.validate(url, credentials=False)` would reject, judged by the same
+    `URL_REGEX` group. Anything that parser reads as userinfo is refused, so
+    the field behaves as though `URLS_ALLOW_CREDENTIALS` were false for it
+    alone.
+
+    Deliberately not `urlsplit`'s reading, which was the first attempt and had
+    a hole exactly where the two parsers disagree: `urlsplit` cuts the fragment
+    and the query off before the netloc, so `https://user:pa#ss@host/x` leaves
+    it a netloc of `user:pa` with no `@` in it at all -- while `URL_REGEX`
+    reads `user:pa#ss@` as credentials and lets the value be stored. A password
+    holding a `#`, a `?` or a `/` therefore got through, and every redaction
+    downstream shares `urlsplit`'s blind spot, so it was then served in full
+    instead of masked. The guard and its safety net failed together rather than
+    in layers.
+
+    The cost of using the wider reading is that an `@` in the path or the query
+    is refused too, because `URL_REGEX` calls that userinfo as well. Of the 49
+    harvest sources in production, none carries an `@` anywhere in its URL.
+    """
+    if not url or "@" not in url:
+        return
+    url = url.strip()
+
+    match = URL_REGEX.match(url)
+    if match and match.group("credentials"):
+        raise HarvestURLForbidden(_("Credentials in URL are not allowed"))
+
+    # Second net, for a shape `URL_REGEX` does not match at all but `urlsplit`
+    # still reads an authority out of.
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        # Not parseable as a URL, so there is no authority to judge. Nothing is
+        # waved through: `check_harvest_url` runs next on the same value and
+        # `urlparse` fails on it too, which rejects it as an invalid source
+        # URL. Falling back to `_URL_USERINFO_RE` here would only change that
+        # message, and would run a quadratic scan over caller-supplied input.
+        return
+    if "@" in netloc:
+        raise HarvestURLForbidden(_("Credentials in URL are not allowed"))

@@ -225,10 +225,18 @@ class HarvestSource(Owned, Document[HarvestSourceQuerySet]):
 
     meta = {
         "indexes": [
+            # `url` is deliberately out of the text index. While it was in,
+            # `?q=<password>` on the public sources route returned the source
+            # that carried that password -- a confirmation oracle for anyone
+            # who had guessed one (LEDG-2477, LEDG-2502). A source URL can no
+            # longer be stored with credentials, and what was stored before
+            # stays out of reach of the search. Changing these fields needs the
+            # migration that drops the old index: MongoDB allows one text index
+            # per collection, so the two cannot coexist.
             {
-                "fields": ["$name", "$url"],
+                "fields": ["$name"],
                 "default_language": "french",
-                "weights": {"name": 10, "url": 5},
+                "weights": {"name": 10},
             },
             "-created_at",
             "slug",

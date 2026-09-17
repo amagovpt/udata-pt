@@ -23,7 +23,7 @@ from .models import (
     HarvestJob,
     HarvestSource,
 )
-from .url_filter import redact_url_credentials
+from .url_filter import redact_url_credentials, redact_url_credentials_in_url
 
 ns = api.namespace("harvest", "Harvest related operations")
 
@@ -230,15 +230,16 @@ source_fields = api.model(
         "id": fields.String(description="The source unique identifier", readonly=True),
         "name": fields.String(description="The source display name", required=True),
         "description": fields.Markdown(description="The source description"),
-        # URLS_ALLOW_CREDENTIALS lets this URL carry user:password@, and both
-        # GET routes that serve this model are open to anonymous callers. The
+        # A URL stored before credentials were rejected may still carry
+        # user:password@, and both GET routes that serve this model are open
+        # to anonymous callers. The
         # gate is the one that guards PUT, so whoever may rewrite the URL still
         # reads it whole and nobody else does -- and no client can round-trip
         # the mask back into the record (LEDG-2477).
         "url": fields.String(
             attribute=lambda s: s.url
             if s.permissions["edit"].can()
-            else redact_url_credentials(s.url),
+            else redact_url_credentials_in_url(s.url),
             description="The source base URL",
             required=True,
         ),
@@ -453,11 +454,10 @@ class SourceAPI(API):
         account, and anyone can create one, so a registered reader would have
         seen exactly what an anonymous one did.
 
-        One residue is known and accepted: `HarvestSource` carries a text
-        index over `$name, $url` and this namespace accepts `q`, so a caller
-        who already guessed a credential can still confirm it
-        (`?q=<password>` returns the source) -- a confirmation oracle, not a
-        disclosure.
+        The confirmation oracle that used to be accepted here is gone: the
+        text index no longer covers `url`, so `?q=<password>` matches nothing,
+        and a source URL can no longer be stored with credentials at all
+        (LEDG-2502).
 
         `odspt` and `maaf` used to build public dataset resource URLs and
         remote ids out of the source URL, which is the same defect in a place
@@ -465,7 +465,7 @@ class SourceAPI(API):
         redacting anyway: a link that only works because it carries somebody
         else's password is the defect, not a feature.
 
-        See LEDG-2477 and LEDG-2500.
+        See LEDG-2477, LEDG-2500 and LEDG-2502.
         """
         return source
 
