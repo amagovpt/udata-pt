@@ -65,6 +65,26 @@ jobs:
       - name: Format
         run: uv run ruff format --check .
 
+      # Prints, never fails. LEDG-2489: the test MongoDB died mid-run of file
+      # descriptor exhaustion against Docker's default ceiling of 1024, and the
+      # only reason anyone found out was reading the server's own startup
+      # warning. This runner inherits whatever limit the runtime gives, so the
+      # value is recorded on every run rather than assumed. The startup warning
+      # is the authority: mongod emits it whenever the soft limit is under its
+      # recommended minimum, and its absence is itself the answer.
+      - name: Mongo file descriptor limits
+        run: |
+          docker exec "$(docker ps -qf ancestor=mongo:7.0.28)" \
+            sh -c 'cat /proc/1/limits | grep -i "open files"' || true
+          uv run python - <<'PY' || true
+          import pymongo
+          warnings = pymongo.MongoClient("localhost", 27019).admin.command(
+              {"getLog": "startupWarnings"}
+          )["log"]
+          hits = [line for line in warnings if "rlimit" in line.lower()]
+          print("\n".join(hits) if hits else "no rlimit startup warning (soft limit is adequate)")
+          PY
+
       - name: Test suite
         run: uv run inv test --ci
 

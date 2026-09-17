@@ -116,6 +116,23 @@ jobs:
             export ELASTICSEARCH_URL=http://localhost:9200
             export UDATA_INSTANCE_NAME=udata-test
             uv run udata-search-service init-es
+      # Prints, never fails. LEDG-2489: the test MongoDB died mid-run of file
+      # descriptor exhaustion against Docker's default ceiling of 1024, and the
+      # only reason anyone found out was reading the server's own startup
+      # warning. There is no shell into a secondary container here, so the
+      # server is asked directly -- it emits that warning whenever its soft
+      # limit is under the recommended minimum, and its absence is the answer.
+      - run:
+          name: Mongo file descriptor limits
+          command: |
+            uv run python - <<'EOF' || true
+            import pymongo
+            warnings = pymongo.MongoClient("localhost", 27017).admin.command(
+                {"getLog": "startupWarnings"}
+            )["log"]
+            hits = [line for line in warnings if "rlimit" in line.lower()]
+            print("\n".join(hits) if hits else "no rlimit startup warning (soft limit is adequate)")
+            EOF
       - run:
           name: Run tests
           environment:
