@@ -10,6 +10,7 @@ from udata.models import Dataset, PeriodicTask
 
 from . import actions
 from .models import HarvestSource
+from .url_filter import redact_url_credentials_in_url
 
 log = logging.getLogger(__name__)
 
@@ -33,15 +34,27 @@ def create(name, url, backend, frequency=None, owner=None, org=None):
     source = actions.create_source(
         name, url, backend, frequency=frequency, owner=owner, organization=org
     )
+    # This command writes a source straight through `actions.create_source`,
+    # so a URL the form would now refuse can still be stored here. Whoever runs
+    # it has a shell and could write to the database anyway -- but the log file
+    # is read by more people than that, so the URL is redacted (LEDG-2502).
     log.info(
         """Created a new Harvest source:
-    name: {0.name},
-    slug: {0.slug},
-    url: {0.url},
-    backend: {0.backend},
-    frequency: {0.frequency},
-    owner: {0.owner},
-    organization: {0.organization}""".format(source)
+    name: {name},
+    slug: {slug},
+    url: {url},
+    backend: {backend},
+    frequency: {frequency},
+    owner: {owner},
+    organization: {organization}""".format(
+            name=source.name,
+            slug=source.slug,
+            url=redact_url_credentials_in_url(source.url),
+            backend=source.backend,
+            frequency=source.frequency,
+            owner=source.owner,
+            organization=source.organization,
+        )
     )
 
 
