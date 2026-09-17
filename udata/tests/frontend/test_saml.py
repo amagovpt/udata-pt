@@ -6607,6 +6607,111 @@ class SAMLAuthProviderWizardTest(APITestCase):
         assert legacy.extras["auth_doc_type"] == "CR"
         assert legacy.extras["auth_doc_nationality"] == "PT"
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_link_completed_account_carries_the_eidas_origin_country(
+        self, mock_client_for, mock_send
+    ):
+        """LEDG-2511, in the shape of the two tests above.
+
+        The click arrives with no session at all -- possibly in another
+        browser -- so the record written when the link was issued is the only
+        thing that knows which member state asserted the identity. Clicked
+        from a fresh client to make that real rather than incidental.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy = UserFactory(
+            email="giulia@example.pt",
+            password="S3cretPass!",
+            first_name="Giulia",
+            last_name="Rossi",
+        )
+
+        self._eidas_sso_with(
+            mock_client_for,
+            person_identifier=self.PERSON_ID,
+            given_name="Giulia",
+            family_name="Rossi",
+        )
+        assert (
+            self.client.post(
+                "/saml/migration/confirm",
+                json={"method": "password", "email": legacy.email, "password": "S3cretPass!"},
+            ).status_code
+            == 200
+        )
+
+        # The record carries it before the click, which is the whole point.
+        legacy.reload()
+        assert legacy.extras[MIGRATION_LINK_PENDING]["eidas_origin_country"] == "IT"
+
+        fresh = self.app.test_client()
+        assert (
+            fresh.get(f"/saml/migration/confirm-link/{self._mailed_token(mock_send)}").status_code
+            == 302
+        )
+
+        legacy.reload()
+        assert legacy.extras["auth_eidas_origin_country"] == "IT"
+
+    def test_the_association_click_records_the_eidas_origin_country(self):
+        """The OTHER consumer of the click, which mutation testing exposed.
+
+        🚩 Removing the read in the association path left the test above green:
+        it exercises the validation-link route, not this one. Two consumers
+        read the same record and only one was covered — the same shape of gap
+        that lets a path be implemented by symmetry and never proved by it.
+
+        Here the citizen is held on the completion screen behind a placeholder
+        and gives an address that already belongs to an account of theirs; the
+        click moves the identity, and must move the country with it.
+        """
+        from flask import url_for
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self.login(
+            UserFactory(
+                email="saml-b0bacafe@autenticacao.gov.pt",
+                password=None,
+                extras={
+                    "auth_nic": _hash_nic(self.PERSON_ID),
+                    "auth_provider": "eidas",
+                    "auth_eidas_origin_country": "IT",
+                },
+                first_name="Giulia",
+                last_name="Rossi",
+            )
+        )
+        target = UserFactory(email="giulia-antiga@example.pt", password="S3cretPass!")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.post(
+                    url_for("security.change_email"),
+                    {
+                        "new_email": target.email,
+                        "new_email_confirm": target.email,
+                        "submit": True,
+                    },
+                    json=False,
+                ).status_code
+                == 302
+            )
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        fresh = self.app.test_client()
+        assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+
+        target.reload()
+        assert target.extras["auth_eidas_origin_country"] == "IT", (
+            "the association moved the identity but left the country behind"
+        )
+        assert User.objects(id=target.id).first().extras["auth_nic"] == _hash_nic(self.PERSON_ID)
+
 
 class SAMLDeclaredCitizenTypeTest(APITestCase):
     """`extras.auth_citizen_declared` holds what the citizen said on the login

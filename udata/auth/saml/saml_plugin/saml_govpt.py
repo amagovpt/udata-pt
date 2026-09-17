@@ -1080,6 +1080,7 @@ MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
 # is the record's own vocabulary, and the two are free to diverge.
 MIGRATION_LINK_DOC_TYPE = "doc_type"
 MIGRATION_LINK_DOC_NATIONALITY = "doc_nationality"
+MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY = "eidas_origin_country"
 
 
 def _declared_citizen():
@@ -1868,6 +1869,7 @@ def _issue_migration_link(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
     origin=None,
     placeholder_id=None,
 ):
@@ -1918,6 +1920,8 @@ def _issue_migration_link(
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_TYPE] = doc_type
     if doc_nationality:
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_NATIONALITY] = doc_nationality
+    if eidas_country:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY] = eidas_country
 
     # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
     # outstanding sessions (LEDG-2134), and a password reset rotates it too,
@@ -1937,6 +1941,7 @@ def _link_identity_and_login(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Bind the authenticated identity to ``user`` and start its session.
 
@@ -1956,6 +1961,7 @@ def _link_identity_and_login(
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -1975,6 +1981,8 @@ def _link_identity_and_login(
         user.extras[AUTH_DOC_TYPE] = doc_type
     if doc_nationality:
         user.extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    if eidas_country:
+        user.extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
     if first_name:
         user.first_name = first_name.title()
     if last_name:
@@ -2464,6 +2472,7 @@ def _mail_registration_association_link(requester, target):
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -2500,6 +2509,7 @@ def _mail_registration_association_link(requester, target):
         # provider: a placeholder created before this field existed has none.
         doc_type=extras.get(AUTH_DOC_TYPE),
         doc_nationality=extras.get(AUTH_DOC_NATIONALITY),
+        eidas_country=extras.get(AUTH_EIDAS_ORIGIN_COUNTRY),
         origin=MIGRATION_LINK_ORIGIN_REGISTRATION,
         placeholder_id=requester.id,
     )
@@ -2565,6 +2575,7 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
         # keys existed names no document, and none is invented for it.
         doc_type=pending.get("saml_doc_type"),
         doc_nationality=pending.get("saml_doc_nationality"),
+        eidas_country=pending.get("saml_eidas_origin_country"),
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
@@ -4137,6 +4148,7 @@ def _complete_registration_association(target, record):
         citizen_declared=record.get("citizen_declared"),
         doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
         doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
+        eidas_country=record.get(MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY),
     )
 
     if placeholder:
@@ -4280,6 +4292,7 @@ def migration_confirm_link(token):
         citizen_declared=record.get("citizen_declared"),
         doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
         doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
+        eidas_country=record.get(MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY),
     )
     current_app.logger.info(f"Migration completed by validation link for user {user.id}")
 
