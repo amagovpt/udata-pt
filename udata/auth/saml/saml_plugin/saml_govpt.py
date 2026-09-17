@@ -562,6 +562,44 @@ EIDAS_ATTR_FAMILY_NAME = "http://eidas.europa.eu/attributes/naturalperson/Curren
 # The MDC/Cidadao URIs are in no map, which is why they stay as raw URIs
 # (allow_unknown_attributes) and the CMD lookups match while URI-based eIDAS
 # lookups do not. Extraction must therefore try both forms.
+# The shape the eIDAS profile recommends for a PersonIdentifier. Matched whole,
+# and deliberately without stripping, upper-casing or any other tidying: the
+# country has to describe the identifier EXACTLY as it is hashed, and anything
+# else would be guessing.
+_EIDAS_PERSON_IDENTIFIER_SHAPE = re.compile(r"([A-Z]{2})/[A-Z]{2}/.+")
+
+
+def _eidas_origin_country(identifier):
+    """The member state that asserted this identity, or None.
+
+    Read-only over the identifier: this NEVER modifies it, because the
+    identifier is the pre-image of the one-way digest every sign-in resolves
+    accounts by. The country is extracted beside it, never instead of it.
+
+    🚩 The shape is a RECOMMENDATION of the eIDAS profile, not a guarantee, and
+    we have exactly one real sample to go on. So the rule is deliberately
+    strict and everything that does not match returns None rather than a guess:
+
+      - a NIC (digits only), which the eIDAS route accepts
+      - "MDC/..." -- three letters, so a foreign citizen's CMD identifier
+        cannot be mistaken for a country code
+      - lower case, a missing id segment, surrounding whitespace
+
+    In every one of those the sign-in proceeds untouched; only the country is
+    absent. A member state that turns out to emit a different shape gets no
+    country until someone decides what that shape means -- admitting a form
+    later is trivial, and telling two forms apart afterwards is not.
+
+    It also leaves alone the invariant _find_or_create_saml_user documents:
+    nothing here adds a fourth identity format, and this pattern cannot match
+    either of the other two.
+    """
+    if not identifier:
+        return None
+    match = _EIDAS_PERSON_IDENTIFIER_SHAPE.fullmatch(identifier)
+    return match.group(1) if match else None
+
+
 EIDAS_FRIENDLY_PERSON_IDENTIFIER = "PersonIdentifier"
 EIDAS_FRIENDLY_GIVEN_NAME = "FirstName"
 EIDAS_FRIENDLY_FAMILY_NAME = "FamilyName"

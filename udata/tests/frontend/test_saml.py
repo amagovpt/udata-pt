@@ -1487,6 +1487,59 @@ class SAMLVuln2077RegressionTest(APITestCase):
         assert response.status_code == 302
 
 
+class SAMLEidasCountryExtractionTest(APITestCase):
+    """LEDG-2511: the member state that asserted an eIDAS identity.
+
+    The eIDAS profile RECOMMENDS the PersonIdentifier be shaped
+    "<origin>/<destination>/<id>" -- a Czech citizen arrives as "CZ/PT/<uuid>".
+    That country reaches us on every sign-in and is then lost: what gets stored
+    is the one-way digest, so nothing downstream can recover it.
+
+    🚩 A recommendation is not a guarantee, and we have one real sample. These
+    tests pin the rule as deliberately strict: anything that is not exactly the
+    recommended shape yields no country at all, and the caller writes nothing.
+    """
+
+    def test_extracts_only_the_exact_recommended_shape(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country("CZ/PT/bfd584e2-7ad1-4375-8803-8db6c96a524c") == "CZ"
+        assert _eidas_origin_country("ES/PT/1234567890") == "ES"
+
+    def test_a_nic_yields_no_country(self):
+        """The eIDAS route accepts a NIC -- its extraction tries the MDC
+        attribute first -- and a NIC carries no country. Inventing one here
+        would turn digits into a member state."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country("12345678") is None
+
+    def test_a_foreign_cmd_identifier_yields_no_country(self):
+        """🚨 The invariant _find_or_create_saml_user documents, from the other
+        side. "MDC" is three letters precisely so a foreign citizen's CMD
+        identifier can never be read as a country code -- and two of the four
+        document types ARE valid alpha-2 codes."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country("MDC/TR/PT/X9912345") is None
+
+    def test_anything_short_of_the_shape_yields_no_country(self):
+        """No stripping, no upper-casing, no guessing. A member state emitting
+        something else gets no country until someone decides what it means --
+        admitting a form later is trivial, telling two apart afterwards is not.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        for identifier in ("cz/pt/abc", "CZ/PT/", "CZ/PT", " CZ/PT/x", "C/PT/x", "CZZ/PT/x"):
+            assert _eidas_origin_country(identifier) is None, identifier
+
+    def test_nothing_in_yields_nothing_out(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country(None) is None
+        assert _eidas_origin_country("") is None
+
+
 class SAMLEidasSSOTest(APITestCase):
     """Success-path coverage for /saml/eidas/sso — parity with CMD.
 
