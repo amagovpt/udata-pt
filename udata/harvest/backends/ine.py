@@ -657,7 +657,11 @@ class INEBackend(BaseBackend):
             )
 
     def _inner_harvest(self):
-        self._log.info("[INE] Iniciando harvester de %s", self.source.url)
+        # Redacted here too: this line runs on every harvest, and an INFO
+        # record also becomes a Sentry breadcrumb (LEDG-2501).
+        self._log.info(
+            "[INE] Iniciando harvester de %s", redact_url_credentials(str(self.source.url))
+        )
         self._log.info(
             "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s, TestMode=%s",
             self.BULK_SIZE,

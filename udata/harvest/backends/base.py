@@ -256,7 +256,12 @@ class BaseBackend(object):
         raise NotImplementedError
 
     def harvest(self):
-        log.debug(f"Starting harvesting {self.source.name} ({self.source.url})…")
+        # The source URL may legitimately carry `user:password@`, and this line
+        # prints it on every run, with no exception involved (LEDG-2501).
+        log.debug(
+            f"Starting harvesting {self.source.name} "
+            f"({redact_url_credentials(str(self.source.url))})…"
+        )
         factory = HarvestJob if self.dryrun else HarvestJob.objects.create
         self.job = factory(status="initialized", started=datetime.now(UTC), source=self.source)
         self.remote_ids = set()
@@ -296,7 +301,8 @@ class BaseBackend(object):
             self.job.errors.append(error)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             log.warning(
-                f'Harvesting connection error for "{safe_unicode(self.source.name)}" ({self.source.backend}): {e}'
+                f'Harvesting connection error for "{safe_unicode(self.source.name)}" '
+                f"({self.source.backend}): {redact_url_credentials(safe_unicode(e))}"
             )
 
             self.job.status = "failed"
@@ -366,7 +372,10 @@ class BaseBackend(object):
             item.errors.append(HarvestError(message=safe_unicode(e)))
         except Exception as e:
             item.status = "failed"
-            log.exception(f"Error while processing {item.remote_id} : {safe_unicode(e)}")
+            log.exception(
+                f"Error while processing {item.remote_id} : "
+                f"{redact_url_credentials(safe_unicode(e))}"
+            )
 
             error = HarvestError(message=safe_unicode(e), details=traceback.format_exc())
             item.errors.append(error)
@@ -426,7 +435,10 @@ class BaseBackend(object):
             item.errors.append(HarvestError(message=safe_unicode(e)))
         except Exception as e:
             item.status = "failed"
-            log.exception(f"Error while processing {item.remote_id} : {safe_unicode(e)}")
+            log.exception(
+                f"Error while processing {item.remote_id} : "
+                f"{redact_url_credentials(safe_unicode(e))}"
+            )
 
             error = HarvestError(message=safe_unicode(e), details=traceback.format_exc())
             item.errors.append(error)
