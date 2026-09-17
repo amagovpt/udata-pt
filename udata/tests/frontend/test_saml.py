@@ -4910,6 +4910,128 @@ class SAMLMigrationLinkClickTest(APITestCase):
         assert "URGENT" not in body
         assert "800-000-000" not in body
 
+    def test_the_association_click_records_the_document_on_the_target(self):
+        """LEDG-2508: the account the association lands on keeps the document.
+
+        A foreign citizen is held on the completion screen behind a
+        placeholder, and gives an address that already belongs to an account
+        of theirs. The click moves the identity onto that older account -- and
+        until now moved ONLY the identity, leaving the older account described
+        as having no document at all.
+
+        The document is read from the placeholder rather than the session,
+        unlike the names in that mail: it is not interpolated into anything,
+        and the placeholder is where the sign-in that minted the identity
+        wrote it. The placeholder is built with those keys here for the same
+        reason the helper builds the identity by hand -- what puts them there
+        in a real sign-in is proved by its own test.
+        """
+        from flask import url_for
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self.login(
+            UserFactory(
+                email="saml-cafe1234@autenticacao.gov.pt",
+                password=None,
+                extras={
+                    "auth_nic": _hash_nic("MDC/DR/PT/DR9081726"),
+                    "auth_provider": "cmd",
+                    "auth_doc_type": "DR",
+                    "auth_doc_nationality": "PT",
+                },
+                first_name="Nuno",
+                last_name="Barros",
+            )
+        )
+        target = UserFactory(
+            email="nuno-antigo@example.pt",
+            password="S3cretPass!",
+            first_name="Nuno",
+            last_name="Barros",
+        )
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.post(
+                    url_for("security.change_email"),
+                    {
+                        "new_email": target.email,
+                        "new_email_confirm": target.email,
+                        "submit": True,
+                    },
+                    json=False,
+                ).status_code
+                == 302
+            )
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        fresh = self.app.test_client()
+        assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+
+        target.reload()
+        assert target.extras["auth_doc_type"] == "DR", (
+            "the association moved the identity but left the document behind"
+        )
+        assert target.extras["auth_doc_nationality"] == "PT"
+
+    def test_an_old_link_record_writes_no_document_keys(self):
+        """LEDG-2508, criterion 5: absent must stay absent.
+
+        🚩 This is the negative half, and it is the one that keeps the change
+        from touching accounts it has no business touching. A record issued
+        before these keys existed — or by a sign-in that carried no document,
+        which is every national — simply has none, and consuming it must leave
+        the target without them rather than writing nulls.
+
+        Built by hand precisely because it cannot be produced any more: the
+        emitting side now always offers the keys when it has them, so an old
+        record is the one shape the current code cannot make.
+        """
+        from flask import url_for
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self.login(
+            UserFactory(
+                email="saml-0ldrec0rd@autenticacao.gov.pt",
+                password=None,
+                # No document keys: a national, or an account from before.
+                extras={"auth_nic": _hash_nic("50607080"), "auth_provider": "cmd"},
+                first_name="Rita",
+                last_name="Santos",
+            )
+        )
+        target = UserFactory(email="rita-sem-doc@example.pt", password="S3cretPass!")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.post(
+                    url_for("security.change_email"),
+                    {
+                        "new_email": target.email,
+                        "new_email_confirm": target.email,
+                        "submit": True,
+                    },
+                    json=False,
+                ).status_code
+                == 302
+            )
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        fresh = self.app.test_client()
+        assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+
+        target.reload()
+        extras = target.extras or {}
+        assert "auth_doc_type" not in extras, "a null was written where there was nothing"
+        assert "auth_doc_nationality" not in extras
+        # The identity still moved: this is a negative test about the document,
+        # not about the link failing to do its job.
+        assert extras["auth_nic"] == _hash_nic("50607080")
+
     def test_registration_link_click_refuses_when_placeholder_gained_content(self):
         """What the citizen did while the mail sat in the inbox still counts.
 
@@ -6259,6 +6381,60 @@ class SAMLAuthProviderWizardTest(APITestCase):
 
         legacy.reload()
         assert legacy.extras[AUTH_PROVIDER] == AUTH_PROVIDER_CMD
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_validation_link_records_the_document_with_no_session(
+        self, mock_client_for, mock_send
+    ):
+        """LEDG-2508, in the shape of the provider test above.
+
+        The click has no session, so the document has to have travelled in the
+        record written when the link was issued. Clicked from a fresh client to
+        make that real rather than incidental.
+
+        A foreign citizen, because that is who has a document instead of a NIC
+        — and the type arrives punctuated, so this pins that what is stored is
+        the normalised value.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy = UserFactory(
+            email="tomas@example.pt",
+            password="S3cretPass!",
+            first_name="Tomas",
+            last_name="Vieira",
+        )
+
+        self._sso_with(
+            mock_client_for,
+            first_name="Tomas",
+            last_name="Vieira",
+            doc_type="CR:",
+            doc_nationality="PT",
+            doc_number="CR5544332",
+        )
+        proof = self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": legacy.email, "password": "S3cretPass!"},
+        )
+        assert proof.status_code == 200
+
+        # The record carries it before the click, which is the whole point.
+        legacy.reload()
+        record = legacy.extras[MIGRATION_LINK_PENDING]
+        assert record["doc_type"] == "CR", "the record carried the raw value"
+        assert record["doc_nationality"] == "PT"
+
+        fresh = self.app.test_client()
+        assert (
+            fresh.get(f"/saml/migration/confirm-link/{self._mailed_token(mock_send)}").status_code
+            == 302
+        )
+
+        legacy.reload()
+        assert legacy.extras["auth_doc_type"] == "CR"
+        assert legacy.extras["auth_doc_nationality"] == "PT"
 
 
 class SAMLDeclaredCitizenTypeTest(APITestCase):
@@ -8282,6 +8458,159 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         still = User.objects(email="gabriel@example.pt").first()
         assert still.id == created.id
         assert still.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_wizard_session_carries_the_normalized_document(
+        self, mock_client_for, _mock_confirm
+    ):
+        """LEDG-2508: the wizard is where the document used to be lost.
+
+        It does not come back through the login funnel in the request that
+        creates the account -- the skip route creates it and returns JSON --
+        and the funnel is the only place that writes these two keys. So they
+        have to travel in the session, or the account is born without them and
+        only gains them on a sign-in that may never happen.
+
+        The type arrives punctuated on purpose. autenticacao.gov sends "PAS:"
+        and not "PAS" (LEDG-2506), and what must reach the session is the
+        clean value -- the same one the identity was composed from.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        response = self._cmd_login(
+            mock_client_for,
+            first_name="Gabriel",
+            last_name="Costa",
+            doc_type="PAS:",
+            doc_nationality="BR",
+            doc_number="BR7788991",
+        )
+        assert response.status_code == 302
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+
+        assert pending["saml_doc_type"] == "PAS", (
+            "the session carried the raw value, so the account it creates will too"
+        )
+        assert pending["saml_doc_nationality"] == "BR"
+        assert pending["saml_nic"] == "MDC/PAS/BR/BR7788991", (
+            "the identity must still compose from the same clean type"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_carries_no_document_into_the_wizard(self, mock_client_for, _mock_confirm):
+        """The guard that keeps the document out when it was not the identity.
+
+        A national's NIC wins the composition, so recording the document would
+        describe something other than what the stored identity holds. The
+        assertion carries both here, which is the case the guard exists for.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        self._cmd_login(
+            mock_client_for,
+            nic="19283746",
+            first_name="Rita",
+            last_name="Nunes",
+            **self.DOC,
+        )
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+
+        assert pending["saml_nic"] == "19283746"
+        assert pending["saml_doc_type"] is None
+        assert pending["saml_doc_nationality"] is None
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_skip_created_account_carries_the_document(self, mock_client_for, _mock_confirm):
+        """LEDG-2508: the account the wizard creates must hold its document.
+
+        🚩 This is the case the funnel cannot cover, and the reason the ticket
+        exists. The skip route creates the account and returns JSON; the login
+        funnel -- the only writer of these two keys until now -- never runs in
+        that request. Before this change the account was created with an
+        identity and a provider and nothing else, and stayed that way until a
+        later sign-in that may never happen.
+
+        The type arrives punctuated, so this also pins that what is stored is
+        the normalised value and not what the IdP sent.
+        """
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        self._cmd_login(
+            mock_client_for,
+            first_name="Gabriel",
+            last_name="Costa",
+            doc_type="PAS:",
+            doc_nationality="BR",
+            doc_number="BR7788991",
+        )
+        created_response = self.client.post(
+            "/saml/migration/skip", json={"email": "gabriel-doc@example.pt"}
+        )
+        assert created_response.status_code == 200
+
+        created = User.objects(email="gabriel-doc@example.pt").first()
+        assert created is not None
+        assert created.extras["auth_doc_type"] == "PAS", (
+            "the wizard created the account without its document type"
+        )
+        assert created.extras["auth_doc_nationality"] == "BR"
+        assert created.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991"), (
+            "the stored identity must not have moved"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_stored_identity_is_unchanged_by_the_document_keys(
+        self, mock_client_for, _mock_confirm
+    ):
+        """🚨 LEDG-2508, criterion 4 — the one that cannot be got wrong.
+
+        The stored identity is the pre-image of a one-way digest and the key
+        every sign-in resolves accounts by. Nothing in this ticket may move it,
+        and "nothing moved it" is not something a reviewer can see by reading a
+        diff across four call sites: it has to be asserted against the exact
+        expected value, on the path that writes the document alongside it.
+
+        If this ever fails, every foreign citizen registered under that
+        identifier is locked out of their own account, with no way to recompute
+        what was stored.
+        """
+        from udata.core.user.models import User
+        from udata.core.user.nic import hash_nic
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        self._cmd_login(
+            mock_client_for,
+            first_name="Gabriel",
+            last_name="Costa",
+            doc_type="PAS:",
+            doc_nationality="BR",
+            doc_number="BR7788991",
+        )
+        assert (
+            self.client.post(
+                "/saml/migration/skip", json={"email": "gabriel-id@example.pt"}
+            ).status_code
+            == 200
+        )
+
+        created = User.objects(email="gabriel-id@example.pt").first()
+        assert created.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991"), (
+            "the identity moved -- everyone registered under it is now locked out"
+        )
+        # And the document rode alongside it rather than instead of it.
+        assert created.extras["auth_doc_type"] == "PAS"
 
 
 class SAMLAuditLoggerLevelTest(APITestCase):
