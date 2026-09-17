@@ -857,7 +857,15 @@ def _idp_status_rejection(raw_saml_response, kind):
 
 
 def _create_saml_user(
-    user_email, user_nic, first_name, last_name, *, provider=None, citizen_declared=None
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Create a new account from SAML attributes (scenario 4).
 
@@ -895,7 +903,12 @@ def _create_saml_user(
             f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
         )
 
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     user_data = {
         "first_name": (first_name or "").title(),
@@ -913,6 +926,16 @@ def _create_saml_user(
         extras[AUTH_PROVIDER] = provider
     if citizen_declared:
         extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # The verified counterpart of the declared type. Recorded HERE and not only
+    # by the funnel, which already writes them a few lines later in this same
+    # request: the funnel's write is guarded bookkeeping that swallows its own
+    # failure on purpose, because it must not cost a sign-in. Written into the
+    # insert instead, they cannot be lost silently -- and the paths that do not
+    # reach the funnel at all (the wizard) now have somewhere to put them.
+    if doc_type:
+        extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        extras[AUTH_DOC_NATIONALITY] = doc_nationality
     if extras:
         user_data["extras"] = extras
 
@@ -1006,6 +1029,11 @@ REGISTRATION_ASSOCIATION_REFUSED_FLASH = "registration_association_refused"
 MIGRATION_LINK_ORIGIN = "origin"
 MIGRATION_LINK_ORIGIN_REGISTRATION = "complete_registration"
 MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
+# The verified document, carried to a click that has no session to read it out
+# of. Named like the keys above rather than reusing the extras key names: this
+# is the record's own vocabulary, and the two are free to diverge.
+MIGRATION_LINK_DOC_TYPE = "doc_type"
+MIGRATION_LINK_DOC_NATIONALITY = "doc_nationality"
 
 
 def _declared_citizen():
@@ -1025,7 +1053,15 @@ def _declared_citizen():
 
 
 def _create_pending_saml_user(
-    user_email, user_nic, first_name, last_name, *, provider=None, citizen_declared=None
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Create an account from a user-declared email, left unconfirmed.
 
@@ -1043,13 +1079,26 @@ def _create_pending_saml_user(
     ``citizen_declared`` reaches here the same way, from the session key the
     login route set after allowlisting it. Same rule, same reason.
     """
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     extras = {"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True}
     if provider:
         extras[AUTH_PROVIDER] = provider
     if citizen_declared:
         extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # This is the path the wizard creates through, and the one the funnel never
+    # sees: the route that calls it returns JSON, and the confirmation that
+    # follows is flask_security's. Without these two the account is born
+    # without its document and only gains it on a sign-in that may never come.
+    if doc_type:
+        extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        extras[AUTH_DOC_NATIONALITY] = doc_nationality
 
     # No datastore.commit() here: create_user already wrote the document, and
     # commit() is a no-op under MongoEngine anyway. Nothing is assigned after
@@ -1598,7 +1647,15 @@ def _handle_saml_user_login(
 
 
 def _handle_migration_redirect(
-    user, user_email, user_nic, first_name, last_name, no_match=False, provider="cmd"
+    user,
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    no_match=False,
+    provider="cmd",
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Store SAML data in session and redirect to migration page.
 
@@ -1627,6 +1684,20 @@ def _handle_migration_redirect(
         "saml_first_name": first_name,
         "saml_last_name": last_name,
         "saml_provider": provider,
+        # Carried for the same reason as the provider above: nothing downstream
+        # can infer them. The wizard does NOT come back through the login
+        # funnel in the request that creates the account -- migration_skip
+        # creates it and returns JSON, and the confirmation that follows is
+        # flask_security's -- so the funnel, which is the only place that
+        # writes these two keys today, only runs on the NEXT CMD sign-in.
+        #
+        # Not read out of saml_nic, even though a foreigner's identifier does
+        # contain both: parsing it would make a second reader of a pre-image
+        # _compose_foreign_identifier declares frozen and additive-only, and
+        # the whole point of that declaration is that nothing depends on its
+        # shape. Two explicit keys cost two short strings in a signed cookie.
+        "saml_doc_type": doc_type,
+        "saml_doc_nationality": doc_nationality,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -1729,6 +1800,8 @@ def _issue_migration_link(
     *,
     provider=None,
     citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
     origin=None,
     placeholder_id=None,
 ):
@@ -1771,6 +1844,14 @@ def _issue_migration_link(
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_ORIGIN] = origin
     if placeholder_id:
         user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_PLACEHOLDER_ID] = str(placeholder_id)
+    # Same rule, and the same reason: the click arrives with no session at all,
+    # so the record is the only thing that knows. A record issued before these
+    # keys existed simply has none, and the consuming side reads them with a
+    # bare get so that absent stays absent rather than becoming a written null.
+    if doc_type:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_TYPE] = doc_type
+    if doc_nationality:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_NATIONALITY] = doc_nationality
 
     # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
     # outstanding sessions (LEDG-2134), and a password reset rotates it too,
@@ -1781,7 +1862,15 @@ def _issue_migration_link(
 
 
 def _link_identity_and_login(
-    user, nic_hash, first_name, last_name, *, provider=None, citizen_declared=None
+    user,
+    nic_hash,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Bind the authenticated identity to ``user`` and start its session.
 
@@ -1797,7 +1886,12 @@ def _link_identity_and_login(
     Recorded under the same rule as everywhere else — only when there is one to
     record.
     """
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     if not user.extras:
         user.extras = {}
@@ -1807,6 +1901,14 @@ def _link_identity_and_login(
         user.extras[AUTH_PROVIDER] = provider
     if citizen_declared:
         user.extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # Not guarded, unlike the funnel's write of the same two keys: the save
+    # below IS the link, and must fail the operation if it fails. Recording
+    # what identified the person is part of completing that link, not
+    # bookkeeping alongside it.
+    if doc_type:
+        user.extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        user.extras[AUTH_DOC_NATIONALITY] = doc_nationality
     if first_name:
         user.first_name = first_name.title()
     if last_name:
@@ -2292,7 +2394,12 @@ def _mail_registration_association_link(requester, target):
     if not allowed:
         return False
 
-    from udata.core.user.constants import AUTH_CITIZEN_DECLARED, AUTH_PROVIDER
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_PROVIDER,
+    )
 
     # From the session's assertion, NEVER from requester.first_name. The
     # profile form lets any account rewrite its own name, and this name is
@@ -2320,6 +2427,13 @@ def _mail_registration_association_link(requester, target):
         # that predates the field would be a worse answer than none.
         provider=extras.get(AUTH_PROVIDER),
         citizen_declared=extras.get(AUTH_CITIZEN_DECLARED),
+        # Read from the requester -- the placeholder -- and not the session,
+        # unlike the names above. These are not interpolated into any mail:
+        # they describe the identity, and the requester is where the sign-in
+        # that minted it wrote them. Bare gets for the same reason as the
+        # provider: a placeholder created before this field existed has none.
+        doc_type=extras.get(AUTH_DOC_TYPE),
+        doc_nationality=extras.get(AUTH_DOC_NATIONALITY),
         origin=MIGRATION_LINK_ORIGIN_REGISTRATION,
         placeholder_id=requester.id,
     )
@@ -2381,6 +2495,10 @@ def _mail_validation_link(pending, user, *, enforce_cap=True):
         # completes without inventing a provider for it.
         provider=pending.get("saml_provider"),
         citizen_declared=_declared_citizen(),
+        # Bare gets, like the provider above: a session opened before these
+        # keys existed names no document, and none is invented for it.
+        doc_type=pending.get("saml_doc_type"),
+        doc_nationality=pending.get("saml_doc_nationality"),
     )
     user.extras[MIGRATION_LINK_SEND_COUNT] = tally
     user.save()
@@ -3028,6 +3146,12 @@ def idp_initiated():
                 last_name,
                 no_match=(status == "no_match"),
                 provider="cmd",
+                # The same guard the funnel already receives below: only when
+                # the document WAS the identity. For a national the NIC won in
+                # the composition, so carrying the document here would describe
+                # something other than what the identity actually holds.
+                doc_type=None if user_nic else doc_type,
+                doc_nationality=None if user_nic else doc_nationality,
             )
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
@@ -3039,6 +3163,12 @@ def idp_initiated():
             last_name,
             provider=AUTH_PROVIDER_CMD,
             citizen_declared=_declared_citizen(),
+            # Same guard as everywhere else: only when the document WAS the
+            # identity. The funnel below writes these too, in this same
+            # request -- but its write is guarded and swallows failure, so
+            # recording them in the insert is what makes them durable.
+            doc_type=None if user_nic else doc_type,
+            doc_nationality=None if user_nic else doc_nationality,
         )
         status = "new"
 
@@ -3924,6 +4054,8 @@ def _complete_registration_association(target, record):
         record.get("last_name"),
         provider=record.get("provider"),
         citizen_declared=record.get("citizen_declared"),
+        doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
+        doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
     )
 
     if placeholder:
@@ -4065,6 +4197,8 @@ def migration_confirm_link(token):
         # issued before either field existed simply has none.
         provider=record.get("provider"),
         citizen_declared=record.get("citizen_declared"),
+        doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
+        doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
     )
     current_app.logger.info(f"Migration completed by validation link for user {user.id}")
 
@@ -4311,6 +4445,12 @@ def migration_skip():
             # session names no provider, and none is invented for it.
             provider=pending.get("saml_provider"),
             citizen_declared=_declared_citizen(),
+            # Bare gets for the same reason: a session opened before these
+            # keys existed names no document, and none is invented for it.
+            # This is the path the funnel never sees, so if they are not read
+            # here the account is created without them.
+            doc_type=pending.get("saml_doc_type"),
+            doc_nationality=pending.get("saml_doc_nationality"),
         )
 
     send_confirmation_instructions(user)
