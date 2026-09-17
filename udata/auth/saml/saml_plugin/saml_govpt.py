@@ -1598,7 +1598,15 @@ def _handle_saml_user_login(
 
 
 def _handle_migration_redirect(
-    user, user_email, user_nic, first_name, last_name, no_match=False, provider="cmd"
+    user,
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    no_match=False,
+    provider="cmd",
+    doc_type=None,
+    doc_nationality=None,
 ):
     """Store SAML data in session and redirect to migration page.
 
@@ -1627,6 +1635,20 @@ def _handle_migration_redirect(
         "saml_first_name": first_name,
         "saml_last_name": last_name,
         "saml_provider": provider,
+        # Carried for the same reason as the provider above: nothing downstream
+        # can infer them. The wizard does NOT come back through the login
+        # funnel in the request that creates the account -- migration_skip
+        # creates it and returns JSON, and the confirmation that follows is
+        # flask_security's -- so the funnel, which is the only place that
+        # writes these two keys today, only runs on the NEXT CMD sign-in.
+        #
+        # Not read out of saml_nic, even though a foreigner's identifier does
+        # contain both: parsing it would make a second reader of a pre-image
+        # _compose_foreign_identifier declares frozen and additive-only, and
+        # the whole point of that declaration is that nothing depends on its
+        # shape. Two explicit keys cost two short strings in a signed cookie.
+        "saml_doc_type": doc_type,
+        "saml_doc_nationality": doc_nationality,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -3028,6 +3050,12 @@ def idp_initiated():
                 last_name,
                 no_match=(status == "no_match"),
                 provider="cmd",
+                # The same guard the funnel already receives below: only when
+                # the document WAS the identity. For a national the NIC won in
+                # the composition, so carrying the document here would describe
+                # something other than what the identity actually holds.
+                doc_type=None if user_nic else doc_type,
+                doc_nationality=None if user_nic else doc_nationality,
             )
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to

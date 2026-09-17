@@ -8283,6 +8283,72 @@ class SAMLForeignMigrationWizardTest(APITestCase):
         assert still.id == created.id
         assert still.extras["auth_nic"] == hash_nic("MDC/PAS/BR/BR7788991")
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_wizard_session_carries_the_normalized_document(
+        self, mock_client_for, _mock_confirm
+    ):
+        """LEDG-2508: the wizard is where the document used to be lost.
+
+        It does not come back through the login funnel in the request that
+        creates the account -- the skip route creates it and returns JSON --
+        and the funnel is the only place that writes these two keys. So they
+        have to travel in the session, or the account is born without them and
+        only gains them on a sign-in that may never happen.
+
+        The type arrives punctuated on purpose. autenticacao.gov sends "PAS:"
+        and not "PAS" (LEDG-2506), and what must reach the session is the
+        clean value -- the same one the identity was composed from.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        response = self._cmd_login(
+            mock_client_for,
+            first_name="Gabriel",
+            last_name="Costa",
+            doc_type="PAS:",
+            doc_nationality="BR",
+            doc_number="BR7788991",
+        )
+        assert response.status_code == 302
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+
+        assert pending["saml_doc_type"] == "PAS", (
+            "the session carried the raw value, so the account it creates will too"
+        )
+        assert pending["saml_doc_nationality"] == "BR"
+        assert pending["saml_nic"] == "MDC/PAS/BR/BR7788991", (
+            "the identity must still compose from the same clean type"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_carries_no_document_into_the_wizard(self, mock_client_for, _mock_confirm):
+        """The guard that keeps the document out when it was not the identity.
+
+        A national's NIC wins the composition, so recording the document would
+        describe something other than what the stored identity holds. The
+        assertion carries both here, which is the case the guard exists for.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+        self._cmd_login(
+            mock_client_for,
+            nic="19283746",
+            first_name="Rita",
+            last_name="Nunes",
+            **self.DOC,
+        )
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+
+        assert pending["saml_nic"] == "19283746"
+        assert pending["saml_doc_type"] is None
+        assert pending["saml_doc_nationality"] is None
+
 
 class SAMLAuditLoggerLevelTest(APITestCase):
     """That the audit line reaches a handler at all — which it did not.
