@@ -8,6 +8,12 @@ from udata.models import License
 
 from .tools.harvester_utils import sync_resources
 
+# The TML source publishes thirteen distributions per collection and the portal
+# only catalogues three of them: the two item downloads and the collection
+# schema. The labels below are the source's own, matched verbatim (LEDG-2512).
+ITEMS_AS_PREFIX = "Items as "
+SCHEMA_DISTRIBUTION_LABEL = "Schema of collection in JSON"
+
 
 class OGCBackend(BaseBackend):
     """
@@ -145,8 +151,15 @@ class OGCBackend(BaseBackend):
                     # Determine format from encodingFormat
                     link_type = dist.get("encodingFormat", "")
 
-                    # Skip HTML and PNG resources as requested
+                    # Skip HTML and PNG resources as requested. This has to stay
+                    # ahead of the label check: the source also publishes an
+                    # "Items as HTML" distribution, which carries the prefix the
+                    # check below looks for and would otherwise be catalogued.
                     if link_type in ("text/html", "image/png"):
+                        continue
+
+                    label = self._distribution_label(dist)
+                    if not self._is_target_distribution(label):
                         continue
 
                     # Extract format from MIME type or use the type directly
@@ -158,8 +171,7 @@ class OGCBackend(BaseBackend):
                             url.split(".")[-1] if "." in url.split("/")[-1] else "unknown"
                         )
 
-                    # Use link title or create a descriptive title
-                    resource_title = dist.get("description") or dist.get("name") or "Resource"
+                    resource_title = self._resource_title(label, item_data["title"])
 
                     resources.append(
                         {
@@ -169,6 +181,26 @@ class OGCBackend(BaseBackend):
                             "format": format_value,
                         }
                     )
+
+        if distributions and not resources:
+            # Nothing matched. The labels are the source's, so an upstream
+            # rename empties the dataset rather than failing the item, and the
+            # job still reports success -- the one way this change can go wrong
+            # without anyone noticing. Say so per item, so the cause is in the
+            # log before the missing downloads are reported by a user.
+            self.logger.warning(
+                "OGC: no distribution of %s matched the catalogued labels; "
+                "%d were offered and all were dropped. Labels seen: %s",
+                item.remote_id,
+                len(distributions),
+                sorted(
+                    {
+                        self._distribution_label(dist)
+                        for dist in distributions
+                        if isinstance(dist, dict)
+                    }
+                ),
+            )
 
         sync_resources(dataset, resources)
 
@@ -238,6 +270,43 @@ class OGCBackend(BaseBackend):
                             dataset.contact_points.append(contact)
 
         return dataset
+
+    def _distribution_label(self, dist: dict) -> str:
+        """The human label a distribution carries, as the resource title reads it.
+
+        The title has always preferred `description` over `name`; the selection
+        below reads the very same value, so a distribution can never be kept
+        under one label and catalogued under another. That matters more than it
+        looks: the TML source leaves `name` unset on every one of its
+        distributions and puts the label in `description`, so a check written
+        against `name` alone would silently match nothing and leave every
+        harvested dataset without resources.
+
+        A non-string `description` - JSON-LD may carry an object there - is
+        treated as absent rather than allowed to raise.
+        """
+        for value in (dist.get("description"), dist.get("name")):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _resource_title(self, label: str, dataset_title: str) -> str:
+        """The title a catalogued distribution is published under.
+
+        The source names its two item downloads after itself - "Items as
+        GeoJSON" - which says nothing about the data once the resource is read
+        outside the collection it came from. They are renamed after the dataset
+        instead, so "Items as GeoJSON" on "Rede Clicavel" reads "Rede Clicavel
+        como GeoJSON" (LEDG-2512). Every other label, the collection schema
+        included, is published exactly as the source wrote it.
+        """
+        if label.startswith(ITEMS_AS_PREFIX):
+            return f"{dataset_title} como {label[len(ITEMS_AS_PREFIX) :]}"
+        return label or "Resource"
+
+    def _is_target_distribution(self, label: str) -> bool:
+        """Whether a distribution is one of the three the portal catalogues."""
+        return label.startswith(ITEMS_AS_PREFIX) or label == SCHEMA_DISTRIBUTION_LABEL
 
     def _extract_format_from_mime(self, mime_type: str) -> str:
         """
