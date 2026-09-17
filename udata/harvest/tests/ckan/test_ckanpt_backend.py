@@ -628,3 +628,78 @@ class CkanPTBackendTest(PytestOnlyDBTestCase):
             self.assert_previewed_one_item(actions.preview(source))
 
         assert self.backend_warnings(caplog) == []
+
+
+CREDENTIALED_CKANPT_URL = "http://harvestuser:sup3rs3cr3t@localhost:5000"
+REDACTED_CKANPT_URL = "http://***@localhost:5000"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ckanpt"])
+class CkanPTCredentialedSourceTest(PytestOnlyDBTestCase):
+    """`ckanpt` inherits both the defect and the fix from `CkanBackend`.
+
+    `inner_process_dataset` delegates to `super()`, so `remote_url` comes from
+    `CkanBackend.dataset_url`. This is where that inheritance is asserted, and
+    where the other half of LEDG-2504 is pinned down: `action_url` keeps the
+    credentials, because redacting what is published must not cost the fetch
+    its authentication.
+    """
+
+    def test_ckanpt_inherits_the_redaction_and_still_authenticates(self, rmock):
+        api_url = "{}/api/3/action/".format(CREDENTIALED_CKANPT_URL)
+        org = OrganizationFactory(acronym="ckanpt-org")
+        package = ckanpt_package(org.acronym)
+        source = HarvestSourceFactory(
+            backend="ckanpt",
+            url=CREDENTIALED_CKANPT_URL,
+            description="",
+            organization=org,
+        )
+        # Registered on the credentialed URL on purpose: `requests` keeps the
+        # userinfo in the prepared URL and `requests_mock` matches the whole
+        # netloc, so a plain registration would not match the real request.
+        rmock.get(
+            "{}package_list".format(api_url),
+            json={"success": True, "result": [DATASET_NAME]},
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+        rmock.get(
+            "{}package_show".format(api_url),
+            json=package,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+        )
+
+        actions.run(source)
+        source.reload()
+
+        job = source.get_last_job()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        dataset = job.items[0].dataset
+        assert dataset.harvest.remote_url == "{0}/dataset/{1}".format(
+            REDACTED_CKANPT_URL, DATASET_NAME
+        )
+        assert "sup3rs3cr3t" not in dataset.harvest.remote_url
+        # The username is a credential too, and the one a partial redaction
+        # most easily leaves behind.
+        assert "harvestuser" not in dataset.harvest.remote_url
+        # Asserted over the whole saved document, not just the field this fix
+        # touches: `ckanpt` writes extras and tags of its own, and a credential
+        # landing in one of those is what this test exists to catch.
+        assert "sup3rs3cr3t" not in str(dataset.to_mongo())
+        assert "harvestuser" not in str(dataset.to_mongo())
+        # The job item is what the unauthenticated harvest job API serializes.
+        assert job.items[0].remote_url == dataset.harvest.remote_url
+        # The source tag is built from `urlparse(...).hostname`, which never
+        # carries userinfo -- asserted so a future change to it is caught here.
+        assert "localhost" in dataset.tags
+        assert not any("harvestuser" in tag for tag in dataset.tags)
+        # `action_url` is the fetch path and must keep the credentials.
+        # Filtered to the action requests so the assertion cannot pass on some
+        # other request, and asserted non-empty so it cannot pass vacuously.
+        action_requests = [r for r in rmock.request_history if "/api/3/action/" in r.url]
+        assert action_requests
+        assert all("harvestuser" in request.url for request in action_requests)
