@@ -87,3 +87,32 @@ AUTH_CITIZEN_DECLARED_VALUES = frozenset({AUTH_CITIZEN_NATIONAL, AUTH_CITIZEN_FO
 # misconfigured.
 AUTH_DOC_TYPE = "auth_doc_type"
 AUTH_DOC_NATIONALITY = "auth_doc_nationality"
+
+# The member state whose eIDAS node asserted the identity: the first segment of
+# the PersonIdentifier, which the eIDAS profile RECOMMENDS be shaped
+# "<origin>/<destination>/<id>" -- a Czech citizen signing in here arrives as
+# "CZ/PT/<uuid>".
+#
+# 🚩 A SEPARATE KEY FROM AUTH_DOC_NATIONALITY ON PURPOSE, and the reason is
+# stronger than "they are similar things". That one is not a nationality at
+# all: DocNationality is FORCED to "PT" on residence permits and residence
+# cards (see _compose_foreign_identifier), so a Brazilian holding a Portuguese
+# residence permit is stored as "PT". Folding the two together would make a
+# count of "PT" sum three different populations -- a real nationality, a forced
+# value, and an issuing member state -- and answer no question at all.
+#
+# And the asymmetry settles it: merging two keys later is trivial, separating
+# them later is impossible, because nothing would say which rows came from
+# which source.
+#
+# ABSENT MEANS ABSENT, with three distinct causes and no way to tell them
+# apart: an account that signed in before this key existed; an identifier that
+# did not match the recommended shape (the shape is a recommendation, not a
+# guarantee); and a NIC arriving through the eIDAS route, which is accepted
+# there and carries no country.
+#
+# 🚨 AND THERE IS NO BACKFILL. The identifier survives only as the one-way
+# digest in auth_nic, so the country cannot be recovered from what is stored.
+# Accounts that predate this gain the key only when their own owner signs in
+# again -- the same semantics as AUTH_PROVIDER above -- and never otherwise.
+AUTH_EIDAS_ORIGIN_COUNTRY = "auth_eidas_origin_country"
