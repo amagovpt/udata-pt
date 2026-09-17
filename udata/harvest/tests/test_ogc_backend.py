@@ -144,8 +144,12 @@ GEOJSON_URL = "https://geoportal.example.pt/collections/a/items?f=json"
 CSV_URL = "https://geoportal.example.pt/collections/a/items.csv"
 
 
-def _distribution(url, encoding_format, name="Distribution"):
-    return {"contentURL": url, "encodingFormat": encoding_format, "name": name}
+def _distribution(url, encoding_format, description="Items as GeoJSON"):
+    # The real source leaves `name` unset and labels its distributions through
+    # `description`, so the fixture does the same. The default is one of the
+    # labels the backend catalogues, which is what every test that does not care
+    # about the selection needs in order to get a resource at all.
+    return {"contentURL": url, "encodingFormat": encoding_format, "description": description}
 
 
 def _item_with_distributions(distributions, name="Dataset A"):
@@ -292,3 +296,70 @@ class OGCBackendContactPointTest(PytestOnlyDBTestCase):
         assert [item.status for item in job.items] == ["done"]
         assert len(list(ContactPoint.objects)) == 1
         assert job.items[0].dataset.contact_points[0].email == "geo@example.pt"
+
+
+SCHEMA_URL = "https://geoportal.example.pt/collections/a/schema?f=json"
+ITEMS_JSONLD_URL = "https://geoportal.example.pt/collections/a/items?f=jsonld"
+ITEMS_HTML_URL = "https://geoportal.example.pt/collections/a/items?f=html"
+DOCUMENT_URL = "https://geoportal.example.pt/collections/a?f=json"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
+    """Only three of the source's distributions are catalogued (LEDG-2512).
+
+    The source publishes thirteen per collection; six are HTML and were already
+    dropped, and of the remaining seven the portal keeps the two item downloads
+    and the collection schema.
+    """
+
+    def _harvest(self, rmock, source, distributions, name="Dataset A"):
+        rmock.get(OGC_URL, text=_ogc_payload([_item_with_distributions(distributions, name)]))
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_only_target_distributions_are_kept(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(DOCUMENT_URL, "application/json", "This document as JSON"),
+            _distribution(GEOJSON_URL, "application/geo+json", "Items as GeoJSON"),
+            _distribution(ITEMS_JSONLD_URL, "application/ld+json", "Items as RDF (GeoJSON-LD)"),
+            _distribution(SCHEMA_URL, "application/schema+json", "Schema of collection in JSON"),
+            # Carries the "Items as" prefix but is HTML: the MIME filter has to
+            # run first, or this one is catalogued and the dataset gets four.
+            _distribution(ITEMS_HTML_URL, "text/html", "Items as HTML"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        assert [r.url for r in dataset.resources] == [GEOJSON_URL, ITEMS_JSONLD_URL, SCHEMA_URL]
+
+    def test_missing_target_does_not_fail_the_harvest(self, rmock):
+        """A source that stops publishing one of the three is not an error."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(DOCUMENT_URL, "application/json", "This document as JSON"),
+            _distribution(GEOJSON_URL, "application/geo+json", "Items as GeoJSON"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        assert [r.url for r in dataset.resources] == [GEOJSON_URL]
+
+    def test_a_distribution_without_a_label_is_not_catalogued(self, rmock):
+        """A non-string `description` is treated as absent, never raised on."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            {"contentURL": DOCUMENT_URL, "encodingFormat": "application/json"},
+            {
+                "contentURL": SCHEMA_URL,
+                "encodingFormat": "application/schema+json",
+                "description": {"@value": "Schema of collection in JSON"},
+            },
+            _distribution(GEOJSON_URL, "application/geo+json", "Items as GeoJSON"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        assert [r.url for r in dataset.resources] == [GEOJSON_URL]
