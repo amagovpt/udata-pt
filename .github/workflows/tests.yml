@@ -26,6 +26,14 @@ jobs:
           # 27017 -- only the published port moves. Service containers are
           # isolated per job on an ephemeral runner, so nothing collides.
           - 27019:27017
+        # Pinned, not inherited -- and pinned even though the runner's default
+        # may already be adequate. Trusting an inherited value is precisely the
+        # defect LEDG-2489 fixed locally: Docker's 1024 was never chosen by
+        # anyone, it was just what nobody overrode. 64000 is the minimum mongod
+        # names in its own startup warning. The step above reports what is
+        # actually in force, so this can be checked rather than believed.
+        options: >-
+          --ulimit nofile=64000:64000
       redis:
         image: redis:7-alpine
         ports:

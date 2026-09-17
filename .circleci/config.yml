@@ -26,6 +26,14 @@ jobs:
         type: string
     docker:
       - image: ghcr.io/astral-sh/uv:python<< parameters.python-version >>-trixie
+      # ⏳ LEDG-2489: the file descriptor ceiling here is NOT pinned, because
+      # this executor offers no field to pin it with -- secondary containers
+      # take no ulimits. The step "Mongo file descriptor limits" below reports
+      # what this container actually inherits; once that value is known from a
+      # real run, either record it here as adequate or raise the soft limit by
+      # overriding this image's command. Left deliberately open rather than
+      # guessed: the risk is bounded, because every CI run gets a fresh server
+      # and the exhaustion seen locally took hours of accumulated runs.
       - image: mongo:<< parameters.mongo-version >>
       - image: redis:alpine
       - image: udata/elasticsearch:7.16.2
