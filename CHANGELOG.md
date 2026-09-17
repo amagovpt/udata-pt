@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **fix(saml): the document was only recorded on the login AFTER the one that created the account**
+  - `extras` holds four keys for an authenticated citizen: the identity, the provider, the
+    document type and the document nationality. Until now **only the login funnel wrote the last
+    two** — so an account created or linked by the migration wizard, by a validation-link click,
+    or by the completion screen's association was born with the first two and nothing else.
+  - 🚩 **The wizard is the case the funnel cannot cover**: the skip route creates the account and
+    returns JSON, and the confirmation that follows is flask_security's. The funnel only runs on
+    the *next* CMD sign-in, which may never happen — **whoever registers and does not come back
+    keeps no document at all**, and drops out of any count of foreign citizens by document type
+    without anything marking their absence.
+  - The document now travels the same way the provider already did: through the wizard's session
+    and through the validation-link record, which is the only thing a click arriving with **no
+    session at all** can read. Deliberately not parsed out of the stored identifier, even though
+    a foreigner's contains both — that would make a second reader of a pre-image declared frozen
+    and additive-only.
+  - 🚨 **Two negatives are pinned, and they are what keep this from touching accounts it has no
+    business touching.** A record carrying no document leaves the target without those keys
+    rather than writing nulls; and the stored identity is asserted byte for byte on the path that
+    now writes the document beside it. It is the pre-image of a one-way digest, so if it ever
+    moved, everyone registered under it would be locked out with no way to recompute it.
+  - No migration and no backfill: accounts created before this keep whatever they have, and the
+    funnel still fills them in on the next sign-in.
+  - The state of `MIGRATION_MODE_ENABLED` per environment can be read without a shell, over a
+    plain unauthenticated request: `GET /saml/migration/pending` answers `403` with
+    `"Migration mode is not enabled"` when it is off and `200` when it is on. Verified in both
+    states.
+
 - **fix(harvest): a harvest source URL no longer accepts credentials**
   - The three changes before this one redacted `user:password@` everywhere it reached a
     reader -- the API, the CSV export, harvest errors and logs, derived resource URLs,
