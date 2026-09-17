@@ -1411,6 +1411,7 @@ def _handle_saml_user_login(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
     asserted_email=None,
     asserted_first_name=None,
     asserted_last_name=None,
@@ -1576,11 +1577,12 @@ def _handle_saml_user_login(
     # (Not the same call as the mail sends that deliberately re-raise: there,
     # swallowing made a failure the user cared about look successful. Here the
     # outcome the user came for still happens.)
-    if provider or citizen_declared or doc_type or doc_nationality:
+    if provider or citizen_declared or doc_type or doc_nationality or eidas_country:
         from udata.core.user.constants import (
             AUTH_CITIZEN_DECLARED,
             AUTH_DOC_NATIONALITY,
             AUTH_DOC_TYPE,
+            AUTH_EIDAS_ORIGIN_COUNTRY,
             AUTH_PROVIDER,
         )
 
@@ -1598,6 +1600,12 @@ def _handle_saml_user_login(
             incoming[AUTH_DOC_TYPE] = doc_type
         if doc_nationality:
             incoming[AUTH_DOC_NATIONALITY] = doc_nationality
+        # The one and only way an account that predates this key ever gains it.
+        # There is no backfill -- the identifier survives solely as the digest
+        # -- so an older account gets its country when its OWN owner signs in
+        # again, and never otherwise. Same semantics as the provider above.
+        if eidas_country:
+            incoming[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
 
         # Only what actually differs, so a repeat login is not a repeat write,
         # and one save for both keys rather than one each.
@@ -3770,6 +3778,7 @@ def idp_eidas_initiated():
         user,
         new_account=(status == "new"),
         provider=AUTH_PROVIDER_EIDAS,
+        eidas_country=eidas_country,
         kind="eidas",
         issuer=issuer,
         name_id=name_id_value,
