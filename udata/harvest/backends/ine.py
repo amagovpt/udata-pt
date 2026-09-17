@@ -18,9 +18,12 @@ from slugify import slugify
 
 from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
+from udata.harvest.exceptions import HarvestValidationError
 from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
+from udata.utils import safe_unicode
 
+from ..url_filter import redact_url_credentials
 from .tools.harvester_utils import normalize_url_slashes, sync_resources
 
 
@@ -654,7 +657,11 @@ class INEBackend(BaseBackend):
             )
 
     def _inner_harvest(self):
-        self._log.info("[INE] Iniciando harvester de %s", self.source.url)
+        # Redacted here too: this line runs on every harvest, and an INFO
+        # record also becomes a Sentry breadcrumb (LEDG-2501).
+        self._log.info(
+            "[INE] Iniciando harvester de %s", redact_url_credentials(str(self.source.url))
+        )
         self._log.info(
             "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s, TestMode=%s",
             self.BULK_SIZE,
@@ -862,6 +869,32 @@ class INEBackend(BaseBackend):
                         and getattr(dataset, "id", None) is not None
                     )
 
+                    if is_existing:
+                        # Every other backend reaches an existing record through
+                        # `BaseBackend.get_dataset`, which asks this right after
+                        # the lookup. This one used to as well; the FAST 2-phase
+                        # rewrite (4dc13d6eb) took it off that shared path in
+                        # favour of a bulk lookup and a bulk write, so when the
+                        # guard was later added to `get_dataset` this backend
+                        # silently missed it — nothing here ever asked whether
+                        # the record it was about to overwrite belongs to
+                        # somebody else. Note the guard is blind to records with
+                        # no owner at all: an orphan is still adopted, upstream
+                        # behaviour shared with `get_dataset`.
+                        # It is asked here rather than in the
+                        # prefetch because the prefetch has no per-item error
+                        # handling — raising there would lose the whole chunk,
+                        # whereas the `except` below fails this one item and
+                        # carries on, which is what `process_dataset` does.
+                        # Asked before `_has_changed` too, for the same reason
+                        # the precedent asks before knowing whether anything
+                        # changed: an unchanged record owned by someone else
+                        # must not be quietly reported as "skipped" against
+                        # this source either. The CREATE branch needs no guard,
+                        # since it can only be reached with a `_new_dataset()`
+                        # already owned by this source.
+                        self.ensure_unique_ownership(dataset)
+
                     # ========================================
                     # CASO 1: Dataset já existe na base de dados
                     # ========================================
@@ -918,13 +951,42 @@ class INEBackend(BaseBackend):
                         created_remote_ids.append(remote_id)
                         self._log.debug("[INE] CREATE: remote_id=%s (novo dataset)", remote_id)
 
-                except Exception:
+                except Exception as e:
                     failed += 1
                     item_status = "failed"
-                    self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
-                    # HarvestItem para falhas
+                    if isinstance(e, HarvestValidationError):
+                        # A refusal, not a crash: `process_dataset` logs these at
+                        # info too. A rejected catalogue can fail every one of
+                        # 13k items, and a full traceback each would bury the
+                        # log without adding anything the message does not say.
+                        self._log.info(
+                            "[INE] Recusado na fase 2 para remote_id=%s: %s", remote_id, e
+                        )
+                    else:
+                        self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
+                    # The message is carried onto the item, as `process_dataset`
+                    # does: a job over 13k items reporting `failed` with an empty
+                    # `errors` list tells the operator nothing about which of
+                    # them is an ownership conflict, or who the other owner is.
+                    # Truncated because the items are pushed into one job
+                    # document: 13k unbounded messages (a mongoengine or pymongo
+                    # error runs to a kilobyte) would carry the job past the
+                    # 16 MB BSON limit and lose the whole record of a harvest
+                    # whose writes already landed.
                     if self.job:
-                        h_item = HarvestItem(remote_id=remote_id, status=item_status)
+                        h_item = HarvestItem(
+                            remote_id=remote_id,
+                            status=item_status,
+                            # Redact before truncating: a cut landing inside the
+                            # userinfo would leave a prefix of the password that
+                            # the constructor can no longer recognise as one.
+                            errors=[
+                                HarvestError(message=redact_url_credentials(safe_unicode(e))[:500])
+                            ],
+                        )
+                        # Kept so the job links to the dataset in conflict; the
+                        # message names the other owner, not the record.
+                        h_item.dataset = getattr(dataset, "id", None)
                         batch_harvest_items.append(h_item)
 
             # --- Fim do loop do chunk ---

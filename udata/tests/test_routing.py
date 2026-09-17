@@ -222,7 +222,11 @@ class SlugAsSLugFieldWithFollowTest(AsSlugMixin):
         dataset_b.save()
         dataset_b_new_url = url_for("model_tester", model=dataset_b)
 
-        assert SlugFollow.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        assert len(list(SlugFollow.objects)) == 1
 
         assert_redirects(client.get(dataset_a_old_url), dataset_b_new_url)
         assert_redirects(client.get(dataset_b_old_url), dataset_b_new_url)
@@ -294,7 +298,7 @@ class SlugAsSLugFieldWithFollowTest(AsSlugMixin):
         assert404(client.get(second_url))
         assert404(client.get(last_url))
 
-        assert SlugFollow.objects.count() == 0
+        assert len(list(SlugFollow.objects)) == 0
 
 
 @pytest.mark.options(TERRITORY_DEFAULT_PREFIX="fr")  # Not implemented

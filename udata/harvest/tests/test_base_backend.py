@@ -128,7 +128,11 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         after = datetime.now(UTC)
 
         assert len(job.items) == nb_datasets
-        assert Dataset.objects.count() == nb_datasets
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a harvest that created too many or too
+        # few documents could go unnoticed.
+        assert len(list(Dataset.objects)) == nb_datasets
         before_naive = before.replace(tzinfo=None)
         after_naive = after.replace(tzinfo=None)
         for dataset in Dataset.objects():
@@ -344,8 +348,8 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         # all datasets except arch : 3 mocks + 1 manual (no_arch)
         assert len(job.items) == (nb_datasets + 1) + (nb_dataservices + 1)
         # all datasets : 3 mocks + 2 manuals (arch and no_arch)
-        assert Dataset.objects.count() == nb_datasets + 2
-        assert Dataservice.objects.count() == nb_dataservices + 2
+        assert len(list(Dataset.objects)) == nb_datasets + 2
+        assert len(list(Dataservice.objects)) == nb_dataservices + 2
 
         archived_items = [i for i in job.items if i.status == "archived"]
         assert len(archived_items) == 2
@@ -466,7 +470,7 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         # 3 (nb_datasets) + 1 (dataset_remote_ids) created by the HarvestSourceFactory
         assert len(job.items) == nb_datasets + 1
         # all datasets : 4 mocks (3 nb_datasets + 1 dataset_remote_ids) + 3 created with DatasetFactory - 2 reused
-        assert Dataset.objects.count() == nb_datasets + 1 + 3 - 2
+        assert len(list(Dataset.objects)) == nb_datasets + 1 + 3 - 2
         assert (
             # and not 3, data_reused was not duplicated
             Dataset.objects(harvest__remote_id="fake-0").count() == 2
@@ -507,8 +511,8 @@ class BaseBackendTest(PytestOnlyDBTestCase):
 
         assert job.status == "done-errors"
         assert len(job.items) == len(dataset_remote_ids) + len(dataservice_remote_ids)
-        assert Dataset.objects.count() == len(set(dataset_remote_ids))
-        assert Dataservice.objects.count() == len(set(dataservice_remote_ids))
+        assert len(list(Dataset.objects)) == len(set(dataset_remote_ids))
+        assert len(list(Dataservice.objects)) == len(set(dataservice_remote_ids))
         seen = set()
         for job in job.items:
             if job.remote_id not in seen:
@@ -627,7 +631,7 @@ class BaseBackendTest(PytestOnlyDBTestCase):
 
         job1 = ReowningBackend(source).harvest()
         assert job1.status == "done"
-        assert Dataset.objects.count() == 2
+        assert len(list(Dataset.objects)) == 2
         assert Dataset.objects.first().organization == publisher
 
         job2 = ReowningBackend(source).harvest()
@@ -635,7 +639,39 @@ class BaseBackendTest(PytestOnlyDBTestCase):
             error.message for item in job2.items for error in item.errors
         ]
         assert all(item.status == "done" for item in job2.items)
-        assert Dataset.objects.count() == 2
+        assert len(list(Dataset.objects)) == 2
+
+    def test_harvest_error_message_has_no_url_credentials(self):
+        """A failed harvest must not persist the source URL password.
+
+        `URLS_ALLOW_CREDENTIALS` lets a source URL carry `user:password@`, and
+        the text of a `requests` exception embeds the URL of the request that
+        failed. The harvest job is readable without a session, so that
+        password used to be served to anonymous callers (LEDG-2477).
+
+        The exception raised here is the one from the ticket's proof of
+        concept -- an `HTTPError` out of `raise_for_status()`, which lands in
+        the generic `except` of `harvest()`, not in the connection-error
+        branch that `test_dcat_backend` already covers.
+        """
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+
+        class FailingBackend(FakeBackend):
+            def inner_harvest(self):
+                raise requests.exceptions.HTTPError(f"500 Server Error: None for url: {url}")
+
+        source = HarvestSourceFactory(url=url, organization=OrganizationFactory())
+
+        job = FailingBackend(source).harvest()
+        job.reload()
+
+        assert job.status == "failed"
+        assert len(job.errors) == 1
+        error = job.errors[0]
+        assert "sup3rs3cr3t" not in error.message
+        assert "harvestuser" not in error.message
+        assert "https://***@www.ine.pt/broken.xml" in error.message
+        assert "sup3rs3cr3t" not in (error.details or "")
 
 
 class BaseBackendValidateTest(PytestOnlyDBTestCase):

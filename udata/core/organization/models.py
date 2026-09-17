@@ -364,6 +364,27 @@ class Organization(
         member = self.member(user)
         return member is not None and member.role == "admin"
 
+    def is_last_admin(self, user):
+        """True when `user` is the only member holding the admin role.
+
+        An organisation without an administrator is stuck: nobody can manage
+        members, accept transfers or edit it, and -- the part that makes it
+        expensive -- it cannot promote anyone from the inside, so recovering
+        needs a sysadmin.
+
+        Lives on the model rather than in the API because it is a question
+        about the organisation, not about one request: the account-deletion
+        paths orphan organisations too, and when their behaviour is decided
+        they have to ask the same question rather than restate the rule.
+
+        Deliberately false for an organisation that already has no admin at
+        all: refusing there would freeze an organisation that is already
+        stuck, over an operation that cannot make it worse.
+        """
+        return self.is_admin(user) and not any(
+            member.user != user and member.role == "admin" for member in self.members
+        )
+
     def pending_request(self, user):
         for request in self.requests:
             if (

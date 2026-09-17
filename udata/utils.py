@@ -334,6 +334,18 @@ def not_none_dict(d: dict) -> dict:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def mask_email(email):
+    """Mask an email address for display (e.g. j***@example.com)."""
+    if not email or "@" not in email:
+        return ""
+    local, domain = email.rsplit("@", 1)
+    if len(local) <= 1:
+        masked = local + "***"
+    else:
+        masked = local[0] + "***"
+    return f"{masked}@{domain}"
+
+
 def hash_url(url: str) -> str | None:
     """Hash an URL to make it indexable"""
     return hashlib.sha1(url.encode("utf-8")).hexdigest() if url else None

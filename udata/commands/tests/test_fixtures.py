@@ -29,7 +29,12 @@ class FixturesTest(PytestOnlyAPITestCase):
     @pytest.mark.options(FIXTURE_DATASET_SLUGS=["some-test-dataset-slug"])
     def test_generate_fixtures_file_then_import(self, mocker):
         """Test generating fixtures from the current env, then importing them back."""
-        assert models.Dataset.objects.count() == 0  # Start with a clean slate.
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction. This file asserts emptiness right after a
+        # `drop_collection()` and non-emptiness right after an import, so it leans on
+        # exactly the metadata a drop has just disturbed.
+        assert len(list(models.Dataset.objects)) == 0  # Start with a clean slate.
         user = UserFactory()
         admin = UserFactory()
         org = OrganizationFactory(
@@ -95,15 +100,15 @@ class FixturesTest(PytestOnlyAPITestCase):
             models.Site.drop_collection()
 
             assert models.Organization.objects(slug=org.slug).count() == 0
-            assert models.Dataset.objects.count() == 0
-            assert models.Discussion.objects.count() == 0
-            assert models.CommunityResource.objects.count() == 0
-            assert models.User.objects.count() == 0
-            assert models.Dataservice.objects.count() == 0
-            assert models.ContactPoint.objects.count() == 0
-            assert models.Page.objects.count() == 0
-            assert models.Post.objects.count() == 0
-            assert models.Site.objects.count() == 0
+            assert len(list(models.Dataset.objects)) == 0
+            assert len(list(models.Discussion.objects)) == 0
+            assert len(list(models.CommunityResource.objects)) == 0
+            assert len(list(models.User.objects)) == 0
+            assert len(list(models.Dataservice.objects)) == 0
+            assert len(list(models.ContactPoint.objects)) == 0
+            assert len(list(models.Page.objects)) == 0
+            assert len(list(models.Post.objects)) == 0
+            assert len(list(models.Site.objects)) == 0
 
             # Then load them in the database to make sure they're correct.
             result = self.cli("import-fixtures", fixtures_fd.name)
@@ -113,35 +118,35 @@ class FixturesTest(PytestOnlyAPITestCase):
         assert result_org.members[0].role == "editor"
         assert result_org.members[1].user.id == admin.id
         assert result_org.members[1].role == "admin"
-        assert models.Dataset.objects.count() > 0
+        assert len(list(models.Dataset.objects)) > 0
         result_dataset = models.Dataset.objects.first()
         assert result_dataset.contact_points == [contact_point]
-        assert models.Discussion.objects.count() > 0
+        assert len(list(models.Discussion.objects)) > 0
         result_discussion = models.Discussion.objects.first()
         assert result_discussion.user.id == user.id
         assert result_discussion.closed_by.id == admin.id
         assert len(result_discussion.discussion) == 2
         assert result_discussion.discussion[0].posted_by.id == user.id
         assert result_discussion.discussion[1].posted_by.id == admin.id
-        assert models.CommunityResource.objects.count() > 0
-        assert models.User.objects.count() > 0
-        assert models.Dataservice.objects.count() > 0
+        assert len(list(models.CommunityResource.objects)) > 0
+        assert len(list(models.User.objects)) > 0
+        assert len(list(models.Dataservice.objects)) > 0
         # Make sure we also import the dataservice organization
         result_dataservice = models.Dataservice.objects.first()
         assert result_dataservice.organization == org
         assert result_dataservice.contact_points == [contact_point]
 
-        assert models.Page.objects.count() > 0
+        assert len(list(models.Page.objects)) > 0
         result_page = models.Page.objects.first()
         assert len(result_page.blocs) == 2
         assert result_page.blocs[0].title == "Test Hero"
         assert result_page.blocs[1].title == "Test Links"
 
-        assert models.Post.objects.count() > 0
+        assert len(list(models.Post.objects)) > 0
         result_post = models.Post.objects.first()
         assert result_post.name == "Test Post"
 
-        assert models.Site.objects.count() > 0
+        assert len(list(models.Site.objects)) > 0
         result_site = models.Site.objects.first()
         assert result_site.id == site.id
         assert result_site.datasets_page == page
@@ -152,11 +157,11 @@ class FixturesTest(PytestOnlyAPITestCase):
         SpamMixin.detect_spam_enabled = False
         self.cli("import-fixtures")
         SpamMixin.detect_spam_enabled = True
-        assert models.Organization.objects.count() > 0
-        assert models.Dataset.objects.count() > 0
-        assert models.Reuse.objects.count() > 0
-        assert models.User.objects.count() > 0
-        assert models.Dataservice.objects.count() > 0
-        assert models.Post.objects.count() > 0
-        assert models.Page.objects.count() > 0
-        assert models.Site.objects.count() > 0
+        assert len(list(models.Organization.objects)) > 0
+        assert len(list(models.Dataset.objects)) > 0
+        assert len(list(models.Reuse.objects)) > 0
+        assert len(list(models.User.objects)) > 0
+        assert len(list(models.Dataservice.objects)) > 0
+        assert len(list(models.Post.objects)) > 0
+        assert len(list(models.Page.objects)) > 0
+        assert len(list(models.Site.objects)) > 0

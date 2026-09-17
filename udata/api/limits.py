@@ -159,6 +159,26 @@ CRAWLER_WRITE_LIMIT = "1200 per minute; 60000 per hour"
 CONTACT_SUBMIT_LIMIT = "20 per minute; 200 per hour"
 
 
+# Ceiling on the SAML migration wizard's address-taking and mail-sending
+# routes. Keyed on the government identity the SSO proved (see
+# _migration_identity_key in the SAML plugin), NOT on the IP: behind the
+# F5/WAF anonymous traffic collapses onto one origin address
+# (docs/infra-adc-waf-impact-ppr-prd.md), so an IP key here would be a single
+# national bucket that separates nobody from anybody. The identity key makes
+# each budget cost a real Autenticacao.gov login, which is what bounds the
+# enumeration these routes would otherwise allow one probe at a time.
+#
+# Sized well above a person finishing the wizard -- a full run is a handful of
+# requests, and the mail caps (MAX_CONFIRMATION_SENDS, MAX_MIGRATION_LINK_SENDS)
+# are the tighter limit on anything that sends. It must also stay above what a
+# single test does in one go: udata/tests/frontend/test_saml.py drives six
+# requests at these routes inside one test to prove those caps, and the
+# limiter is live under pytest (RATELIMIT_ENABLED is switched off in
+# settings.Debug, not in settings.Testing). No per-day cap, for the same
+# reason CONTACT_SUBMIT_LIMIT has none.
+MIGRATION_SUBMIT_LIMIT = "30 per minute; 200 per hour"
+
+
 def user_or_ip() -> str:
     """Return a rate-limit key keyed on the authenticated user when present,
     falling back to the remote IP address otherwise.

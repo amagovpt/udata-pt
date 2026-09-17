@@ -2,6 +2,1516 @@
 
 ## Unreleased
 
+- **fix(harvest): a harvest source URL no longer accepts credentials**
+  - The three changes before this one redacted `user:password@` everywhere it reached a
+    reader -- the API, the CSV export, harvest errors and logs, derived resource URLs,
+    Sentry -- but none of them touched the cause: the portal still accepted a source URL
+    with credentials in it. Storing a password in a field that is indexed and serialized by
+    half a dozen paths is fragile by construction; each of those fixes closed one path, and
+    any new serialization reopened the problem.
+  - 📋 **The inventory that decided this.** Every harvest source in production, deleted ones
+    included, read through the public API: **49 sources, 44 active, zero carrying userinfo
+    in the URL**, and zero `config` keys shaped like a credential (only `filters` and
+    `features`). The reading is trustworthy because production still serializes `url`
+    verbatim -- the redaction is not deployed there yet, so nothing was masked. It matches
+    the earlier count taken against a production-scale restore. The credentialed source in
+    the original report was built for the proof of concept; no live source authenticates
+    this way.
+  - **Decision: reject, rather than move the credentials to a write-only field.** A field
+    that is never serialized nor indexed, composed into the request at fetch time, is the
+    right design for a portal that needs basic auth. This one does not: nobody uses it, so
+    it would be a new feature with no consumer. Rejecting is the small, definitive change
+    the inventory allows.
+  - **The rule is `udata.uris`'s own reading, not a second opinion.** The field rejects
+    exactly what `uris.validate(url, credentials=False)` would, judged by the same
+    `URL_REGEX` group. Judging on `urlsplit` instead -- the first attempt -- left a hole
+    precisely where the two parsers disagree: `urlsplit` cuts the fragment and the query
+    off before the netloc, so `https://user:pa#ss@host/x` shows it no `@` at all, while
+    `URL_REGEX` reads `user:pa#ss@` as credentials and lets the value be stored. A password
+    holding a `#`, a `?` or a `/` got through -- and since every redaction downstream shares
+    `urlsplit`'s blind spot, it was then served in full rather than masked: the guard and
+    its safety net failed together instead of in layers. The cost of the wider reading is
+    that an `@` in the path or the query is refused too; none of the 49 production sources
+    carries an `@` anywhere in its URL.
+  - Two more channels the same URL leaked through are closed here: the `url` served to a
+    reader without `edit` now goes through the URL-shaped redaction instead of the free-text
+    one, which let a password holding `"`, `{`, `<` or `|` through whole; and
+    `udata harvest create`, which writes past the form, no longer prints the credentials to
+    the log -- running it needs a shell, reading the log file does not.
+  - **The rejection is local to the harvest source URL.** `URLS_ALLOW_CREDENTIALS` stays
+    true: `udata.uris.validate` reads it for every URL in the portal -- a user or
+    organization website, a dataset schema url, a resource url a publisher typed, an RDF
+    URI -- and turning it off would reject all of those to fix one field. It is also not
+    `uris.validate(url, credentials=False)`, which would be one line: that composes the
+    rejected URL into the error text, so the 400 body would repeat the password back.
+  - **`url` is out of the text index, and the confirmation oracle is closed.** The index
+    covered `$name, $url` while the sources route accepts `q`, so `?q=<password>` returned
+    the source carrying it -- which the two previous entries both recorded as a residue
+    they were leaving standing. It no longer stands. The index is kept over `name` alone;
+    the frontend never sent `q` to that route, so no search anyone uses is lost.
+  - **The migration reports; it does not rewrite.** Stripping the userinfo from a stored
+    URL would break that source's harvest with a 401 that nobody decided, and destroy the
+    only copy of the credential its owner would need to reconfigure it. After the rejection
+    and the index change, a stored credential is a working-source problem rather than an
+    exposure, so the migration names each source -- id, slug, host, never the URL -- and
+    leaves the decision to the operator. In production the list is empty.
+  - ⚠️ **Operational: run `udata db migrate` before restarting web and workers.** MongoDB
+    allows one text index per collection and refuses to create the new one beside the old,
+    so a process running the new code against an un-migrated database raises
+    `IndexOptionsConflict` the first time it touches `harvest_source`. That failure hides
+    itself, which is why it is worth stating plainly: mongoengine caches the collection
+    *before* creating the indexes, so the error happens **once** and the process then
+    serves normally -- over the old index, with the `?q=<password>` oracle still open and
+    with the indexes `ensure_indexes` had not reached yet, `slug` (unique) among them,
+    missing. A single unexplained 500 is the only symptom. The same holds in reverse for a
+    process on the old code started after the migration.
+  - ⚠️ **A legacy source with credentials keeps harvesting, but can no longer be saved**
+    without removing them: the PUT revalidates the stored URL, so even an edit that does
+    not touch it -- deactivating the source, say -- is refused until the URL is cleaned.
+    That is the migration path, and with the inventory at zero it affects nobody today.
+  - ⚠️ **Rolling the release back needs the old index recreated by hand.** Old code calls
+    `ensure_indexes` for `$name, $url` and MongoDB refuses it next to `name_text`, so a
+    revert without that step fails the same way an un-migrated upgrade does.
+  - ⚠️ **A future source needing HTTP basic auth now has no route.** `user:password@` in
+    the URL was the only channel for it -- `requests` extracts it and authenticates; there
+    is no header or dedicated field. Designing the write-only field is the work that would
+    unblock such a source, and it was deliberately not done here. The one adjacent channel
+    that does exist is not a substitute and is worse: the `ckan`, `dkan` and `ckanpt`
+    backends read `config["apikey"]` into an `Authorization` header, and `config` is
+    serialized raw to anonymous callers on the same routes -- never redacted, unlike `url`.
+    Closing that is a separate ticket, not something to route people towards.
+  - ⚠️ Unchanged on purpose: the fetch-time guard, which would otherwise break legacy
+    harvests in silence, and `udata harvest create`, which bypasses the form -- whoever runs
+    it has a shell and could write to the database anyway.
+
+- **fix(sentry): URL credentials no longer reach Sentry, nor the log lines that printed them**
+  - A harvest source URL may legitimately carry `user:password@`, and every `requests`
+    exception raised over one embeds it in its message. An earlier change kept that out of
+    the API; nothing kept it out of **Sentry**, which has a DSN configured in production,
+    nor out of the server's own **log files**.
+  - 🔑 **The scrubber walks the whole event instead of a list of keys**, and that is the
+    point of it. The four places the leak was first noticed --
+    `logentry.message`, `logentry.params`, `exception.values[].value`, `request.url` --
+    are not where the secret actually survives: it also sits in `logentry.formatted`,
+    which is *the string Sentry displays*, and in
+    `exception.values[].stacktrace.frames[].vars`, because `include_local_variables`
+    defaults to true. Measured on the real exception: the password appears **twice** in an
+    event the enumerated fix would have called clean. `request.data` leaks it too -- the
+    harvest source create and preview endpoints take the URL in the body, and the body is
+    attached regardless of `send_default_pii`. A walk also covers whatever the SDK adds
+    next.
+  - A value that *is* a whole URL -- `request.url`, `Referer`, `Origin`, `Location`, the
+    `url` of a breadcrumb or a span -- is redacted by **splitting** rather than by the
+    free-text regex: the regex cannot tell where a URL ends in prose, so it would reach
+    past the authority and rewrite a legitimate
+    `https://data.gov.pt/files//report@2026.csv` into `//***@2026.csv`, claiming
+    credentials that were never there. A key that turns out to hold prose after all falls
+    back to the regex, because splitting prose finds no `@` in the netloc and would return
+    it unredacted.
+  - Transactions get the same scrubber. `before_send` is never called for them, and
+    `traces_sample_rate` is 1.0, so every request and every harvest task produces one.
+  - An event the scrubber cannot process is **dropped, not sent**. Losing one report costs
+    visibility; letting one through costs the credential.
+  - ⚠️ Not the SDK's `EventScrubber`, which matches *key names* (`password`, `secret`) and
+    would see nothing here -- the secret is inside the value of an ordinarily-named key.
+  - **Decision on the harvest `log.*` calls: they redact at the source too, and this is the
+    line that was drawn.** The scrubber protects Sentry only; the server's log files keep
+    whatever the calls write. The start line of a harvest and the INE one printed a
+    credentialed URL *literally, on every run, with no exception involved*, so those and the
+    three that interpolate a `requests` exception now redact before logging. **Left
+    uncovered on purpose:** the traceback `logging` attaches to `log.exception`, where the
+    URL travels outside the message -- redacting that on disk would need a
+    `logging.Filter` on the root logger of every process, a new mechanism. In Sentry those
+    frames *are* covered, by the walk above.
+  - The redaction helpers **stay** in `udata/harvest/url_filter.py`. Moving them to
+    `udata/utils.py` was considered and rejected: the isolation argument does not hold
+    (`udata/harvest/__init__.py` is two lines, and `udata/core/dataset/download_proxy.py`
+    already imports from that module from outside the harvest package), so what remained
+    was tidiness -- not worth rewriting the import of nine files, two of them migrations
+    that have already run, inside a security fix that has to be promoted and possibly
+    reverted on its own.
+  - ⚠️ **This undoes nothing.** Credentials already in Sentry or in old log files are still
+    there; rotating the credential at the source is the only remediation for those.
+
+- **fix(saml): a foreign citizen is recognised again -- the document type arrives punctuated**
+  - autenticacao.gov sends `DocType` as **`TR:`**, with a trailing colon, and not `TR`.
+    The gate compared the raw value against the four accepted types, never matched, and
+    the identifier composition returned nothing -- so **no foreign citizen was ever
+    recognised**: every sign-in minted another account, and `extras` recorded the raw
+    `TR:`. Measured in DEV against a real foreign CMD.
+  - 🚨 **The composition itself is untouched.** It is the pre-image of a one-way HMAC and
+    the digest is the key logins resolve accounts by, so the fix normalises the **input**
+    instead. That is safe only because it is a no-op on all four accepted types -- none
+    carries a trailing separator -- which means an identifier that already resolves an
+    account cannot change. A test asserts exactly that.
+  - Only a **trailing run** of separators is removed, never an interior character. A rule
+    that stripped every non-letter would fold `T:R` into `TR` and admit a type the gate
+    exists to refuse; `T:R`, `TR1`, `XTR`, `CC:` and `:TR` all still reject.
+  - Normalised at the **extraction**, not inside the shared `_first_value`: the eIDAS route
+    reads its `PersonIdentifier` through that same extractor, and trimming punctuation
+    there would unmatch eIDAS accounts already registered. The single assignment feeds
+    both consumers -- the identifier, and the document type stored for counting.
+  - A migration cleans the punctuated values already stored. It never touches the stored
+    identity, and writes through the collection rather than the document, because saving a
+    `User` re-sanitises names on any write path.
+
+- **fix(tests): counts that tests assert on are now exact, not estimated**
+  - mongoengine routes a `QuerySet.count()` with **no filter** to
+    `estimated_document_count()`, which reads WiredTiger's collection metadata
+    instead of counting. That metadata drifts in **both** directions in databases
+    produced by ordinary suite runs.
+  - 🚨 **The dangerous direction is the false green**: `assert X.objects.count() == 0`
+    passes with a document still in the collection, so a test written precisely to
+    catch an orphan reports success with the orphan there. The other direction fails
+    a correct test for no reason.
+  - All **240** such assertions across **32** test files now use `len(list(Model.objects))`
+    for a genuine total, or a **filtered** `Model.objects(field=value).count()` -- which
+    goes through `count_documents()` and is exact -- where the test can name what it
+    expects gone. No expected number was changed anywhere; only how it is counted.
+  - 🚩 **Two production counts were also wrong.** `Site.count_discussions` and
+    `Site.count_harvesters` computed a **persisted, published metric** from an
+    unfiltered count. They were the only two of the ten site metrics not already
+    filtered, and are now exact via `count_documents({})`, which counts on the server
+    without loading the documents. They still count every document, deleted sources
+    included -- the meaning is unchanged. `count_discussions` had no test at all; it
+    has one now.
+  - A guard test walks the test tree and fails if an unfiltered count reappears, so
+    this stays fixed rather than being fixed once.
+  - 🚩 **And the paginated `total` was estimated too** -- the root cause behind most of
+    the instability. `Pagination.total` came from an unfiltered `QuerySet.count()`, and
+    it is what every paginated API response reports as `total`, with `pages`,
+    `next_page` and `previous_page` derived from it, so an estimate could truncate a
+    listing. A filtered listing was always exact; an unfiltered one is reachable in
+    production -- `GET /api/1/reports/` paginates a bare `Report.objects`. Only that
+    previously-estimated path changes.
+  - ⚠️ **Measured, not assumed**: three full-suite runs on unmodified code, same
+    machine, databases dropped before each -- 11 failures, then 0, then 0, with the
+    failing set differing between runs. Four of the five failures named in the red run
+    were in files this change converts; the fifth was the site-metric one above.
+
+- **fix(auth): a citizen can no longer sign in with no way of being recognised**
+  - The four attributes that identify a citizen — civil ID, and the document's type,
+    nationality and number — were asked for as **optional**, and autenticacao.gov lists
+    an optional attribute **with a checkbox the citizen can clear**.
+  - 🚨 **Cleared, the assertion carries no identifier at all.** Nothing links the person
+    to an account, so a **new one is minted on every sign-in**. Measured: one person,
+    one CMD, **three accounts** in two afternoons — and in one of them they gave their
+    real email on the completion screen and the account was still not linked.
+  - All four are now required, which removes the checkboxes. **No logic changed**: the
+    resolver already prefers the civil ID when it is there and composes from the
+    document when it is not, so nationals keep resolving by civil ID exactly as before.
+  - 🚩 **This flag has changed three times in three weeks**, so the reasoning is now
+    written beside it. The claim it replaces — that requiring an attribute makes the IdP
+    refuse whoever lacks it — was never observed. What was observed: tst ran with the
+    civil ID required for **two and a half weeks**, with sign-ins working throughout.
+  - ⚠️ **That window covers the civil ID and covers nationals.** It does not cover the
+    three document attributes, which did not exist then — so a check against a real CMD,
+    **national and foreign**, is a condition of promotion, not of merge: no automated
+    test can reach the IdP.
+  - 🚩 **And the risk is not bounded to foreigners**, which is the easy thing to assume.
+    The consent screen offers the document attributes to a national too; whether the
+    assertion arrives with them filled in is not known for either population. Under the
+    pessimistic reading of the flag the blast radius is unknown, not one group.
+- **fix(harvest): odspt and maaf no longer publish the source URL password in resource URLs and remote ids**
+  - This is the item the previous entry left standing. `URLS_ALLOW_CREDENTIALS`
+    is true, so a source that needs basic auth is configured as
+    `https://user:password@host` — and two backends built **published data** out
+    of it. `odspt` derived `Dataset.resources[].url` and `extras["ods:url"]`;
+    `maaf` used the descriptor URL as `HarvestItem.remote_id`, which the first
+    `save_job()` persists before the metadata supplies the real one, so a failed
+    item kept it.
+  - 🔑 **The worst consumer is the portal itself.** `/r/<id>` redirects to
+    `resource.url` or streams it as an attachment — so the download proxy was
+    fetching the file **authenticated with somebody else's credentials** and
+    handing it to an anonymous caller. That is the argument for the decision
+    below, more than the listing that exposes the string.
+  - 🔑 **The decision: redact, and accept that the link stops downloading.** A
+    link that only works because it carries somebody else's password is the
+    defect, not a feature — an anonymous reader is not supposed to hold the
+    credentials. The alternatives were weighed and rejected: refusing to harvest
+    a credentialed source would produce empty datasets in silence, and moving
+    the credentials out of the URL is a new feature with no consumer asking for
+    it, which would still need this redaction for a URL somebody types by hand.
+  - **Nobody pays that cost today.** An inventory against a production-scale
+    restore (23,080 datasets, 46 harvest sources, data through August 2026)
+    found one `odspt` source and no `maaf` source, neither carrying credentials,
+    and not one affected resource URL, `ods:url` or `remote_id`. The fix is
+    preventive. ⚠️ The restore is not the live database, which is why the
+    migration logs the live source counts rather than leaving the caveat open.
+  - **What made `odspt` tractable is an asymmetry:** `api_url` is the only
+    request the backend makes and the only consumer that needs the credentials
+    back. `public_source_url` redacts the rest; `download_url` and `export_url`
+    derive from `explore_url` and inherit it.
+  - **`maaf` inverts the relationship instead:** the `remote_id` is built from
+    the redacted URL and the credentialed one travels as a kwarg, which
+    `process_dataset` forwards without storing. Redacting at serialization
+    instead would have left the password in Mongo and needed three call sites
+    rather than one — unlike errors and logs, where neither half was redundant,
+    here the second would be.
+  - **Redacting a URL now splits it instead of pattern-matching it.** The
+    free-text helper has to stop at the RFC 3986 authority alphabet, because in
+    prose it cannot tell where a URL ends — but `udata.uris` accepts any run of
+    non-space characters as userinfo, so a password holding `{`, `|`, `^`, `"`,
+    `<`, `>` or a backtick went straight through it. The same regex also
+    rewrites `https://host/files//report@2026.csv`, a legitimate resource URL,
+    into something broken. `redact_url_credentials_in_url` splits the URL and
+    replaces the authority, which is exact in both directions; the free-text
+    helper keeps the error messages and log lines it was written for.
+  - A migration redacts what is already stored, writing only the individual
+    fields that change and pinning each one to the value it read — `resources`
+    is not append-only, so an editor deleting one between the read and the write
+    would otherwise shift the redaction onto a different resource. ⚠️ **It does
+    not un-leak anything**: a credential that was publicly readable is
+    compromised, and the remedy is to rotate it at the remote source. It is
+    expected to be a no-op, and its counters are the inventory of the live
+    database.
+  - ⚠️ **If those counters come back non-zero**, two follow-ups are not
+    automatic: the search index keeps its own copy of `extras` and of the
+    `harvest` sub-document, so the touched datasets need reindexing; and a
+    harvest that ran between the code deploy and the migration would have
+    appended a second, redacted copy of every ODS resource, because `odspt`
+    matches resources by URL and never prunes. Run `udata db upgrade` before
+    restarting the workers and neither applies.
+  - 🚩 **Still standing.** From the previous entry: the `$name, $url` text index
+    that lets a caller confirm a guessed credential via `?q=`, and the raw URL
+    interpolated into `log.warning` / `log.exception`, which belongs in
+    `udata/sentry.py` because every `requests` exception shares it. **And one
+    this work found:** the `ckan` backend builds `Dataset.harvest.remote_url`
+    out of the source URL (`ckan/harvesters.py`, inherited by `ckanpt`), which
+    is the same defect in a field that is more public and longer-lived than
+    either of the two fixed here — it is on every dataset, not on a job that
+    gets purged. It needs its own change and its own migration field; no live
+    source carries credentials today, so it is preventive there too.
+
+- **fix(harvest): a harvest source URL no longer publishes its own password**
+  - `URLS_ALLOW_CREDENTIALS` is true, so a source that needs basic auth is
+    configured as `https://user:password@host/path` — and the portal accepted
+    exactly that. Everything derived from such a URL was then served verbatim
+    to callers **without a session**, because the harvest reads have no
+    `@api.secure`.
+  - 🔑 **The worst channel was not the one reported.** `GET
+    /api/1/site/harvests.csv` needs no session and dumps the `url` column of
+    **every** source in one file — no id, no failed harvest, nothing to guess —
+    and when the CSV export feature is on, that same adapter publishes the file
+    as a downloadable resource on the portal.
+  - The rest: the text of a `requests` exception embeds the URL of the failed
+    request, so it went into `HarvestError.message` — the case that was
+    reported — and into the log lines captured onto `HarvestItem.logs`. The
+    source URL was also copied onto every harvested dataservice, so
+    `GET /dataservices/` handed it out in a listing. And `source_fields`
+    serialized `url` as plain text on both public source routes.
+  - 🔑 **The rule is now "whoever may rewrite the URL reads it whole; nobody
+    else does."** The gate is the one that already guards `PUT`, so owners,
+    organization admins and sysadmins are unaffected, and no client can
+    round-trip the mask back into the record. **Organization editors lose
+    access** — they can create a source but not edit one, so a URL they typed
+    themselves comes back masked.
+  - Errors and logs are redacted **as they are built** and again **as they are
+    serialized**. Neither half is redundant. The constructor is what covers the
+    INE backend, which appends its items with a queryset update that never
+    validates; the serialization is what covers the preview, which runs in
+    dryrun and never saves at all. The jobs list marshals neither — it projects
+    an aggregation and builds its dicts by hand — so it repeats the redaction
+    itself.
+  - A migration redacts what is already stored, writing only the individual
+    fields that change so that a harvest running at the same time does not lose
+    the items it appended. ⚠️ **It does not un-leak anything**: a credential
+    that was publicly readable is compromised, and the real remedy is to rotate
+    it at the remote source. ⚠️ **Nor does it reach the published CSV export or
+    its S3 archive** — those have to be regenerated, and the old ones removed.
+  - 🚩 **Left standing, and named rather than discovered later:** `odspt` and
+    `maaf` build public dataset resource URLs and remote ids out of the source
+    URL. It is the same defect, but there redacting would break a download link
+    that works, so it needs its own decision. `HarvestSource` also has a text
+    index over `$name, $url` and the sources route accepts `q`, so a caller who
+    already guessed a credential can confirm it — a confirmation oracle, not a
+    disclosure. And the harvest backends still interpolate the raw URL into
+    `log.warning` / `log.exception`, which reaches internal logs and Sentry:
+    every `requests` exception in the application shares that, so it belongs in
+    `udata/sentry.py` and not here.
+
+- **test(saml): the account-linking mail's security properties are now held by a test**
+  - That mail's own docstring calls its body a security control: the wizard reaches an
+    account having proved nothing about it, so the mail is what stands between a
+    request nobody made and an identity bound to somebody else's account.
+  - Two properties carry that weight — it **names who asked**, and it **says plainly
+    not to open the link** if you did not start this — and **nothing held either of
+    them**. Anyone shortening the copy could have dropped both and left every test in
+    the file green.
+  - No text changed. The test is the change.
+
+- **feat(auth): the confirm-email mail is written for the three flows that send it**
+  - It used to be two lines — *"Please confirm your email address"* and a button. It
+    now says what address it is about, what confirming does, what to do if you did
+    not ask for it, and where to get help.
+  - **Not "to finish registering".** The same mail serves an email change from the
+    profile, where that phrasing is false for somebody who registered years ago.
+  - **The site name is written out** rather than interpolated: `SITE_TITLE` in
+    production is the platform's full descriptive title, which would make the subject
+    line unreadable.
+  - 🔑 **No greeting and no sign-off in the body** — the mail frame already supplies
+    both for every message on the platform, so a paragraph repeating them would
+    print them twice.
+  - The help line carries an inline link, which needed the one paragraph type that
+    supports one; a button there would give an aside more weight than the
+    confirmation it sits under. ⚠️ The **text/plain** version of every mail renders
+    that paragraph without its URL — a template limitation shared by the whole
+    codebase, not introduced here — so that reader gets the page name and no way to
+    reach it.
+  - ⚠️ **French loses this mail's translation.** The old subject had a `fr` entry;
+    the new strings have only `pt`, so a French reader now receives it in English.
+    Consistent with the rest of the family, and named here rather than discovered
+    later.
+  - 🚩 **Left standing, and it contradicts this change's own reasoning:** the other
+    two notices still interpolate `SITE_TITLE` into their subject — the very thing
+    avoided here because in production it is the platform's full descriptive title.
+    Their subjects arrive unreadable. Out of scope for a ticket asked to translate
+    them, but it is the same defect.
+
+- **fix(auth): the address-taken notice stops giving advice its reader cannot follow**
+  - It said *"sign in to that account the way you normally do, or use the account
+    recovery if you cannot"*. For the reader most likely to receive it — somebody
+    held on the registration completion screen — **signing in is exactly what they
+    cannot do** until that screen lets them through. The account may also be a SAML
+    one with no usable password at all.
+  - It now says nothing is needed to keep the account, and points at support for
+    anyone who cannot reach it. No step that assumes a capability the reader may
+    not have.
+  - The old wording stays in use by the migration wizard's sibling notice, where the
+    advice **is** sound: that reader is not held anywhere, and the paragraph after it
+    tells them what to do.
+
+- **fix(auth): the registration-refusal email was going out in English**
+  - The notice that tells somebody their account could not be linked had **no entry
+    at all** in the Portuguese catalogue, so it shipped in English to every reader —
+    and production defaults to Portuguese.
+  - 🚩 **Nothing failed.** `gettext` returns the message id when a catalogue has no
+    entry, so the mail rendered cleanly and read fine to anyone who reads English.
+    Nobody reading it in production did.
+  - The cause is a gap in the guard, not in the translation: the test that pins
+    "every auth string has a Portuguese translation" lists them by hand, and this
+    notice was written **after** the commit that translated its siblings and
+    extended that list. A list pinning "the set that was actually broken" only
+    stays useful if it grows with the set — so the four strings are in it now,
+    with the reason written beside them.
+  - The notice also gains the structural check its sibling already had, plus an
+    assertion it carries **no link** — there is nothing a link could do here, and a
+    paragraph with one would be the first sign somebody added an action that cannot
+    help.
+- **refactor(discussions): stop the purge paths' notification cleanup from being a coincidence**
+  - The four places that delete a subject's discussions in bulk — the dataset, reuse and
+    dataservice purge jobs, and `DELETE /api/2/topics/<topic>/` — were reported as leaving
+    orphaned notifications behind, on the grounds that a `QuerySet.delete()` never
+    instantiates a document and so never reaches the `Discussion.delete()` override that
+    emits `on_discussion_deleted`. They were not. Mongoengine's `QuerySet.delete()` falls
+    back to deleting document by document whenever a `pre_delete`/`post_delete` receiver
+    is registered for the model, and two unrelated modules register one for `Discussion`:
+    `udata.core.reports`, because it is in `REPORTABLE_MODELS`, and `udata.search`,
+    because it has a search adapter. The override does run, the signal is emitted, and
+    the notifications were already being cleaned up.
+  - That is worth nothing as a guarantee. The correctness of the notification cleanup
+    rested on two registrations that exist for reasons having nothing to do with
+    notifications, and it needed only one of them to survive. Removing both -- or, later,
+    the last one standing -- would have reintroduced the orphans silently, in four places
+    at once, with nothing in the code to warn whoever did it.
+  - The four paths now go through a single `delete_discussions_for_subject()` helper that
+    deletes each discussion explicitly, so the cleanup no longer depends on that
+    coincidence, and a future fifth caller has something to copy.
+  - Five tests cover the helper and the four paths. They are green on both sides of this
+    change and are not claimed to prove a fix: they lock the behaviour, so that whichever
+    way the cleanup stops running, a test says so.
+  - Pre-existing orphaned notifications, if any were ever produced by another route, are
+    not cleaned up here; that would need a migration.
+  - The `fix(discussions)` entry further down this section still says the bulk purges are
+    not covered and still leave orphans. That sentence is wrong, for the reason above. It
+    is left as written because the entry has already been promoted, and editing a
+    promoted line is what makes the same line diverge between environment branches.
+
+- **fix(saml): the audit line now describes the sign-in that actually happened**
+  - Both ACS routes wrote their `outcome=` line **before** handing control to the
+    login funnel. Two of the funnel's exits do not sign anyone in — a deleted
+    account is refused, an unconfirmed address is diverted — and by then the line
+    already said `success`. **Anyone counting successes counted those.**
+  - It stopped being harmless on 2026-09-14: until then the audit logger reached no
+    handler at all, so the wrong lines went nowhere. They reach the log file now.
+  - The line is emitted **by the funnel**, at whichever exit it reaches. One line per
+    request, at the point the outcome is known.
+  - 🔑 **No new vocabulary.** A deleted account is `rejected` (`deleted_account`),
+    alongside the `inactive_account` refusal it mirrors. A pending confirmation is
+    **not** a refusal — nobody was turned away, the citizen is sent on to finish
+    confirming, and the destination is the same `/migrate-account` the routes already
+    audit as `migration_pending`. The **reason** is what separates the cases.
+  - The five outcomes and the reasons that distinguish them are now written in the
+    emitter's own docstring. They had lived only in a test's prose, which is not where
+    a contract belongs.
+  - Four new tests, one per outcome, each fixing the log level explicitly — without
+    that, an "and never success" assertion passes over an empty capture. **One of them
+    covers `user_not_found`, which had no assertion anywhere in the tree** and is
+    precisely the line this change moves.
+  - ⚠️ **One trade, stated rather than hidden:** an exception inside the funnel now
+    leaves no line at all, where before the route had already written one. Emitting
+    earlier is what caused the bug, so the trade is deliberate.
+
+- **feat(auth): finish a CMD/eIDAS registration by linking the account you already had**
+  - A citizen signing in with a digital identity for the first time gets a temporary
+    account with a placeholder address and is held on the registration completion
+    screen until they provide a real one. If the address they provide is the one on
+    the account they already had, there was nowhere to go: the address is taken, so
+    the screen mailed a silent notice and the citizen stayed stuck — unable to finish
+    registering and unable to reach their own account. It was the most reported
+    problem of this review.
+  - That branch now mails an **association link** to the address's owner. Clicking it
+    moves the identity onto the older account and retires the temporary one, so the
+    next sign-in lands where the citizen expects. The link is a different instrument
+    from the confirmation link the branch still refuses to issue: it grants the
+    requesting session nothing and does nothing until the mailbox's owner opens it.
+  - **The screen stays one field.** The taken/free distinction is decided on the
+    server and shows up only in what is mailed; the browser is answered identically
+    either way, so the enumeration oracle this flow was built without stays closed —
+    now pinned for the new branches too.
+  - **The address the CMD asserted is offered back as a prefill.** It is captured in
+    the login funnel, so accounts created before this existed get it on their next
+    sign-in rather than needing a backfill. eIDAS never supplies one — its Minimum
+    Data Set has no email attribute — so that field is simply empty there.
+  - ⚠️ **When the temporary account already holds work, the association is refused**
+    rather than moving content between accounts, and the owner is told by a mail
+    written for that case. What counts as work is derived from what retiring an
+    account destroys irrecoverably; follows are moved across instead, since the
+    person is the same.
+  - 🚩 **The three writes are ordered so failures stay recoverable.** The identity
+    leaves the temporary account before it is bound to the older one: the reverse
+    order has a window where one identity sits on two accounts, which the login
+    lookup refuses outright, locking the citizen out of both. This way a failure
+    leaves it on neither, and the next sign-in puts that right by itself.
+  - The link is re-checked at the click, not trusted from when it was issued: an
+    inbox can hold it for hours while the account acquires work, finishes
+    registering another way, or changes identity.
+  - Works with the migration wizard switched off — this path is not the wizard, and
+    the citizens who need it are held on a screen the wizard cannot help with.
+
+- **fix(organization): the membership accept endpoint no longer force-accepts invitations**
+  - `POST /organizations/<org>/membership/<id>/accept/` approves a request to
+    *join* — the organization side of the flow. An invitation travels the other
+    way, and only the invitee may accept it. The endpoint had lost the check
+    that tells the two apart, so an organization admin could point it at a
+    pending invitation and add that person as a member without them having
+    consented to anything.
+  - It now answers 400 and names the cancel endpoint, exactly as the refuse
+    endpoint has always done for invitations. The invitee's own route is
+    untouched: invitations are still accepted through
+    `POST /me/org_invitations/<id>/accept/`.
+  - ⚠️ **The admin members screen will start showing that 400.** It lists
+    pending invitations and pending join requests in one table with the same
+    Accept button, without distinguishing them. Clicking Accept on an
+    invitation row now fails instead of silently adding the member — which is
+    the point, and is already what Refuse does there.
+  - ⚠️ **That leaves an invitation row with no working action**, because the
+    cancel endpoint it should offer instead is not wired into the admin screen
+    at all. The row can only be resolved by the invitee accepting or refusing
+    it. Teaching that table to tell the two kinds apart, and to cancel an
+    invitation, is a separate frontend change and should follow closely.
+  - **A repeated accept no longer rewrites who handled the request, or when.**
+    Accepting an already accepted request stays idempotent and still answers
+    200 with the existing member, but the request keeps the original
+    `handled_by`/`handled_on` instead of restamping them on every call. That
+    also stops the handled signal from firing a second time, which used to
+    rewrite `handled_at` on every notification of the same organization and
+    user. A request that is still pending against someone who already is a
+    member is a first handling, and is stamped as before.
+
+- **fix(organization): an organization admin can save the organization again without being a site admin**
+  - Updating an organization demanded site-admin rights as soon as the payload
+    carried a `badges` key. A full-object PUT — what a client sends after
+    reading the organization back — always carries one, because the serialization
+    emits every stored field and `badges` defaults to an empty list. So an
+    organization admin editing nothing but the description or the business
+    number got a bare 403, naming a field they never touched.
+  - The requirement now applies only when the submitted set of badge kinds
+    differs from the persisted one. Changing badges stays reserved to site
+    admins in both directions: adding one and dropping one are equally refused.
+    When the sets match, the badges are left alone entirely instead of being
+    rewritten to the same value.
+  - A badges payload whose `kind` is not a string is now rejected with 400.
+    It used to reach the badge machinery unchecked and surface as a 500 — only
+    for a site admin, since the permission check ran first; moving the parse
+    ahead of that check would have opened the same 500 to every editor, so the
+    validation closes it for both.
+
+- **fix(saml): the SSO audit log now actually reaches the log file**
+  - The authentication funnel writes one structured line per terminal decision
+    — success, rejection, error — so a sign-in problem can be reconstructed
+    afterwards instead of guessed. **In production none of those lines was ever
+    written**, and had not been since the feature was added in May.
+  - Two independent causes, and fixing either alone changes nothing. The logger
+    sat outside the `udata.*` tree, so its records propagated to a root the
+    application attaches no handler to; and it had no level of its own, so it
+    inherited the WARNING that production sets while every call is `INFO`.
+  - Both are fixed the way the mail dispatch audit already does it: the logger
+    moves under `udata.*` and its level is pinned where the startup order
+    guarantees it survives.
+  - **A malformed request now leaves a trace too.** A POST to either ACS route
+    with no assertion returned 400 without reaching the audit funnel at all —
+    the request ended and nothing recorded that it had happened. It is audited
+    as `error` rather than `rejected`, because nothing was decided about
+    anybody: a rejection answers an identity, and that request carries none.
+  - ⚠️ **Still not audited, and deliberately so:** an unhandled exception in
+    the funnel propagates as a 500 with no line, which is what the fail-closed
+    policy says it does. Catching it needs an error handler on the blueprint,
+    which would change how errors surface and belongs in its own change.
+  - 🚩 **The line is kept out of Sentry**, as the mail audit already is. Sentry's
+    logging integration sees records at INFO whether or not a handler is
+    attached, the line carries the caller's address and user agent, and this
+    project runs with the SDK default of not sending those. Emitting without
+    the exclusion would have pushed them out through a side door — a privacy
+    setting undone as a side effect rather than as a decision.
+  - The Subject identifier stays HMAC-hashed, as it always was. What is newly
+    written to disk is the **address and user agent** of each sign-in, in a
+    file administrators can read from the backoffice — intended, and worth
+    knowing.
+  - The test that was missing: the two existing audit tests assert what the
+    line *says*, through a helper that pins the level on the logger under test
+    — which is exactly why they stayed green for four months while production
+    stayed silent. The new one forces the parent to production's level,
+    attaches a handler to it, and asserts the record *crosses*.
+
+- **feat(auth): a foreign citizen signing in with CMD now gets an account tied to their identity**
+  - A foreigner has no NIC. The portal demanded one as a *required* attribute
+    and asked for nothing that identifies a foreign document, so the person
+    could not end up with an account bound to who they are — they arrived as a
+    stranger on every sign-in.
+  - The request now asks for the document type, nationality and number, and the
+    NIC drops to optional. `isRequired` tells the identity provider the sign-in
+    cannot proceed without the attribute, so demanding the one thing a
+    foreigner does not have *was* the exclusion. Email and the names stay
+    required, and nothing about a national's consent screen changes.
+  - When no NIC arrives, those three compose the identity that is hashed into
+    the login key. **The NIC always wins when there is one** — that ordering is
+    the whole non-regression, because reversing it would rewrite the identity
+    of every national whose assertion also carries document attributes.
+  - The composition is **frozen from the first deploy**, documented where it is
+    computed. Two details it has to get right: the number alone is not unique
+    (a passport and a residence permit can share one, and the nationality is
+    forced to `PT` on permits), and the leading segment exists because `TR` and
+    `CR` are real country codes — without it a residence-permit holder would
+    compose exactly what a Turkish citizen presents through eIDAS, and the two
+    would share an account.
+  - The verified document type and nationality are recorded beside the hash,
+    where the self-declared answer already sits. The **number is not** — it
+    identifies the person and stays inside the digest.
+  - 🚨 **Known limitation, accepted and not fixed here.** This identity is less
+    stable than a NIC. A residence permit is renewed and changes number; a
+    passport expires. When that happens the person arrives as a **new
+    identity**, and the old account — with its datasets and its organization
+    memberships — **becomes unreachable**, often behind a placeholder address
+    nobody reads. A verified email is the only thing that survives a document
+    swap, which is why it matters more for foreign citizens than for nationals.
+    Reuniting the two accounts is support work.
+  - ⚠️ The tests mock the SAML library, so they prove our side of the exchange
+    and not the identity provider's. Lowering the NIC to optional, the exact
+    shape of the three attributes, and whether a national's assertion can carry
+    a foreign document type all have to be confirmed against the real service
+    before this reaches production.
+
+- **fix(harvest): a source can no longer claim a domain it does not control, and the INE harvest asks who owns a record before overwriting it**
+  - Two pre-existing defects composed into one: any authenticated user could
+    stage a mass overwrite of the 13 054 datasets harvested from INE, the
+    largest source in the portal, without an administrator approving anything.
+  - `HarvestSource.domain` read the **netloc** and split it on `":"`. The netloc
+    carries the userinfo prefix, and allowing credentials in URLs is the
+    configured default, so that split returned the *credentials* rather than
+    the host: a source pointed at `https://www.ine.pt:1@attacker.example/c.xml`
+    claimed the domain `www.ine.pt` while downloading from somewhere else
+    entirely. The domain branch of the harvest scoping query then matched every
+    dataset the real source had ever harvested. It now reads `hostname`, which
+    is what the SSRF guard next door already used; as a side effect the host is
+    lowercased and IPv6 brackets are unwrapped, where the split returned `"["`.
+  - The INE backend is the only one of the fifteen that does not reach an
+    existing record through `BaseBackend.get_dataset`. It looks datasets up in
+    bulk and writes them in bulk, so nothing on that path ever asked whether the
+    record it was about to replace belonged to somebody else — the guard added
+    for the single-record case simply was not on this road. It is now asked once
+    per matched record, before any metadata is applied.
+  - The question is asked in the per-item loop rather than in the batched
+    lookup, because the lookup has no per-item error handling: raising there
+    would lose the whole chunk of 500, whereas the loop's handler fails that one
+    item and carries on, which is what the single-record path does. It is asked
+    before change detection for the same reason the precedent asks before
+    knowing whether anything changed — a record owned by someone else must not
+    be quietly reported as "skipped" against this source either. Creating a new
+    dataset needs no guard, since a new one is born owned by the source.
+  - That same handler now records the failure message and the id of the dataset
+    in conflict on the harvest item. A job over 13 000 items that reports
+    `failed` with an empty `errors` list does not tell the operator which
+    failure is an ownership conflict, who the other owner is, or which record
+    it is about; every other backend already carried the message. A refusal is
+    logged at info rather than as a traceback per item, since a catalogue that
+    conflicts wholesale can refuse every one of those items. The message is
+    truncated at 500 characters, because the items are pushed into a single job
+    document and unbounded messages at that volume would carry it past the
+    16 MB BSON limit and lose the whole record of a harvest whose writes had
+    already landed.
+  - 🚨 **Two operational consequences.** Any source whose URL carries credentials
+    or an uppercase host now resolves to a different `domain` than before, so
+    the datasets it already harvested keep a stale `harvest.domain` until the
+    next run; matching still works, because the scoping query also matches on
+    the source id. And `ine`, `inehvd` and `dgtIne` all live on `www.ine.pt`: if
+    they sit in different organizations and share any remote id, those items
+    will now be refused on every harvest. Worth counting both before promoting.
+  - Note that the harvest runs inside the long-lived Celery worker, which holds
+    its code in memory — the worker and beat have to be restarted after the
+    deploy, or asynchronous harvests keep running the old backend.
+
+- **fix(auth): a spelling that differs only in capitalisation is now the same address everywhere**
+  - Two functions decided whether an email already existed and disagreed: the
+    SAML resolver asked case-insensitively, the account-creation path and the
+    profile's email-change flow asked exactly. The unique index on `User.email`
+    is case-sensitive, so `Maria@x.pt` and `maria@x.pt` coexist — and the row
+    minted by the exact check held the **real** address, not a placeholder.
+  - That duplicate was the expensive kind, because nothing found it: every
+    count filtered by the `saml-` prefix missed it, and `migrate-nics` iterates
+    exactly those. The audit had to grow a second axis before it could see any.
+  - The lookup that already did the right thing moved out of the SAML plugin to
+    sit next to `User`, so the profile can ask the same question. Its reason to
+    exist is the preference for the **exactly matching** row, not the
+    case-insensitivity: two rows can answer to one address and `User` orders by
+    `-created_at`, so a bare `.first()` returns whichever was created last. The
+    docstring now says so, because flask_security's own
+    `find_user(case_insensitive=True)` is precisely that bare `.first()`.
+  - Re-casing your own address still works — the lookup returns your own row,
+    so the identity guard holds.
+  - 🚨 **Known consequence, accepted.** Someone whose real address is held by
+    another row in a different casing can no longer set it, and the response is
+    generic by design so they are not told why. That is the population a
+    manual merge has to reconcile; it is not created by this change, only made
+    visible by refusing to paper over it.
+  - Both states of the migration flag are pinned by tests. With the flag on —
+    the production value — the resolver already diverted to the wizard, so this
+    fixes the fallback that runs where the flag is off.
+
+- **chore(scripts): the account audit now answers the three counts that were blocking decisions**
+  - Three questions were being decided without a number behind them: how many
+    accounts carry no confirmation date, how many organisations are already
+    without an administrator, and which of the duplicate-identity groups can be
+    merged at all.
+  - **Accounts with no `confirmed_at`**, split by whether they carry a CMD link.
+    Password recovery refuses them, and the generic anti-enumeration response
+    makes that refusal look exactly like a mail that was sent — so the
+    population was invisible from the outside. The CMD-linked subset is the one
+    the SAML creation-path fix had never reached.
+  - **Organisations with no member holding the admin role**, listed by name.
+    The guard on the member endpoints stops new ones; it does not repair the
+    existing ones, and nobody had counted them. Reported alongside them:
+    membership rows pointing at a user document that no longer exists, which is
+    what a hard delete leaves behind when it removes the account but not its
+    memberships. Soft-deleted accounts are not counted as missing — the
+    document is still there.
+  - **Each duplicate account now says what it holds** — content, membership,
+    administration. Merging a group by moving the identifier alone destroys
+    whatever the other side owns, so the decision needs this before it can be
+    taken. The report also prints how many accounts own content overall, so a
+    zero on the dangerous groups cannot be mistaken for a scan that found
+    nothing.
+  - Read-only, as before: it never writes to the database.
+
+- **fix(organization): removing or demoting the last administrator is now refused**
+  - Neither member endpoint checked that an administrator remained. Both
+    verified only who may manage members, so the last admin could be removed
+    or demoted to editor and the organisation was left stuck: nobody can
+    manage members, accept transfers or edit it, and — the part that makes it
+    expensive — **it cannot promote anyone from the inside**, so recovering
+    needs a sysadmin.
+  - The check is a single predicate on the organisation model rather than a
+    rule restated in each endpoint, so the account-deletion paths can ask the
+    same question when their behaviour is decided.
+  - It fires on a role *change*, not on any update of the last admin's record,
+    and it deliberately does **not** fire for an organisation that already has
+    no administrator: refusing there would freeze an organisation that is
+    already stuck, over an operation that cannot make it worse.
+  - 🚨 **This does NOT close the problem, and the gap is the larger half.**
+    Deleting an account still strips the person from every organisation with a
+    direct write that never passes through these endpoints, so **an
+    organisation can still be left without an administrator that way** — by a
+    person deleting their own profile, by an admin deleting someone, by the
+    inactive-account job, or by the command line.
+  - That half is not a matter of adding the same guard: refusing to delete
+    one's own account would tie a person to it, which has data-protection
+    implications. It needs a product decision, and it is tracked separately.
+  - Also still open: nobody has counted the organisations that are *already*
+    without an administrator. This guard prevents new ones; it does not repair
+    old ones.
+
+- **fix(auth): an identity claimed by two accounts is now refused, not resolved**
+  - The CMD/eIDAS login looked the identifier up with `.first()`. That reads
+    like a coin toss and is not one: the user document orders by newest first,
+    so **the most recently created account won every time** — silently and
+    consistently.
+  - ⚠️ **That is worse than a random pick, not better.** A random one would
+    eventually be noticed by whoever it happened to. This hands over the same
+    wrong session, content and organisation memberships on every sign-in, and
+    nothing ever contradicts the impression that the account is yours. Making
+    the choice "deterministic" was never the missing piece — it already was.
+    What is missing is proof of possession, and there is no way to obtain it
+    at that point, so the only honest answer is to refuse and let a person
+    disambiguate.
+  - The resolver now reports the ambiguity instead of resolving it, and both
+    ACS routes refuse with their own code and audit line, before anything is
+    written and before the migration wizard branch.
+  - 🔑 **It also closes a case the previous code could not see at all.** The
+    hashed lookup ran first and the plain-value fallback only when it found
+    nothing, so an account holding the hashed identifier and another holding
+    the same identifier in plain form were **invisible to each other** — the
+    first returned one and the fallback never ran. The question that matters
+    is "how many accounts claim this identity?", and only asking across both
+    stored forms answers it.
+  - 🚨 **This denies access to roughly 26 accounts** — the 13 duplicate groups
+    measured in production. They sign in today, into the wrong account; after
+    this they do not sign in at all until the duplicates are merged. That is
+    the correct outcome and a real change in access, so it is stated here
+    rather than discovered. Merging them is separate work.
+  - The tests read **both** accounts back from the database. "Refused" and
+    "signed into the other one" look identical from the outside, and only the
+    absence of a session on either account tells them apart — an assertion on
+    the redirect alone would pass while the defect was present.
+
+- **fix(auth): the SAML auto-confirm was never actually stored**
+  - `datastore.commit()` does nothing in this application. `Datastore.commit`
+    is `pass` on Flask-Security's base class and `MongoEngineDatastore` does
+    not override it, because its `put()` is already `model.save()`. The SAML
+    plugin called it in three places as if it flushed pending changes, which
+    is correct advice for SQLAlchemy and noise here.
+  - The consequence was not a write lost on a repeat login but a field that
+    never reached the database at all. `create_user` ends in that `put()`, so
+    the document was written *before* `confirmed_at` was assigned; the
+    returned object carried the value, so the check that decides whether to
+    auto-confirm — which is simply `confirmed_at is None` — said no, and the
+    provider stamp saw its own value already agreed and saved nothing. The
+    next sign-in reloaded from the database, found the field null, assigned it
+    in memory again, and lost it again.
+  - ⚠️ **That reaches beyond tidiness.** An account whose `confirmed_at` is
+    null is refused by password recovery, and the deliberately generic
+    anti-enumeration response makes that refusal indistinguishable from a mail
+    that was sent. Every account created through this path could never recover
+    its password and was never told why.
+  - Fixed in the two places that matter, differently on purpose: the creation
+    path now passes the field *into* `create_user`, so there is one write and
+    the ordering mistake stops being expressible; the sign-in path uses an
+    atomic single-field update. **Not a document save** — that would drag
+    `about`, `first_name` and `last_name` through the model's sanitisation,
+    which genuinely changes a legacy value, so signing in would silently
+    rewrite the person's own name. A failure there is logged and the login
+    proceeds: bookkeeping must never cost anyone their account.
+  - The third call, on the pending-account path, is simply removed. Nothing
+    was assigned after it — that path leaves the field unset by design, since
+    the address is self-declared and still has to be proved — so the call only
+    ever suggested a flush that does not exist.
+  - Searched the whole backend: those three were the only occurrences, so the
+    pattern is not spread elsewhere.
+  - ⚠️ **Observable data change:** accounts whose `confirmed_at` is null today
+    will have it filled in on their next sign-in. That is what the code always
+    intended, but anyone counting unconfirmed accounts will see the number
+    fall. No migration is proposed — the next login of each account resolves
+    it — but the count of affected accounts still needs measuring in
+    production.
+  - The tests read the value back from the database, never from the handed-in
+    object, and the sign-in test is set up so the auto-confirm is the *only*
+    writer: with the provider already stored and agreeing, the stamp saves
+    nothing. Without that, the stamp's save would carry the field along and
+    the test would pass green while proving nothing — which is how this
+    survived in the first place.
+
+- **fix(auth): Flask-Security's mails were going out from a non-existent domain**
+  - Password reset, email confirmation and welcome mails were all sent from
+    `webmaster@udata` — a domain that is not even a valid TLD — while udata's
+    own mails used the real configured address. The mails were delivered, from
+    an unrecognisable sender and flagged as external by the recipient's mail
+    system, which is why they read as "not arriving" to the person waiting for
+    them. Confirmed in a delivered message, not inferred.
+  - The cause was `SECURITY_EMAIL_SENDER = MAIL_DEFAULT_SENDER` in the
+    `Defaults` class body. A class-body assignment captures the class value
+    once, and the environment overrides only `MAIL_DEFAULT_SENDER`, so the
+    sender stayed frozen at the placeholder no matter what was configured.
+    Flask-Security's own default for that key is already a `LocalProxy` that
+    reads `MAIL_DEFAULT_SENDER` from the live config at send time, so that line
+    had replaced a correct lazy default with a broken eager one. Removing it —
+    rather than overriding it — restores the value to follow
+    `MAIL_DEFAULT_SENDER` wherever it is set: config file, environment, a
+    test's settings class, or `create_app`'s override.
+  - ⚠️ **If an environment does not set `MAIL_DEFAULT_SENDER`, it now inherits
+    the same placeholder from the defaults** — the same symptom by another
+    route. Worth confirming the value per environment.
+  - The test has to make the two settings *differ* to be a test at all: the
+    testing profile defines neither, so both inherit the placeholder and an
+    assertion comparing them would pass whether or not the defect is present.
+    Both the reset and the confirmation mail are asserted, since the defect was
+    in the setting they share.
+  - Also fixed alongside it: **`SEND_MAIL` could not be switched off from
+    configuration.** It read the raw string, so `SEND_MAIL=False` produced
+    `"False"` — truthy. Every other boolean in that file already parsed
+    properly. The default is unchanged, so no environment changes behaviour;
+    the variable simply becomes usable.
+  - Three hypotheses that the investigation **eliminated**, recorded so they are
+    not re-explored: the recovery form is case-insensitive and finds accounts
+    whose address differs in capitalisation; the contact-form default recipient
+    does not redirect these mails; and mail sending could not have been off,
+    because of the bug above.
+
+- **fix(auth): a refused SAML sign-in is now refused all the way down**
+  - `flask_login.login_user` returns `False` *without establishing a session*
+    when the account is not active, and everything downstream carried on as if
+    it had succeeded: the session was marked `saml_login`, the debug log said
+    `login_user OK`, and the ACS route had already emitted an audit line
+    reading `outcome=success`. Whoever counted successful sign-ins was
+    counting logins that never happened. It is reachable rather than
+    theoretical — `active` carries no default on the user document, so a
+    legacy account imported without the field lands here, and no guard in the
+    funnel looked at it.
+  - The guard goes in both ACS routes right after the account is resolved, and
+    deliberately not at the `login_user` return value. By the time the funnel
+    reaches that call it has already auto-confirmed the account and stamped
+    the authentication provider on it, so refusing later would leave an
+    account confirmed and marked as having authenticated through CMD by a
+    login that was declined. Refusing before any of it runs is what keeps
+    those two writes honest, and the refusal is logged at `warning` rather
+    than `error` because it reaches the legacy population in bulk and the
+    error level opens a Sentry issue per login.
+  - It also sits above the wizard branch, which matters for the people most
+    affected: an inactive legacy account that is not linked yet is, by
+    construction, the one that receives validation links. A guard any lower
+    would have sent it back to the wizard on every attempt, mailing it another
+    link that the link path then refuses, without ever telling it what was
+    wrong.
+  - The validation link is no longer burned by a click that cannot sign anyone
+    in. The check joins the deleted-account one inside the read-only token
+    validation, so the single-use token is preserved by *where* the check
+    lives rather than by remembering to undo the consumption. The click
+    answers "link invalid" rather than naming the real cause, which is the
+    same deliberately opaque answer a deleted account already gets: an
+    unauthenticated GET — a mail scanner pre-opening the link, a forwarded URL
+    — must not become an oracle for account state.
+  - ⚠️ **The refusal is now distinguishable, but not yet visible to the
+    person.** Two pre-existing gaps, common to every rejection code in this
+    flow and not introduced here: the frontend does not render `saml_error`,
+    so the explanatory message is carried in the redirect but never shown;
+    and the `saml.audit` logger has no handler and neither does the root, so
+    the audit line is emitted but does not reach anywhere in production at
+    any level. Both need their own work — a frontend ticket covering all the
+    rejection codes at once, and the separate fix for the audit logger.
+
+- **fix(auth): SAML sign-ins now keep the trackable session fields**
+  - `SECURITY_TRACKABLE` is on and the five fields are declared on our own
+    `User` document, so a password login kept `last_login_at`,
+    `current_login_at`, `last_login_ip`, `current_login_ip` and `login_count`
+    up to date. A CMD or eIDAS login did not: the SAML plugin imports
+    `login_user` from `flask_login`, which only establishes the session, while
+    the code that maintains those fields lives in `flask_security`'s
+    `login_user`. Measured on production data, 83% of the accounts created
+    before 2026-01 carry `last_login_at` against 3% of those created between
+    June and August 2026, and every account with a synthetic address had all
+    five empty — so "how many of these accounts are still in use?" had no
+    answer from the data, and anything keyed on inactivity read every recent
+    CMD/eIDAS user as dormant.
+  - Fixed by mirroring that block rather than by importing it. Reaching
+    flask_security's `login_user` would have persisted the fields on its own,
+    since its `_datastore.put()` is `document.save()` under MongoEngine, but
+    the swap is wider than the defect and every part of it lands on the
+    sign-in path: that `put()` is unguarded, so a legacy document failing
+    validation would turn a working sign-in into a 500; it sets `fs_cc`/
+    `fs_paa` in the session; and it fires `identity_changed`/
+    `user_authenticated`, which never fired here. There is no smaller unit to
+    import, the semantics being inline rather than a public function, so a
+    test asserts the mirrored write and the dependency agree instead of
+    trusting that they do, and another pins which `login_user` is imported —
+    the tidier-looking swap would otherwise double-count logins in production
+    while the suite stayed green.
+  - Written as an atomic update of exactly those five fields, **not** through
+    `user.save()`. A save writes the whole dirty document, and `User.pre_save`
+    sanitizes `about`, `first_name` and `last_name` on every write path: on a
+    document predating that sanitization the value genuinely changes, so
+    MongoEngine marks the field dirty and it rides along in the same `$set` —
+    someone signing in with CMD would find their own name rewritten on screen,
+    silently, since this write is deliberately swallowed. The same coupling
+    would let a login clobber a bio edited in another tab. Cleaning up legacy
+    documents is a migration, not a side effect of a login. The atomic write
+    also makes the counter safe, where read-modify-write loses a count when two
+    sign-ins land at once.
+  - Written only when the login actually happened, and never able to cost
+    someone their account. `login_user` returns false without establishing a
+    session for an account that is not active, and `active` has no default on
+    the document, so a legacy account imported without the field lands there;
+    stamping it would claim a sign-in that was refused. The write is guarded,
+    so a failure loses the fields, is logged, and the login stands. It is also
+    gated on the extension's trackable flag and timestamped from its datetime
+    factory, so it cannot outlive or drift from what the password login writes
+    into the same fields.
+  - Covers both places that sign someone in — the shared ACS funnel behind
+    `/saml/sso` and `/saml/eidas/sso`, and the emailed validation link, which
+    arrives with no session — pinned by separate tests, because the asymmetry
+    between those two paths is what left an earlier write in the same function
+    unproven.
+  - Accounts authenticated through CMD/eIDAS now carry the dates the admin
+    listings and the inactivity tasks read, where they previously showed
+    nothing. **Not retroactive:** the fields have meaning only from this
+    deploy onward, and their absence on older accounts does not mean the
+    account was unused.
+
+- **fix(scripts): ignore deleted organizations when auditing membership**
+  - The audit built its set of organization members from every organization,
+    deleted ones included, so an account counted as a member of organizations
+    that no longer exist. On production data that inflated the sole-admin
+    exposure by half: six organizations reported, four actually live, because
+    one entity had been created three times on the same day and two of the
+    records were already cleaned up.
+
+- **feat(scripts): count both duplicate-account axes in the institutional audit**
+  - `migrate-nics --dry-run` cannot answer either. Its `_find_shared_nics`
+    filters on `is_nic_hashed`, so in an environment where nothing is hashed
+    yet it has nothing to look at and reports zero — guaranteed rather than
+    measured. And it only ever iterates accounts with the `saml-` placeholder
+    prefix, so duplicates without one are invisible to it.
+  - The audit now groups accounts by their stored identifier and by their
+    lowercased email, reporting every group with more than one account. Both
+    are grouped on the values **as stored**, so neither needs the `SECRET_KEY`
+    and the answer holds in any environment: two accounts with the same plain
+    NIC hash to the same digest, so grouping the plain values finds them
+    without hashing anything.
+  - The report states what it cannot see rather than implying completeness: a
+    plain NIC on one account and the hash of that same NIC on another cannot be
+    matched without the key, so the identifier figure is a lower bound.
+
+- **fix(scripts): classify NICs in the institutional audit with the production predicates**
+  - The audit script re-implemented the NIC classification instead of importing
+    it, and the two copies had already drifted: it lowercased a value before
+    testing it for hex and `udata/core/user/nic.py` does not. An uppercase hex
+    ciphertext was therefore `legacy-encrypted` to the audit and `unrecognized`
+    to the login — and that bucket holds most of the accounts carrying an
+    identifier, so the risk sat exactly where the volume is.
+  - It now imports `is_nic_hashed`, `is_nic_legacy_encrypted` and
+    `is_nic_plain`, so the audit and `migrate-nics` put every account in the
+    same bucket by construction rather than by two authors agreeing. The
+    predicates need no app context; only `hash_nic` does, for the `SECRET_KEY`.
+  - The script consequently runs inside the project venv (`uv run python …`),
+    which the usage lines now say. It stays strictly read-only.
+
+- **test(saml): cover the declared citizen type on the emailed validation link**
+  - Of the four places that write `extras.auth_citizen_declared`, the emailed
+    validation link was the only one with no test. It is also the one that
+    cannot use the session: the click arrives with no session at all, so the
+    declaration has to travel inside the pending-link record written when the
+    link was issued. The path was implemented by symmetry with `provider`,
+    whose equivalent test already existed — and symmetry is not proof.
+  - It is the path a citizen takes when the CMD assertion brings no email and
+    they type a new address, so it is neither rare nor a corner. The test
+    asserts the value is in the record *before* the click and on the account
+    *after* it, clicking from a fresh client so the absence of a session is
+    real rather than incidental.
+  - No production code changed: the behaviour was already correct. Verified by
+    mutation — dropping the value from the record, and dropping the write at
+    the click, each turn the test red.
+
+- **feat(auth): record the citizen type declared at CMD sign-in**
+  - The login screen asks whether the citizen is national or foreign, and the
+    answer was thrown away in the browser — it only enabled the submit button.
+    The portal was collecting an answer it then had no way of using.
+  - Adds `extras.auth_citizen_declared`. The login route reads `?citizen=`,
+    checks it against an exact allowlist, and only then puts it in the session
+    — the same treatment the neighbouring `next` parameter gets, and for the
+    same reason: it arrives in a query parameter the caller controls. An
+    unrecognised value is **dropped**, never stored raw and never replaced by a
+    default, because a guess written into this field reads exactly like
+    something the citizen said.
+  - Wherever `auth_provider` is recorded, this is recorded, under the same
+    conditions: account creation, the login funnel that backfills older
+    accounts, the wizard's create branch, and the emailed validation link —
+    whose click arrives with no session, so the value travels in the link
+    record alongside the hashed NIC and the names.
+  - Unlike the provider it is known at `/saml/login`, *before* the redirect to
+    the IdP, so it lives at the top of the session next to `saml_next_url`
+    rather than inside the wizard's pending record. That made
+    `_handle_migration_redirect` unnecessary to touch.
+  - **Self-declared, and it gates nothing.** Anyone can open
+    `/saml/login?citizen=foreign` and claim whatever they like, so a test
+    drives both declarations through a full sign-in and requires the outcomes
+    to be identical in status, redirect and resolved account — everything
+    except the value stored. If something ever starts deciding from it, that
+    test fails. When the document attributes arrive, the verified value wins,
+    and a disagreement becomes the signal for a misconfigured IdP.
+  - Only CMD collects it: the eIDAS screen does not ask, and a declaration left
+    in the session is not recorded on an eIDAS login.
+  - **The value is the last one declared**, not the one declared at this
+    sign-in. The write is conditional, so opening `/saml/login` directly keeps
+    whatever was there — a direct link must not destroy a good value, and no
+    guess stands in for it. Anyone counting these needs to read the field as
+    "what this person last told us".
+
+- **feat(auth): record whether an account authenticated through CMD or eIDAS**
+  - `extras.auth_nic` could not answer that question: it holds a NIC or an
+    eIDAS PersonIdentifier indifferently, and the hash does not say which. The
+    only distinction that existed was ephemeral, inside the migration wizard's
+    session, so "how many people use eIDAS?" had no answer at all.
+  - Adds `extras.auth_provider`, carried down from the ACS route that received
+    the assertion. The route is the only place that knows — the same reason
+    `_handle_migration_redirect` already took the provider explicitly: the two
+    routes converge downstream and the assertion attributes look identical
+    afterwards, so deducing it below them is wrong by construction.
+  - Written at account creation, so an account carries it from the moment it
+    exists, and again in the single funnel every path ending in a session
+    passes through, which is what backfills the accounts that predate the
+    field — they get it on their owner's next sign-in. That funnel also covers
+    the identity whose stored NIC is upgraded from the old plain format, so no
+    third write inside the resolver is needed. The write sits after the login
+    guards on purpose: an account turned away by the deleted or
+    pending-confirmation gate did not authenticate through anything, and
+    stamping it would say it did.
+  - Two paths do not run inside an ACS request and are handled separately. The
+    wizard reads the provider from its session. The emailed validation link
+    reads it from the record on the account, because that click arrives with
+    no session at all — the same reason the hashed NIC and the names already
+    travel there.
+  - **Absent means absent.** Nothing is written when no provider is supplied,
+    and no default is substituted for a missing one. The wizard's JSON
+    response does substitute `"cmd"` so its heading reads sensibly rather than
+    "Associar conta a"; that line now says in as many words that it is
+    presentation only, because reusing it to persist would store a supposition
+    that reads as a fact and the question this field exists to answer would
+    come back wrong with nobody able to tell. A test pins the rule from the
+    other side: a session carrying every key but that one produces an account
+    with no provider.
+  - It deliberately does **not** distinguish a national from a foreign CMD
+    citizen, even though their identity attributes differ. Both arrive on the
+    same ACS route, the frontend collects the citizen type and never sends it,
+    and the MDC document attributes that would tell them apart are not
+    requested yet. Inferring "foreign" from a missing NIC would be a deduction
+    from the attributes rather than the route, and a CMD assertion with no NIC
+    is also what a misconfigured IdP produces. That dimension belongs in
+    sibling keys, added when those attributes start arriving, which keeps
+    every value written now correct instead of needing a rewrite.
+  - `udata/core/user/nic.py` now records why the identifier hash carries no
+    provider prefix. The original request asked for one; the hash is the key
+    the login resolves accounts by and the original NIC cannot be recovered to
+    recompute it, so adding a prefix would mean either two formats forever or
+    locking out every already-registered CMD/eIDAS user. Without the reason
+    written where the field is defined, the next reader of that request
+    concludes it was forgotten.
+
+- **fix(auth): stop the change-email form disclosing whether an address is registered**
+  - Submitting an address that already belonged to another account answered
+    with a form error — "This email is already registered" — rendered straight
+    back to whoever submitted it. One account was therefore enough to test any
+    address for existence, which is the same CWE-203 oracle the account
+    migration wizard was fixed to close, and it was reached from the
+    complete-registration screen that every CMD/eIDAS account with a
+    placeholder address lands on.
+  - The check moves out of `ChangeEmailForm`, which can only refuse, and into
+    the `change_email` view, which can answer identically either way: the owner
+    of the address is warned by mail, and the browser gets the free-address
+    response down to the echoed address — which discloses nothing, because the
+    caller is the one who submitted it.
+  - No confirmation link is issued for a taken address. Sending one would act
+    on an account the requesting session has proved nothing about, and would
+    turn this into a way to spray confirmation mail at any address on demand.
+    The notice therefore carries no link at all, and prescribes no particular
+    next step: the account may have been created through SAML and have no
+    usable password, so "use your password" would be impossible advice.
+  - Replicates the taken-address branch of the migration wizard, including its
+    two load-bearing details: the deleted-row guard (`mark_as_deleted` rewrites
+    the address, so mailing such a row would be mailing nobody) and the single
+    shared rate-limit budget — a per-branch budget would diverge, and a
+    divergence is itself an oracle. The notice mail is a sibling of
+    `welcome_existing` rather than a reuse of the wizard's, whose copy names a
+    digital identity; that is false here, because `change_email` is also
+    reached from the profile by a password user.
+  - `confirm_change_email` keeps its own already-taken guard. It is the net for
+    an address that becomes taken between the request and the click, which the
+    new branch cannot see.
+  - The regression suite carried a class for each enumeration vector the audit
+    found — login, register, forgot-password, resend-confirmation — and none
+    for change-email, which is why this survived. One is added in the same
+    shape, plus coverage that the taken branch warns the owner and leaves both
+    accounts untouched. The test that previously asserted the disclosure is
+    rewritten with its original intent — the collision is still handled at
+    submit time — keeping its one load-bearing assertion: the address does not
+    move.
+
+- **fix(auth): translate the authentication mails and form errors that reached readers in English**
+  - The SAML account-linking mail went out entirely in English, subject
+    included — "Confirm linking a digital identity to your account". Its
+    strings were wrapped in gettext but had no pt catalogue entry, and that
+    fails silently: gettext returns the msgid, so the mail renders and reads
+    perfectly well to anyone reading English. It had been doing so unnoticed.
+  - "Your new email must be different than your previous email" was worse: it
+    was never wrapped in gettext at all, so no catalogue entry could have
+    helped it.
+  - Measured with `pybabel` over `udata/auth/`: 56 msgids, 37 translated, 19
+    not. Twelve of those are shown to a Portuguese reader in English and are
+    added — the seven of the account-linking mail, the two still missing from
+    the address-taken notice, and the three reCAPTCHA form strings.
+  - The remaining seven are left alone deliberately, not by omission: their
+    msgid is already written in Portuguese ("Autenticação rejeitada: …"), so a
+    pt reader sees them correctly. What is wrong there is the reverse — the
+    msgid should be English with a pt translation, like every other string in
+    the catalogue — and correcting it rewrites the msgids and touches the five
+    other locales, which is a change of its own rather than a line in this one.
+  - The regression test pins the twelve msgids instead of re-extracting them,
+    because an extraction cannot tell which missing entries a pt reader can
+    actually see and would report those seven as missing forever. A second test
+    pins the notice message structurally, so a paragraph added to it later
+    without a translation is caught even if nobody extends the list.
+  - The catalogue is edited and recompiled directly, without regenerating the
+    `.pot` or touching the other locales, which is how the existing translation
+    commits in this repository do it. The other five locales compiled to
+    identical bytes and were left untouched.
+
+- **fix(discussions): send the new-discussion mail even when the discussion has no messages yet**
+  - The mail builder indexed `discussion.discussion[0]` unconditionally, so a
+    discussion whose message list is empty raised `IndexError` inside the
+    notification task and no mail was sent at all.
+  - The comment block is now omitted instead, which is what the
+    discussion-closed mail already did when there was no comment; the mail
+    keeps its title, context paragraph and reply link. Nothing changes for the
+    discussions created through the API, which always attach the first message
+    in the same expression that creates the discussion.
+  - On how reachable that state is: no path in this repository produces it.
+    Every creator attaches the first message atomically, deleting the message
+    at index 0 is refused, and the GDPR deletion either removes the discussion
+    or overwrites the content. The only producer is the test factory. The guard
+    is still right — the model permits the state, so a document written by a
+    migration, by legacy data or by hand reaches it, and the failure mode was
+    losing the mail entirely — but it is a guard against a state we cannot
+    currently create, not a fix for an observed production incident.
+  - The failure was and remains invisible in the mail dispatch audit log: the
+    exception is raised while the message is being built, before the send, so
+    the audit line is never reached. What it leaves is a Celery traceback.
+
+- **fix(mail): name the mails whose subject is a template, instead of logging the template**
+  - The audit line derives its `kind` from the subject's msgid, which reads well
+    for a subject that is a plain sentence and badly for one that is not: the
+    support form logged `kind="[%(site)s] %(topic)s — %(subject)s"`, telling a
+    reader nothing about what the mail was. Worse, a subject built with
+    `.format()` resolves eagerly and left the kind as the *translated* sentence,
+    so the same mail logged differently per language — the opposite of a stable
+    identifier.
+  - A `MailMessage` can now carry an explicit `kind`, and the six mails with a
+    templated subject use it, named after the function that builds them so a
+    grep of the log leads straight to the code. The legal deletion notice also
+    carries the type it deleted, since one builder serves all seven deletable
+    kinds and "we deleted your dataset" must not read the same as "we deleted
+    your account". The field is optional and the remaining mails are untouched:
+    deriving from the msgid is already right for them.
+
+- **feat(mail): log every outgoing email — type, masked recipient, outcome — including the Flask-Security ones**
+  - A real send used to leave no trace at all. The `log.debug` calls and the
+    `mail_sent` signal in `send_mail` sit in the `else` branch, so they only
+    fire when `SEND_MAIL` is off; in every deployed environment a successful
+    send and a failed one were equally silent. "Did this user ever get the
+    confirmation mail?" was therefore unanswerable from the backoffice log
+    page, which is one of the most recurring operational questions.
+  - Each attempt now emits a single `key=value` audit line — kind, masked
+    recipient, outcome, and on failure the error class with a scrubbed message
+    — shaped after the SAML audit line. `conn.send` is wrapped so a failure is
+    recorded instead of passing without a trace, and the exception is still
+    re-raised: a failed send must not look successful, and the multi-recipient
+    semantics (the loop stops) are left exactly as they were, since changing
+    who still receives a mail is a delivery decision rather than an audit one.
+    A test pins that behaviour so a future change to it is deliberate.
+  - The logger is `udata.mail.audit`, deliberately inside the `udata` tree so
+    its records reach the handlers of `app.logger`, whose stderr is written to
+    the file that page reads. Its level is pinned in `init_app`: `init_logging`
+    puts the `udata` logger at WARNING outside debug, and a child with no level
+    of its own inherits it, which would have dropped every line before it
+    reached a handler — the whole feature a silent no-op. A test guards that
+    specific failure.
+  - The error text is scrubbed rather than logged verbatim, because
+    `str(SMTPRecipientsRefused)` *is* the `{address: (code, response)}` dict:
+    writing it out would leak the very address the line takes care to mask, in
+    exactly the case that matters (a refused recipient). Only the local part is
+    masked, so the domain survives — a whole domain refusing mail is a real
+    signal. Matching the domain too, the obvious way to write that pattern,
+    failed open on every domain not starting with an ASCII alphanumeric (an
+    address literal, an IDN, a leading underscore), letting the whole address
+    through untouched. The scrubbed text is also capped: it comes from the
+    remote server, `smtplib` puts no ceiling on an accumulated multi-line
+    response, and the substitution is quadratic.
+  - The audit logger is excluded from Sentry. Its ERROR line accompanies an
+    exception that already reaches Sentry through the Flask and Celery
+    integrations, so the logging integration's defaults would have raised a
+    second issue for every refused recipient and made a breadcrumb of every
+    successful send.
+  - Flask-Security dispatches confirmation, welcome and password-reset mails
+    itself, bypassing `send_mail` entirely, so `AuditMailUtil` now takes the
+    place of the bare `MailUtil` and emits the same line for them. Its `kind`
+    is the template name Flask-Security passes, which arrives bare
+    (`reset_instructions`, `welcome`) — the `security/email/` prefix exists
+    only while the template file is resolved.
+  - Address masking moved out of the SAML plugin into `udata.utils`, where the
+    mail code can reach it, instead of adding a third divergent copy.
+
+- **fix(saml)!: no unproven session may destroy a validation link, and the skip stops saying whether an address is taken**
+  - The `migration_link_pending` record lives on the User document, so it is
+    global to the account and outlives the session that asked for it. Two
+    routes could point the migration candidate at an arbitrary account by
+    address, with no proof of anything, and pointing destroys the link
+    outstanding for the previous target: `POST /saml/migration/search`, and the
+    `email_taken` branch of the skip. Either was a destructor for any account's
+    link, and the pending session now surviving `migration_confirm` made it a
+    loop. Neither points any more, and `search` is removed outright rather than
+    hardened a second time — it has had no consumer since the wizard stopped
+    calling it. Its boundary coercion moves to the skip, and `_find_legacy_user`
+    loses the name branch it was the only caller of.
+  - One unproven pointer remains and is not a request: the SSO points a
+    candidate by itself, by email match and then by unique name match, so a
+    homonym reaches the wizard aimed at somebody else's account and the
+    account-creation tail would destroy the link that account was holding.
+    Destroying a link is now scoped to the session that issued it, which costs
+    nothing: the invariant the drop protects is that a live link in the old
+    candidate's mailbox would put this session's NIC on a second account, and
+    only a link this session issued can be in that position.
+  - `POST /saml/migration/skip` answered 409 `email_taken` for a taken address
+    and 200 for a free one, so one wizard session was an oracle over every
+    address anyone cared to submit — against the portal's own
+    `SECURITY_RETURN_GENERIC_RESPONSES`, and useful mainly for picking targets.
+    A taken address now gets a notice mailed to it and the caller gets the
+    creation branch's answer. The notice carries no token and writes nothing at
+    all on the target: mailing the validation link instead would mint a fresh
+    nonce over the record and hand every session the power to destroy a link on
+    demand, which is the very thing being fixed.
+  - Indistinguishable also means one request later. The refusals that depend
+    only on the identity are settled before the address is looked up; the
+    wizard ends on both branches; and `saml_confirmation_pending` keeps ONE
+    shape — the caller's own address and the hash of the NIC they
+    authenticated with — with the branch recomputed server-side, because the
+    Flask session cookie is signed but not encrypted and a handle shaped
+    differently per branch hands the answer over to a base64 decode. That one
+    shape is also what keys the mailer budget on the identity in both cases:
+    keyed on the identity for one branch and on the IP for the other, the 429
+    would itself have been the answer — and, behind the F5/WAF, every
+    legitimate resend in the country would have shared one bucket of five
+    mails an hour. What this does not buy is stated rather than implied:
+    repetition still distinguishes, because the creation branch consumes an
+    allowance on the account it creates while the notice deliberately consumes
+    nothing on the target — so the guarantee is one probe per CMD
+    authentication, plus one per window per identity, not zero.
+  - The wizard's four mail-sending routes gain a ceiling keyed on the
+    government identity the SSO proved, not on the IP: behind the F5/WAF every
+    anonymous visitor collapses onto one origin address, so an IP key would be
+    a single national bucket. Its own limiter scope, so the wizard cannot spend
+    the login's budget or the reverse.
+  - Breaking: `POST /saml/migration/search` is gone, and the skip no longer
+    returns `email_taken` or `candidate_found`. The frontend that reads them
+    must be deployed first.
+
+- **feat(saml)!: mail the validation link after the password proof instead of logging in**
+  - The password on `POST /saml/migration/confirm` said which legacy account to
+    link and then linked it, session and all. It does not prove that the
+    account's email is reachable, so it no longer completes anything: the route
+    re-points the candidate at the account whose password was proved, mails the
+    validation link to that account's own address, and leaves
+    `migration_confirm_link` as the single place that binds the identity and
+    starts a session. The response is `{"sent": true}`; the session stays
+    pending, because the resend and a second attempt both need it and the click
+    is what clears it.
+  - Re-pointing goes through `_point_migration_candidate`, the only mutator of
+    the candidate reference. That is what makes the resend endpoint — which
+    reads no body, on purpose — mail the proven account rather than the homonym
+    the assertion matched by name, and it destroys any link already issued for
+    the previous target. Where the proven account *is* the candidate, the fresh
+    nonce written over the same record is what stops the earlier token
+    validating: the invariant the emailed link arrived with holds, by a
+    different mechanism.
+  - A correct password resets the attempt tally. The tally is incremented before
+    the password is checked, so without the reset the send cap would spend
+    attempts that were all correct, until five of them locked the session out of
+    the only branch that can identify the account.
+  - The emit-store-tally-send block is shared with `migration_send_link` through
+    `_mail_validation_link`, which runs the NIC guard first: without a NIC the
+    token would be consumed with `nic_hash=None`, which is a link that starts a
+    session and binds no identity at all.
+- **feat(saml): report the identity provider that started the migration**
+  - The wizard names the provider on every screen it renders and had no way to
+    tell which one started the flow — the CMD and eIDAS ACS routes converge on
+    `_handle_migration_redirect` and the assertion attributes are
+    indistinguishable afterwards, so an eIDAS user read "Chave Móvel Digital" on
+    the screen asking for their credentials. The pending state now carries
+    `saml_provider` and `GET /saml/migration/pending` returns it, defaulting to
+    `cmd` for sessions opened before the field existed.
+  - **Deploy this before the matching frontend change**: the wizard depends on
+    both the `{"sent": true}` contract and this field.
+
+- **feat(saml)!: prove the legacy account by an emailed link instead of a 6-digit code**
+  - Linking a legacy account to a CMD/eIDAS identity proved ownership with a
+    code the user copied off their mail into the wizard. It is now a validation
+    link sent to the address already on that account, matching what the portal
+    already does everywhere else it asks someone to check their inbox. Clicking
+    it links the identity and starts the session; before the click there is no
+    authenticated session at all.
+  - The pending request is recorded on the account document, not in the
+    session. That is what lets the click work with no session — the owner may
+    open the mail in another browser — and it is the only way to invalidate a
+    mailed token, which is stateless: re-pointing the wizard at another
+    account, linking by password, creating a new account instead, or consuming
+    the link all destroy the record, and each of those kills any link still in
+    the wild. Consumption additionally refuses outright if the NIC has since
+    landed on another account, so one identity can never sit on two: the login
+    lookup resolves by `auth_nic` ordered by `-created_at`, and the newer
+    account would silently win it.
+  - The token payload is tagged. The confirm serializer and its salt are shared
+    with flask-security's own confirmation token, whose payload is also a
+    two-element list of strings and which anyone gets in their inbox by
+    registering; untagged, that token reached this route and its uuid
+    uniquifier hit an `ObjectIdField` as an unauthenticated 500.
+  - An expired link is refused rather than reissued, departing from the
+    change-email confirmation this route otherwise follows. Mail scanners open
+    links in inboxes before their owners do, and reissuing from an
+    unauthenticated GET would let a scanner keep an old mail alive
+    indefinitely, each pass minting a link with a fresh deadline. Recovering
+    means authenticating again.
+  - The token carries the account id and a hash of the record's nonce, not the
+    `fs_uniquifier`: `/logout` and a password reset both rotate that to kill
+    outstanding sessions, either of which would silently void a link the owner
+    had not opened yet. Validity is checked before expiry, inverting the
+    change-email precedent, because a resend mints a new nonce and a superseded
+    token reaching the expiry branch would reissue and kill the newer link.
+  - Sends are capped per hour on the account rather than for its lifetime. The
+    account-creation cap is monotonic because the recipient there is an address
+    the wizard user typed; here it is always the account's own address, so a
+    lifetime ceiling would only let five anonymous requests permanently deny
+    the owner the email route.
+  - The mail body is part of the boundary rather than decoration. A code was
+    inert to a click — an attacker needed the owner to transcribe it — whereas
+    a link is not, so the mail names the identity that asked for the link and
+    says plainly not to open it otherwise.
+  - Removing the code path also removes the takeover chain it carried: the code
+    was written in cleartext into the requester's own signed-but-readable
+    session cookie, already bound to the account they had pointed at, so the
+    target-confusion guard passed by construction. Leaving the endpoint alive
+    but unused would have left that reachable by direct POST.
+  - `POST /saml/migration/send-code` is gone and `POST /saml/migration/confirm`
+    no longer accepts `method="code"`; the `method="password"` proof is
+    untouched. **Deploy this before the frontend change** — the new wizard
+    screen calls `send-link`, which does not exist until this lands. Between
+    the two, the old wizard's "Enviar código" button hits a removed endpoint
+    and reports a generic error; that window is accepted deliberately, because
+    the path it breaks is the account-takeover vector above and the password
+    branch keeps working throughout.
+
+- **chore(tests): stop the suite from loading the deployment config by default**
+  - `udata.cfg` is tracked in this repo and `create_app` loads it over
+    `settings.Testing`, so a plain `pytest` tested the deployment rather than the
+    defaults the suite is written against. Measured on `develop`, whole suite,
+    clean test databases: **617s and 10 failures with it loaded, against 236s and
+    green without it**. Every failure was a rate-limit test, which follows —
+    `udata.cfg` configures the limiter's storage, and `RATELIMIT_ENABLED=False`
+    lives in `settings.Debug`, not in `settings.Testing`.
+  - `pyproject.toml` now defaults `UDATA_SETTINGS` to a path that does not exist,
+    which is how `udata/tests/__init__.py` asks for the load to be skipped and
+    what the CI job already did on its own. The default now covers everyone:
+    local runs, IDE runs, and any new CI job that forgets the variable.
+  - The `D:` prefix is pytest-env for *only if not already set*, so a run that
+    deliberately loads the deployment config still wins — the CI step that
+    asserts the download-proxy timeouts against the real `udata.cfg` is
+    unaffected, and was re-run to confirm it.
+
+- **fix(saml): request every MDC attribute the CMD login actually needs as required**
+  - `sp_initiated()` asked Autenticação.gov for NIC, NomeProprio and NomeApelido
+    with `isRequired="False"` while only CorreioElectronico was required. All
+    four are consumed unconditionally on the ACS side: the NIC feeds the
+    NameID ↔ NIC binding that rejects an XSW-style wrapper assertion, and the
+    two names build or match the account. Declaring them optional described an
+    SP that can work without them, which is not this one, and left the login
+    depending on the PT node volunteering them.
+  - Mirrors the alignment already done for the eIDAS AuthnRequest, where the
+    Minimum Data Set attributes were promoted for the same reason: relying on
+    the node's downstream normalisation instead of stating the requirement was
+    fragile. The consent screen still lists exactly the same four attributes —
+    nothing new is requested, and nothing stops being requested.
+- **fix(saml): the wizard no longer refuses the one address the person is sure of**
+  - `POST /saml/migration/skip` rejected any email already held by an account.
+    Correct for someone else's address; wrong for the caller's *own* legacy
+    account, which is precisely what the wizard exists to migrate. When the CMD
+    brings an address that differs from the portal one — institutional against
+    personal, the common case — and the name does not match either, the identity
+    is classed `no_match` and lands on the account-creation step; typing the real
+    address then got "email already registered". The skip now resolves that
+    address and, when it belongs to a legacy account this identity could
+    legitimately claim, points it as the candidate and reports
+    `candidate_found` alongside the existing `email_taken`, so the wizard
+    continues into the linking branch instead of asking for a retype.
+  - **Nothing is linked by this, and no new mechanism was added.** The response
+    only points the candidate; ownership is still proven at
+    `POST /saml/migration/confirm`, by password or by a code mailed to that same
+    account. The session mutation the search endpoint already performed —
+    including killing any code issued for a previous target — moved into a
+    single shared helper, so that invariant lives in one place rather than
+    being copied to a second call site. Accounts already linked to another CMD
+    identity, or without a password, are still refused, as is a replayed
+    session whose identity already holds an account.
+  - The status code and error key are unchanged, so the field is purely
+    additive and an older frontend keeps its current behaviour. **Promote this
+    before the matching frontend release**: the frontend narrows the
+    already-registered message to "cannot be linked", which is false advice
+    while the backend still refuses a claimable address.
+  - Three lookups in the same flow still resolved addresses case-sensitively
+    while every login and recovery lookup does not: the wizard's own search,
+    the email rule that decides whether an identity is a linking candidate at
+    all, and the confirm endpoint's password branch. The last one failed the
+    ownership proof for a *correct* password and reported it through the
+    deliberately generic "invalid credentials", making it indistinguishable
+    from a wrong one.
+  - The pending endpoint no longer offers an address another casing already
+    holds. It pre-fills the creation field precisely so nobody is handed an
+    address that can only be rejected, and checking it exactly defeated that
+    for the commonest case there is: a CMD carrying "Rui@Example.pt" against an
+    account at "rui@example.pt".
+  - The search endpoint now coerces its payload to strings before querying.
+    A JSON body can carry a dict, and a dict reaching a MongoEngine query is
+    how a field lookup becomes an operator lookup: `{"$regex": "^adm"}` made
+    the endpoint's `found` flag a per-character oracle over every registered
+    address, returning the domain and first character of whatever matched.
+  - Those three now go through one helper that prefers an **exact** match.
+    Matching case-insensitively is not enough on its own: the unique index on
+    `User.email` is case-sensitive, so a row differing only in case can exist
+    (the email-change form and the SAML account creation both still check
+    exact), and accounts are ordered newest-first — so a plain
+    case-insensitive lookup hands back whichever row was created last. That
+    would have pointed the wizard at the shadow row and linked the identity to
+    an empty account, leaving the real one unreachable by CMD.
+
+- **feat(saml): a CMD account now needs a confirmed email before it has a session**
+  - Creating an account through the account-linking wizard used to mint one from
+    whatever the IdP happened to send: auto-confirmed, logged in on the spot, and
+    given a `saml-*` placeholder address whenever the CMD brought no email or the
+    one it brought was taken. autenticação.gov proves *who the person is*; it says
+    nothing about an address, and the address is the account's recovery and
+    notification channel. `POST /saml/migration/skip` now requires an email, checks
+    it is well-formed and unused, creates the account **unconfirmed**, mails the
+    stock Flask-Security confirmation link, and starts no session. No new token,
+    template or mechanism was introduced.
+  - The gate would have been trivially bypassable: the new account already carries
+    the NIC, so a repeat CMD login resolved straight to it and hit the auto-confirm
+    that ran on *every* SAML login — "try again" would have been enough to get in.
+    Accounts carrying the new `pending_email_confirmation` marker in `extras` are
+    now neither confirmed nor logged in until their owner follows the link; they
+    land back on the wizard, which explains why and offers a resend. Everything
+    without the marker keeps the previous behaviour, which is what the marker is
+    for. It never needs clearing: once `confirmed_at` is set the gate stops
+    matching.
+  - The requirement would also have missed the people it is most for. An identity
+    matching no account never reached the wizard at all — it was created and logged
+    in inside the SSO callback — so `_find_or_create_saml_user` is now a pure
+    resolver that returns `no_match` instead of creating. Both callbacks route that
+    through the wizard when it is enabled, and fall back to creating the account
+    outright when it is not, exactly as before. eIDAS follows, sharing the resolver.
+  - Resending the confirmation has to work with no session, since by design there
+    isn't one. A dedicated endpoint keyed on the pending-confirmation marker left in
+    the session identifies the user without authenticating them, so it takes no
+    email argument and can only ever mail the account's own address — an endpoint
+    accepting an arbitrary one would be an open relay. It carries its own limit of
+    three sends per session, because the stock `security.send_confirmation` view is
+    registered with no rate limit to lean on.
+  - **Requires `MIGRATION_MODE_ENABLED` to be on in the environment's `udata.cfg`.**
+    The flag has no value in `Defaults`, and with it off none of the above applies:
+    the fallback keeps creating auto-confirmed accounts with placeholder emails,
+    silently and without error.
+
 - **fix(harvest): authorize the config preview, and give it a rate limit of its own**
   - `POST /harvest/source/preview/` tested `organization.permissions["harvest"]`
     only when the payload named an organization, so a payload that named none

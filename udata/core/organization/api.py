@@ -84,7 +84,7 @@ def _parse_badge_kinds(payload):
     for item in payload:
         if isinstance(item, str):
             kinds.append(item)
-        elif isinstance(item, dict) and "kind" in item:
+        elif isinstance(item, dict) and isinstance(item.get("kind"), str):
             kinds.append(item["kind"])
         else:
             api.abort(400, "Each badge must be a kind string or an object with a kind field")
@@ -243,8 +243,17 @@ class OrganizationAPI(API):
         payload = request.json or {}
         badge_kinds = None
         if "badges" in payload:
-            admin_permission.test()
-            badge_kinds = _parse_badge_kinds(payload["badges"])
+            # A full-object PUT always carries a badges key: org_fields marshals
+            # badges as a list on every read, and to_dict() emits every stored
+            # field, so both an API client echoing back what it read and the
+            # test suite send one whether or not they touched it. Only an actual
+            # change of the badge set is a site-admin operation: echoing back
+            # what is already there must not cost an organization admin their
+            # own edit permission.
+            submitted_kinds = _parse_badge_kinds(payload["badges"])
+            if set(submitted_kinds) != {badge.kind for badge in org.badges}:
+                admin_permission.test()
+                badge_kinds = submitted_kinds
 
         form = api.validate(OrganizationForm, org)
         org = form.save()
@@ -528,11 +537,33 @@ class MembershipAPI(API):
 class MembershipAcceptAPI(MembershipAPI):
     @api.secure
     @api.doc("accept_membership", **common_doc)
+    @api.response(400, "Use the cancel endpoint for invitations")
     @api.marshal_with(member_fields)
     def post(self, org, id):
         """Accept user membership to a given organization."""
         org.permissions["members"].test()
         membership_request = self.get_or_404(org, id)
+
+        # This endpoint approves a request to join, so it is the organization
+        # side of the flow. An invitation travels the other way and only the
+        # invitee may accept it, through /me/org_invitations/<id>/accept/;
+        # without this guard an admin could add someone who consented to
+        # nothing. MembershipRefuseAPI keeps the symmetric check.
+        if membership_request.kind == "invitation":
+            api.abort(400, _("Use the cancel endpoint for invitations"))
+
+        # A repeated accept stays idempotent — same 200, same body — but must
+        # not restamp the request: handled_by/handled_on are the only record of
+        # who approved the membership, and re-firing after_handle would also
+        # rewrite handled_at on every notification of this pair. Both conditions
+        # are required: a request still pending against an existing member is a
+        # first handling and is stamped below, and an accepted request whose
+        # member was since removed still goes through the normal path.
+        # Trade-off: repeating the call used to double as a retry when the
+        # signal failed after the save, leaving notifications unhandled. That
+        # retry is gone; the receiver is where such a failure belongs.
+        if membership_request.status == "accepted" and org.is_member(membership_request.user):
+            return org.member(membership_request.user)
 
         membership_request.status = "accepted"
         membership_request.handled_by = current_user._get_current_object()
@@ -758,6 +789,20 @@ class MemberAPI(API):
         member = org.member(user)
         old_role = member.role
         form = api.validate(MemberForm, member)
+
+        # Checked BEFORE populate_obj, and with the new role read from the
+        # form: once the member is populated its role is already the new one,
+        # so is_last_admin would say False and the guard would never fire.
+        # Refusing here also means nothing was mutated, not even in memory.
+        if old_role == "admin" and form.role.data != "admin" and org.is_last_admin(user):
+            api.abort(
+                400,
+                _(
+                    "Não é possível retirar o papel de administrador ao último administrador "
+                    "da organização. Promova outro membro a administrador primeiro."
+                ),
+            )
+
         form.populate_obj(member)
         org.save()
 
@@ -773,6 +818,17 @@ class MemberAPI(API):
         org.permissions["members"].test()
         member = org.member(user)
         if member:
+            # An organisation left without an administrator is stuck: nobody
+            # can manage members, accept transfers or edit it, and it cannot
+            # promote anyone from the inside -- recovering needs a sysadmin.
+            if org.is_last_admin(user):
+                api.abort(
+                    400,
+                    _(
+                        "Não é possível remover o último administrador da organização. "
+                        "Promova outro membro a administrador primeiro."
+                    ),
+                )
             Organization.objects(id=org.id).update_one(pull__members=member)
             Assignment.objects(user=user, organization=org).delete()
             org.reload()

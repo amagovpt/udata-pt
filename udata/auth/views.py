@@ -126,6 +126,8 @@ def confirm_change_email_token_status(token):
 
 
 def confirm_change_email(token):
+    from udata.core.user.models import find_user_by_email_ci
+
     expired, invalid, user, new_email = confirm_change_email_token_status(token)
 
     flash = None
@@ -143,8 +145,13 @@ def confirm_change_email(token):
     if flash:
         return redirect(homepage_url(flash=flash, flash_data=flash_data))
 
-    # Check if the new email is already taken by another user
-    existing_user = _datastore.find_user(email=new_email)
+    # Check if the new email is already taken by another user.
+    #
+    # Case-insensitively: the unique index on User.email is case-sensitive, so
+    # an exact check let "maria@x.pt" through while "Maria@x.pt" already
+    # existed, and this is the line that writes the address -- the two rows
+    # answering to one mailbox were born right here.
+    existing_user = find_user_by_email_ci(new_email)
     if existing_user and existing_user.id != user.id:
         return redirect(homepage_url(flash="change_email_already_taken"))
 
@@ -171,13 +178,120 @@ def get_csrf():
 @login_required
 def change_email():
     """Change email page."""
+    from udata.core.user.models import find_user_by_email_ci
 
     form = ChangeEmailForm()
 
     if form.validate_on_submit():
-        new_email = form.new_email.data
-        send_change_email_confirmation_instructions(current_user, new_email)
+        # Stripped once and used for every step below, so the lookup and the
+        # confirmation token can never disagree about the address.
+        #
+        # This is defence, not the check: udata's StringField has no strip
+        # filter, but validators.Email() refuses a padded address inside
+        # super().validate(), so the branch below only ever sees a trimmed one.
+        # The check this replaced stripped here too, and it was unreachable for
+        # the same reason. Kept because it costs nothing and stops a laxer
+        # email validator from quietly making this lookup the only thing
+        # between "taken@example.org " and a confirmation link for someone
+        # else's address. Pinned by test_change_mail_rejects_a_padded_address.
+        #
+        # `or ""` because EmptyNone turns a blank field into None; DataRequired
+        # means validation never gets here with one, so this is a type guard.
+        new_email = (form.new_email.data or "").strip()
 
+        # The address is taken -- but the caller must not learn that. A form
+        # error, which is what used to happen here, is rendered straight back
+        # to them, and one account is then enough to test any address. So the
+        # party who can actually act on this is told instead: whoever reads
+        # that mailbox. The browser is answered exactly as it would be for a
+        # free address, down to echoing the submitted address, which discloses
+        # nothing because the caller is the one who submitted it.
+        #
+        # No *confirmation* link is issued for a taken address: that link acts
+        # on behalf of the requesting session, which has proved nothing about
+        # the account it would change, and issuing one on demand would make
+        # this a way to spray confirmation mail at any address.
+        #
+        # One exception, and only one (LEDG-2431). A caller who signed in with
+        # a government identity, holds a placeholder account, and submits the
+        # address of an existing account is the single case where the taken
+        # address is not an accident but the destination: it is their own older
+        # account, and refusing to say so leaves them unable to finish
+        # registering or to reach it. They are mailed an ASSOCIATION link,
+        # which is a different instrument -- it grants nothing to this session
+        # and does nothing until the mailbox's owner opens it, and what it then
+        # does is move the caller's identity onto the account that was clicked.
+        #
+        # This does not widen who may have mail sent on their behalf: the
+        # migration wizard already mails exactly this link, to a candidate the
+        # SSO picked by email or name match, for the same population of
+        # CMD-authenticated sessions, and says so in its own comment. What is
+        # new is that the address is typed rather than asserted, which is why
+        # _mail_registration_association_link carries the per-target cap the
+        # wizard's own send path carries.
+        #
+        # `confirm_change_email` keeps its own already-taken guard: it is the
+        # net for an address that becomes taken between this request and the
+        # click, which this branch cannot see.
+        # Case-insensitive for the same reason as in confirm_change_email:
+        # a spelling that differs only in case is the SAME mailbox, so it is
+        # taken. This widens what counts as taken -- deliberately -- and the
+        # answer to the caller must stay identical either way.
+        # Run BEFORE the address is looked up, and unconditionally. The
+        # migration notice's own budget check does the same thing for the same
+        # reason: work that happens only on one branch is work an attacker can
+        # time. It reads nothing but the caller's own account, so running it on
+        # the free branch too costs a query and discloses nothing.
+        from udata.auth.saml.saml_plugin.saml_govpt import (
+            _has_linked_nic,
+            _placeholder_owns_content,
+        )
+
+        requester = current_user._get_current_object()
+        # The same two conditions the association itself requires of the
+        # requester, so the refusal notice is only ever sent where an
+        # association was actually on the table. Without the identity check, a
+        # pending account with content but nothing to move would have the
+        # address's owner told that linking was refused over content, when no
+        # linking was ever possible.
+        requester_could_associate = requester.has_placeholder_email and _has_linked_nic(requester)
+        requester_owns_content = requester_could_associate and _placeholder_owns_content(requester)
+
+        existing = find_user_by_email_ci(new_email)
+        if existing and existing.id != current_user.id:
+            # mark_as_deleted rewrites the address to <id>@deleted, so a row
+            # deleted through the product is not found by a submitted address
+            # at all; this guard is for rows deleted by any other means, and
+            # mailing one would be mailing nobody. The response does not change
+            # either way -- the caller must not learn which case it was.
+            # The association attempt comes first, and falls through to the
+            # silent notice whenever any of its guards refuses. Nothing the
+            # branch chooses is visible from outside: both arms mail somebody
+            # who already had this address, and the caller is answered by the
+            # shared exit below either way.
+            from udata.auth.saml.saml_plugin.saml_govpt import (
+                _mail_registration_association_link,
+                _send_association_refused_notice,
+            )
+
+            if existing.deleted:
+                pass
+            elif requester_owns_content:
+                # Refused, and said so. The temporary account holds work that
+                # retiring it would destroy, and the product decision was to
+                # refuse rather than move content between accounts. The owner
+                # is told because they are the only party who can act; the
+                # caller is answered by the shared exit, as in every branch.
+                _send_association_refused_notice(existing)
+            elif not _mail_registration_association_link(requester, existing):
+                mails.address_taken_notice().send(existing)
+        else:
+            send_change_email_confirmation_instructions(current_user, new_email)
+
+        # Shared exit on purpose: the two branches above must not be
+        # distinguishable from out here. The rate limit on this view is also
+        # shared by both -- a per-branch budget would diverge, and a divergence
+        # is an oracle.
         if wants_json():
             return jsonify({})
 

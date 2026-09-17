@@ -6,6 +6,7 @@ from werkzeug.test import TestResponse
 
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import DatasetFactory
+from udata.core.discussions import mails as mails_module
 from udata.core.discussions.factories import DiscussionFactory
 from udata.core.discussions.metrics import update_discussions_metric  # noqa
 from udata.core.discussions.models import Discussion, Message
@@ -30,6 +31,7 @@ from udata.core.spam.signals import on_new_potential_spam
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.core.user.models import User
 from udata.features.notifications.models import Notification
+from udata.mail import LabelledContent, ParagraphWithLinks
 from udata.models import Dataset, Member
 from udata.tests.helpers import capture_mails
 from udata.utils import faker
@@ -1073,6 +1075,54 @@ class NotifyDiscussionsTest(APITestCase):
         notifications = Notification.objects(user=owner)
         self.assertEqual(len(notifications), 1)
         self.assertEqual(notifications[0].details.status, DiscussionStatus.NEW_DISCUSSION)
+
+    def test_new_discussion_mail_without_messages(self):
+        """A discussion with no messages yet must still notify the owner.
+
+        The mail builder used to index `discussion.discussion[0]`
+        unconditionally, so this raised IndexError inside the Celery task and
+        no mail left at all. The empty list is the natural state of a freshly
+        created discussion, before the first message is attached.
+        """
+        user = UserFactory()
+        owner = UserFactory()
+        discussion = Discussion.objects.create(
+            subject=DatasetFactory(owner=owner),
+            user=user,
+            title=faker.sentence(),
+        )
+
+        with capture_mails() as mails:
+            notify_new_discussion(discussion.id)
+
+        # The point of the fix: a mail is sent at all. Before it, the task
+        # raised and this was zero.
+        self.assertEqual(len(mails), 1)
+        self.assertEqual(mails[0].recipients[0], owner.email)
+
+        # And it is the comment block that is omitted, not some other one.
+        # Counting paragraphs is not enough: omitting the title instead would
+        # keep the same count and pass. Labels are compared by msgid, read the
+        # way `mail_kind` reads it, because the suite does not run in English.
+        empty = mails_module.new_discussion(discussion).paragraphs
+        labels = [p.label._args[0] for p in empty if hasattr(p, "label")]
+
+        self.assertEqual(labels, ["Discussion title:", "Reply"])
+        self.assertEqual(
+            [p for p in empty if isinstance(p, LabelledContent)][0].content,
+            discussion.title,
+        )
+        self.assertTrue(any(isinstance(p, ParagraphWithLinks) for p in empty))
+
+        # The same mail with a message keeps the comment block, so the omission
+        # above is conditional and not a removal.
+        discussion.discussion = [Message(content=faker.sentence(), posted_by=user)]
+        filled = mails_module.new_discussion(discussion).paragraphs
+
+        self.assertEqual(
+            [p.label._args[0] for p in filled if hasattr(p, "label")],
+            ["Discussion title:", "Comment:", "Reply"],
+        )
 
     def test_new_discussion_comment_mail(self):
         owner = UserFactory()

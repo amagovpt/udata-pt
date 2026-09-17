@@ -4,6 +4,7 @@ from udata.utils import (
     daterange_end,
     daterange_start,
     get_by,
+    mask_email,
     recursive_get,
     safe_unicode,
     to_bool,
@@ -255,3 +256,26 @@ class AwareDateTest:
         naive_datetime = to_naive_datetime(random_date)
         assert isinstance(naive_datetime, datetime)
         assert naive_datetime.tzname() is None
+
+
+class MaskEmailTest:
+    def test_keeps_first_character_and_domain(self):
+        assert mask_email("jane.doe@example.com") == "j***@example.com"
+
+    def test_single_character_local_part_is_not_revealed_twice(self):
+        assert mask_email("j@example.com") == "j***@example.com"
+
+    def test_domain_with_subdomains_is_preserved(self):
+        assert mask_email("jane@mail.example.co.uk") == "j***@mail.example.co.uk"
+
+    def test_last_at_sign_separates_local_from_domain(self):
+        assert mask_email('"odd@local"@example.com') == '"***@example.com'
+
+    def test_string_without_at_sign_is_dropped(self):
+        assert mask_email("not-an-email") == ""
+
+    def test_empty_string_is_dropped(self):
+        assert mask_email("") == ""
+
+    def test_none_is_dropped(self):
+        assert mask_email(None) == ""

@@ -199,6 +199,32 @@ class DcatBackendTest(PytestOnlyDBTestCase):
             == "https://data.paris2024.org/api/explore/v2.1/console"
         )
 
+    def test_dataservice_source_url_has_no_credentials(self, rmock):
+        """The source URL denormalized onto a dataservice must carry no password.
+
+        Dataservice.harvest is readable without a session, so a credentialed
+        source URL copied verbatim would be handed out by every dataservice
+        listing -- no failed harvest needed (LEDG-2477).
+        """
+        rmock.get("https://example.com/schemas", json=ResourceSchemaMockData.get_mock_data())
+
+        filename = "bnodes.xml"
+        url = mock_dcat(rmock, filename)
+        scheme, _, rest = url.partition("://")
+        credentialed_url = f"{scheme}://harvestuser:sup3rs3cr3t@{rest}"
+        with open(os.path.join(DCAT_FILES_DIR, filename)) as dcatfile:
+            rmock.get(credentialed_url, text=dcatfile.read())
+        org = OrganizationFactory()
+        source = HarvestSourceFactory(backend="dcat", url=credentialed_url, organization=org)
+
+        actions.run(source)
+
+        dataservice = Dataservice.objects.first()
+        assert dataservice is not None
+        assert "sup3rs3cr3t" not in dataservice.harvest.source_url
+        assert "harvestuser" not in dataservice.harvest.source_url
+        assert dataservice.harvest.source_url == f"{scheme}://***@{rest}"
+
     def test_harvest_dataservices_keep_attached_associated_datasets(self, rmock):
         """It should update the existing list of dataservice.datasets and not overwrite existing ones"""
 
@@ -377,7 +403,11 @@ class DcatBackendTest(PytestOnlyDBTestCase):
 
         actions.run(source)
 
-        assert Dataset.objects.count() == 2
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a harvest that created too many or too
+        # few documents could go unnoticed.
+        assert len(list(Dataset.objects)) == 2
         assert HarvestJob.objects.first().status == "done"
 
     def test_harvest_spatial(self, rmock):
@@ -981,6 +1011,41 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         assert "connection error" in mock_warning.call_args[0][0].lower()
         mock_exception.assert_not_called()
 
+    def test_harvest_log_lines_do_not_carry_the_source_password(self, rmock, mocker):
+        """A source URL may legitimately carry `user:password@`, and the log
+        lines that print it reach the server's log files, which the Sentry
+        `before_send` does not protect (LEDG-2501).
+
+        The connection error is given a message holding the whole URL so that
+        the assertion on the warning line means something: without it, it would
+        pass whether or not the line redacts. urllib3 formats its own
+        `ConnectionError` with host and path only, but `HTTPError` from
+        `raise_for_status` does carry the userinfo, since it interpolates
+        `response.url`.
+        """
+        url = f"http://harvestuser:sup3rs3cr3t@{TEST_DOMAIN}/test.jsonld"
+        # Registered with the credentials in it: `requests` leaves the userinfo
+        # in the prepared URL, so that is the request the adapter sees.
+        rmock.get(
+            url,
+            exc=requests.exceptions.ConnectionError(f"Failed to establish a connection to {url}"),
+        )
+
+        source = HarvestSourceFactory(backend="dcat", url=url, organization=OrganizationFactory())
+
+        mock_debug = mocker.patch("udata.harvest.backends.base.log.debug")
+        mock_warning = mocker.patch("udata.harvest.backends.base.log.warning")
+
+        actions.run(source)
+
+        logged = " ".join(
+            str(call) for call in mock_debug.call_args_list + mock_warning.call_args_list
+        )
+        assert "sup3rs3cr3t" not in logged
+        assert "harvestuser" not in logged
+        # Still says the source carried credentials, and still names the host.
+        assert "http://***@data.test.org" in logged
+
     def test_preview_does_not_create_contact_points(self, rmock):
         """Preview should not create ContactPoints in DB."""
         from udata.core.contact_point.models import ContactPoint
@@ -992,7 +1057,7 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         org = OrganizationFactory()
         source = HarvestSourceFactory(backend="dcat", url=url, organization=org)
 
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
         job = actions.preview(source)
 
@@ -1000,10 +1065,10 @@ class DcatBackendTest(PytestOnlyDBTestCase):
         assert len(job.items) == 4
 
         # No ContactPoints should have been created in the database
-        assert ContactPoint.objects.count() == 0
+        assert len(list(ContactPoint.objects)) == 0
 
         # No datasets should have been created either
-        assert Dataset.objects.count() == 0
+        assert len(list(Dataset.objects)) == 0
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["csw*"])

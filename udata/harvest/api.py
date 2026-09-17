@@ -23,19 +23,31 @@ from .models import (
     HarvestJob,
     HarvestSource,
 )
+from .url_filter import redact_url_credentials, redact_url_credentials_in_url
 
 ns = api.namespace("harvest", "Harvest related operations")
 
 
+# Both fields are redacted on the way out as well as on the way in
+# (`HarvestError.clean`). The preview runs the backend with `dryrun=True`, so
+# it never saves and `clean()` never runs, yet `preview_job_fields` and
+# `preview_item_fields` are clones of these models and serialize the very same
+# errors. Gating `details` behind the admin permission is authorization, not
+# secrecy: it decides who may read the traceback, not whether the traceback
+# still carries a password (LEDG-2477).
 error_fields = api.model(
     "HarvestError",
     {
         "created_at": fields.ISODateTime(
             description="The error creation date", required=True, readonly=True
         ),
-        "message": fields.String(description="The error short message", required=True),
+        "message": fields.String(
+            attribute=lambda o: redact_url_credentials(o.message),
+            description="The error short message",
+            required=True,
+        ),
         "details": fields.Raw(
-            attribute=lambda o: o.details if admin_permission else None,
+            attribute=lambda o: redact_url_credentials(o.details) if admin_permission else None,
             description="Optional details (only for super-admins)",
             readonly=True,
         ),
@@ -47,7 +59,12 @@ log_fields = api.model(
     "HarvestError",
     {
         "level": fields.String(required=True),
-        "message": fields.String(required=True),
+        # Captured from the application logger while an item is processed, and
+        # the line logged just before a failure carries the same exception text
+        # as the error itself (LEDG-2477).
+        "message": fields.String(
+            attribute=lambda o: redact_url_credentials(o.message), required=True
+        ),
     },
 )
 
@@ -109,6 +126,10 @@ item_counts_fields = api.model(
     | {"total": fields.Integer(description="Total number of items")},
 )
 
+# The jobs list does not marshal documents: it projects them in an aggregation
+# and `_serialize_light_job` builds the dicts by hand, so the redaction that
+# `error_fields` applies has to be repeated there -- this model only describes
+# the shape for the API documentation (LEDG-2477).
 error_light_fields = api.model(
     "HarvestErrorLight",
     {
@@ -209,7 +230,19 @@ source_fields = api.model(
         "id": fields.String(description="The source unique identifier", readonly=True),
         "name": fields.String(description="The source display name", required=True),
         "description": fields.Markdown(description="The source description"),
-        "url": fields.String(description="The source base URL", required=True),
+        # A URL stored before credentials were rejected may still carry
+        # user:password@, and both GET routes that serve this model are open
+        # to anonymous callers. The
+        # gate is the one that guards PUT, so whoever may rewrite the URL still
+        # reads it whole and nobody else does -- and no client can round-trip
+        # the mask back into the record (LEDG-2477).
+        "url": fields.String(
+            attribute=lambda s: s.url
+            if s.permissions["edit"].can()
+            else redact_url_credentials_in_url(s.url),
+            description="The source base URL",
+            required=True,
+        ),
         "backend": fields.String(
             description="The source backend",
             enum=lambda: list(get_enabled_backends().keys()),
@@ -404,7 +437,36 @@ class SourceAPI(API):
     @api.doc("get_harvest_source")
     @api.marshal_with(source_fields)
     def get(self, source: HarvestSource):
-        """Get a single source given an ID or a slug"""
+        """Get a single source given an ID or a slug.
+
+        Deliberately readable without a session, like the rest of the harvest
+        reads -- which sources feed an open data portal is public information,
+        it is the contract the frontend and upstream udata are built on, and
+        `test_get_source_permissions_as_anonymous` draws that anonymous 200
+        explicitly.
+
+        What makes it safe is that no secret reaches the payload, not that
+        nobody is looking: `url` is redacted here and in `harvests.csv` for
+        anyone without `edit`, `HarvestError` and `HarvestLog` are redacted as
+        they are built and again as they are serialized, and the source URL
+        copied onto harvested dataservices is redacted at the copy.
+        `@api.secure` would not have replaced any of that -- it only demands an
+        account, and anyone can create one, so a registered reader would have
+        seen exactly what an anonymous one did.
+
+        The confirmation oracle that used to be accepted here is gone: the
+        text index no longer covers `url`, so `?q=<password>` matches nothing,
+        and a source URL can no longer be stored with credentials at all
+        (LEDG-2502).
+
+        `odspt` and `maaf` used to build public dataset resource URLs and
+        remote ids out of the source URL, which is the same defect in a place
+        where redacting breaks a working download link. That was settled by
+        redacting anyway: a link that only works because it carries somebody
+        else's password is the defect, not a feature.
+
+        See LEDG-2477, LEDG-2500 and LEDG-2502.
+        """
         return source
 
     @api.secure
@@ -596,7 +658,10 @@ def _serialize_light_job(doc, dataset_map, source_id, show_details):
 
     def _errors(raw):
         return [
-            {"message": e.get("message"), "details": e.get("details") if show_details else None}
+            {
+                "message": redact_url_credentials(e.get("message")),
+                "details": redact_url_credentials(e.get("details")) if show_details else None,
+            }
             for e in (raw or [])
         ]
 
@@ -720,7 +785,18 @@ class JobAPI(API):
     @api.expect(parser)
     @api.marshal_with(job_fields)
     def get(self, ident):
-        """Get a single job given an ID"""
+        """Get a single job given an ID.
+
+        Readable without a session by the same decision as the source reads --
+        see `SourceAPI.get`, which records it in full. The errors and captured
+        logs served here are redacted twice over: in their constructors on the
+        way into the database, and in `error_fields`/`log_fields` on the way
+        out, which is what covers the preview, where nothing is ever saved.
+        The jobs list is the one route that marshals neither, so
+        `_serialize_light_job` repeats the redaction by hand.
+
+        See LEDG-2477.
+        """
         return actions.get_job(ident)
 
 

@@ -19,6 +19,7 @@ def support_contact(
     """Mail composed when a portal visitor submits the support form."""
     topic_label = SUPPORT_TOPIC_LABELS.get(topic, _("Support"))
     return MailMessage(
+        kind="support_contact",
         subject=_(
             "[%(site)s] %(topic)s — %(subject)s",
             site="dados.gov.pt",

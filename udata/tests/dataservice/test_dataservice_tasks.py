@@ -41,7 +41,11 @@ class DataserviceTasksTest(PytestOnlyDBTestCase):
 
         tasks.purge_dataservices()
 
-        assert Dataservice.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        assert len(list(Dataservice.objects)) == 1
         assert Transfer.objects.filter(id=transfer.id).count() == 0
         assert Discussion.objects.filter(id=discussion.id).count() == 0
         assert Follow.objects.filter(id=follower.id).count() == 0

@@ -189,7 +189,22 @@ norecursedirs = [
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 python_classes = ["*Test"]
-env = ["AUTHLIB_INSECURE_TRANSPORT=true", "mock_use_standalone_module=true"]
+env = [
+    "AUTHLIB_INSECURE_TRANSPORT=true",
+    "mock_use_standalone_module=true",
+    # udata.cfg is a *deployment* config, tracked in this repo, and create_app loads it over
+    # settings.Testing -- so a plain `pytest` tests the deployment, not the defaults the
+    # suite is written against. Measured on develop, whole suite, clean test databases:
+    # 617s with it loaded and 10 failures (all rate-limit tests: udata.cfg configures the
+    # limiter storage, and RATELIMIT_ENABLED=False lives in settings.Debug, not Testing),
+    # against 236s and green without it. CI already worked around this per job; this makes
+    # it the default for everyone, IDE runs included.
+    #
+    # `D:` is pytest-env for "only if not already set", so a run that deliberately loads the
+    # deployment config still wins -- the CI job that asserts the download-proxy timeouts
+    # against the real udata.cfg keeps working.
+    "D:UDATA_SETTINGS=/nonexistent/udata.cfg",
+]
 filterwarnings = ["ignore::DeprecationWarning:mongoengine"]
 markers = [
     "frontend: load the frontend stack",
