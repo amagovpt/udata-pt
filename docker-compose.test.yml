@@ -1,7 +1,7 @@
 # Disposable test stack for E2E destructive tests.
 #
 # Spins up an isolated MongoDB + Redis on non-standard ports so the dev/prod
-# stack on 27017/6379 stays untouched. Use `inv test` for pytest (port 27018)
+# stack on 27017/6379 stays untouched. Use `inv test` for pytest (port 27019)
 # or the helpers in scripts/test_db.sh for Playwright destructive runs.
 #
 # Run:
@@ -18,6 +18,29 @@ services:
       # bind-mounts intentionally; this DB is meant to be disposable.
       - /data/db
     command: ["--bind_ip_all", "--quiet"]
+    # 🚩 Without this the suite looks intermittent (LEDG-2489).
+    #
+    # Docker gives a container 1024 open files unless told otherwise, and mongod
+    # warns about it on EVERY startup -- "Soft rlimits for open file descriptors
+    # too low", naming 64000 as its own recommended minimum. Nobody was reading
+    # the warning. Under `pytest -n 4` the four workers crossed the ceiling and
+    # the server died: exit 14, preceded by ~12000 "Too many open files" lines.
+    # It leaves no restart policy to hide behind, so it stays dead and every
+    # later run fails -- which reads as a broken suite, not a dead database.
+    #
+    # It is NOT a connection leak: measured across 602 tests, concurrent
+    # connections stayed flat at 15-19. What accumulates is data files. The 87
+    # collections across the four worker databases persist by design -- see the
+    # comment on _CleanDBMixin.drop_db in udata/tests/api/__init__.py, which
+    # switched to truncation for this very reason -- and that is what keeps the
+    # cost flat. This raises the ceiling; that keeps the floor low.
+    #
+    # 64000 and not the maximum on purpose: generous but finite, so a real leak
+    # stays visible instead of quietly eating the host.
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 2s

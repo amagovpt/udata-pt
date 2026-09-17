@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **fix(tests): the test MongoDB was dying of file-descriptor exhaustion mid-run**
+  - After pointing the suite at the dedicated test database (entry below), the intermittency
+    had a second cause. Three runs passed; on the fourth the server died: **exit 14**, preceded
+    by roughly **12000** `Too many open files` lines. With no restart policy it stayed dead, so
+    every later run failed -- which reads as a broken suite, not a dead database.
+  - 🔑 **mongod had been warning about it on every startup since the container was built**:
+    *"Soft rlimits for open file descriptors too low"*, naming `1024` as the current value and
+    `64000` as its own recommended minimum. Docker gives 1024 unless told otherwise, and none
+    of this repository's compose files declared `ulimits`. The test and development MongoDB now
+    both get 64000 -- the figure the server asks for by name.
+  - 🚩 **It is not a connection leak, and that was measured rather than assumed.** Sampling
+    `serverStatus.connections` every five seconds across 602 tests under `-n 4`: concurrent
+    connections stayed flat at **15-19** from start to finish. Closing clients per test or
+    capping the pool would have fixed nothing. What accumulates is data files -- 544 descriptors
+    in use at rest, against a ceiling of 1024.
+  - The existing decision to clear collections by truncation rather than dropping them is
+    **confirmed, not reverted**: it names the same scarce resource, and it is why the cost at
+    rest is flat -- the persisting collections are one per model per worker database, bounded by
+    the schema and not by the number of tests.
+  - Both CI pipelines now report the descriptor limit they inherit, and pin it where the
+    executor allows. No test was disabled, marked `xfail` or made tolerant; nothing under
+    `udata/` changed in this fix at all.
+
 - **fix(tests): the suite was running against the development MongoDB, and that is what made it flaky**
   - `pytest -n 4 --dist loadscope` failed intermittently: the failing tests **changed every
     run**, spanned modules with nothing in common, and **all passed when run alone**. 13 such
