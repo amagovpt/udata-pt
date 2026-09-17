@@ -19,6 +19,11 @@
   - **The two item downloads are renamed after the dataset.** "Items as GeoJSON" says nothing
     about the data once the resource is read outside its collection, so it is published as
     "<dataset title> como GeoJSON". The collection schema keeps the label the source gave it.
+  - **An upstream rename is logged rather than absorbed.** The labels belong to the source,
+    so if it renames them every distribution is dropped, the dataset is left without
+    resources and the job still reports success. A dataset that matches nothing now logs a
+    warning naming the labels it was offered, so the cause is in the log before a user
+    reports the missing downloads.
   - The four dropped resources lose their `/api/1/datasets/r/<id>` permalink, which is the
     point of the change. The three that stay keep theirs: `sync_resources` matches on URL, so
     renaming a resource refreshes the existing object rather than minting a new id.

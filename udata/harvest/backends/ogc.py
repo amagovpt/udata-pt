@@ -182,6 +182,26 @@ class OGCBackend(BaseBackend):
                         }
                     )
 
+        if distributions and not resources:
+            # Nothing matched. The labels are the source's, so an upstream
+            # rename empties the dataset rather than failing the item, and the
+            # job still reports success -- the one way this change can go wrong
+            # without anyone noticing. Say so per item, so the cause is in the
+            # log before the missing downloads are reported by a user.
+            self.logger.warning(
+                "OGC: no distribution of %s matched the catalogued labels; "
+                "%d were offered and all were dropped. Labels seen: %s",
+                item.remote_id,
+                len(distributions),
+                sorted(
+                    {
+                        self._distribution_label(dist)
+                        for dist in distributions
+                        if isinstance(dist, dict)
+                    }
+                ),
+            )
+
         sync_resources(dataset, resources)
 
         # Add extra metadata

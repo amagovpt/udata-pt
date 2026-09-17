@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 
 import pytest
@@ -177,7 +178,7 @@ class OGCResourceIdentityTest(PytestOnlyDBTestCase):
         source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
         distributions = [
             _distribution(GEOJSON_URL, "application/geo+json"),
-            _distribution(CSV_URL, "text/csv"),
+            _distribution(CSV_URL, "text/csv", "Items as CSV"),
         ]
         before = [r.id for r in self._harvest(rmock, source, distributions).resources]
         assert len(before) == 2
@@ -188,7 +189,7 @@ class OGCResourceIdentityTest(PytestOnlyDBTestCase):
 
     def test_renamed_dataset_keeps_the_resource_ids(self, rmock):
         source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
-        distributions = [_distribution(CSV_URL, "text/csv")]
+        distributions = [_distribution(CSV_URL, "text/csv", "Items as CSV")]
         before = [r.id for r in self._harvest(rmock, source, distributions).resources]
 
         dataset = self._harvest(rmock, source, distributions, name="Dataset A revisto")
@@ -200,7 +201,7 @@ class OGCResourceIdentityTest(PytestOnlyDBTestCase):
         source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
         distributions = [
             _distribution(GEOJSON_URL, "application/geo+json"),
-            _distribution(CSV_URL, "text/csv"),
+            _distribution(CSV_URL, "text/csv", "Items as CSV"),
         ]
         kept_id = self._harvest(rmock, source, distributions).resources[0].id
 
@@ -348,6 +349,27 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, source, distributions)
 
         assert [r.url for r in dataset.resources] == [GEOJSON_URL]
+
+    def test_a_source_that_matches_nothing_is_logged(self, rmock, caplog):
+        """The one way this can break without anyone noticing.
+
+        If the source renames its labels, every distribution is dropped, the
+        dataset loses its resources and the item still reports `done`. That has
+        to leave a trace, or the first report is a user asking where the
+        downloads went.
+        """
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(GEOJSON_URL, "application/geo+json", "Objetos como GeoJSON"),
+            _distribution(SCHEMA_URL, "application/schema+json", "Esquema da coleção"),
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="udata.harvest.backends.ogc"):
+            dataset = self._harvest(rmock, source, distributions)
+
+        assert dataset.resources == []
+        assert "no distribution" in caplog.text
+        assert "Objetos como GeoJSON" in caplog.text
 
     def test_a_distribution_without_a_label_is_not_catalogued(self, rmock):
         """A non-string `description` is treated as absent, never raised on."""
