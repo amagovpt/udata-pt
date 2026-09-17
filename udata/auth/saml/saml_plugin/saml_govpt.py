@@ -1108,6 +1108,7 @@ def _create_pending_saml_user(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Create an account from a user-declared email, left unconfirmed.
 
@@ -1129,6 +1130,7 @@ def _create_pending_saml_user(
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -1145,6 +1147,11 @@ def _create_pending_saml_user(
         extras[AUTH_DOC_TYPE] = doc_type
     if doc_nationality:
         extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    # The wizard is the path the funnel never sees: the route that calls
+    # this returns JSON. Without it the country is gone by the time an
+    # account exists, and there is nothing to recover it from.
+    if eidas_country:
+        extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
 
     # No datastore.commit() here: create_user already wrote the document, and
     # commit() is a no-op under MongoEngine anyway. Nothing is assigned after
@@ -1710,6 +1717,7 @@ def _handle_migration_redirect(
     provider="cmd",
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Store SAML data in session and redirect to migration page.
 
@@ -1752,6 +1760,10 @@ def _handle_migration_redirect(
         # shape. Two explicit keys cost two short strings in a signed cookie.
         "saml_doc_type": doc_type,
         "saml_doc_nationality": doc_nationality,
+        # Carried for the same reason, and for the path that needs it most:
+        # the wizard creates its account outside any login funnel, so without
+        # this the country is simply gone by the time there is an account.
+        "saml_eidas_origin_country": eidas_country,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -3736,6 +3748,7 @@ def idp_eidas_initiated():
                 last_name,
                 no_match=(status == "no_match"),
                 provider="eidas",
+                eidas_country=eidas_country,
             )
         # Migration wizard disabled: never log into an unproven account, and
         # nobody is around to ask for a confirmed email — fall back to
@@ -4519,6 +4532,7 @@ def migration_skip():
             # here the account is created without them.
             doc_type=pending.get("saml_doc_type"),
             doc_nationality=pending.get("saml_doc_nationality"),
+            eidas_country=pending.get("saml_eidas_origin_country"),
         )
 
     send_confirmation_instructions(user)

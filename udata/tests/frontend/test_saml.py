@@ -6435,6 +6435,56 @@ class SAMLAuthProviderWizardTest(APITestCase):
         assert created is not None
         assert created.extras[AUTH_PROVIDER] == AUTH_PROVIDER_EIDAS
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_wizard_created_account_carries_the_eidas_origin_country(self, mock_client_for):
+        """LEDG-2511, in the shape of the provider test above.
+
+        🚩 The wizard is the path that needs this most: the skip route creates
+        the account and returns JSON, so the login funnel -- which stamps the
+        country on every other sign-in -- never runs. Without the session
+        carrying it, the country is simply gone by the time an account exists,
+        and nothing can recover it from the digest.
+        """
+        from udata.core.user.constants import AUTH_EIDAS_ORIGIN_COUNTRY
+        from udata.core.user.models import User
+
+        self._eidas_sso_with(
+            mock_client_for,
+            person_identifier=self.PERSON_ID,
+            given_name="Giulia",
+            family_name="Rossi",
+        )
+        response = self.client.post(
+            "/saml/migration/skip", json={"email": "giulia.country@example.pt"}
+        )
+        assert response.status_code == 200
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.PERSON_ID)).first()
+        assert created is not None
+        assert created.extras[AUTH_EIDAS_ORIGIN_COUNTRY] == self.PERSON_ID.split("/")[0]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_through_the_wizard_gets_no_origin_country(self, mock_client_for):
+        """The CMD route passes nothing, so a national keeps the key absent.
+
+        Pinned where it would be easiest to break: a default that quietly
+        supplies "PT" would turn every Portuguese account into an eIDAS
+        assertion that never happened.
+        """
+        from udata.core.user.models import User
+
+        self._sso_with(mock_client_for, nic=self.NIC, first_name="Rita", last_name="Nunes")
+        assert (
+            self.client.post(
+                "/saml/migration/skip", json={"email": "rita.nocountry@example.pt"}
+            ).status_code
+            == 200
+        )
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.NIC)).first()
+        assert created is not None
+        assert "auth_eidas_origin_country" not in (created.extras or {})
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_a_session_naming_no_provider_creates_an_account_without_one(self, mock_client_for):
         """The criterion that forbids a default, pinned where it would be
