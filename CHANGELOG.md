@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- **fix(harvest): the CKAN family no longer builds a dataset's public remote URL on a credentialed source URL**
+  - `URLS_ALLOW_CREDENTIALS` lets a harvest source URL carry `user:password@`, and
+    `CkanBackend.dataset_url()` built on it with `urljoin`, which keeps the userinfo. Its
+    result becomes `Dataset.harvest.remote_url`. `ckanpt` and `dkan` inherit the method,
+    so all three backends leaked.
+  - 🔑 **The previous inventory was incomplete, and this is the channel it missed.** The
+    earlier pass concluded that only `odspt` and `maaf` derived published data from the
+    source URL. `Dataset.harvest.remote_url` is worse than either: it is a field of
+    *every* dataset, not only the ones an audit thinks to look at; it is served without a
+    session by the dataset API, the public dataset CSV and the RDF `dcat:landingPage`; it
+    is copied onto `HarvestItem.remote_url`, which the harvest job API serializes
+    unauthenticated; and, unlike a harvest job, it is never purged.
+  - The fix draws the fetch/published line **in the backend itself**, the way the ODS one
+    does, and names *both* sides: `source_url` holds the raw value and is what `action_url()`
+    builds on, because that is the request this backend makes; `public_source_url` holds the
+    redacted one and is what `dataset_url()` builds on. The harvest keeps authenticating;
+    only what is written to a document is redacted. Leaving the line implicit -- a bare
+    `self.source.url` read with nothing saying which role it was in -- is what let two
+    inventories miss this channel.
+  - A migration cleans `dataset.harvest.remote_url`, the `harvest_job.items[].remote_url`
+    copies, and the legacy `extras["remote_url"]` that two earlier scoped migrations may have
+    left behind, with the same per-field guarded writes as the previous one, so a harvest
+    running concurrently is not overwritten. **It runs unscoped**, unlike the ODS pass: that
+    one needed a marker because a publisher may legitimately type a credentialed URL on a
+    resource of their own, whereas nothing but a harvester writes `dataset.harvest`, and a
+    landing page gains nothing from carrying a password.
+  - It cleans **MongoDB only**: the search document copies every `harvest` subfield, and the
+    migration's raw writes fire no reindex. At the expected count of zero there is nothing in
+    the index either; a non-zero count means reindex as well.
+  - **Decision on `dataset.harvest.remote_id`: counted, not rewritten.** The question was
+    worth asking, since the previous migration redacted `harvest_job.items[].remote_id`, but
+    no writer derives a dataset's remote id from the source URL -- the CKAN family uses the
+    package name and then its id, and `maaf` replaces it before the dataset is saved.
+    Rewriting it would break the match `get_dataset` makes on it, for no leak. The migration
+    logs a count so the answer comes from live data; a non-zero one is a new ticket.
+  - **Still standing**, both found by the review of this change and left for their own
+    tickets rather than widening a security fix that has to be promoted on its own:
+    `redact_url_credentials`, the free-text sibling used by the error/log/Sentry paths, has a
+    narrower character class than `URL_REGEX` accepts, so a password containing `{`, `^`, `|`
+    or `/` survives it; and `HarvestSource.config` is marshalled on the anonymous harvest
+    source routes, which publishes the CKAN `apikey` of every source that uses one.
+    `CkanPTBackend.source_label()` also still falls back to the source URL when a source has
+    no name -- unreachable through the API today, because the harvest source form requires
+    one.
+  - Inventory against a production-scale restore (23,080 datasets, 46 harvest sources):
+    **no source of any backend carries `@` in its URL**, so nothing is exposed today and the
+    migration is expected to be a no-op. It exists so the invariant holds for whatever is
+    written between that restore and the deploy.
+  - ⚠️ **None of this un-leaks anything.** A credential that was publicly readable is
+    compromised and has to be rotated at the remote source.
+
 - **fix(saml): the document was only recorded on the login AFTER the one that created the account**
   - `extras` holds four keys for an authenticated citizen: the identity, the provider, the
     document type and the document nationality. Until now **only the login funnel wrote the last
