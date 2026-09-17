@@ -1645,6 +1645,74 @@ class SAMLEidasSSOTest(APITestCase):
         assert response.status_code == 302
         assert response.headers["Location"] == "http://localhost:3000/complete-registration"
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_new_account_records_origin_country_beside_unchanged_digest(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """LEDG-2511: the member state is recorded, and the digest does not move.
+
+        Both halves matter, and the second is the one that cannot be got wrong.
+        The identifier is the pre-image of a one-way digest and the key every
+        sign-in resolves accounts by: the country is read BESIDE it, never
+        instead of it, and if this assertion ever fails then every eIDAS
+        citizen registered under it is locked out with no way to recompute
+        what was stored.
+
+        The flag is off because that is the state in which this route creates
+        an account at all -- with it on, an unmatched identity is parked in the
+        wizard, which is the path pinned separately.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.PERSON_ID)).first()
+        assert created is not None
+        assert created.extras["auth_eidas_origin_country"] == "ES"
+        assert created.extras["auth_nic"] == _hash_nic(self.PERSON_ID), (
+            "the digest moved -- everyone registered under it is now locked out"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_repeat_eidas_login_stamps_origin_country_on_a_prior_account(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The only way an account that predates this key ever gains it.
+
+        There is no backfill: the identifier survives only as the digest, so
+        nothing can recover the country from what is stored. An older account
+        gets it when its OWN owner signs in again, and never otherwise -- the
+        same semantics auth_provider already has.
+        """
+        existing = UserFactory(
+            email="saml-feedc0de@autenticacao.gov.pt",
+            extras={"auth_nic": _hash_nic(self.PERSON_ID)},
+            confirmed_at="2024-01-01",
+        )
+        assert "auth_eidas_origin_country" not in (existing.extras or {})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+
+        existing.reload()
+        assert existing.extras["auth_eidas_origin_country"] == "ES"
+        assert existing.extras["auth_nic"] == _hash_nic(self.PERSON_ID)
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_eidas_name_match_redirects_to_migration_wizard(self, mock_client_for):
         """A homonym account without a linked identity becomes a wizard

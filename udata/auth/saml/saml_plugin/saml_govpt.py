@@ -904,6 +904,7 @@ def _create_saml_user(
     citizen_declared=None,
     doc_type=None,
     doc_nationality=None,
+    eidas_country=None,
 ):
     """Create a new account from SAML attributes (scenario 4).
 
@@ -945,6 +946,7 @@ def _create_saml_user(
         AUTH_CITIZEN_DECLARED,
         AUTH_DOC_NATIONALITY,
         AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
         AUTH_PROVIDER,
     )
 
@@ -974,6 +976,12 @@ def _create_saml_user(
         extras[AUTH_DOC_TYPE] = doc_type
     if doc_nationality:
         extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    # A DIFFERENT thing from the nationality above, which is why it is a
+    # different key: that one is printed on a document and is forced to "PT" on
+    # residence permits, this one is the member state whose node asserted the
+    # identity. See the comment on the constant.
+    if eidas_country:
+        extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
     if extras:
         user_data["extras"] = extras
 
@@ -3459,6 +3467,7 @@ def idp_eidas_initiated():
     user_nic = None
     first_name = None
     last_name = None
+    eidas_country = None
     authn_response = None
 
     raw_saml_response = request.form.get("SAMLResponse")
@@ -3611,9 +3620,16 @@ def idp_eidas_initiated():
                 id_source = "eidas-friendly"
             else:
                 id_source = None
+            # Read beside the identifier, never instead of it: what goes into
+            # the digest below is `user_nic` verbatim. Named in the log because
+            # a member state is not personal data -- the identifier itself
+            # stays masked -- and because a country that comes back None here
+            # is the only way a shape we did not anticipate becomes visible.
+            eidas_country = _eidas_origin_country(user_nic)
             current_app.logger.info(
                 f"eIDAS atributos via pysaml2: email={user_email}, "
                 f"id={'***' if user_nic else None} (source={id_source}), "
+                f"origin_country={eidas_country}, "
                 f"nome={first_name} {last_name}, "
                 f"identity_keys={list(identity.keys())}, "
                 f"name_id_format={name_id_format!r}"
@@ -3717,7 +3733,12 @@ def idp_eidas_initiated():
         # nobody is around to ask for a confirmed email — fall back to
         # creating the account outright, exactly as before (scenario 4).
         user = _create_saml_user(
-            user_email, user_nic, first_name, last_name, provider=AUTH_PROVIDER_EIDAS
+            user_email,
+            user_nic,
+            first_name,
+            last_name,
+            provider=AUTH_PROVIDER_EIDAS,
+            eidas_country=eidas_country,
         )
         status = "new"
 
