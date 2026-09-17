@@ -8,6 +8,8 @@ runs unscoped, because no publisher-facing form writes `dataset.harvest`, and
 it counts `harvest.remote_id` without rewriting it.
 """
 
+import logging
+
 import pytest
 from mongoengine.connection import get_db
 
@@ -92,8 +94,27 @@ class RedactHarvestedRemoteUrlCredentialsMigrationTest(PytestOnlyDBTestCase):
 
         assert db.dataset.find_one({})["harvest"]["remote_url"] == REDACTED_REMOTE_URL
 
-    def test_a_credentialed_remote_id_is_counted_but_left_alone(self):
-        """Rewriting it would break the match `BaseBackend.get_dataset` makes on it."""
+    def test_the_legacy_extras_copy_is_redacted_too(self):
+        """Two earlier migrations moved this extra, both scoped and both skipping failures."""
+        db = get_db()
+        dataset = self._harvested_dataset()
+        dataset["extras"] = {"remote_url": REMOTE_URL, "ckan:name": "leaky"}
+        db.dataset.insert_one(dataset)
+
+        self.migrate(db)
+
+        dataset = db.dataset.find_one({})
+        assert dataset["extras"]["remote_url"] == REDACTED_REMOTE_URL
+        assert dataset["extras"]["ckan:name"] == "leaky"
+        assert "sup3rs3cr3t" not in str(dataset)
+
+    def test_a_credentialed_remote_id_is_counted_but_left_alone(self, caplog):
+        """Rewriting it would break the match `BaseBackend.get_dataset` makes on it.
+
+        Counting it is the migration's whole deliverable for `remote_id`, so the
+        warning is asserted too: a silent pass would look identical to a missing
+        one.
+        """
         db = get_db()
         dataset = self._harvested_dataset()
         dataset["harvest"]["remote_url"] = "https://ckan.example.pt/dataset/clean"
@@ -101,9 +122,14 @@ class RedactHarvestedRemoteUrlCredentialsMigrationTest(PytestOnlyDBTestCase):
         db.dataset.insert_one(dataset)
         before = db.dataset.find_one({})
 
-        self.migrate(db)
+        with caplog.at_level(logging.WARNING):
+            self.migrate(db)
 
         assert db.dataset.find_one({}) == before
+        warnings = [record.getMessage() for record in caplog.records if record.levelno >= 30]
+        assert any("harvest.remote_id" in message for message in warnings), warnings
+        # The counter reports how many, never the credentialed value itself.
+        assert not any("sup3rs3cr3t" in message for message in warnings)
 
     def test_documents_without_credentials_are_untouched(self):
         db = get_db()

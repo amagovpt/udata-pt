@@ -40,6 +40,12 @@ path justifies paying it. The counter answers the question with live data
 instead of by omission; a non-zero result is a new ticket, with the backend
 named.
 
+This cleans MongoDB only. `DatasetSearch` copies every `harvest` subfield into
+the search document, and raw pymongo writes fire no mongoengine signal, so an
+already-indexed credentialed value survives until the dataset is reindexed. If
+a pass here reports a non-zero count, reindex; at zero, as expected, there is
+nothing in the index either.
+
 This does NOT un-leak anything. A credential that was publicly readable is
 compromised, and the remedy is to rotate it at the remote source; cleaning the
 database does not replace telling the source owners.
@@ -142,6 +148,37 @@ def _redact_item_remote_urls(db):
     log.info("Redacted %s harvest job(s).", jobs)
 
 
+def _redact_dataset_extra_remote_urls(db):
+    """Redact the legacy `extras["remote_url"]` copy of the same value.
+
+    `2022-10-10-migrate-harvest-extras.py` moved this extra onto
+    `harvest.remote_url`, and `2026-08-25-migrate-legacy-ckanpt-extras.py` had
+    to do it again for the `ckanpt` fork that kept writing it back. Both were
+    scoped, and both logged-and-continued past datasets they could not migrate,
+    so a copy of the same source-derived URL can still be sitting here --
+    serialized in the public dataset payload like any other extra.
+
+    Unscoped, for the same reason as the pass above: unlike `Resource.url`,
+    which is a download a publisher may legitimately want to gate behind
+    credentials, this extra is a landing page. Nothing is gained by it carrying
+    a password, whichever writer put it there.
+    """
+    query = {"extras.remote_url": {"$regex": USERINFO_PATTERN}}
+
+    datasets = 0
+    for dataset in db.dataset.find(query, no_cursor_timeout=True):
+        before = (dataset.get("extras") or {}).get("remote_url")
+        after = redact_url_credentials_in_url(before)
+        if after == before:
+            continue
+
+        guard = {"_id": dataset["_id"], "extras.remote_url": before}
+        if db.dataset.update_one(guard, {"$set": {"extras.remote_url": after}}).modified_count:
+            datasets += 1
+
+    log.info("Redacted %s legacy extras.remote_url value(s).", datasets)
+
+
 def _count_credentialed_remote_ids(db):
     """Count, without rewriting, the datasets whose `harvest.remote_id` holds userinfo.
 
@@ -169,5 +206,8 @@ def migrate(db):
 
     log.info("Redacting URL credentials stored in harvest item remote urls...")
     _redact_item_remote_urls(db)
+
+    log.info("Redacting URL credentials stored in legacy extras.remote_url...")
+    _redact_dataset_extra_remote_urls(db)
 
     _count_credentialed_remote_ids(db)

@@ -683,6 +683,14 @@ class CkanPTCredentialedSourceTest(PytestOnlyDBTestCase):
             REDACTED_CKANPT_URL, DATASET_NAME
         )
         assert "sup3rs3cr3t" not in dataset.harvest.remote_url
+        # The username is a credential too, and the one a partial redaction
+        # most easily leaves behind.
+        assert "harvestuser" not in dataset.harvest.remote_url
+        # Asserted over the whole saved document, not just the field this fix
+        # touches: `ckanpt` writes extras and tags of its own, and a credential
+        # landing in one of those is what this test exists to catch.
+        assert "sup3rs3cr3t" not in str(dataset.to_mongo())
+        assert "harvestuser" not in str(dataset.to_mongo())
         # The job item is what the unauthenticated harvest job API serializes.
         assert job.items[0].remote_url == dataset.harvest.remote_url
         # The source tag is built from `urlparse(...).hostname`, which never

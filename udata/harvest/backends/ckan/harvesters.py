@@ -46,16 +46,29 @@ class CkanBackend(BaseBackend):
         return headers
 
     @property
+    def source_url(self):
+        """The source URL as configured, credentials included.
+
+        `URLS_ALLOW_CREDENTIALS` is true, so this may be
+        `https://user:password@host/path`. Only the URLs this backend actually
+        requests may be built on it -- `action_url`, and `get_status` if it
+        ever regains a caller. Everything else derived from the source URL is
+        published, and must go through `public_source_url` instead.
+
+        Both sides are named so that the line between them is greppable: the
+        leak this closes (LEDG-2504) was missed by two inventories because
+        `dataset_url` read `self.source.url` inline, with nothing to tell a
+        reader which of the two roles it was in.
+        """
+        return self.source.url
+
+    @property
     def public_source_url(self):
         """The source URL with any userinfo replaced by `***`.
 
-        `URLS_ALLOW_CREDENTIALS` is true, so `self.source.url` may be
-        `https://user:password@host/path`. Only `action_url` and `get_status`
-        may be built on the raw value: those are the requests this backend
-        makes, and the only place that needs the credentials back. Everything
-        derived from the source URL that ends up on a document -- today
-        `dataset_url`, whose result becomes `Dataset.harvest.remote_url` --
-        must go through this property instead. See LEDG-2504.
+        Everything derived from the source URL that ends up on a document --
+        today `dataset_url`, whose result becomes `Dataset.harvest.remote_url`
+        -- goes through this property rather than `source_url`. See LEDG-2504.
 
         `Dataset.harvest.remote_url` is served to callers without a session by
         the dataset API, the public dataset CSV and the RDF `dcat:landingPage`,
@@ -73,12 +86,11 @@ class CkanBackend(BaseBackend):
     def action_url(self, endpoint):
         """Build a CKAN action API URL on the raw, credentialed source URL.
 
-        This is the only URL this backend requests (with `get_status`), so it
-        is the only one that keeps the credentials. Anything published is built
-        on `public_source_url`.
+        This is the URL this backend requests, so it is the one that keeps the
+        credentials. Anything published is built on `public_source_url`.
         """
         path = "/".join(["api/3/action", endpoint])
-        return urljoin(self.source.url, path)
+        return urljoin(self.source_url, path)
 
     def dataset_url(self, name):
         path = "/".join(["dataset", name])
@@ -122,7 +134,7 @@ class CkanBackend(BaseBackend):
             raise HarvestException(msg)
 
     def get_status(self):
-        url = urljoin(self.source.url, "/api/util/status")
+        url = urljoin(self.source_url, "/api/util/status")
         response = self.get(url)
         return response.json()
 

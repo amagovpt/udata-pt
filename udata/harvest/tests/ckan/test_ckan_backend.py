@@ -762,6 +762,11 @@ class CkanBackendCredentialedSourceTest(PytestOnlyDBTestCase):
         assert dataset.harvest.remote_url == "{0}/dataset/{1}".format(REDACTED_CKAN_URL, name)
         assert "sup3rs3cr3t" not in dataset.harvest.remote_url
         assert "harvestuser" not in dataset.harvest.remote_url
+        # Asserted over the whole saved document, not just the field this fix
+        # touches: a second write of the credential onto the same dataset -- an
+        # extra, a tag, a resource -- is exactly what these tests exist to catch.
+        assert "sup3rs3cr3t" not in str(dataset.to_mongo())
+        assert "harvestuser" not in str(dataset.to_mongo())
         # The job item is what the unauthenticated harvest job API serializes.
         assert job.items[0].remote_url == dataset.harvest.remote_url
         # The harvest itself still authenticates: redacting what is published
