@@ -1487,6 +1487,59 @@ class SAMLVuln2077RegressionTest(APITestCase):
         assert response.status_code == 302
 
 
+class SAMLEidasCountryExtractionTest(APITestCase):
+    """LEDG-2511: the member state that asserted an eIDAS identity.
+
+    The eIDAS profile RECOMMENDS the PersonIdentifier be shaped
+    "<origin>/<destination>/<id>" -- a Czech citizen arrives as "CZ/PT/<uuid>".
+    That country reaches us on every sign-in and is then lost: what gets stored
+    is the one-way digest, so nothing downstream can recover it.
+
+    🚩 A recommendation is not a guarantee, and we have one real sample. These
+    tests pin the rule as deliberately strict: anything that is not exactly the
+    recommended shape yields no country at all, and the caller writes nothing.
+    """
+
+    def test_extracts_only_the_exact_recommended_shape(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country("CZ/PT/bfd584e2-7ad1-4375-8803-8db6c96a524c") == "CZ"
+        assert _eidas_origin_country("ES/PT/1234567890") == "ES"
+
+    def test_a_nic_yields_no_country(self):
+        """The eIDAS route accepts a NIC -- its extraction tries the MDC
+        attribute first -- and a NIC carries no country. Inventing one here
+        would turn digits into a member state."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country("12345678") is None
+
+    def test_a_foreign_cmd_identifier_yields_no_country(self):
+        """🚨 The invariant _find_or_create_saml_user documents, from the other
+        side. "MDC" is three letters precisely so a foreign citizen's CMD
+        identifier can never be read as a country code -- and two of the four
+        document types ARE valid alpha-2 codes."""
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country("MDC/TR/PT/X9912345") is None
+
+    def test_anything_short_of_the_shape_yields_no_country(self):
+        """No stripping, no upper-casing, no guessing. A member state emitting
+        something else gets no country until someone decides what it means --
+        admitting a form later is trivial, telling two apart afterwards is not.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        for identifier in ("cz/pt/abc", "CZ/PT/", "CZ/PT", " CZ/PT/x", "C/PT/x", "CZZ/PT/x"):
+            assert _eidas_origin_country(identifier) is None, identifier
+
+    def test_nothing_in_yields_nothing_out(self):
+        from udata.auth.saml.saml_plugin.saml_govpt import _eidas_origin_country
+
+        assert _eidas_origin_country(None) is None
+        assert _eidas_origin_country("") is None
+
+
 class SAMLEidasSSOTest(APITestCase):
     """Success-path coverage for /saml/eidas/sso — parity with CMD.
 
@@ -1591,6 +1644,124 @@ class SAMLEidasSSOTest(APITestCase):
         # Still holding the placeholder → forced back to the page.
         assert response.status_code == 302
         assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_eidas_new_account_records_origin_country_beside_unchanged_digest(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """LEDG-2511: the member state is recorded, and the digest does not move.
+
+        Both halves matter, and the second is the one that cannot be got wrong.
+        The identifier is the pre-image of a one-way digest and the key every
+        sign-in resolves accounts by: the country is read BESIDE it, never
+        instead of it, and if this assertion ever fails then every eIDAS
+        citizen registered under it is locked out with no way to recompute
+        what was stored.
+
+        The flag is off because that is the state in which this route creates
+        an account at all -- with it on, an unmatched identity is parked in the
+        wizard, which is the path pinned separately.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.PERSON_ID)).first()
+        assert created is not None
+        assert created.extras["auth_eidas_origin_country"] == "ES"
+        assert created.extras["auth_nic"] == _hash_nic(self.PERSON_ID), (
+            "the digest moved -- everyone registered under it is now locked out"
+        )
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_repeat_eidas_login_stamps_origin_country_on_a_prior_account(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The only way an account that predates this key ever gains it.
+
+        There is no backfill: the identifier survives only as the digest, so
+        nothing can recover the country from what is stored. An older account
+        gets it when its OWN owner signs in again, and never otherwise -- the
+        same semantics auth_provider already has.
+        """
+        existing = UserFactory(
+            email="saml-feedc0de@autenticacao.gov.pt",
+            extras={"auth_nic": _hash_nic(self.PERSON_ID)},
+            confirmed_at="2024-01-01",
+        )
+        assert "auth_eidas_origin_country" not in (existing.extras or {})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(
+                mock_client_for,
+                person_identifier=self.PERSON_ID,
+                given_name="Carmen",
+                family_name="García",
+            )
+
+        existing.reload()
+        assert existing.extras["auth_eidas_origin_country"] == "ES"
+        assert existing.extras["auth_nic"] == _hash_nic(self.PERSON_ID)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_nic_shaped_identifier_via_eidas_route_writes_no_country(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """🚩 The eIDAS route accepts a NIC — its extraction tries the MDC
+        attribute FIRST — and a NIC carries no country at all.
+
+        The sign-in must work exactly as before and the key must be ABSENT,
+        not present and null: a null would be indistinguishable from a country
+        we failed to read, and counting it as anything would turn a gap in the
+        data into a population figure.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(mock_client_for, nic="87654321", given_name="Rita", family_name="Nunes")
+
+        created = User.objects(extras__auth_nic=_hash_nic("87654321")).first()
+        assert created is not None, "the sign-in itself must be untouched"
+        assert "auth_eidas_origin_country" not in (created.extras or {})
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_an_unexpected_identifier_shape_still_signs_in_without_a_country(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """The shape is a RECOMMENDATION of the eIDAS profile, not a guarantee.
+
+        We have one real sample. A member state emitting something else must
+        still get its citizens in — the country is the thing that is allowed
+        to be missing, never the sign-in — and the digest must be exactly what
+        it would have been before any of this.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        odd = "cz/pt/lowercase-is-not-the-recommended-shape"
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._sso_with(
+                mock_client_for, person_identifier=odd, given_name="Jan", family_name="Novák"
+            )
+
+        created = User.objects(extras__auth_nic=_hash_nic(odd)).first()
+        assert created is not None, "an unrecognised shape must never cost a sign-in"
+        assert "auth_eidas_origin_country" not in (created.extras or {})
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
     def test_eidas_name_match_redirects_to_migration_wizard(self, mock_client_for):
@@ -6314,6 +6485,56 @@ class SAMLAuthProviderWizardTest(APITestCase):
         assert created is not None
         assert created.extras[AUTH_PROVIDER] == AUTH_PROVIDER_EIDAS
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_wizard_created_account_carries_the_eidas_origin_country(self, mock_client_for):
+        """LEDG-2511, in the shape of the provider test above.
+
+        🚩 The wizard is the path that needs this most: the skip route creates
+        the account and returns JSON, so the login funnel -- which stamps the
+        country on every other sign-in -- never runs. Without the session
+        carrying it, the country is simply gone by the time an account exists,
+        and nothing can recover it from the digest.
+        """
+        from udata.core.user.constants import AUTH_EIDAS_ORIGIN_COUNTRY
+        from udata.core.user.models import User
+
+        self._eidas_sso_with(
+            mock_client_for,
+            person_identifier=self.PERSON_ID,
+            given_name="Giulia",
+            family_name="Rossi",
+        )
+        response = self.client.post(
+            "/saml/migration/skip", json={"email": "giulia.country@example.pt"}
+        )
+        assert response.status_code == 200
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.PERSON_ID)).first()
+        assert created is not None
+        assert created.extras[AUTH_EIDAS_ORIGIN_COUNTRY] == self.PERSON_ID.split("/")[0]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_national_through_the_wizard_gets_no_origin_country(self, mock_client_for):
+        """The CMD route passes nothing, so a national keeps the key absent.
+
+        Pinned where it would be easiest to break: a default that quietly
+        supplies "PT" would turn every Portuguese account into an eIDAS
+        assertion that never happened.
+        """
+        from udata.core.user.models import User
+
+        self._sso_with(mock_client_for, nic=self.NIC, first_name="Rita", last_name="Nunes")
+        assert (
+            self.client.post(
+                "/saml/migration/skip", json={"email": "rita.nocountry@example.pt"}
+            ).status_code
+            == 200
+        )
+
+        created = User.objects(extras__auth_nic=_hash_nic(self.NIC)).first()
+        assert created is not None
+        assert "auth_eidas_origin_country" not in (created.extras or {})
+
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_a_session_naming_no_provider_creates_an_account_without_one(self, mock_client_for):
         """The criterion that forbids a default, pinned where it would be
@@ -6435,6 +6656,112 @@ class SAMLAuthProviderWizardTest(APITestCase):
         legacy.reload()
         assert legacy.extras["auth_doc_type"] == "CR"
         assert legacy.extras["auth_doc_nationality"] == "PT"
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail")
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_link_completed_account_carries_the_eidas_origin_country(
+        self, mock_client_for, mock_send
+    ):
+        """LEDG-2511, in the shape of the two tests above.
+
+        The click arrives with no session at all -- possibly in another
+        browser -- so the record written when the link was issued is the only
+        thing that knows which member state asserted the identity. Clicked
+        from a fresh client to make that real rather than incidental.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_LINK_PENDING
+
+        legacy = UserFactory(
+            email="giulia@example.pt",
+            password="S3cretPass!",
+            first_name="Giulia",
+            last_name="Rossi",
+        )
+
+        self._eidas_sso_with(
+            mock_client_for,
+            person_identifier=self.PERSON_ID,
+            given_name="Giulia",
+            family_name="Rossi",
+        )
+        assert (
+            self.client.post(
+                "/saml/migration/confirm",
+                json={"method": "password", "email": legacy.email, "password": "S3cretPass!"},
+            ).status_code
+            == 200
+        )
+
+        # The record carries it before the click, which is the whole point.
+        legacy.reload()
+        assert legacy.extras[MIGRATION_LINK_PENDING]["eidas_origin_country"] == "IT"
+
+        fresh = self.app.test_client()
+        assert (
+            fresh.get(f"/saml/migration/confirm-link/{self._mailed_token(mock_send)}").status_code
+            == 302
+        )
+
+        legacy.reload()
+        assert legacy.extras["auth_eidas_origin_country"] == "IT"
+
+    def test_the_association_click_records_the_eidas_origin_country(self):
+        """The OTHER consumer of the click, which mutation testing exposed.
+
+        🚩 Removing the read in the association path left the test above green:
+        it exercises the validation-link route, not this one. Two consumers
+        read the same record and only one was covered — the same shape of gap
+        that lets a path be implemented by symmetry and never proved by it.
+
+        Here the citizen is held on the completion screen behind a placeholder
+        and gives an address that already belongs to an account of theirs; the
+        click moves the identity, and must move the country with it.
+        """
+        from flask import url_for
+
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+
+        self.login(
+            UserFactory(
+                email="saml-b0bacafe@autenticacao.gov.pt",
+                password=None,
+                extras={
+                    "auth_nic": _hash_nic(self.PERSON_ID),
+                    "auth_provider": "eidas",
+                    "auth_eidas_origin_country": "IT",
+                },
+                first_name="Giulia",
+                last_name="Rossi",
+            )
+        )
+        target = UserFactory(email="giulia-antiga@example.pt", password="S3cretPass!")
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.send_mail") as mock_send:
+            assert (
+                self.post(
+                    url_for("security.change_email"),
+                    {
+                        "new_email": target.email,
+                        "new_email_confirm": target.email,
+                        "submit": True,
+                    },
+                    json=False,
+                ).status_code
+                == 302
+            )
+            ctas = [p for p in mock_send.call_args[0][1].paragraphs if getattr(p, "link", None)]
+            token = ctas[0].link.rsplit("/", 1)[1]
+
+        fresh = self.app.test_client()
+        assert fresh.get(f"/saml/migration/confirm-link/{token}").status_code == 302
+
+        target.reload()
+        assert target.extras["auth_eidas_origin_country"] == "IT", (
+            "the association moved the identity but left the country behind"
+        )
+        assert User.objects(id=target.id).first().extras["auth_nic"] == _hash_nic(self.PERSON_ID)
 
 
 class SAMLDeclaredCitizenTypeTest(APITestCase):

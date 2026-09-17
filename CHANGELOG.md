@@ -28,6 +28,30 @@
     point of the change. The three that stay keep theirs: `sync_resources` matches on URL, so
     renaming a resource refreshes the existing object rather than minting a new id.
 
+- **feat(saml): the member state that asserted an eIDAS identity is now recorded**
+  - The eIDAS profile recommends the PersonIdentifier be shaped
+    `<origin>/<destination>/<id>`, so a Czech citizen signing in here arrives as `CZ/PT/<uuid>`.
+    That country reached us on **every** sign-in and was then lost: what gets stored is the
+    one-way digest, so nothing downstream could recover it. The portal knew someone had signed
+    in through eIDAS, and **never from which country**.
+  - 🚨 **There is no backfill, and there cannot be one.** The identifier survives solely as the
+    digest in `auth_nic`. Accounts that predate this key gain it only when **their own owner
+    signs in again**, and never otherwise — the same semantics `auth_provider` already has.
+  - 🚩 **A separate key from `auth_doc_nationality`, and the reason is stronger than "they are
+    similar".** That one is not a nationality at all: `DocNationality` is **forced to `PT`** on
+    residence permits and residence cards, so a Brazilian holding a Portuguese residence permit
+    is stored as `PT`. Folding the two together would make a count of `PT` sum three different
+    populations — a real nationality, a forced value, and an issuing member state — and answer
+    no question at all. Merging two keys later is trivial; separating them later is impossible.
+  - The extraction rule is deliberately strict: matched whole, with no stripping, no upper-casing
+    and no guessing, because the country must describe the identifier **exactly as it is hashed**.
+    A NIC (which this route accepts), an `MDC/...` identifier, lower case or a missing id segment
+    all yield nothing rather than a guess — and in every one of those the sign-in proceeds
+    untouched. **The country is the thing allowed to be missing; never the sign-in.**
+  - The stored identity does not move. It is read **beside** the identifier, never instead of it,
+    and a test asserts that digest byte for byte on the path that now writes the country next to
+    it.
+
 - **fix(harvest): the CKAN family no longer builds a dataset's public remote URL on a credentialed source URL**
   - `URLS_ALLOW_CREDENTIALS` lets a harvest source URL carry `user:password@`, and
     `CkanBackend.dataset_url()` built on it with `urljoin`, which keeps the userinfo. Its
