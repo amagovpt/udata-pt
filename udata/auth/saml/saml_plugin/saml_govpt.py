@@ -747,6 +747,18 @@ def _resolve_link_intent(relay_token):
 
     from udata.core.user.models import User
 
+    # 🚩 OFF HAS TO MEAN OFF, INCLUDING MID-FLIGHT. The ticket lives for ten
+    # minutes, which is a window in which a deploy can turn the invite off
+    # while somebody is at autenticacao.gov. Honouring it then would send them
+    # to a wizard whose every endpoint now answers 403 -- a dead end, and the
+    # one shape this whole ticket exists to avoid.
+    #
+    # Read BEFORE the ticket is consumed, deliberately: with the feature off
+    # there is nothing to consume for, and leaving the entry to expire on its
+    # own keeps this read free of side effects.
+    if not _invite_enabled():
+        return None
+
     user_id = _consume_link_intent(relay_token)
     if not user_id:
         return None

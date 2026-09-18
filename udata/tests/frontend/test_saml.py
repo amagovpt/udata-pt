@@ -9792,6 +9792,54 @@ class InvitedLinkDoesNotCreateASecondAccountTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_ticket_issued_before_the_invite_was_turned_off_is_ignored(
+        self, mock_client_for, _mock_confirm
+    ):
+        """🚩 Off has to mean off everywhere, including mid-flight.
+
+        The ticket lives for ten minutes, which is a window in which the flag
+        can be turned off by a deploy while somebody is at autenticacao.gov.
+        Honouring it then would send them to a wizard whose every endpoint now
+        answers 403 -- a dead end, and the one shape this ticket exists to
+        avoid.
+
+        Falling back to an ordinary sign-in is not a compromise: it IS the
+        behaviour of a portal with the invite off, which is exactly what the
+        operator asked for by turning it off.
+        """
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+        cache, token = self._ticket_for(account)
+
+        # The deploy lands between the click and the callback.
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_callback(
+                mock_client_for,
+                cache,
+                relay_token=token,
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        with self.client.session_transaction() as sess:
+            assert "saml_migration_pending" not in sess, (
+                "the callback opened a wizard that is now shut -- every endpoint it needs "
+                "answers 403, so the citizen is left with no way forward"
+            )
+
+    def _ticket_for(self, account):
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+        return cache, token
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_a_ticket_for_an_account_linked_meanwhile_is_ignored(
         self, mock_client_for, _mock_confirm
     ):
