@@ -115,7 +115,12 @@ def scrub_url_credentials(event, hint):
 
     This is not the SDK's `EventScrubber`, which matches *key names*
     (`password`, `secret`) and would see nothing here: the secret is inside the
-    value of an ordinarily-named key.
+    value of an ordinarily-named key. The two are complementary, and `init_app`
+    runs both -- a harvest source also carries a credential that is a bare
+    token under a secret-sounding name (`config["apikey"]`, sent as an
+    `Authorization` header), which is the scrubber's job and not this one's,
+    since no regex over the value can tell an API key from any other string
+    (LEDG-2514).
 
     Anything it cannot walk is dropped rather than sent: losing one report
     costs visibility, letting one through costs the credential.
@@ -162,6 +167,7 @@ def init_app(app: UDataApp):
             from sentry_sdk.integrations.celery import CeleryIntegration
             from sentry_sdk.integrations.flask import FlaskIntegration
             from sentry_sdk.integrations.logging import ignore_logger
+            from sentry_sdk.scrubber import EventScrubber
         except ImportError:
             log.error("sentry-sdk is required to use Sentry")
             return
@@ -177,6 +183,25 @@ def init_app(app: UDataApp):
             dsn=app.config["SENTRY_PUBLIC_DSN"],
             integrations=[FlaskIntegration(), CeleryIntegration()],
             ignore_errors=list(exceptions),
+            # The SDK already builds a scrubber when none is passed, and it
+            # already walks `exception.values[].stacktrace.frames[].vars`. What
+            # it does not do by default is descend: without `recursive` it only
+            # compares the top-level keys of each dict it is handed. The
+            # harvest secret sits one level below one of them --
+            # `BaseBackend._request_with_retry` keeps `headers` (with
+            # `Authorization: <apikey>` for the CKAN family) as a local of the
+            # frame that re-raises every SSLError, ConnectionError and Timeout,
+            # so the key reaching Sentry is `headers`, not `Authorization`.
+            # Recursing puts the SDK's own denylist (authorization, apikey,
+            # token, secret, password) where the value actually is.
+            #
+            # It runs before `before_send`, and replaces the value with an
+            # `AnnotatedValue`, which `_redact_in_place` returns untouched --
+            # it is neither str, dict, list nor tuple. The two do not collide:
+            # this one knows secret *key names* whatever the value looks like,
+            # `scrub_url_credentials` knows credentialed *URLs* whatever the
+            # key is called (LEDG-2514).
+            event_scrubber=EventScrubber(recursive=True),
             before_send=scrub_url_credentials,
             # `before_send` is not called for transactions, and
             # `traces_sample_rate` is 1.0 here, so every request and every
