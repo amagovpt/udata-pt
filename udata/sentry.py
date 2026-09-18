@@ -42,6 +42,54 @@ _URL_VALUED_KEYS = frozenset(
 )
 
 
+# Keys whose *value* is a secret, whatever it looks like. No regex over the
+# value can tell an API key from any other opaque string, so the key name is
+# the only signal there is.
+#
+# The SDK's own `EventScrubber` covers these too, and `init_app` runs it with
+# `recursive=True`. It is not enough on its own for two reasons. It compares
+# key names exactly, so `X-API-Key` -- the header spelling a CKAN-like source
+# would use -- misses a denylist that lists `x_api_key`. And each of its
+# sections runs inside `capture_internal_exceptions`, so a cyclic or very deep
+# frame local raises `RecursionError`, the remaining frames go unscrubbed and
+# the event is sent anyway. This walk normalizes the name before comparing, and
+# a walk it cannot finish drops the event instead of sending it (LEDG-2514).
+_SECRET_VALUED_KEYS = frozenset(
+    {
+        "authorization",
+        "proxyauthorization",
+        "apikey",
+        "xapikey",
+        "apisecret",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "privatekey",
+        "credentials",
+    }
+)
+
+# What the SDK writes in place of a secret. Same marker, so an event redacted
+# by either side reads the same in Sentry.
+_FILTERED = "[Filtered]"
+
+
+def _is_secret_key(key) -> bool:
+    """Whether a dict key names a secret, ignoring spelling.
+
+    `Authorization`, `X-API-Key`, `api_key` and `apikey` are the same key wearing
+    four different separators, and a header dict picks whichever the remote
+    server used.
+    """
+    if not isinstance(key, str):
+        return False
+    return "".join(c for c in key.lower() if c.isalnum()) in _SECRET_VALUED_KEYS
+
+
 def _redact_url_value(value: str) -> str:
     """Redact a value expected to be a whole URL, falling back to prose.
 
@@ -74,7 +122,11 @@ def _redact_in_place(node, depth: int = 0):
         # Rebinding existing keys does not resize the dict, so iterating it
         # while assigning is safe.
         for key, value in node.items():
-            if key in _URL_VALUED_KEYS and isinstance(value, str):
+            if _is_secret_key(key):
+                # Whatever the value is -- a token, a dict of them, already
+                # `[Filtered]` -- nothing under this name may be sent.
+                node[key] = _FILTERED
+            elif key in _URL_VALUED_KEYS and isinstance(value, str):
                 node[key] = _redact_url_value(value)
             else:
                 node[key] = _redact_in_place(value, depth + 1)
@@ -195,12 +247,16 @@ def init_app(app: UDataApp):
             # Recursing puts the SDK's own denylist (authorization, apikey,
             # token, secret, password) where the value actually is.
             #
-            # It runs before `before_send`, and replaces the value with an
-            # `AnnotatedValue`, which `_redact_in_place` returns untouched --
-            # it is neither str, dict, list nor tuple. The two do not collide:
-            # this one knows secret *key names* whatever the value looks like,
-            # `scrub_url_credentials` knows credentialed *URLs* whatever the
-            # key is called (LEDG-2514).
+            # It runs before `before_send`, and what `before_send` then sees
+            # is the string `[Filtered]`: `_prepare_event` serializes between
+            # the two, precisely so annotated types do not surface there, and
+            # the annotation moves to `event["_meta"]`. So the two do not
+            # collide -- redacting `[Filtered]` is a no-op -- and they cover
+            # different things: the SDK's walk reaches arbitrary depth but is
+            # best-effort and matches key names exactly, while
+            # `scrub_url_credentials` runs after serialization, normalizes the
+            # key name, and drops the event rather than send a subtree it could
+            # not walk (LEDG-2514).
             event_scrubber=EventScrubber(recursive=True),
             before_send=scrub_url_credentials,
             # `before_send` is not called for transactions, and

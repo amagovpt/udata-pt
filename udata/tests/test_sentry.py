@@ -5,7 +5,7 @@ import pytest
 import requests
 from sentry_sdk.scrubber import EventScrubber
 
-from udata.sentry import _MAX_SCRUB_DEPTH, init_app, scrub_url_credentials
+from udata.sentry import _FILTERED, _MAX_SCRUB_DEPTH, init_app, scrub_url_credentials
 from udata.tests import PytestOnlyTestCase
 
 # The proof of concept from LEDG-2477: a harvest source whose URL legitimately
@@ -223,6 +223,67 @@ class ScrubURLCredentialsTest:
         """Losing one report costs visibility; letting one through costs the
         credential."""
         assert scrub_url_credentials(event, {}) is None
+
+
+class ScrubSecretKeysTest:
+    """`scrub_url_credentials` also redacts values whose *key* names a secret.
+
+    The SDK's `EventScrubber` covers the same ground with `recursive=True`, but
+    it matches key names exactly and is best-effort; this walk normalizes the
+    name and drops an event it cannot finish (LEDG-2514).
+    """
+
+    def test_an_authorization_header_is_redacted_wherever_it_sits(self):
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {"vars": {"headers": {"Authorization": PASSWORD}}},
+                            ]
+                        }
+                    }
+                ]
+            },
+            "extra": {"request_headers": {"authorization": PASSWORD}},
+        }
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert PASSWORD not in json.dumps(scrubbed, default=str)
+
+    @pytest.mark.parametrize(
+        "key",
+        ["Authorization", "X-API-Key", "api_key", "apikey", "APIKEY", "access-token", "secret"],
+    )
+    def test_a_secret_key_is_matched_whatever_its_spelling(self, key):
+        """A header dict carries whichever separator the remote server used,
+        and the SDK's denylist only matches one spelling of each."""
+        event = {"extra": {"headers": {key: PASSWORD}}}
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert scrubbed["extra"]["headers"][key] == _FILTERED
+
+    def test_an_ordinary_key_keeps_its_value(self):
+        """The redaction is by name, so everything else stays readable --
+        an event scrubbed into uselessness gets reported as a Sentry bug."""
+        event = {"extra": {"headers": {"content-type": "application/json", "token_count": 12}}}
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert scrubbed["extra"]["headers"]["content-type"] == "application/json"
+        assert scrubbed["extra"]["headers"]["token_count"] == 12
+
+    def test_a_secret_holding_a_structure_goes_whole(self):
+        """`[Filtered]` replaces the subtree: a dict under a secret-named key
+        is not descended into and partially kept."""
+        event = {"extra": {"credentials": {"user": "harvestuser", "pass": PASSWORD}}}
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert scrubbed["extra"]["credentials"] == _FILTERED
 
 
 class SentryInitAppTest(PytestOnlyTestCase):
