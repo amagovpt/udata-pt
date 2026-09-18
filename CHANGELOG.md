@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **chore(harvest): the `dgtIne` backend is gone, and so is every registration that pointed at it**
+  - The module had already been deleted; what stayed behind was the part that breaks things.
+    `get_all_backends()` is `{ep.load().name: ep.load() for ep in entry_points(group="udata.harvesters")}`
+    -- it loads *every* entry point in the group, so one whose module no longer exists does
+    not degrade that one backend, it raises `ModuleNotFoundError` out of the comprehension
+    and takes the whole call with it. `get_backend()`, `get_enabled_backends()` and
+    `GET /api/1/harvest/backends/` all go through it, so every harvest and the admin
+    creation wizard would have gone down together, and not with the clean
+    `ValueError: Backend … unknown` an unregistered name gets. Verified:
+    `EntryPoint("dgtIne", "udata.harvest.backends.dgtIne:DGTINEBackend", "udata.harvesters").load()`
+    -> `ModuleNotFoundError: No module named 'udata.harvest.backends.dgtIne'`.
+  - Removed with it: the `udata.harvesters` entry point in `pyproject.toml`, the name in
+    `HARVESTER_BACKENDS` (`udata.cfg`), and `udata/harvest/tests/test_dgtine_backend.py`,
+    which imported the module and so failed at collection rather than as a test.
+  - Nothing is lost by the removal: `dgtIne` read the same INE HVD catalogue as `ine` and
+    `inehvd`, from `www.ine.pt/ine/catalogo_hvd.jsp?opc=4` hardcoded in the class with
+    `source.url` ignored, and that endpoint serves HTML today, so the backend harvested
+    nothing. The name was misleading too -- nothing in it came from DGT.
+  - **No source to migrate.** Production, read on 2026-09-18 via
+    `GET /api/1/harvest/sources/?deleted=true&page_size=100`: 49 sources, deleted ones
+    included, and **none on `dgtIne`** (27 `dgt`, 7 `ckanpt`, 4 `ckan`, 3 `apambiente`, 2
+    each of `ogc`, `ine` and `dcat`, 1 each of `inehvd` and `odspt`). So there is no data
+    migration here, and no dataset changes owner.
+  - ⚠️ **Each environment has its own `udata.cfg`**, and dropping the name from the one in
+    this repo does not touch the deployed ones. Before promoting to each environment, count
+    sources per backend (`db.harvest_source.aggregate` by `backend`) and drop `"dgtIne"`
+    from that environment's `HARVESTER_BACKENDS`: a source left on a backend that no longer
+    exists fails its next scheduled run. Restart the Celery worker and beat after the
+    deploy, as for any harvest change -- the backend registry is read in-process.
+  - `HARVESTER_BACKENDS` still lists `dadosGov`, a name that has never had an entry point.
+    That one is harmless (an unmatched name in the enable list is just ignored) and belongs
+    to the configuration cleanup of LEDG-2493, not here.
+
 - **fix(harvest): a harvest source's config is no longer served to readers who cannot edit it**
   - `source_fields["config"]` was a raw passthrough while both GET routes that serve the
     model are open to anonymous callers, so the CKAN API key -- which `ckan`, `dkan` and
