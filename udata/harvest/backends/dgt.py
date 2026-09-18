@@ -52,6 +52,11 @@ MAX_CONSTRAINT_LENGTH = 5000
 # truncating could cut off the very restriction that withholds the licence.
 MAX_DECIDABLE_LENGTH = 20000
 
+# The licence THIS backend last wrote. Without it, a licence the harvester
+# derived and one a producer corrected by hand are the same value in the
+# database, and the fallback below cannot tell them apart.
+DERIVED_LICENSE_EXTRA = "harvest:derived_license"
+
 CC_CODE_TO_LICENSE_ID = {
     "by": "cc-by",
     "by-sa": "cc-by-sa",
@@ -306,12 +311,17 @@ class DGTBackend(BaseBackend):
     def _license_for(self, dataset, item: HarvestItem, data: dict):
         """The licence the source grants, falling back the way CKAN does.
 
-        Source first, then whatever the dataset already carries, then the
-        portal default. The middle step is what lets a producer correct the
-        licence in the back office and keep the correction: before this, every
-        harvest stamped `cc-by` over it. It never falls back to `cc-by` -- that
-        constant was the bug, and `notspecified` is what the portal says when
-        it does not know.
+        Source first, then a correction a producer made by hand, then the
+        portal default. It never falls back to `cc-by` -- that constant was the
+        bug, and `notspecified` is what the portal says when it does not know.
+
+        The middle step is the delicate one. Keeping whatever the dataset
+        already carries is what lets a producer's correction survive a harvest,
+        but applied blindly it also makes the licence irrevocable: a source that
+        stops granting CC BY would never take it back, because the value we
+        wrote ourselves last night is indistinguishable from an editorial
+        decision. So what this backend derived is recorded, and only a licence
+        that differs from it is treated as somebody's correction.
         """
         license_id = license_id_from_legal_constraints(data.get("legal_constraints") or [])
         resolved = License.objects(id=license_id).first() if license_id else None
@@ -324,6 +334,21 @@ class DGTBackend(BaseBackend):
                 item.remote_id,
                 license_id,
             )
+
+        if resolved is not None:
+            dataset.extras[DERIVED_LICENSE_EXTRA] = resolved.id
+            return resolved
+
+        # The source grants nothing. Anything on the dataset that is not what
+        # we last wrote is a correction, and stays.
+        current = dataset.license
+        if current is not None and current.id != dataset.extras.get(DERIVED_LICENSE_EXTRA):
+            dataset.extras.pop(DERIVED_LICENSE_EXTRA, None)
+            return current
+
         # `default` has to be a document: Dataset.license is a ReferenceField
         # and a raw string raises (LEDG-2315).
-        return resolved or dataset.license or License.default()
+        default = License.default()
+        if default is not None:
+            dataset.extras[DERIVED_LICENSE_EXTRA] = default.id
+        return default

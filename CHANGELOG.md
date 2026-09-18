@@ -38,6 +38,13 @@
     the eleven existing Portuguese-titled licences with it. A second migration clears the
     `cc-by` on DGT-harvested datasets, because the new fallback would otherwise read the bug
     as an editorial decision and preserve it forever.
+  - **A source can take back a licence it stopped granting.** Keeping whatever the dataset
+    already carries is what lets a producer's correction survive a harvest, but applied
+    blindly it also makes the licence irrevocable: the value written last night is
+    indistinguishable from an editorial decision, so a source that stopped granting CC BY
+    would never take it back -- the mirror image of the bug being fixed. What this backend
+    derived is recorded in `extras["harvest:derived_license"]`, and only a licence that
+    differs from it is treated as somebody's correction.
   - **Deploy order matters:** stop `worker` and `beat`, deploy, run `udata db upgrade`, then
     start them again. A long-running worker keeps the old code in memory, and a harvest that
     runs before the restart writes `cc-by` straight back over the migration.

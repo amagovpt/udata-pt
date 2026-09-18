@@ -5,9 +5,11 @@ import json
 import pytest
 
 from udata.core.dataset.factories import LicenseFactory
+from udata.models import License
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.dgt import (
+    DERIVED_LICENSE_EXTRA,
     MAX_CONSTRAINT_ENTRIES,
     MAX_CONSTRAINT_LENGTH,
     DGTBackend,
@@ -460,3 +462,81 @@ class DGTUntrustedInputTest:
         # licence, so nothing is granted at all.
         constraints = ["CC BY 4.0 " + "x" * 25000]
         assert license_id_from_legal_constraints(constraints) is None
+
+
+CC_BY_LABEL = "Licença de utilização - CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)"
+IPR_ONLY = "Direitos de Propriedade Intelectual"
+AZORES_SHORT = (
+    "A reprodução e cópia para usos não comerciais é autorizada nos termos de licença "
+    "Creative Commons – Atribuição (CC-BY). O uso comercial é expressamente proibido."
+)
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTLicenseWithdrawalTest(PytestOnlyDBTestCase):
+    """A source can take back a licence it stopped granting."""
+
+    def _licenses(self):
+        LicenseFactory(id="notspecified", title="License Not Specified")
+        LicenseFactory(id="cc-by", title="Creative Commons Attribution 4.0 - CC BY 4.0")
+        LicenseFactory(id="cc-by-nc", title="Creative Commons Attribution-NonCommercial 4.0")
+
+    def _harvest(self, rmock, legal_constraints):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(REMOTE_ID, legal_constraints)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(REMOTE_ID)
+
+    def test_a_withdrawn_license_is_not_kept_forever(self, rmock):
+        # The mirror image of the bug this ticket fixes: keeping whatever the
+        # dataset carries would mean our own previous write outlives the grant
+        # it came from.
+        self._licenses()
+        assert self._harvest(rmock, [CC_BY_LABEL]).license.id == "cc-by"
+
+        dataset = self._harvest(rmock, [PUBLIC_ACCESS, IPR_ONLY])
+
+        assert dataset.license.id == "notspecified"
+
+    def test_a_license_restricted_upstream_is_not_kept(self, rmock):
+        self._licenses()
+        self._harvest(rmock, [CC_BY_LABEL])
+
+        dataset = self._harvest(rmock, [AZORES_SHORT])
+
+        assert dataset.license.id == "notspecified"
+
+    def test_a_manual_edit_still_survives(self, rmock):
+        # The Q4 guarantee, unchanged: a correction a producer made by hand is
+        # not what we wrote, so it stays.
+        self._licenses()
+        self._harvest(rmock, [CC_BY_LABEL])
+        dataset = harvested_dataset(REMOTE_ID)
+        dataset.license = License.objects(id="cc-by-nc").first()
+        dataset.save()
+
+        dataset = self._harvest(rmock, [PUBLIC_ACCESS, IPR_ONLY])
+
+        assert dataset.license.id == "cc-by-nc"
+
+    def test_a_manual_edit_clears_the_derived_marker(self, rmock):
+        self._licenses()
+        self._harvest(rmock, [CC_BY_LABEL])
+        dataset = harvested_dataset(REMOTE_ID)
+        dataset.license = License.objects(id="cc-by-nc").first()
+        dataset.save()
+
+        dataset = self._harvest(rmock, [PUBLIC_ACCESS, IPR_ONLY])
+
+        assert DERIVED_LICENSE_EXTRA not in dataset.extras
+
+    def test_the_extra_records_what_we_derived(self, rmock):
+        self._licenses()
+        dataset = self._harvest(rmock, [CC_BY_LABEL])
+        assert dataset.extras[DERIVED_LICENSE_EXTRA] == "cc-by"
+
+        dataset = self._harvest(rmock, [PUBLIC_ACCESS, IPR_ONLY])
+        assert dataset.extras[DERIVED_LICENSE_EXTRA] == "notspecified"
