@@ -1,6 +1,7 @@
 import re
 from urllib.parse import parse_qs, urlparse
 
+from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
@@ -32,12 +33,24 @@ CC_LICENSE_CODE_RE = re.compile(r"CC[\s-]?BY(?:[\s-]?NC)?(?:[\s-]?ND|[\s-]?SA)?"
 # source on a restriction that is not aimed at the data.
 NON_COMMERCIAL_GRANT_RE = re.compile(
     r"(?:usos?|fins|utiliza[\u00e7c][\u00e3a]o)\s+n[\u00e3a]o[\s-]*comercia"
-    r"|proibid[ao]s?\b[^.]*\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
-    r"|(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial\b[^.]*\bproibid"
-    r"|n[\u00e3a]o\s+(?:\u00e9\s+)?(?:permitid|autorizad)[ao]\b[^.]*\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
+    r"|proibid[ao]s?\b[^.]{0,200}\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
+    r"|(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial\b[^.]{0,200}\bproibid"
+    r"|n[\u00e3a]o\s+(?:\u00e9\s+)?(?:permitid|autorizad)[ao]\b[^.]{0,200}\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
     r"|non[\s-]?commercial\s+use\s+only",
     re.IGNORECASE,
 )
+
+# The source decides how long its own prose is, so the bounds are ours to set.
+# Three of the patterns above are of the form `<word>[^.]{0,200}<word>`: the
+# gap is bounded because an unbounded `[^.]*` is quadratic in the length of a
+# run without a full stop, and legal prose with the stops removed turned into
+# 7.9s of CPU per 128 KiB record -- reachable through the harvest preview
+# endpoint, which runs synchronously on an HTTP worker.
+MAX_CONSTRAINT_ENTRIES = 20
+MAX_CONSTRAINT_LENGTH = 5000
+# Past this the record is not decided at all rather than decided on a prefix:
+# truncating could cut off the very restriction that withholds the licence.
+MAX_DECIDABLE_LENGTH = 20000
 
 CC_CODE_TO_LICENSE_ID = {
     "by": "cc-by",
@@ -100,7 +113,12 @@ def license_id_from_legal_constraints(constraints: list[str]) -> str | None:
     None is not "cc-by by default" -- that constant is the bug this replaces.
     The caller turns it into the portal's default licence.
     """
-    restricted = _grant_is_restricted(" ".join(constraints))
+    text = " ".join(constraints)
+    if len(text) > MAX_DECIDABLE_LENGTH:
+        # Fail closed: no licence, rather than one read off a prefix.
+        return None
+
+    restricted = _grant_is_restricted(text)
 
     found = set()
     for entry in constraints:
@@ -145,7 +163,19 @@ class DGTBackend(BaseBackend):
             constraints = [constraints]
         elif not isinstance(constraints, list):
             return []
-        return [entry.strip() for entry in constraints if isinstance(entry, str) and entry.strip()]
+
+        entries = []
+        for entry in constraints[:MAX_CONSTRAINT_ENTRIES]:
+            if not isinstance(entry, str):
+                continue
+            # Sanitized here for the same reason ine.py and inehvd.py sanitize
+            # what they put in extras: extras are marshalled raw by the API and
+            # copied into the search document, and nothing downstream cleans
+            # them -- pre_save only covers title and description.
+            entry = sanitize_strict(entry).strip()[:MAX_CONSTRAINT_LENGTH]
+            if entry:
+                entries.append(entry)
+        return entries
 
     def inner_harvest(self):
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
@@ -290,7 +320,7 @@ class DGTBackend(BaseBackend):
             # silently landing on a near neighbour is how a record ends up
             # granting more than its source does.
             self.logger.warning(
-                "DGT record %s declares licence %r, which the portal does not have",
+                "DGT record %r declares licence %r, which the portal does not have",
                 item.remote_id,
                 license_id,
             )

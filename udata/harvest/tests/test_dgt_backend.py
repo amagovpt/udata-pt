@@ -7,7 +7,12 @@ import pytest
 from udata.core.dataset.factories import LicenseFactory
 from udata.tests.api import PytestOnlyDBTestCase
 
-from ..backends.dgt import DGTBackend, license_id_from_legal_constraints
+from ..backends.dgt import (
+    MAX_CONSTRAINT_ENTRIES,
+    MAX_CONSTRAINT_LENGTH,
+    DGTBackend,
+    license_id_from_legal_constraints,
+)
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -412,4 +417,46 @@ class DGTConflictingCodesTest:
 
     def test_two_codes_in_one_entry_grant_neither(self):
         constraints = ["Dados derivados sob CC BY 4.0; originais sob CC BY-NC 4.0"]
+        assert license_id_from_legal_constraints(constraints) is None
+
+
+class DGTUntrustedInputTest:
+    """The source decides its own prose; the bounds are ours."""
+
+    def test_markup_is_stripped_before_it_reaches_extras(self):
+        # extras are marshalled raw by the API and copied into the search
+        # document, and nothing downstream cleans them: pre_save only covers
+        # the title and the description.
+        record = {"legalConstraints": ["<script>alert(1)</script>Licença CC-BY-4.0"]}
+        stored = DGTBackend._legal_constraints(record)[0]
+        assert "<script>" not in stored
+        assert "Licença CC-BY-4.0" in stored
+
+    def test_markup_does_not_cost_the_license(self):
+        record = {"legalConstraints": ["<b>Licença de utilização</b> - CC-BY-4.0"]}
+        assert license_id_from_legal_constraints(DGTBackend._legal_constraints(record)) == "cc-by"
+
+    def test_entries_are_capped(self):
+        record = {"legalConstraints": ["Sem restrições"] * (MAX_CONSTRAINT_ENTRIES + 10)}
+        assert len(DGTBackend._legal_constraints(record)) == MAX_CONSTRAINT_ENTRIES
+
+    def test_an_entry_is_truncated(self):
+        record = {"legalConstraints": ["a" * (MAX_CONSTRAINT_LENGTH + 100)]}
+        assert len(DGTBackend._legal_constraints(record)[0]) == MAX_CONSTRAINT_LENGTH
+
+    def test_a_pathological_run_does_not_hang_the_resolver(self):
+        # An unbounded gap in the restriction pattern cost 7.9s per 128 KiB of
+        # full-stop-free prose, reachable through the synchronous harvest
+        # preview endpoint.
+        import time
+
+        constraints = ["proibida " * 2000]
+        started = time.perf_counter()
+        license_id_from_legal_constraints(constraints)
+        assert time.perf_counter() - started < 1
+
+    def test_text_beyond_the_decidable_length_grants_nothing(self):
+        # Fail closed: a prefix could omit the restriction that withholds the
+        # licence, so nothing is granted at all.
+        constraints = ["CC BY 4.0 " + "x" * 25000]
         assert license_id_from_legal_constraints(constraints) is None

@@ -54,8 +54,15 @@ def migrate(db):
     result = db.dataset.update_many(query, {"$unset": {"license": ""}})
 
     log.info(
-        "Cleared the license on %s dataset(s) across %s dgt source(s): %s",
+        "Cleared the license on %s dataset(s) across %s dgt source(s).",
         result.modified_count,
         len(source_ids),
-        ", ".join(str(dataset_id) for dataset_id in touched) or "none",
     )
+    # The ids are what lets a producer's complaint be answered afterwards, but
+    # 1213 of them on one line is 31 KB that syslog and the log shippers
+    # truncate -- which loses the very thing they are logged for.
+    for start in range(0, len(touched), 50):
+        log.info(
+            "  cleared: %s",
+            ", ".join(str(dataset_id) for dataset_id in touched[start : start + 50]),
+        )
