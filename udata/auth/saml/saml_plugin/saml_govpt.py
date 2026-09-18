@@ -4155,6 +4155,27 @@ def _needs_identity_link(user):
     return bool(not _has_linked_nic(user) and user.password)
 
 
+def _wizard_open():
+    """True when the linking wizard is reachable at all, in either mode.
+
+    The wizard's endpoints were gated on the mandatory flag because that was
+    the only way anyone reached them. The invite is a second way in, so the
+    gate has to name both -- otherwise the ACS hands somebody a wizard whose
+    every endpoint answers 403, which is a dead end wearing the costume of a
+    flow.
+
+    🚫 ONE ENDPOINT IS DELIBERATELY NOT HERE: ``migration_skip``, which creates
+    a brand-new account. In the mandatory mode it is the emergency exit for
+    somebody who cannot prove the old account is theirs and would otherwise be
+    locked out of the portal entirely. In invite mode they signed in with a
+    password seconds ago and are locked out of nothing -- so there it is not a
+    safety net, it is a way to manufacture the second account the invite
+    exists to prevent. The button goes from the screen AND the endpoint keeps
+    refusing: one of those alone is a UI change, not a guarantee.
+    """
+    return _migration_enabled() or _invite_enabled()
+
+
 def _invite_dismissed(user):
     """True while a dismissal of the linking invite is still in force.
 
@@ -4256,7 +4277,7 @@ def migration_pending():
     """Check if there is a pending migration in the session."""
     from udata.core.user.models import find_user_by_email_ci
 
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -4353,7 +4374,7 @@ def migration_send_link():
     in — the link is what grants the session, exactly as on the
     account-creation branch (see migration_skip).
     """
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -4603,7 +4624,7 @@ def migration_confirm_link(token):
     user, record, state = _migration_link_token_status(token)
     origin = (record or {}).get(MIGRATION_LINK_ORIGIN)
 
-    if not _migration_enabled() and origin != MIGRATION_LINK_ORIGIN_REGISTRATION:
+    if not _wizard_open() and origin != MIGRATION_LINK_ORIGIN_REGISTRATION:
         return redirect(f"{wizard_url}?flash=migration_link_invalid")
 
     if state == "already_done":
@@ -4661,7 +4682,7 @@ def migration_confirm():
     """
     from udata.core.user.models import find_user_by_email_ci
 
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -4934,7 +4955,7 @@ def migration_resend_confirmation():
     and the stock ``security.send_confirmation`` view carries no rate limit of
     its own to fall back on.
     """
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     awaiting = session.get("saml_confirmation_pending")

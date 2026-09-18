@@ -9823,3 +9823,77 @@ class InvitedLinkDoesNotCreateASecondAccountTest(APITestCase):
 
         with self.client.session_transaction() as sess:
             assert "saml_migration_pending" not in sess
+
+
+class WizardOpenInInviteModeTest(APITestCase):
+    """The wizard has to answer in invite mode -- except the one door that
+    manufactures the duplicate.
+
+    🚨 Without this the ACS hands somebody a wizard whose every endpoint
+    answers 403: a dead end wearing the costume of a flow, and exactly the
+    shape of defect this project keeps shipping (LEDG-1628, LEDG-2438).
+    """
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _pending_session(self, account):
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(account.id),
+                "no_match": False,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_first_name": "Maria",
+                "saml_last_name": "Silva",
+                "saml_provider": "cmd",
+            }
+
+    def test_the_wizard_answers_in_invite_mode(self):
+        """Not "returns 200" -- returns anything other than the 403 that says
+        the wizard does not exist."""
+        self._invite_on()
+        account = UserFactory(password="x" * 12)
+        self._pending_session(account)
+
+        assert self.client.get("/saml/migration/pending").status_code != 403
+        assert self.client.post("/saml/migration/send-link").status_code != 403
+        assert self.client.post("/saml/migration/confirm", json={}).status_code != 403
+
+    def test_creating_a_new_account_stays_shut_in_invite_mode(self):
+        """🚫 The whole point of the exception.
+
+        In the mandatory mode this is the emergency exit for somebody who
+        cannot prove the old account is theirs and would otherwise be locked
+        out of the portal. In invite mode they signed in with a password
+        seconds ago and are locked out of nothing -- so it is not a safety
+        net, it is a way to manufacture the second account.
+        """
+        self._invite_on()
+        self._pending_session(UserFactory(password="x" * 12))
+
+        response = self.client.post("/saml/migration/skip", json={"email": "nova@example.pt"})
+        assert response.status_code == 403
+
+    def test_creating_a_new_account_still_works_in_the_mandatory_mode(self):
+        """Paired with the test above: a guard that refused in BOTH modes would
+        take away the emergency exit from the people who need it."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        self._pending_session(UserFactory(password="x" * 12))
+
+        response = self.client.post("/saml/migration/skip", json={"email": "nova@example.pt"})
+        assert response.status_code != 403
+
+    def test_with_both_flags_off_the_wizard_is_shut_exactly_as_before(self):
+        """Criterion 12: turning the invite off returns today's behaviour,
+        without turning the mandatory mode on."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        self._pending_session(UserFactory(password="x" * 12))
+
+        assert self.client.get("/saml/migration/pending").status_code == 403
+        assert self.client.post("/saml/migration/send-link").status_code == 403
+        assert self.client.post("/saml/migration/confirm", json={}).status_code == 403
+        assert self.client.post("/saml/migration/skip", json={}).status_code == 403
+        assert self.client.post("/saml/migration/resend-confirmation").status_code == 403
