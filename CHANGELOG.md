@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- **fix(harvest): the DGT backend derives the license from `legalConstraints` instead of
+  stamping `cc-by` on every dataset**
+  - The constant ran on every harvest of all 27 DGT sources, over all 1213 datasets, so it
+    was never an initial value: it was a daily rewrite. A producer who corrected the licence
+    in the back office had it stamped over by the next run. Against a live sample of 1400
+    records from the SNIG index, 57% declare no licence the portal can honour -- and every
+    one of them was published as CC BY 4.0. That is what LNEG reported.
+  - **Where a restriction appears is what decides whether the grant holds.** "Mentions
+    commercial use, therefore not CC BY" would have been the easy rule and the wrong one: it
+    would also turn the SNIT records, which are the largest slice of the source. Those forbid
+    commercialising what the SNIT PORTAL shows and then grant CC BY over the geographic
+    information itself -- a restriction on the viewer, not on the data, and CC BY 4.0 permits
+    commercial use by definition, so reading it the other way makes the record contradict
+    itself. The Azores records, by contrast, grant CC BY and forbid commercial use OF THE
+    DATA in the same sentence, so there the grant does not hold. The check runs on whichever
+    entry produced the licence code, whether it came from a URL or from the text: the Azores
+    wording ends with the CC BY URL, so exempting URLs would have let through exactly the
+    records it guards against.
+  - **The free text is never handed to `License.guess`.** Its fuzzy fallback ranks every
+    licence slug and title by edit distance, so a thousand characters of legal prose would
+    resolve to whatever happens to be nearest. A canonical Creative Commons code is extracted
+    first -- from a licence URL, or from the code spelled out in the text -- and only that is
+    looked up, by exact id. The URL pattern tolerates the two defects the source really
+    carries: the domain misspelled `creativecoomons`, and a version path written `by4.0`
+    without the separating slash.
+  - **Nothing falls back to `cc-by` any more.** Source first, then whatever the dataset
+    already carries, then the portal default -- the same order the CKAN backend uses, which
+    is what lets a producer's correction survive the next harvest. The raw text is kept in
+    `extras["harvest:legal_constraints"]` so a licence decision can be audited without going
+    back to the source.
+  - **Two licences added, and the harvester-written `cc-by` cleared.** The sources publish
+    CC BY-NC and CC BY-NC-ND, which the portal did not carry; they are upserted rather than
+    seeded through the `licenses` command, which drops the whole collection and would take
+    the eleven existing Portuguese-titled licences with it. A second migration clears the
+    `cc-by` on DGT-harvested datasets, because the new fallback would otherwise read the bug
+    as an editorial decision and preserve it forever.
+  - **Deploy order matters:** stop `worker` and `beat`, deploy, run `udata db upgrade`, then
+    start them again. A long-running worker keeps the old code in memory, and a harvest that
+    runs before the restart writes `cc-by` straight back over the migration.
+
 - **fix(saml): an invited link whose identity is already taken now stops and says so**
   - Pressing "link" with a CMD/eIDAS identity that already belongs to another account used
     to sign the citizen into that other account. That is the right answer for anyone who
