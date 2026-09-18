@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **fix(saml): an invited link whose identity is already taken now stops and says so**
+  - Pressing "link" with a CMD/eIDAS identity that already belongs to another account used
+    to sign the citizen into that other account. That is the right answer for anyone who
+    pressed "sign in" -- the identity IS that account's -- and the wrong one for somebody
+    who pressed "link": they end up in an account they never asked about, the one they
+    clicked from stays unlinked, and nothing says so. They walk away believing it worked
+    and find out when the invite comes back.
+  - Same principle the password screen already applies: never switch accounts in silence.
+    Refusing costs one click to whoever did want that account, since the sign-in button is
+    still there, and saves everyone else a change they never asked for. An ordinary
+    sign-in with the same identity is untouched -- the guard is scoped to a link ticket.
+  - The redirect carries a generic code and no identity: the query string lands in browser
+    history, Referer headers and proxy logs.
 - **fix(saml): the invited link now binds the account the person clicked from**
   - The wizard re-points the pending migration at whichever account the typed password
     proves. In the mandatory mode that is the only evidence there is -- the citizen
