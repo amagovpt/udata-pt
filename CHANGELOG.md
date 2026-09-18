@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- **feat(saml): invite a password account to link a CMD/eIDAS identity, optionally**
+  - Two flags, one question each. `MIGRATION_MODE_ENABLED` asks whether linking is
+    mandatory; `MIGRATION_INVITE_ENABLED` asks whether the portal invites it. A single
+    flag could not express the state the portal is actually in -- inviting without
+    forcing -- and hanging a fourth question on the existing one would mean reading
+    `not _migration_enabled()` as "we are in invite mode", making a negation stand for
+    a feature. The payoff that decides it: turning the invite off restores today's
+    behaviour WITHOUT turning the mandatory mode on. With both on, mandatory wins, and
+    that is arbitrated in one place so no call site combines two flags on the spot.
+  - **The default is `False`, in one place, and deliberately not `True`.** A `True`
+    default would put every test that only switches the mandatory flag off into invite
+    mode without saying so, and those tests assert that an unmatched identity creates an
+    account. Enabling it is a deployment decision, as it already is for the other flag.
+  - **An account that is already signed in had no way to start a SAML flow.**
+    `/saml/login` and `/saml/eidas/login` are `@anonymous_user_required`, which is right
+    for a way IN and exactly wrong for somebody who just signed in with a password and
+    wants to add an identity: the invite's button would have bounced off them and done
+    nothing. `/saml/link/start` and `/saml/eidas/link/start` are those doors, and the
+    AuthnRequest itself is now built in one shared place rather than copied.
+  - **What stops a second account being created.** The callback cannot see who started
+    the flow: the IdP posts the assertion back cross-site and `SESSION_COOKIE_SAMESITE`
+    is `Lax`, so the browser withholds the session cookie. A ticket therefore rides the
+    RelayState-keyed bucket, beside the outstanding one that exists for the same reason.
+    With a ticket present, both `migration_candidate` AND `no_match` divert to the
+    wizard -- the second is the case that mattered, a CMD carrying a different address
+    that nobody else holds, where a brand-new account used to be minted. eIDAS needed it
+    more, not less: its Minimum Data Set carries no email at all.
+  - **The ticket decides routing, never identity.** It says "whoever comes back this way
+    is linking, not signing up" and nothing more; proof of ownership stays with the
+    wizard, by password or by a link mailed to the account's own address. It is single
+    use, expires with the sign-in, and a cache that is down degrades to today's
+    behaviour rather than to an error on a flow that cannot be retried.
+  - The wizard's endpoints now answer in invite mode too, or the callback would hand
+    somebody a wizard whose every endpoint returns 403. One stays shut: `migration_skip`,
+    which creates a new account. In the mandatory mode it is the emergency exit for
+    somebody who would otherwise be locked out of the portal; in invite mode they signed
+    in with a password seconds ago and are locked out of nothing, so there it is only a
+    way to manufacture the duplicate the invite exists to prevent.
+  - **Dismissing is "not now", never "never let me".** The dismissal is stored as a DATE
+    -- a boolean can only express two frequencies and both are wrong -- and the invite
+    returns after eight days. Eight and not seven because a seven-day window always falls
+    on the same weekday, so somebody who only opens the portal on Tuesdays would see it
+    every time or never. `migration_invite` on the caller's own `/me` carries the notice;
+    `migration_link_available` is the same predicate minus the dismissal, so the
+    permanent entry point does not vanish with the notice.
+  - The audit log gains two reasons rather than a sixth outcome: `invite_link` answers
+    "how many people accepted?", and `invite_identity_elsewhere` names the case nobody
+    would look for -- somebody who clicked Associate from their own account and whose
+    CMD already belongs to a different one, so the portal signs them into that other
+    account. Correct, and today's behaviour, and not what they expected.
 - **feat(harvest): the INE harvesters read their metadata from the catalogue instead of hardcoding it**
   - Both INE backends read the same catalogue and both fixed in code what the source
     publishes, so every INE dataset reached the portal with `frequency = unknown`, a
