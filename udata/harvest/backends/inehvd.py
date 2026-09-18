@@ -2,11 +2,16 @@ import re
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from xml.dom import minidom
 
+from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
 
-from .tools.harvester_utils import sync_resources
+from .tools.harvester_utils import (
+    map_ine_periodicity,
+    reset_ine_periodicity_warnings,
+    sync_resources,
+)
 
 
 class INEHvdBackend(BaseBackend):
@@ -26,6 +31,8 @@ class INEHvdBackend(BaseBackend):
     geo_lastlevel                               | dataset.extras['geo_lastlevel']
     source                                      | dataset.extras['source_description']
     html > bdd_url                              | dataset.extras['bdd_url']
+    html > metainfo_url                         | dataset.extras['metainfo_url']
+    update_type                                 | dataset.extras['update_type'] (optional)
     json > json_dataset                         | dataset.resources (JSON Dataset)
     json > json_metainfo                        | dataset.resources (Metainfo JSON)
     """
@@ -39,6 +46,7 @@ class INEHvdBackend(BaseBackend):
         Fetches the main source XML, parses the available indicators (datasets),
         and initiates the processing for each identified dataset ID.
         """
+        reset_ine_periodicity_warnings()
         try:
             from ineDatasets import datasetIds
         except ImportError:
@@ -129,7 +137,8 @@ class INEHvdBackend(BaseBackend):
         # Description
         dataset.description = get_text(target.getElementsByTagName("description"))
 
-        # License (Guessing cc-by as in ine.py)
+        # cc-by is our editorial choice, not something the feed states: the INE catalogue
+        # publishes no licence element at all. Same decision as in `ine.py`.
         dataset.license = License.guess("cc-by")
 
         # Tags (Keywords + Theme + Subtheme)
@@ -152,16 +161,31 @@ class INEHvdBackend(BaseBackend):
                 keywordSet.add(val.lower())
 
         dataset.tags = sorted(list(keywordSet))
-        if "ine.pt" not in dataset.tags:
-            dataset.tags.append("ine.pt")
+        # Which source a dataset came from, as a tag, like `ckanpt` and `odspt` do. Has to
+        # come after the tags are rebuilt from the remote payload. `TagListField` slugifies
+        # it on save, giving the same `www-ine-pt` the `ine` backend stores, so the two
+        # INE harvesters stop disagreeing over `ine.pt` versus `ine-pt`.
+        source_tag = urlparse(self.source.url or "").hostname or ""
+        if source_tag and source_tag not in dataset.tags:
+            dataset.tags.append(source_tag)
 
         # Frequency / Periodicity
         periodicity = get_text(target.getElementsByTagName("periodicity"))
-        dataset.frequency = self.map_frequency(periodicity)
+        dataset.frequency = map_ine_periodicity(periodicity)
 
-        # Extras
-        dataset.extras["geo_lastlevel"] = get_text(target.getElementsByTagName("geo_lastlevel"))
-        dataset.extras["source_description"] = get_text(target.getElementsByTagName("source"))
+        # Extras. The free-text ones are sanitized like `ine.py` does, so the same field
+        # is not treated differently depending on which INE harvester wrote it.
+        dataset.extras["geo_lastlevel"] = sanitize_strict(
+            get_text(target.getElementsByTagName("geo_lastlevel"))
+        )
+        dataset.extras["source_description"] = sanitize_strict(
+            get_text(target.getElementsByTagName("source"))
+        )
+
+        # Published for a minority of indicators, and an opaque code: stored verbatim.
+        update_type = get_text(target.getElementsByTagName("update_type"))
+        if update_type:
+            dataset.extras["update_type"] = update_type
 
         dates_node = target.getElementsByTagName("dates")
         if dates_node:
@@ -175,6 +199,9 @@ class INEHvdBackend(BaseBackend):
         html_node = target.getElementsByTagName("html")
         if html_node:
             dataset.extras["bdd_url"] = get_text(html_node[0].getElementsByTagName("bdd_url"))
+            metainfo_url = get_text(html_node[0].getElementsByTagName("metainfo_url"))
+            if metainfo_url:
+                dataset.extras["metainfo_url"] = metainfo_url
 
         # Resources: matched against the ones already stored, so that the
         # download permalinks stay valid across harvests (LEDG-2251).
@@ -209,24 +236,3 @@ class INEHvdBackend(BaseBackend):
         sync_resources(dataset, resources)
 
         return dataset
-
-    def map_frequency(self, text):
-        """
-        Maps the Portuguese frequency text (e.g., 'Mensal', 'Anual') to the
-        internal uData controlled vocabulary (e.g., 'monthly', 'annual').
-        Returns 'unknown' if no match is found.
-        """
-        if not text:
-            return "unknown"
-        t = text.lower()
-        if "mensal" in t:
-            return "monthly"
-        if "anual" in t:
-            return "annual"
-        if "trimestral" in t:
-            return "quarterly"
-        if "semanal" in t:
-            return "weekly"
-        if "diário" in t or "diario" in t:
-            return "daily"
-        return "unknown"

@@ -3,10 +3,13 @@ import logging
 import random
 import re
 import time
+import unicodedata
+from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import requests
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.models import Resource
 
 log = logging.getLogger(__name__)
@@ -187,3 +190,113 @@ def guess_url_format(url: str, fallback: str = "remote") -> str:
         if extension.isalnum() and len(extension) <= 5:
             return extension
     return fallback
+
+
+# INE publishes the update frequency of every indicator as free Portuguese text in
+# `<periodicity>`. Mapping it onto our controlled vocabulary is shared by the two INE
+# backends (`ine`, `inehvd`), which read the same catalogue.
+#
+# The map is closed over the values actually published: the full catalogue
+# (`xml_indic.jsp?opc=2`) was enumerated on 2026-09-18 and carries 15 distinct values over
+# 13154 indicators — anual 7158, decenal 1786+1, mensal 1420, não periódica 1025+1,
+# trimestral 605, bienal 419, sexenal 414, quinquenal 276, semestral 19, quadrienal 11,
+# mensal acumulado 10, trienal 7, semanal 2. Re-run that enumeration before assuming a
+# value is absent; anything unmapped degrades to UNKNOWN rather than failing the item.
+#
+# Two properties of the feed drive the normalisation below, and both are load-bearing:
+# 13152 of the 13154 values carry surrounding whitespace (`<![CDATA[ Mensal]]>`), and the
+# same value appears in different capitalisations (`Decenal`/`decenal`,
+# `Não periódica`/`Não Periódica`).
+INE_PERIODICITY: dict[str, UpdateFrequency] = {
+    "anual": UpdateFrequency.ANNUAL,
+    "mensal": UpdateFrequency.MONTHLY,
+    # Accumulated monthly figures are still published monthly.
+    "mensal acumulado": UpdateFrequency.MONTHLY,
+    "trimestral": UpdateFrequency.QUARTERLY,
+    "semestral": UpdateFrequency.SEMIANNUAL,
+    "semanal": UpdateFrequency.WEEKLY,
+    "bienal": UpdateFrequency.BIENNIAL,
+    "trienal": UpdateFrequency.TRIENNIAL,
+    "quadrienal": UpdateFrequency.QUADRENNIAL,
+    "quinquenal": UpdateFrequency.QUINQUENNIAL,
+    "decenal": UpdateFrequency.DECENNIAL,
+    "não periódica": UpdateFrequency.IRREGULAR,
+    # `UpdateFrequency` has no six-yearly member (it jumps QUINQUENNIAL -> DECENNIAL), so
+    # the 414 indicators published as "Sexenal" land on OTHER. Not UNKNOWN: the source does
+    # state a frequency, and `Dataset.has_frequency` counts UNKNOWN as "no frequency given".
+    "sexenal": UpdateFrequency.OTHER,
+    # Not observed in the catalogue on 2026-09-18, kept so the mapping does not regress:
+    # "diário" is the one value the previous `inehvd.map_frequency` recognised.
+    "diário": UpdateFrequency.DAILY,
+    "diario": UpdateFrequency.DAILY,
+    "bimestral": UpdateFrequency.BIMONTHLY,
+    "ocasional": UpdateFrequency.IRREGULAR,
+}
+
+# Warn once per unseen value: a single INE harvest walks ~13k indicators, and an unmapped
+# periodicity would otherwise log once per dataset. Reset per harvest by
+# `reset_ine_periodicity_warnings`, so a value that is still unmapped is reported again on
+# the next run instead of being silenced for the lifetime of the Celery worker.
+_warned_periodicities: set[str] = set()
+
+
+def reset_ine_periodicity_warnings() -> None:
+    """Let the next harvest report unmapped periodicities again."""
+    _warned_periodicities.clear()
+
+
+def map_ine_periodicity(text: str | None) -> UpdateFrequency:
+    """Map INE's `<periodicity>` text onto `UpdateFrequency`.
+
+    Returns `UpdateFrequency.UNKNOWN` for empty, missing or unrecognised values and never
+    raises: a periodicity we cannot name must not fail the item being harvested.
+
+    Matching is exact on the stripped, case-folded text rather than a substring test. The
+    previous per-backend implementation used `"mensal" in text`, which silently swallowed
+    "Mensal acumulado" and would misread any future compound value the same way.
+    """
+    if not text:
+        return UpdateFrequency.UNKNOWN
+
+    # NFC first: the map's keys are composed, and the feed's encoding is not something to
+    # trust — `INEBackend._normalize_tag` decomposes for the same reason. Without this, a
+    # decomposed "Não periódica" would miss the lookup and send 1026 indicators to UNKNOWN.
+    key = unicodedata.normalize("NFC", text).strip().casefold()
+    if not key:
+        return UpdateFrequency.UNKNOWN
+
+    frequency = INE_PERIODICITY.get(key)
+    if frequency is None:
+        if key not in _warned_periodicities:
+            _warned_periodicities.add(key)
+            log.warning("Unmapped INE <periodicity> value: %r", text.strip())
+        return UpdateFrequency.UNKNOWN
+
+    return frequency
+
+
+# INE publishes `<dates><last_update>` as dd-mm-yyyy.
+INE_DATE_FORMAT = "%d-%m-%Y"
+
+
+def parse_ine_date(text: str | None) -> datetime | None:
+    """Parse an INE `dd-mm-yyyy` date, day first. Returns `None` if it cannot be read.
+
+    Deliberately not left to `safe_harvest_datetime`: that helper goes through
+    `dateutil.parser.parse` without `dayfirst`, which reads "04-02-2026" as 2 April rather
+    than 4 February. Measured against the full catalogue on 2026-09-18, 4930 of the 13154
+    published dates are ambiguous under that reading and 4615 of them would be stored as a
+    silently different day. `dkan.py` already passes `dayfirst=True` for the same reason;
+    here the format is fixed, so an exact parse is both stricter and cheaper.
+
+    Callers pass the result through `safe_harvest_datetime` to pick up the naive-UTC
+    normalisation and the future-date guard.
+    """
+    if not text:
+        return None
+
+    try:
+        return datetime.strptime(text.strip(), INE_DATE_FORMAT)
+    except ValueError:
+        log.warning("Unparseable INE <last_update> value: %r", text.strip())
+        return None
