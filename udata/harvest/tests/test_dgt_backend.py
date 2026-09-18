@@ -4,7 +4,7 @@ import pytest
 
 from udata.tests.api import PytestOnlyDBTestCase
 
-from ..backends.dgt import DGTBackend
+from ..backends.dgt import DGTBackend, license_id_from_legal_constraints
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -87,3 +87,141 @@ class DGTLegalConstraintsFieldTest:
     def test_blank_and_non_string_entries_are_dropped(self):
         record = {"legalConstraints": ["  Sem restrições  ", "", "   ", None, 42]}
         assert DGTBackend._legal_constraints(record) == ["Sem restrições"]
+
+
+# Verbatim from the SNIG index (checked live against the source on 2026-09-18).
+# The wording is the fixture: a paraphrase would stop testing the text the
+# harvester actually meets.
+SNIT_TEXT = (
+    "A informação disponibilizada no SNIT destina-se à consulta e visualização, sendo "
+    "interdita a sua comercialização. A informação obtida através do SNIT, nomeadamente "
+    "utilizando a funcionalidade de impressão, não se destina a ser utilizada para a "
+    "instrução de procedimentos administrativos, salvo autorização expressa por parte da "
+    "entidade pública responsável pelo procedimento. A sua incorporação em documentos "
+    "publicados implica sempre a indicação dos diplomas legais e regulamentares que lhe "
+    "estão associados. A presente informação geográfica é disponibilizada em regime de "
+    "dados abertos, ao abrigo da licença Creative Commons Attribution 4.0 International "
+    "(CC BY 4.0). Nos termos desta licença, a utilização da informação é permitida, "
+    "incluindo a sua reprodução, adaptação e reutilização, para os fins entendidos, desde "
+    "que seja assegurada a devida atribuição da fonte, com referência clara à entidade "
+    "disponibilizadora dos dados e à licença aplicável. Contacte a DGT para obter mais "
+    "informações (https://www.dgterritorio.gov.pt)."
+)
+
+# The Azores wording ENDS with the CC BY URL. Truncating the fixture before it
+# would let the test pass while the source records still came out cc-by.
+AZORES_TEXT = (
+    "A reprodução e cópia para usos não comerciais é autorizada nos termos de licença "
+    "Creative Commons – Atribuição 4.0 Internacional (CC BY 4.0). O uso comercial sem "
+    "consentimento por escrito da Direção Regional de Políticas Marítimas/Governo dos "
+    "Açores é expressamente proibido. Sempre que o utilizador publique e/ou divulgue, por "
+    "meio analógico ou digital, informação geográfica propriedade da Direção Regional de "
+    "Políticas Marítimas (DRPM), ainda que parcialmente adaptada, deverá atribuir os "
+    "respetivos créditos. Termos da licença Creative Commons: "
+    "[https://creativecommons.org/licenses/by/4.0/]"
+)
+
+PUBLIC_ACCESS = "Acesso público sem restrições"
+DGT_CONTACT_FORM_TEXT = (
+    "Visualização e descarregamento de dados a pedido através de Formulário de Contacto da "
+    "DGT (https://www.dgterritorio.gov.pt/formulario-contacto#no-back) para o assunto "
+    "Cartografia. Uso sem restrições mas sujeito a atribuição de créditos com inclusão do "
+    'texto "Informação geográfica cedida pela Direção-Geral do Território".'
+)
+
+
+class DGTLicenseResolutionTest:
+    """The licence the source grants, read out of the real `legalConstraints`."""
+
+    def test_snit_text_grants_cc_by(self):
+        # The interdiction is aimed at the SNIT portal; the grant is aimed at
+        # the data, is named, and says "para os fins entendidos".
+        assert license_id_from_legal_constraints([SNIT_TEXT, "Sem restrições"]) == "cc-by"
+
+    def test_azores_non_commercial_grant_has_no_license(self):
+        # Same text names CC BY and forbids commercial use OF THE DATA, so the
+        # grant does not hold -- even though it ends with the CC BY URL.
+        assert license_id_from_legal_constraints([PUBLIC_ACCESS, AZORES_TEXT]) is None
+
+    def test_ipr_only_has_no_license(self):
+        # The LNEG complaint: no licence declared at all.
+        assert (
+            license_id_from_legal_constraints(
+                [PUBLIC_ACCESS, "Direitos de Propriedade Intelectual"]
+            )
+            is None
+        )
+
+    def test_explicit_cc_by_label_resolves(self):
+        constraints = [
+            PUBLIC_ACCESS,
+            "Licença de utilização - CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)",
+        ]
+        assert license_id_from_legal_constraints(constraints) == "cc-by"
+
+    def test_bare_cc_by_url_resolves(self):
+        constraints = [PUBLIC_ACCESS, "https://creativecommons.org/licenses/by/4.0/"]
+        assert license_id_from_legal_constraints(constraints) == "cc-by"
+
+    def test_misspelled_domain_url_resolves(self):
+        # Bare URL on purpose: with the `CC-BY` label the code branch would
+        # answer and the URL pattern would never be exercised.
+        assert (
+            license_id_from_legal_constraints(["https://creativecoomons.org/licenses/by/4.0/"])
+            == "cc-by"
+        )
+
+    def test_malformed_version_path_resolves(self):
+        assert (
+            license_id_from_legal_constraints(["https://creativecommons.org/licenses/by4.0/"])
+            == "cc-by"
+        )
+
+    def test_en_dash_label_resolves(self):
+        constraints = [
+            "Licença de utilização – CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)"
+        ]
+        assert license_id_from_legal_constraints(constraints) == "cc-by"
+
+    def test_cc_by_sa_resolves(self):
+        constraints = [
+            PUBLIC_ACCESS,
+            "Licença de utilização - CC-BY-SA-4.0 (https://creativecommons.org/licenses/by-sa/4.0/)",
+        ]
+        assert license_id_from_legal_constraints(constraints) == "cc-by-sa"
+
+    def test_nc_nd_code_resolves(self):
+        constraints = [
+            PUBLIC_ACCESS,
+            "Licença de utilização - CC BY-NC-ND 4.0 "
+            "(https://creativecommons.org/licenses/by-nc-nd/4.0/)",
+        ]
+        assert license_id_from_legal_constraints(constraints) == "cc-by-nc-nd"
+
+    def test_nc_nd_is_not_vetoed_by_the_restriction_rule(self):
+        # An NC code already says what the restriction says; the veto is only
+        # there to stop a permissive code being granted alongside one.
+        constraints = ["CC BY-NC 4.0, uso comercial expressamente proibido"]
+        assert license_id_from_legal_constraints(constraints) == "cc-by-nc"
+
+    def test_use_without_conditions_has_no_license(self):
+        # "No conditions" is an access policy, not a licence grant.
+        assert (
+            license_id_from_legal_constraints([PUBLIC_ACCESS, "acesso e uso sem condições"]) is None
+        )
+
+    def test_non_license_url_is_ignored(self):
+        assert license_id_from_legal_constraints([PUBLIC_ACCESS, DGT_CONTACT_FORM_TEXT]) is None
+
+    def test_conflicting_entries_have_no_license(self):
+        # Ambiguity does not grant: the same stance `License.guess_one` takes
+        # when two candidates tie.
+        constraints = [
+            "https://creativecommons.org/licenses/by/4.0/",
+            "https://creativecommons.org/licenses/by-nc-nd/4.0/",
+        ]
+        assert license_id_from_legal_constraints(constraints) is None
+
+    def test_empty_and_missing_have_no_license(self):
+        assert license_id_from_legal_constraints([]) is None
+        assert license_id_from_legal_constraints(["Sem restrições", "Sem restrições"]) is None

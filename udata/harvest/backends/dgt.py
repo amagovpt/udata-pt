@@ -1,3 +1,4 @@
+import re
 from urllib.parse import parse_qs, urlparse
 
 from udata.harvest.backends.base import BaseBackend
@@ -5,6 +6,99 @@ from udata.harvest.models import HarvestItem
 from udata.models import License
 
 from .tools.harvester_utils import sync_resources
+
+# The SNIG index publishes the licence as free text inside `legalConstraints`.
+# It is never fed to `License.guess`: that falls back to a Damerau-Levenshtein
+# match over every licence slug and title, and free text of a thousand
+# characters would resolve to whatever happens to be closest. Instead a
+# canonical Creative Commons code is extracted first -- from a licence URL, or
+# from the code spelled out in the text -- and only that is looked up.
+
+# Tolerates the two defects the source really carries: the domain misspelled
+# `creativecoomons` (two o's, one m), and a version path written `by4.0`
+# without the separating slash.
+CC_LICENSE_URL_RE = re.compile(
+    r"creativec(?:o|oo)m{1,2}ons\.org/licenses/(by(?:-nc)?(?:-sa|-nd)?)/?\d", re.IGNORECASE
+)
+
+# `CC-BY-4.0`, `CC BY 4.0`, `CC BY-NC-ND 4.0`, `CC-BY-SA-4.0`, `(CC-BY)`.
+CC_LICENSE_CODE_RE = re.compile(r"CC[\s-]?BY(?:[\s-]?NC)?(?:[\s-]?ND|[\s-]?SA)?", re.IGNORECASE)
+
+# A restriction on commercial use that is part of the grant itself, as the
+# Azores (SRAAC/DRPM) records word it. See `_grant_is_restricted`.
+NON_COMMERCIAL_GRANT_RE = re.compile(
+    r"(?:usos?|fins)\s+n[\u00e3a]o[\s-]+comerciai?s?|uso\s+comercial\b[^.]*\bproibido",
+    re.IGNORECASE,
+)
+
+CC_CODE_TO_LICENSE_ID = {
+    "by": "cc-by",
+    "by-sa": "cc-by-sa",
+    "by-nc": "cc-by-nc",
+    "by-nc-nd": "cc-by-nc-nd",
+    # Neither of these exists in the portal's licence list, deliberately: a
+    # record carrying one resolves to an id that is looked up, not found, and
+    # logged -- which is visible, unlike silently landing on a near neighbour.
+    "by-nd": "cc-by-nd",
+    "by-nc-sa": "cc-by-nc-sa",
+}
+
+# Codes that already say "no commercial use" or "no derivatives" on their own.
+RESTRICTIVE_CC_CODES = frozenset({"by-nc", "by-nc-nd", "by-nd", "by-nc-sa"})
+
+
+def _cc_code(entry: str) -> str | None:
+    """The Creative Commons code an entry declares, or None."""
+    match = CC_LICENSE_URL_RE.search(entry)
+    if match:
+        return match.group(1).lower()
+
+    match = CC_LICENSE_CODE_RE.search(entry)
+    if match:
+        # `CC BY-NC-ND` and `CC-BY-NC-ND` are the same code written differently.
+        return re.sub(r"[\s-]+", "-", match.group(0).strip()).lower().removeprefix("cc-")
+    return None
+
+
+def _grant_is_restricted(entry: str) -> bool:
+    """Whether the entry's own grant forbids commercial use.
+
+    Where the restriction appears is what decides. The Azores records grant
+    CC BY and restrict commercial use of the DATA in the same breath, so the
+    grant does not hold. The SNIT records forbid commercialising what the SNIT
+    PORTAL shows and then grant CC BY over the geographic information itself,
+    which is a restriction on the viewer, not on the data -- and CC BY 4.0
+    permits commercial use by definition, so reading it the other way would
+    make the record contradict itself.
+
+    The check runs on the entry that produced the code, whether the code came
+    from a URL or from the text: the Azores wording ends with the CC BY URL,
+    so exempting URLs would let exactly the records this guards against
+    through.
+    """
+    return bool(NON_COMMERCIAL_GRANT_RE.search(entry))
+
+
+def license_id_from_legal_constraints(constraints: list[str]) -> str | None:
+    """The udata licence id the source grants, or None when it grants none.
+
+    None is not "cc-by by default" -- that constant is the bug this replaces.
+    The caller turns it into the portal's default licence.
+    """
+    found = set()
+    for entry in constraints:
+        code = _cc_code(entry)
+        if code is None:
+            continue
+        if code not in RESTRICTIVE_CC_CODES and _grant_is_restricted(entry):
+            continue
+        license_id = CC_CODE_TO_LICENSE_ID.get(code)
+        if license_id:
+            found.add(license_id)
+
+    if len(found) == 1:
+        return found.pop()
+    return None
 
 
 class DGTBackend(BaseBackend):
