@@ -10209,3 +10209,98 @@ class MigrationInviteFlagIsWiredToTheEnvironmentTest(APITestCase):
         source = self._source()
         assert 'MIGRATION_INVITE_ENABLED = _env_bool("MIGRATION_INVITE_ENABLED", False)' in source
         assert Defaults.MIGRATION_INVITE_ENABLED is False
+
+
+class InvitedLinkStaysOnTheAccountThatAskedTest(APITestCase):
+    """🚩 The notice promises "you keep the account you already have". This is
+    what keeps that true.
+
+    The wizard identifies the account to link by the password proved on its
+    screen. In the mandatory mode that is the only evidence there is -- the
+    citizen arrives deauthenticated and the portal has no idea who they are.
+
+    In invite mode they clicked from INSIDE an account and the ticket says
+    which. Following the typed address instead lands the identity on an
+    account they never asked about, leaves the one they clicked from unlinked,
+    and tells them nothing. They find out by signing in with CMD later and not
+    recognising what they see.
+
+    Not a security hole: reaching another account still costs that account's
+    password. A broken promise, which is worse in its own way, because nothing
+    looks wrong at the time.
+    """
+
+    def _pending(self, clicked_from, *, invited):
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(clicked_from.id),
+                "no_match": False,
+                "saml_invited": invited,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_provider": "cmd",
+            }
+
+    def _confirm_as(self, user, password="x" * 12):
+        return self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": user.email, "password": password},
+        )
+
+    def test_the_invited_flow_refuses_a_different_account(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        clicked_from = UserFactory(password="x" * 12, email="maria@camara.pt")
+        other = UserFactory(password="x" * 12, email="maria@gmail.com")
+        self._pending(clicked_from, invited=True)
+
+        response = self._confirm_as(other)
+
+        assert response.status_code == 409
+        assert response.json["code"] == "invited_account_mismatch"
+        # Named so the screen can say which account it is linking, instead of
+        # leaving somebody to guess why a correct password was refused.
+        assert response.json["expected_email"]
+        assert "camara.pt" in response.json["expected_email"]
+
+    def test_the_invited_flow_accepts_the_account_that_asked(self):
+        """Paired with the test above: a guard that refused everybody would
+        pass it and break the whole flow."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        clicked_from = UserFactory(password="x" * 12, email="maria@camara.pt")
+        self._pending(clicked_from, invited=True)
+
+        response = self._confirm_as(clicked_from)
+
+        assert response.status_code != 409
+
+    def test_the_mandatory_flow_still_follows_the_password(self):
+        """🚨 The asymmetry, and the reason this guard is scoped to one mode.
+
+        There the citizen arrives deauthenticated: the candidate was matched by
+        NAME, which is a guess, and the proved password is the only real
+        evidence. Refusing here would lock homonyms out of their own accounts.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        guessed_by_name = UserFactory(password="x" * 12, email="maria@camara.pt")
+        actually_theirs = UserFactory(password="x" * 12, email="maria@gmail.com")
+        self._pending(guessed_by_name, invited=False)
+
+        response = self._confirm_as(actually_theirs)
+
+        assert response.status_code != 409
+
+    def test_a_wrong_password_is_still_a_wrong_password(self):
+        """The mismatch check sits AFTER the password, so it cannot become a
+        way to learn which addresses exist."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        clicked_from = UserFactory(password="x" * 12, email="maria@camara.pt")
+        other = UserFactory(password="x" * 12, email="maria@gmail.com")
+        self._pending(clicked_from, invited=True)
+
+        response = self._confirm_as(other, password="errada")
+
+        assert response.status_code == 400
+        assert response.json["error"] == "Invalid credentials"

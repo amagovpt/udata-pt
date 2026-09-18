@@ -4820,7 +4820,7 @@ def migration_confirm():
     mails the validation link and migration_confirm_link — the single place
     that binds the identity and starts a session — consumes the click.
     """
-    from udata.core.user.models import find_user_by_email_ci
+    from udata.core.user.models import User, find_user_by_email_ci
 
     if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
@@ -4870,6 +4870,39 @@ def migration_confirm():
 
     else:
         return jsonify({"error": "Invalid method"}), 400
+
+    # 🚩 IN INVITE MODE THE CANDIDATE IS NOT UP FOR RE-POINTING, and this is
+    # the one place the two modes must differ.
+    #
+    # In the mandatory mode the citizen arrives DEAUTHENTICATED: the portal has
+    # no idea which account is theirs, so the proved password is the only
+    # evidence there is, and re-pointing to it is the only thing that can be
+    # done. In invite mode they clicked from INSIDE an account and the ticket
+    # says which — so re-pointing silently throws away evidence the portal
+    # already holds, and lands the identity on an account they never asked
+    # about while the one they clicked from stays unlinked. They would find out
+    # by signing in with CMD later and not recognising what they see.
+    #
+    # It is not a security hole -- reaching another account still costs that
+    # account's password, so nothing is taken from anybody. It is the notice
+    # promising "you keep the account you already have" and then not.
+    #
+    # Refused AFTER the password check on purpose: a correct password for the
+    # wrong account is not a guess, and must not spend an attempt from a cap
+    # that never resets.
+    invited_target = pending.get("legacy_user_id") if pending.get("saml_invited") else None
+    if invited_target and str(user.id) != invited_target:
+        expected = User.objects(id=invited_target).first()
+        return jsonify(
+            {
+                "error": "Different account",
+                "code": "invited_account_mismatch",
+                # Masked, like everywhere else an address is echoed: the caller
+                # owns this one, but the habit is what stops the next reader
+                # printing one they do not.
+                "expected_email": _mask_email(expected.email) if expected else None,
+            }
+        ), 409
 
     # The account whose password was proved is the one to link, and by design
     # it may not be the candidate the assertion matched by name. Re-pointing
