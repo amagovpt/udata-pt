@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix(saml): the invited link now binds the account the person clicked from**
+  - The wizard re-points the pending migration at whichever account the typed password
+    proves. In the mandatory mode that is the only evidence there is -- the citizen
+    arrives deauthenticated and the candidate was matched by name, which is a guess --
+    so refusing there would lock homonyms out of their own accounts.
+  - In invite mode the portal knows which account they clicked from. Re-pointing silently
+    threw that away, landed the identity on an account they never asked about, and left
+    the one they clicked from unlinked. Not a security hole -- reaching another account
+    still costs that account's password -- but the notice promises "you keep the account
+    you already have", and this is what keeps that true.
+  - Refused after the password check on purpose: a correct password for the wrong account
+    is not a guess and must not spend an attempt from a cap that never resets. The refusal
+    names the expected account, masked, so the screen can explain itself.
+
 - **feat(saml): invite a password account to link a CMD/eIDAS identity, optionally**
   - Two flags, one question each. `MIGRATION_MODE_ENABLED` asks whether linking is
     mandatory; `MIGRATION_INVITE_ENABLED` asks whether the portal invites it. A single
