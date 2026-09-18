@@ -9394,3 +9394,118 @@ class NeedsIdentityLinkTest(APITestCase):
 
         response = self.client.get("/saml/migration/check")
         assert response.json == {"needs_migration": False}
+
+
+class MigrationInviteDismissTest(APITestCase):
+    """ "Not now" has to be a state, and it has to expire.
+
+    Without it the invite comes back on every sign-in and teaches people to
+    click it away without reading -- which is the outcome the notice exists to
+    avoid. With it permanent, everyone who was merely busy that day is lost in
+    silence, and finds out when the portal starts requiring a single account
+    per person.
+
+    So the stamp is a DATE, and these tests pin both ends of the rule: it holds
+    for a month, and then the invite comes back.
+    """
+
+    def _offered(self, user):
+        from udata.auth.saml.saml_plugin.saml_govpt import _invite_offered_to
+
+        with self.app.app_context():
+            return _invite_offered_to(user)
+
+    def _invitable(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        return UserFactory(password="x" * 12)
+
+    def test_an_invitable_account_is_offered_the_invite(self):
+        assert self._offered(self._invitable()) is True
+
+    def test_dismissing_requires_being_signed_in(self):
+        """Self-scoped: the account comes from the session, never from a body."""
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        response = self.client.post("/saml/migration/invite/dismiss")
+        assert response.status_code == 401
+
+    def test_dismissing_writes_the_stamp_and_hides_the_invite(self):
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        self.login(user)
+
+        response = self.client.post("/saml/migration/invite/dismiss")
+        assert response.status_code == 200
+        assert response.json == {"dismissed": True}
+
+        user.reload()
+        assert user.extras[MIGRATION_INVITE_DISMISSED_AT]
+        assert self._offered(user) is False
+
+    def test_the_invite_comes_back_after_the_written_window(self):
+        """The half a boolean could not express."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_INVITE_REMIND_AFTER
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        long_ago = datetime.utcnow() - MIGRATION_INVITE_REMIND_AFTER - timedelta(days=1)
+        user.extras[MIGRATION_INVITE_DISMISSED_AT] = long_ago.isoformat()
+        user.save()
+
+        assert self._offered(user) is True
+
+    def test_a_stamp_just_inside_the_window_still_holds(self):
+        """Paired with the test above: without this one, a rule that expired
+        immediately would pass just as well."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_INVITE_REMIND_AFTER
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        recent = datetime.utcnow() - MIGRATION_INVITE_REMIND_AFTER + timedelta(days=1)
+        user.extras[MIGRATION_INVITE_DISMISSED_AT] = recent.isoformat()
+        user.save()
+
+        assert self._offered(user) is False
+
+    def test_an_unreadable_stamp_means_never_dismissed(self):
+        """Degrades towards showing an optional, dismissible notice rather than
+        towards never telling the person anything."""
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        user.extras[MIGRATION_INVITE_DISMISSED_AT] = "não é uma data"
+        user.save()
+
+        assert self._offered(user) is True
+
+    def test_dismissing_leaves_the_rest_of_extras_alone(self):
+        """Hiding a notice touches one key, and this account holds a credential.
+
+        🚩 What this does NOT prove is the atomic write: MongoEngine sends a
+        delta, so a `save()` on an account that already has `extras` lands on
+        the same single key and keeps this test green. That was checked by
+        mutation rather than assumed, and the narrower reason the targeted
+        write is still the right form is written where it is used.
+        """
+        user = self._invitable()
+        user.extras["auth_nic"] = _hash_nic("12345678")
+        user.save()
+        self.login(user)
+
+        assert self.client.post("/saml/migration/invite/dismiss").status_code == 200
+
+        user.reload()
+        assert user.extras["auth_nic"] == _hash_nic("12345678")
+
+    def test_the_invite_is_not_offered_with_the_flag_off(self):
+        user = UserFactory(password="x" * 12)
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        assert self._offered(user) is False
+
+    def test_the_invite_is_not_offered_to_an_already_linked_account(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        linked = UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")})
+        assert self._offered(linked) is False

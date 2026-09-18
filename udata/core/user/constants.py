@@ -116,3 +116,23 @@ AUTH_DOC_NATIONALITY = "auth_doc_nationality"
 # Accounts that predate this gain the key only when their own owner signs in
 # again -- the same semantics as AUTH_PROVIDER above -- and never otherwise.
 AUTH_EIDAS_ORIGIN_COUNTRY = "auth_eidas_origin_country"
+
+# `extras` key holding WHEN the account last dismissed the optional CMD/eIDAS
+# linking invite, as an ISO-8601 UTC string.
+#
+# A DATE AND NOT A BOOLEAN, and that is the whole design. "Dismissed: yes" can
+# only express two frequencies, and both are wrong: show it again on the next
+# sign-in, which teaches people to click it away without reading, or never
+# show it again, which loses them silently before the portal requires a single
+# account per person. A date lets the rule be stated -- and the rule is written
+# next to it, in MIGRATION_INVITE_REMIND_AFTER_DAYS, rather than left implicit
+# in a comparison somewhere.
+#
+# Dismissing is NOT the same as declining. The invite is optional and the
+# account keeps working either way; what this records is "not now", and the
+# portal keeps a permanent way back for the person who changes their mind.
+#
+# ABSENT MEANS NEVER DISMISSED, which is why it is only ever written and never
+# defaulted: an account that has not seen the invite and an account that
+# dismissed it long ago are different states, and the second one comes back.
+MIGRATION_INVITE_DISMISSED_AT = "migration_invite_dismissed_at"

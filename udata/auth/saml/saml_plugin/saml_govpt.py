@@ -1056,6 +1056,24 @@ MIGRATION_LINK_SEND_COUNT = "migration_link_send_count"
 MAX_MIGRATION_LINK_SENDS = 5
 MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
 
+# How long a dismissal of the optional linking invite lasts before the invite
+# comes back. The acceptance criterion asks for a frequency rule that is
+# WRITTEN rather than implied, so here it is, with its reasoning:
+#
+# - on every sign-in is not a rule, it is nagging, and it trains people to
+#   dismiss the notice without reading a word of it;
+# - once and never again loses, in silence, everyone who was merely busy that
+#   day -- and they find out when the portal starts requiring a single account
+#   per person (LEDG-1277), which is far too late to be told;
+# - thirty days is roughly a month of normal use: frequent enough that nobody
+#   reaches the deadline having seen it once, rare enough that it never reads
+#   as pressure.
+#
+# It is a constant and not configuration on purpose: a per-deployment value
+# would be one more thing that can differ between environments while nothing
+# tells you it did.
+MIGRATION_INVITE_REMIND_AFTER = timedelta(days=30)
+
 # Which flow put a link record on an account. Absent means the wizard, which
 # is every record written before this existed, so the default must stay the
 # wizard's behaviour in every branch that reads it.
@@ -3922,6 +3940,78 @@ def _needs_identity_link(user):
     readers of one predicate, not two predicates that agree today.
     """
     return bool(not _has_linked_nic(user) and user.password)
+
+
+def _invite_dismissed(user):
+    """True while a dismissal of the linking invite is still in force.
+
+    Reads the stamp rather than a flag, so "dismissed" has an expiry instead
+    of being permanent (see MIGRATION_INVITE_REMIND_AFTER for the rule and
+    why it exists). An absent or unparseable stamp means never dismissed,
+    which is the safe direction: the person sees an optional notice they can
+    dismiss again, rather than silently never being told.
+    """
+    from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+    dismissed_at = _parse_isoformat((user.extras or {}).get(MIGRATION_INVITE_DISMISSED_AT))
+    if dismissed_at is None:
+        return False
+    return datetime.utcnow() - dismissed_at < MIGRATION_INVITE_REMIND_AFTER
+
+
+def _invite_offered_to(user):
+    """The whole invite predicate, in one place, for one account.
+
+    Four conditions, and each one is somebody's bug if it goes missing: the
+    invite is on (and the mandatory mode is not, which _invite_enabled already
+    settles), the account has something to link, and it has not just said
+    "not now".
+
+    Every reader asks this function -- the /me field and the route that starts
+    a link -- so the notice and the door it opens can never disagree about
+    whether this account is being invited.
+    """
+    if not _invite_enabled():
+        return False
+    if not user or not user.is_authenticated:
+        return False
+    return _needs_identity_link(user) and not _invite_dismissed(user)
+
+
+@autenticacao_gov.route("/saml/migration/invite/dismiss", methods=["POST"])
+@csrf.exempt
+def migration_invite_dismiss():
+    """Record that this account is not linking right now.
+
+    Authenticated and self-scoped: the caller can only dismiss their OWN
+    invite, because the account is read from the session and never from the
+    request. The body is ignored entirely.
+
+    Answers 200 whether or not the invite was actually being offered. There is
+    nothing to protect here -- the caller already knows whether they were
+    shown a notice -- and a refusal would only turn a harmless double-click
+    into an error the frontend has to explain.
+    """
+    from flask_login import current_user
+
+    from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+    from udata.core.user.models import User
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Authentication required"}), 401
+
+    # A targeted single-field write, and the honest reason is narrower than
+    # "a save would clobber the document": MongoEngine sends a delta, so for
+    # an account that already has `extras` a save lands on the same one key.
+    # The difference is the account that has NONE -- assigning a fresh dict
+    # makes the delta the WHOLE dict, and a concurrent write (auth_nic, say,
+    # which is a credential) is lost. This form has no such edge, needs no
+    # empty-dict dance, and is what the rest of this module already does for a
+    # single key on an account somebody else may be touching.
+    User.objects(id=current_user.id).update_one(
+        **{f"set__extras__{MIGRATION_INVITE_DISMISSED_AT}": datetime.utcnow().isoformat()}
+    )
+    return jsonify({"dismissed": True})
 
 
 @autenticacao_gov.route("/saml/migration/check", methods=["GET"])
