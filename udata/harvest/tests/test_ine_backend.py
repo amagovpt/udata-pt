@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.organization.factories import OrganizationFactory
@@ -133,16 +134,52 @@ class INEPrefetchDatasetsTest(PytestOnlyDBTestCase):
         assert dataset.organization == org
 
 
-def _catalog_xml(ids, revision=""):
+def _catalog_xml(
+    ids,
+    revision="",
+    periodicity=None,
+    last_update=None,
+    last_period=None,
+    geo_lastlevel=None,
+    source_description=None,
+    update_type=None,
+    metainfo_url=None,
+):
+    """Build a catalogue fixture.
+
+    Every metadata kwarg defaults to `None` meaning "element not emitted", so the fixtures
+    of the tests written before the source metadata was read stay byte-for-byte identical.
+    """
+    metainfo = f"<metainfo_url><![CDATA[{metainfo_url}]]></metainfo_url>" if metainfo_url else ""
+
+    dates = ""
+    if last_update or last_period:
+        parts = ""
+        if last_period:
+            parts += f"<last_period_available><![CDATA[{last_period}]]></last_period_available>"
+        if last_update:
+            parts += f"<last_update><![CDATA[{last_update}]]></last_update>"
+        dates = f"\n        <dates>{parts}</dates>"
+
+    extra = dates
+    if periodicity is not None:
+        extra += f"\n        <periodicity><![CDATA[{periodicity}]]></periodicity>"
+    if geo_lastlevel:
+        extra += f"\n        <geo_lastlevel><![CDATA[{geo_lastlevel}]]></geo_lastlevel>"
+    if source_description:
+        extra += f"\n        <source><![CDATA[{source_description}]]></source>"
+    if update_type:
+        extra += f"\n        <update_type><![CDATA[{update_type}]]></update_type>"
+
     indicators = "\n".join(
         f"""<indicator id='{i}'>
         <title><![CDATA[Indicador {i}]]></title>
         <description><![CDATA[Descrição {i}{revision}]]></description>
-        <html><bdd_url><![CDATA[https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod={i}]]></bdd_url></html>
+        <html><bdd_url><![CDATA[https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod={i}]]></bdd_url>{metainfo}</html>
         <json>
         <json_dataset><![CDATA[https://www.ine.pt/js/{i}.json]]></json_dataset>
         </json>
-        <keywords>INE,<![CDATA[Estatística]]></keywords>
+        <keywords>INE,<![CDATA[Estatística]]></keywords>{extra}
         </indicator>"""
         for i in ids
     )
@@ -805,3 +842,104 @@ class INEHarvestLogCredentialsTest(PytestOnlyDBTestCase):
         assert "sup3rs3cr3t" not in logged
         assert "harvestuser" not in logged
         assert "https://***@www.ine.pt" in logged
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESourceMetadataTest(PytestOnlyDBTestCase):
+    """Metadata the catalogue publishes and the backend used to hardcode or ignore."""
+
+    def _harvest(self, rmock, tmp_path, source, **kwargs):
+        rmock.get(INE_URL, text=_catalog_xml(["0001"], **kwargs))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        job = backend.harvest()
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        return job, dataset
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def test_periodicity_becomes_frequency(self, rmock, tmp_path):
+        # Leading whitespace on purpose: 13152 of the 13154 published values carry it.
+        _job, dataset = self._harvest(rmock, tmp_path, self._source(), periodicity=" Decenal")
+
+        assert dataset.frequency == UpdateFrequency.DECENNIAL
+        assert dataset.frequency != UpdateFrequency.UNKNOWN
+
+    def test_sexenal_becomes_other_rather_than_unknown(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source(), periodicity="Sexenal")
+
+        assert dataset.frequency == UpdateFrequency.OTHER
+
+    def test_unrecognised_periodicity_stays_unknown_without_failing_the_item(self, rmock, tmp_path):
+        job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="De vez em quando"
+        )
+
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+        # Degrades, never fails the item.
+        assert [item.status for item in job.items] == ["done"]
+
+    def test_missing_periodicity_stays_unknown(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source())
+
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+    def test_uri_is_the_published_bdd_url_and_extras_come_from_the_source(self, rmock, tmp_path):
+        _job, dataset = self._harvest(
+            rmock,
+            tmp_path,
+            self._source(),
+            periodicity="Mensal",
+            last_update="18-09-2026",
+            last_period="S3A202608",
+            geo_lastlevel="Portugal",
+            source_description="INE, Índice de preços",
+            update_type="A",
+            metainfo_url="https://www.ine.pt/xurl/metax/0001/PT",
+        )
+
+        # The landing page the source publishes, not the composed /indicador/<id>.
+        assert dataset.harvest.uri == (
+            "https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod=0001"
+        )
+        assert "ine.pt/indicador/" not in dataset.harvest.uri
+        assert dataset.extras["geo_lastlevel"] == "Portugal"
+        assert dataset.extras["source_description"] == "INE, Índice de preços"
+        assert dataset.extras["last_period_available"] == "S3A202608"
+        assert dataset.extras["last_update_remote"] == "18-09-2026"
+        assert dataset.extras["update_type"] == "A"
+        assert dataset.extras["metainfo_url"] == "https://www.ine.pt/xurl/metax/0001/PT"
+
+    def test_optional_update_type_is_absent_when_the_source_omits_it(self, rmock, tmp_path):
+        """Published for ~5% of indicators, so its absence is the normal case."""
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Anual", geo_lastlevel="Portugal"
+        )
+
+        assert "update_type" not in dataset.extras
+        assert dataset.extras["geo_lastlevel"] == "Portugal"
+
+    def test_source_tag_is_derived_from_the_source_hostname(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source())
+
+        # Derived from the source URL, not a literal: www.ine.pt -> www-ine-pt.
+        assert "www-ine-pt" in dataset.tags
+        assert "ine-pt" not in dataset.tags
+
+    def test_source_tag_follows_a_source_on_another_host(self, rmock, tmp_path):
+        """The tag tracks the configured source, which is what "derived" has to mean."""
+        source = HarvestSourceFactory(
+            backend="ine",
+            url="https://ine.example.test/ine/xml_indic.jsp?opc=2",
+            organization=OrganizationFactory(),
+        )
+        rmock.get("https://ine.example.test/ine/xml_indic.jsp?opc=2", text=_catalog_xml(["0001"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.harvest()
+
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        assert "ine-example-test" in dataset.tags

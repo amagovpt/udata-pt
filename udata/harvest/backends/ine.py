@@ -9,6 +9,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import defusedxml.ElementTree as DET
@@ -16,6 +17,7 @@ import requests
 from flask import current_app
 from slugify import slugify
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.exceptions import HarvestValidationError
@@ -24,7 +26,24 @@ from udata.models import Dataset, License
 from udata.utils import safe_unicode
 
 from ..url_filter import redact_url_credentials
-from .tools.harvester_utils import normalize_url_slashes, sync_resources
+from .tools.harvester_utils import (
+    map_ine_periodicity,
+    normalize_url_slashes,
+    sync_resources,
+)
+
+# Metadata the INE catalogue publishes per indicator and that we store as extras. Kept as
+# a tuple so `_has_changed` and `_apply_metadata_to_dataset` iterate the same set: a key
+# written by one and ignored by the other is how enrichment silently fails to reach the
+# ~13k datasets already in the database.
+INE_SOURCE_EXTRAS = (
+    "geo_lastlevel",
+    "source_description",
+    "last_period_available",
+    "last_update_remote",
+    "update_type",
+    "metainfo_url",
+)
 
 
 class INEDownloadIncomplete(Exception):
@@ -242,6 +261,20 @@ class INEBackend(BaseBackend):
     # --------------------------
     # Normalização de tags
     # --------------------------
+    def _text(self, node: ET.Element, tag: str) -> str:
+        """Text of a child element, stripped.
+
+        Values arrive wrapped in CDATA and 13152 of the 13154 published periodicities
+        carry surrounding whitespace, so stripping is not defensive tidying here.
+        """
+        child = node.find(tag)
+        if child is None or not child.text:
+            return ""
+        return child.text.strip()
+
+    def _source_hostname(self) -> str:
+        return urlparse(self.source.url or "").hostname or ""
+
     def _normalize_tag(self, tag: str) -> str:
         if not tag:
             return ""
@@ -298,12 +331,16 @@ class INEBackend(BaseBackend):
         if node is not None and node.text:
             desc = node.text
 
+        metainfo_url = None
         html_node = elem.find("html")
         if html_node is not None:
             bdd_url = html_node.find("bdd_url")
             if bdd_url is not None and bdd_url.text:
                 remote_url = bdd_url.text.strip()
                 desc = (desc + "\n" + bdd_url.text) if desc else bdd_url.text
+            metainfo_node = html_node.find("metainfo_url")
+            if metainfo_node is not None and metainfo_node.text:
+                metainfo_url = metainfo_node.text.strip()
 
         if desc:
             md["description"] = sanitize_markdown_html(desc)
@@ -319,7 +356,7 @@ class INEBackend(BaseBackend):
             if jds is not None and jds.text:
                 resources.append(
                     {
-                        "title": "Dataset json url",
+                        "title": "Dados (JSON)",
                         "description": "Dataset em formato json",
                         "url": normalize_url_slashes(jds.text),
                         "filetype": "remote",
@@ -330,7 +367,7 @@ class INEBackend(BaseBackend):
             if jmi is not None and jmi.text:
                 resources.append(
                     {
-                        "title": "Json metainfo url",
+                        "title": "Metainfo (JSON)",
                         "description": "Metainfo em formato json",
                         "url": normalize_url_slashes(jmi.text),
                         "filetype": "remote",
@@ -362,8 +399,46 @@ class INEBackend(BaseBackend):
 
         tags_norm = {self._normalize_tag(t) for t in keywords if t}
         tags_norm.discard("")
-        tags_norm.add("ine-pt")
+        # Which source a dataset came from, as a tag. Derived from the source URL rather
+        # than hardcoded, like `ckanpt` and `odspt` do. Normalized on the way in because
+        # `TagListField` slugifies on write while `_has_changed` compares the stored tags
+        # against this dict: storing "www.ine.pt" here and "www-ine-pt" in Mongo would
+        # report every dataset in the catalogue as changed on every nightly harvest.
+        tags_norm.add(self._normalize_tag(self._source_hostname()))
+        tags_norm.discard("")
         md["tags_norm"] = sorted(tags_norm)
+
+        md["frequency"] = map_ine_periodicity(self._text(elem, "periodicity"))
+
+        extras = {}
+        # Free text rendered by the portal, so sanitized here for the same reason the
+        # docstring gives for the title and description.
+        geo_lastlevel = self._text(elem, "geo_lastlevel")
+        if geo_lastlevel:
+            extras["geo_lastlevel"] = sanitize_strict(geo_lastlevel)
+        source_description = self._text(elem, "source")
+        if source_description:
+            extras["source_description"] = sanitize_strict(source_description)
+
+        dates_node = elem.find("dates")
+        if dates_node is not None:
+            last_period = self._text(dates_node, "last_period_available")
+            if last_period:
+                extras["last_period_available"] = last_period
+            last_update = self._text(dates_node, "last_update")
+            if last_update:
+                extras["last_update_remote"] = last_update
+
+        # Published for ~5% of indicators only, and an opaque code ("A", "N"): stored
+        # verbatim, never mapped onto a meaning we would be inventing.
+        update_type = self._text(elem, "update_type")
+        if update_type:
+            extras["update_type"] = update_type
+
+        if metainfo_url:
+            extras["metainfo_url"] = metainfo_url
+
+        md["extras"] = extras
 
         return md
 
@@ -458,17 +533,29 @@ class INEBackend(BaseBackend):
         if self._cc_by_license is None:
             self._cc_by_license = License.guess("cc-by")
 
+        # cc-by is our editorial choice, not something the feed states: the INE catalogue
+        # publishes no licence element at all.
         dataset.license = self._cc_by_license
-        dataset.frequency = "unknown"
+        dataset.frequency = md.get("frequency", UpdateFrequency.UNKNOWN)
 
         tags = list(md.get("tags_norm") or [])
         if remote_id in self.HVD_INDICATOR_IDS:
             for t in ("estatisticas", "hvd"):
                 if t not in tags:
                     tags.append(t)
-        if "ine-pt" not in tags:
-            tags.append("ine-pt")
+        source_tag = self._normalize_tag(self._source_hostname())
+        if source_tag and source_tag not in tags:
+            tags.append(source_tag)
         dataset.tags = tags
+
+        for key in INE_SOURCE_EXTRAS:
+            value = (md.get("extras") or {}).get(key)
+            if value:
+                dataset.extras[key] = value
+            else:
+                # An indicator that stopped publishing a field must not keep the stale
+                # value glued to it.
+                dataset.extras.pop(key, None)
 
         if "title" in md:
             dataset.title = md["title"]
@@ -499,8 +586,11 @@ class INEBackend(BaseBackend):
         # Identificador DCT (Dublin Core Terms)
         dataset.harvest.dct_identifier = f"ine:{remote_id}"
 
-        # URI única para o dataset
-        dataset.harvest.uri = f"https://www.ine.pt/indicador/{remote_id}"
+        # The landing page the source itself publishes, not one we compose. Written
+        # unconditionally, `None` included: leaving a previously invented URI in place
+        # while the dict carries none would make `_has_changed` fire on every harvest and
+        # rewrite the dataset nightly, forever.
+        dataset.harvest.uri = md.get("remote_url") or None
 
         # Data de criação (apenas se for novo)
         if not dataset.harvest.created_at:
