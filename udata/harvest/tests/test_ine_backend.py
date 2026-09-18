@@ -13,11 +13,13 @@ from udata.core.user.factories import UserFactory
 from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
-from ..backends.ine import INEBackend, INEDownloadIncomplete
+from ..backends.ine import INE_HVD_FEED_URL, INEBackend, INEDownloadIncomplete
 from .factories import HarvestSourceFactory
 
 INE_URL = "https://www.ine.pt/ine/xml_indic.jsp?opc=2&lang=PT"
-INE_HVD_URL = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
+# Bound to the backend constant on purpose: if the feed URL moves, these fixtures
+# follow it instead of silently mocking an endpoint nothing requests any more.
+INE_HVD_URL = INE_HVD_FEED_URL
 
 COMPLETE_XML = (
     "<?xml version='1.0' encoding='UTF-8'?>\n"
@@ -985,6 +987,14 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
         assert [item.status for item in job.items] == ["done"]
         # The raw text is still kept, so nothing the source said is lost.
         assert dataset.extras["last_update_remote"] == "2026/09/18"
+
+    def test_harvest_backend_is_the_display_name(self, rmock, tmp_path):
+        """Stamped by hand here, because this backend never reaches the base class helper."""
+        _job, dataset = self._harvest(rmock, tmp_path, self._source())
+
+        assert dataset.harvest.backend == INEBackend.display_name
+        assert dataset.harvest.backend != "ine"
+        assert dataset.harvest.backend
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])

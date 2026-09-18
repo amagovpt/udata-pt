@@ -37,6 +37,10 @@ from .tools.harvester_utils import (
 # a tuple so `_has_changed` and `_apply_metadata_to_dataset` iterate the same set: a key
 # written by one and ignored by the other is how enrichment silently fails to reach the
 # ~13k datasets already in the database.
+# The HVD subset of the catalogue, published as a separate feed. A fact of the source
+# rather than an operator choice, so a module constant and not a per-source extra config.
+INE_HVD_FEED_URL = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
+
 INE_SOURCE_EXTRAS = (
     "geo_lastlevel",
     "source_description",
@@ -291,7 +295,7 @@ class INEBackend(BaseBackend):
     # HVD IDs
     # --------------------------
     def _fetch_hvd_ids(self) -> set[str]:
-        url = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
+        url = INE_HVD_FEED_URL
         try:
             # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
             resp = self.get(url, timeout=30)
@@ -597,8 +601,11 @@ class INEBackend(BaseBackend):
         dataset.harvest.last_update = datetime.now(timezone.utc)
         dataset.harvest.domain = getattr(self.source, "domain", "") or ""
 
-        # Identificador do backend
-        dataset.harvest.backend = "ine"
+        # The display name, as `BaseBackend.update_dataset_harvest_info` stamps for every
+        # other backend. This one never reaches that method — it bypasses `process_dataset`
+        # for the bulk write path — so the field has to be set by hand here; dropping the
+        # line would leave it empty rather than let the base class fill it in.
+        dataset.harvest.backend = self.display_name
 
         # URL remota do dataset no portal de origem
         if md.get("remote_url"):
