@@ -22,6 +22,22 @@ def _get_asserted_email():
     return session.get("saml_asserted_email")
 
 
+def _get_migration_invite(user) -> bool:
+    """Whether this account is being offered the optional CMD/eIDAS link.
+
+    The whole decision lives in the SAML plugin, next to the flags and the
+    predicate it shares with the wizard, and is merely surfaced here. A second
+    copy of the condition in the serializer is how the notice and the flow it
+    starts end up disagreeing about who is invited.
+
+    Imported inside the function because udata.auth.saml imports back into the
+    user package, and this module is imported at API registration time.
+    """
+    from udata.auth.saml.saml_plugin.saml_govpt import _invite_offered_to
+
+    return _invite_offered_to(user)
+
+
 def _is_current_user(user) -> bool:
     """True when the serialized user is the authenticated caller.
 
@@ -133,6 +149,27 @@ user_fields = api.model(
             "prefill on the registration completion screen. Null for eIDAS (the "
             "Minimum Data Set has no email attribute), for a CMD assertion that "
             "carried none, and on any user other than the caller",
+            readonly=True,
+        ),
+        # The optional CMD/eIDAS linking invite, decided here and never in the
+        # browser. That is not a style preference: the frontend reading a
+        # migration flag is what removed the sign-in form from production
+        # (LEDG-2432), and nothing observable in a rendered page distinguishes
+        # "the backend said so" from "we guessed from configuration".
+        #
+        # It rides /me rather than /saml/migration/check because that
+        # endpoint's `needs_migration` means MANDATORY, and the frontend logs
+        # the user out when it is true -- which would sign people out of a
+        # notice they are allowed to dismiss.
+        #
+        # Guarded by _is_current_user like saml_login, not by the admin guard:
+        # whether somebody has linked an identity is not a listing column.
+        "migration_invite": fields.Raw(
+            attribute=lambda o: _get_migration_invite(o) if _is_current_user(o) else None,
+            description="True when this account is being invited (optionally) to link a "
+            "CMD/eIDAS identity: the invite is enabled, linking is not mandatory, the "
+            "account signs in with a password and holds no identity yet, and the invite "
+            "has not been dismissed recently. Only present on the caller's own user",
             readonly=True,
         ),
         "avatar": fields.ImageField(original=True, description="The user avatar URL"),
