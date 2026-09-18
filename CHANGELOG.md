@@ -6,9 +6,9 @@
   stamping `cc-by` on every dataset**
   - The constant ran on every harvest of all 27 DGT sources, over all 1213 datasets, so it
     was never an initial value: it was a daily rewrite. A producer who corrected the licence
-    in the back office had it stamped over by the next run. Against a live sample of 1400
-    records from the SNIG index, 57% declare no licence the portal can honour -- and every
-    one of them was published as CC BY 4.0. That is what LNEG reported.
+    in the back office had it stamped over by the next run. Of the 2900 records the sources actually
+    harvest, 840 declare no licence the portal can honour -- and every one of them was
+    published as CC BY 4.0. That is what LNEG reported.
   - **Where a restriction appears is what decides whether the grant holds.** "Mentions
     commercial use, therefore not CC BY" would have been the easy rule and the wrong one: it
     would also turn the SNIT records, which are the largest slice of the source. Those forbid

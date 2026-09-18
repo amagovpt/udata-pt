@@ -162,6 +162,25 @@ class DGTLicenseResolutionTest:
         ]
         assert license_id_from_legal_constraints(constraints) == "cc-by"
 
+    def test_label_without_a_url_resolves(self):
+        # The label-bearing fixtures all carry the licence URL too, so the URL
+        # branch alone would satisfy them. This one exercises the code branch.
+        assert license_id_from_legal_constraints(["Licença de utilização - CC-BY-4.0"]) == "cc-by"
+
+    def test_label_without_a_url_resolves_for_sa_and_nc_nd(self):
+        assert license_id_from_legal_constraints(["Licença de utilização - CC-BY-SA-4.0"]) == (
+            "cc-by-sa"
+        )
+        assert license_id_from_legal_constraints(["Licença de utilização - CC BY-NC-ND 4.0"]) == (
+            "cc-by-nc-nd"
+        )
+
+    def test_code_written_without_a_separator_resolves(self):
+        # `CCBY` is the one spelling the pattern accepts, so it has to
+        # normalize rather than become a code nothing maps.
+        assert license_id_from_legal_constraints(["Licença CCBY-4.0"]) == "cc-by"
+        assert license_id_from_legal_constraints(["Licença CCBY-NC 4.0"]) == "cc-by-nc"
+
     def test_bare_cc_by_url_resolves(self):
         constraints = [PUBLIC_ACCESS, "https://creativecommons.org/licenses/by/4.0/"]
         assert license_id_from_legal_constraints(constraints) == "cc-by"
@@ -181,10 +200,9 @@ class DGTLicenseResolutionTest:
         )
 
     def test_en_dash_label_resolves(self):
-        constraints = [
-            "Licença de utilização – CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)"
-        ]
-        assert license_id_from_legal_constraints(constraints) == "cc-by"
+        # No URL: with one, the URL branch would answer and the en dash would
+        # never be part of what is tested.
+        assert license_id_from_legal_constraints(["Licença de utilização – CC-BY-4.0"]) == "cc-by"
 
     def test_cc_by_sa_resolves(self):
         constraints = [
@@ -330,3 +348,68 @@ class DGTLicenseHarvestTest(PytestOnlyDBTestCase):
         self._licenses()
         dataset = self._harvest(rmock, None)
         assert dataset.extras["harvest:legal_constraints"] == []
+
+
+class DGTRestrictedGrantTest:
+    """Wordings that restrict the grant the source appears to make."""
+
+    def test_a_restriction_in_a_sibling_entry_still_counts(self):
+        # ISO 19115 separates use constraints from other constraints, so the
+        # grant and the restriction qualifying it arrive as two strings.
+        constraints = [
+            "Licença Creative Commons Atribuição (CC BY 4.0). "
+            "Termos: https://creativecommons.org/licenses/by/4.0/",
+            "O uso comercial sem consentimento por escrito é expressamente proibido.",
+        ]
+        assert license_id_from_legal_constraints(constraints) is None
+
+    def test_the_restriction_is_recognised_in_its_natural_word_order(self):
+        # "é proibido o uso comercial" is how Portuguese puts it, and an
+        # order-sensitive pattern would miss exactly that.
+        assert (
+            license_id_from_legal_constraints(
+                ["Licença CC BY 4.0. É proibido o uso comercial dos dados."]
+            )
+            is None
+        )
+
+    def test_utilizacao_comercial_is_recognised(self):
+        assert (
+            license_id_from_legal_constraints(
+                ["Licença CC BY 4.0. É proibida a utilização comercial dos dados."]
+            )
+            is None
+        )
+
+    def test_nao_permitido_is_recognised(self):
+        assert (
+            license_id_from_legal_constraints(
+                ["Licença CC BY 4.0. Não é permitido o uso comercial dos dados."]
+            )
+            is None
+        )
+
+    def test_english_wording_is_recognised(self):
+        assert license_id_from_legal_constraints(["CC BY 4.0. Non-commercial use only."]) is None
+
+    def test_the_snit_wording_is_not_caught_by_any_of_them(self):
+        # The guard that keeps the largest slice of the source from turning on
+        # a restriction aimed at the portal rather than at the data.
+        assert license_id_from_legal_constraints([SNIT_TEXT, "Sem restrições"]) == "cc-by"
+
+
+class DGTConflictingCodesTest:
+    """Two licences named at once grant neither."""
+
+    def test_a_boilerplate_url_does_not_override_a_restrictive_code(self):
+        # The URL is generic guidance about Creative Commons; the code is the
+        # licence. Reading the URL first would grant more than the source does.
+        constraints = [
+            "Os dados são disponibilizados sob CC BY-NC 4.0. Sobre as licenças "
+            "Creative Commons consulte https://creativecommons.org/licenses/by/4.0/"
+        ]
+        assert license_id_from_legal_constraints(constraints) is None
+
+    def test_two_codes_in_one_entry_grant_neither(self):
+        constraints = ["Dados derivados sob CC BY 4.0; originais sob CC BY-NC 4.0"]
+        assert license_id_from_legal_constraints(constraints) is None

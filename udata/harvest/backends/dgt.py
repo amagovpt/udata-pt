@@ -24,10 +24,18 @@ CC_LICENSE_URL_RE = re.compile(
 # `CC-BY-4.0`, `CC BY 4.0`, `CC BY-NC-ND 4.0`, `CC-BY-SA-4.0`, `(CC-BY)`.
 CC_LICENSE_CODE_RE = re.compile(r"CC[\s-]?BY(?:[\s-]?NC)?(?:[\s-]?ND|[\s-]?SA)?", re.IGNORECASE)
 
+
 # A restriction on commercial use that is part of the grant itself, as the
-# Azores (SRAAC/DRPM) records word it. See `_grant_is_restricted`.
+# Azores (SRAAC/DRPM) records word it. Deliberately narrow around the WORD
+# "comercial": the SNIT records say "interdita a sua comercializacao" about
+# what the portal shows, and matching that would turn the largest slice of the
+# source on a restriction that is not aimed at the data.
 NON_COMMERCIAL_GRANT_RE = re.compile(
-    r"(?:usos?|fins)\s+n[\u00e3a]o[\s-]+comerciai?s?|uso\s+comercial\b[^.]*\bproibido",
+    r"(?:usos?|fins|utiliza[\u00e7c][\u00e3a]o)\s+n[\u00e3a]o[\s-]*comercia"
+    r"|proibid[ao]s?\b[^.]*\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
+    r"|(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial\b[^.]*\bproibid"
+    r"|n[\u00e3a]o\s+(?:\u00e9\s+)?(?:permitid|autorizad)[ao]\b[^.]*\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
+    r"|non[\s-]?commercial\s+use\s+only",
     re.IGNORECASE,
 )
 
@@ -47,21 +55,27 @@ CC_CODE_TO_LICENSE_ID = {
 RESTRICTIVE_CC_CODES = frozenset({"by-nc", "by-nc-nd", "by-nd", "by-nc-sa"})
 
 
-def _cc_code(entry: str) -> str | None:
-    """The Creative Commons code an entry declares, or None."""
-    match = CC_LICENSE_URL_RE.search(entry)
-    if match:
-        return match.group(1).lower()
+def _cc_codes(entry: str) -> set[str]:
+    """Every Creative Commons code this entry declares.
 
-    match = CC_LICENSE_CODE_RE.search(entry)
-    if match:
-        # `CC BY-NC-ND` and `CC-BY-NC-ND` are the same code written differently.
-        return re.sub(r"[\s-]+", "-", match.group(0).strip()).lower().removeprefix("cc-")
-    return None
+    Both branches are read rather than the first that answers: a text granting
+    CC BY-NC while linking creativecommons.org/licenses/by/4.0 as boilerplate
+    would otherwise be read as the more permissive of the two, purely because
+    the URL happens to be looked at first.
+    """
+    codes = {match.group(1).lower() for match in CC_LICENSE_URL_RE.finditer(entry)}
+    for match in CC_LICENSE_CODE_RE.finditer(entry):
+        # `CC BY-NC-ND`, `CC-BY-NC-ND` and `CCBY-NC-ND` are one code written
+        # three ways. The prefix is stripped after the separators collapse, so
+        # the spelling without one normalizes too instead of becoming garbage
+        # that is silently dropped.
+        code = re.sub(r"[\s-]+", "-", match.group(0).strip()).lower()
+        codes.add(re.sub(r"^cc-?", "", code))
+    return codes
 
 
-def _grant_is_restricted(entry: str) -> bool:
-    """Whether the entry's own grant forbids commercial use.
+def _grant_is_restricted(text: str) -> bool:
+    """Whether the record's own grant forbids commercial use.
 
     Where the restriction appears is what decides. The Azores records grant
     CC BY and restrict commercial use of the DATA in the same breath, so the
@@ -71,12 +85,13 @@ def _grant_is_restricted(entry: str) -> bool:
     permits commercial use by definition, so reading it the other way would
     make the record contradict itself.
 
-    The check runs on the entry that produced the code, whether the code came
-    from a URL or from the text: the Azores wording ends with the CC BY URL,
-    so exempting URLs would let exactly the records this guards against
-    through.
+    Read over the record's entries joined together rather than one by one:
+    ISO 19115 separates use constraints from other constraints, so a grant and
+    the restriction qualifying it routinely arrive as two different strings.
+    The check runs whether the code came from a URL or from the text, because
+    the Azores wording ends with the CC BY URL.
     """
-    return bool(NON_COMMERCIAL_GRANT_RE.search(entry))
+    return bool(NON_COMMERCIAL_GRANT_RE.search(text))
 
 
 def license_id_from_legal_constraints(constraints: list[str]) -> str | None:
@@ -85,16 +100,19 @@ def license_id_from_legal_constraints(constraints: list[str]) -> str | None:
     None is not "cc-by by default" -- that constant is the bug this replaces.
     The caller turns it into the portal's default licence.
     """
+    restricted = _grant_is_restricted(" ".join(constraints))
+
     found = set()
     for entry in constraints:
-        code = _cc_code(entry)
-        if code is None:
+        codes = {code for code in _cc_codes(entry) if code in CC_CODE_TO_LICENSE_ID}
+        if len(codes) != 1:
+            # Nothing recognisable, or one entry naming two different
+            # licences, which grants neither.
             continue
-        if code not in RESTRICTIVE_CC_CODES and _grant_is_restricted(entry):
+        code = codes.pop()
+        if code not in RESTRICTIVE_CC_CODES and restricted:
             continue
-        license_id = CC_CODE_TO_LICENSE_ID.get(code)
-        if license_id:
-            found.add(license_id)
+        found.add(CC_CODE_TO_LICENSE_ID[code])
 
     if len(found) == 1:
         return found.pop()
