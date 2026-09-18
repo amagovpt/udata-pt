@@ -38,6 +38,19 @@ def _get_migration_invite(user) -> bool:
     return _invite_offered_to(user)
 
 
+def _get_migration_link_available(user) -> bool:
+    """Whether this account may still reach the linking flow at all.
+
+    The sibling of _get_migration_invite, and the difference is one condition:
+    this one ignores a dismissal. "Not now" must never mean "never let me", so
+    the permanent way in stays while the notice is hidden -- otherwise the
+    notice would have closed the door behind itself.
+    """
+    from udata.auth.saml.saml_plugin.saml_govpt import _link_available_to
+
+    return _link_available_to(user)
+
+
 def _is_current_user(user) -> bool:
     """True when the serialized user is the authenticated caller.
 
@@ -170,6 +183,18 @@ user_fields = api.model(
             "CMD/eIDAS identity: the invite is enabled, linking is not mandatory, the "
             "account signs in with a password and holds no identity yet, and the invite "
             "has not been dismissed recently. Only present on the caller's own user",
+            readonly=True,
+        ),
+        # The permanent way in, as opposed to the notice above. Same guard,
+        # same reason; the difference is that this one survives a dismissal,
+        # because dismissing is "not now" and never "never let me".
+        "migration_link_available": fields.Raw(
+            attribute=lambda o: _get_migration_link_available(o) if _is_current_user(o) else None,
+            description="True when this account can still link a CMD/eIDAS identity: the "
+            "invite is enabled, linking is not mandatory, and the account signs in with a "
+            "password and holds no identity yet. Unlike migration_invite this stays true "
+            "after the notice has been dismissed, so the entry point in the profile does "
+            "not disappear with it. Only present on the caller's own user",
             readonly=True,
         ),
         "avatar": fields.ImageField(original=True, description="The user avatar URL"),

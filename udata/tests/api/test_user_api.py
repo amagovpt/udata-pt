@@ -891,3 +891,76 @@ class MigrationInviteFieldTest(APITestCase):
         response = self.get(url_for("api.user", user=other))
         self.assert200(response)
         assert response.json["migration_invite"] is None
+
+
+class MigrationLinkAvailableFieldTest(APITestCase):
+    """"Not now" must never mean "never let me".
+
+    🚩 This field exists because `migration_invite` goes FALSE the moment
+    somebody dismisses the notice -- which is what it is for. A permanent
+    entry point built on that field would vanish with the notice, so the
+    notice would have closed the door behind itself and changing your mind
+    would mean waiting out the window.
+
+    The pair of tests that matters is the first two: same account, one
+    dismissal, opposite answers.
+    """
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _me(self):
+        response = self.get(url_for("api.me"))
+        self.assert200(response)
+        return response.json
+
+    def test_after_dismissing_the_notice_goes_but_the_way_back_stays(self):
+        from datetime import datetime
+
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        self._invite_on()
+        self.login(
+            UserFactory(
+                password="x" * 12,
+                extras={MIGRATION_INVITE_DISMISSED_AT: datetime.utcnow().isoformat()},
+            )
+        )
+
+        me = self._me()
+        assert me["migration_invite"] is False, "the notice should be hidden"
+        assert me["migration_link_available"] is True, "the way back must not be hidden with it"
+
+    def test_before_dismissing_both_are_offered(self):
+        self._invite_on()
+        self.login(UserFactory(password="x" * 12))
+
+        me = self._me()
+        assert me["migration_invite"] is True
+        assert me["migration_link_available"] is True
+
+    def test_an_account_that_already_linked_has_no_way_in(self):
+        """Nothing to link, so the entry point is not an entry to anywhere --
+        and the route itself answers 409 for the same reason."""
+        from udata.core.user.nic import hash_nic
+
+        self._invite_on()
+        self.login(UserFactory(password="x" * 12, extras={"auth_nic": hash_nic("12345678")}))
+        assert self._me()["migration_link_available"] is False
+
+    def test_with_the_invite_off_there_is_no_way_in_either(self):
+        """The feature being off means off, notice and entry point alike."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        self.login(UserFactory(password="x" * 12))
+        assert self._me()["migration_link_available"] is False
+
+    def test_it_never_appears_on_somebody_elses_user(self):
+        self._invite_on()
+        other = UserFactory(password="x" * 12)
+        self.login(UserFactory(password="x" * 12))
+
+        response = self.get(url_for("api.user", user=other))
+        self.assert200(response)
+        assert response.json["migration_link_available"] is None

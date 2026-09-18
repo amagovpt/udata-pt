@@ -1170,18 +1170,25 @@ MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
 # WRITTEN rather than implied, so here it is, with its reasoning:
 #
 # - on every sign-in is not a rule, it is nagging, and it trains people to
-#   dismiss the notice without reading a word of it;
+#   dismiss the notice without reading a word of it. And it would BE every day:
+#   login_user() marks no permanent session, so the cookie dies with the
+#   browser and somebody who works in the portal each morning signs in each
+#   morning;
 # - once and never again loses, in silence, everyone who was merely busy that
 #   day -- and they find out when the portal starts requiring a single account
 #   per person (LEDG-1277), which is far too late to be told;
-# - thirty days is roughly a month of normal use: frequent enough that nobody
-#   reaches the deadline having seen it once, rare enough that it never reads
-#   as pressure.
+# - eight days, the product owner's decision, is about weekly: often enough
+#   that nobody reaches the deadline having seen it once, rare enough that
+#   dismissing it never becomes a reflex.
+#
+# 🔑 EIGHT AND NOT SEVEN, which is the part worth writing down: a seven-day
+# window always falls on the same weekday, so somebody who only opens the
+# portal on Tuesdays would see it every single time or never. Eight rotates.
 #
 # It is a constant and not configuration on purpose: a per-deployment value
 # would be one more thing that can differ between environments while nothing
 # tells you it did.
-MIGRATION_INVITE_REMIND_AFTER = timedelta(days=30)
+MIGRATION_INVITE_REMIND_AFTER = timedelta(days=8)
 
 # Which flow put a link record on an account. Absent means the wizard, which
 # is every record written before this existed, so the default must stay the
@@ -4256,6 +4263,29 @@ def _invite_offered_to(user):
     if not user or not user.is_authenticated:
         return False
     return _needs_identity_link(user) and not _invite_dismissed(user)
+
+
+def _link_available_to(user):
+    """Whether this account may still reach the linking flow at all.
+
+    🔑 THE SAME PREDICATE AS ``_invite_offered_to`` MINUS THE DISMISSAL, and
+    that single difference is the whole reason it exists.
+
+    Dismissing means "not now", never "never let me". A permanent way in that
+    asked ``_invite_offered_to`` would vanish the moment somebody pressed
+    "Not now" — so the notice would have closed the door behind itself, and
+    changing your mind would mean waiting out the window.
+
+    It is the same asymmetry ``_refuse_link_start`` already applies at the door
+    itself, which checks that there is something to link and not that a notice
+    is on screen. Two readers of one rule, so the button and the route it opens
+    can never disagree.
+    """
+    if not _invite_enabled():
+        return False
+    if not user or not user.is_authenticated:
+        return False
+    return _needs_identity_link(user)
 
 
 @autenticacao_gov.route("/saml/migration/invite/dismiss", methods=["POST"])

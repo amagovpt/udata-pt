@@ -125,7 +125,7 @@ AUTH_EIDAS_ORIGIN_COUNTRY = "auth_eidas_origin_country"
 # sign-in, which teaches people to click it away without reading, or never
 # show it again, which loses them silently before the portal requires a single
 # account per person. A date lets the rule be stated -- and the rule is written
-# next to it, in MIGRATION_INVITE_REMIND_AFTER_DAYS, rather than left implicit
+# next to it, in MIGRATION_INVITE_REMIND_AFTER, rather than left implicit
 # in a comparison somewhere.
 #
 # Dismissing is NOT the same as declining. The invite is optional and the
