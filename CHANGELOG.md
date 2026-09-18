@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+- **fix(harvest): a harvest source's config is no longer served to readers who cannot edit it**
+  - `source_fields["config"]` was a raw passthrough while both GET routes that serve the
+    model are open to anonymous callers, so the CKAN API key -- which `ckan`, `dkan` and
+    `ckanpt` read from `config["apikey"]` into an `Authorization` header -- was public to
+    anyone who could name a source. `config` is free-form: `HarvestConfigField.pre_validate`
+    only checks `filters`, `extra_configs` and `features`, so nothing stopped a credential
+    from being stored there, and nothing redacted it on the way out. This is the residue the
+    URL work left standing, named in two entries below as a separate ticket; it is closed
+    here.
+  - **Where a source's credential lives, decided: in `config`, behind the `edit` gate.**
+    That is the rule already fixed for `url` -- whoever may rewrite a field reads it whole,
+    nobody else reads it at all -- and the gate is the one that already guards `PUT`, so the
+    people who need the key are exactly the people who still see it. A dedicated write-only
+    field was considered and rejected for now: `PUT` replaces the whole `DictField`, so a
+    secret the GET does not return would be wiped by the next save from the admin screen
+    unless the server grew merge semantics for it. That is feature work with no consumer
+    today, and it is the natural next step if a source ever does need a credential. Keeping
+    the key in server settings was rejected too: it belongs to whoever runs the source, and
+    settings would make rotating it a deploy.
+  - **The channel a reader pulls is closed; the one the process pushes is now covered twice.**
+    The serialization is the first. The second is Sentry: `BaseBackend._request_with_retry`
+    keeps the request headers as a local of the frame that re-raises every connection
+    failure, and frame locals are sent. The SDK's own scrubber walks those frames and lists
+    `authorization`, `apikey` and `token`, but it does not descend by default -- the key it
+    sees at the top is `headers` -- so it is now built with `recursive=True`. That alone is
+    best-effort: it matches key names exactly (`X-API-Key` is not `x_api_key`) and each of
+    its sections swallows its own errors, so a cyclic or very deep frame local aborts the
+    walk and the event is sent anyway. So this module's own walk, which drops what it cannot
+    scrub rather than sending it, now redacts by normalized key name as well. A decision that
+    said "keep the key in `config`" while that stayed open would have pointed the next
+    operator at a field that still leaked.
+  - ⚠️ **What is still not covered, and is a separate problem:** an API key that reaches an
+    event as part of a *string* rather than as the value of a named key. Two shapes exist --
+    the raw header block that `http.client` keeps as a local while sending, and an error
+    message a remote server builds by echoing back the `Authorization` it received, which
+    `CkanBackend.get_action` copies into a `HarvestError`. Neither is reachable by a name
+    match; both need the harvest error path to redact at the source, the way the URL already
+    does.
+  - **An empty dict rather than a masked one.** A mask can only hide the keys we already know
+    about, and the failure being fixed is precisely that the next credential key will have a
+    name nobody listed. An allowlist built from each backend's declared specs was rejected
+    for the same reason: a backend that declares `apikey` as an extra config would make the
+    credential "declared" and serve it again.
+  - **Production inventory, read anonymously on 2026-09-18** via
+    `GET /api/1/harvest/sources/?deleted=true&page_size=100` -- the very route this change
+    closes, so repeating it now needs a session: **49 sources, 44 active**; the only config
+    keys in use anywhere are `filters` (13 sources) and `features` (1); **no credential-shaped
+    key at all**, in any environment-visible source. Eleven sources run a backend that reads
+    `apikey` (`ckan`, `ckanpt`) and none has one set. **So nothing has to be rotated.** Any
+    `apikey` found in a source stored before this version should still be treated as
+    compromised and rotated at the remote, since it was readable without a session for as
+    long as it was there.
+  - ⚠️ **The visible change is for organization editors**, who keep `preview` but never had
+    `edit`: the configuration tab of a source they do not administer now reads empty, and the
+    config they send when previewing that source from the admin screen no longer carries a
+    key they cannot see. `PUT` already answered them 403, so nothing they could save is lost,
+    and creating a source is unaffected -- it needs `organization.permissions["harvest"]`,
+    which is the organization *admin* need, so a creator always reads their own config back.
+    The frontend needs no change: whoever saves has `edit`, receives the whole config, and
+    the admin screen's merge keeps the keys it does not model.
+
 - **fix(harvest): the OGC backend catalogues three distributions per dataset, not seven**
   - The TML source publishes thirteen distributions per collection. Six are HTML and were
     already dropped, but the other seven all became resources, so every harvested dataset
