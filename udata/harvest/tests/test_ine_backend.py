@@ -943,3 +943,43 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
 
         dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
         assert "ine-example-test" in dataset.tags
+
+    def test_modified_at_is_the_source_last_update_not_the_harvest_time(self, rmock, tmp_path):
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        # 4 February, not 2 April: the shared date parser would read this one month-first.
+        assert dataset.harvest.modified_at.year == 2026
+        assert dataset.harvest.modified_at.month == 2
+        assert dataset.harvest.modified_at.day == 4
+
+    def test_modified_at_survives_a_second_harvest_without_source_changes(self, rmock, tmp_path):
+        """Criterion 2: the stored date must not drift to "now" on the next run."""
+        source = self._source()
+        _job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"
+        )
+        first = dataset.harvest.modified_at
+
+        job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        assert [item.status for item in job.items] == ["skipped"]
+        assert dataset.harvest.modified_at == first
+
+    def test_missing_last_update_falls_back_to_the_harvest_time(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source(), periodicity="Anual")
+
+        assert dataset.harvest.modified_at is not None
+
+    def test_unparseable_last_update_falls_back_to_the_harvest_time(self, rmock, tmp_path):
+        job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Anual", last_update="2026/09/18"
+        )
+
+        assert dataset.harvest.modified_at is not None
+        assert [item.status for item in job.items] == ["done"]
+        # The raw text is still kept, so nothing the source said is lost.
+        assert dataset.extras["last_update_remote"] == "2026/09/18"

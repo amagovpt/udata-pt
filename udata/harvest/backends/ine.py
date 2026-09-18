@@ -23,12 +23,13 @@ from udata.harvest.backends.base import BaseBackend
 from udata.harvest.exceptions import HarvestValidationError
 from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
-from udata.utils import safe_unicode
+from udata.utils import safe_harvest_datetime, safe_unicode
 
 from ..url_filter import redact_url_credentials
 from .tools.harvester_utils import (
     map_ine_periodicity,
     normalize_url_slashes,
+    parse_ine_date,
     sync_resources,
 )
 
@@ -428,6 +429,9 @@ class INEBackend(BaseBackend):
             last_update = self._text(dates_node, "last_update")
             if last_update:
                 extras["last_update_remote"] = last_update
+                md["modified_at"] = safe_harvest_datetime(
+                    parse_ine_date(last_update), "INE <last_update>", refuse_future=True
+                )
 
         # Published for ~5% of indicators only, and an opaque code ("A", "N"): stored
         # verbatim, never mapped onto a meaning we would be inventing.
@@ -596,8 +600,10 @@ class INEBackend(BaseBackend):
         if not dataset.harvest.created_at:
             dataset.harvest.created_at = datetime.now(timezone.utc)
 
-        # Data de modificação (sempre atualizada)
-        dataset.harvest.modified_at = datetime.now(timezone.utc)
+        # When the source last updated the indicator — not when we last looked at it.
+        # `harvest.last_update` above is the timestamp of this run; conflating the two is
+        # what made every INE dataset look freshly modified after every nightly harvest.
+        dataset.harvest.modified_at = md.get("modified_at") or datetime.now(timezone.utc)
 
         # Gera slug a partir do título para novos datasets
         # Adiciona remote_id ao final para garantir unicidade
