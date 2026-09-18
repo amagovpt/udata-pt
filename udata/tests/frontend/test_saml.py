@@ -9861,6 +9861,45 @@ class WizardOpenInInviteModeTest(APITestCase):
         assert self.client.post("/saml/migration/send-link").status_code != 403
         assert self.client.post("/saml/migration/confirm", json={}).status_code != 403
 
+    def test_the_wizard_is_told_the_flow_came_from_the_invite(self):
+        """The wizard cannot infer it: both modes reach it through the same
+        redirect and look identical afterwards. It decides which escape hatch
+        the screen offers, so it has to be told."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        account = UserFactory(password="x" * 12)
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(account.id),
+                "no_match": False,
+                "saml_invited": True,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_provider": "cmd",
+            }
+
+        response = self.client.get("/saml/migration/pending")
+        assert response.status_code == 200
+        assert response.json["invited"] is True
+
+    def test_a_session_from_the_mandatory_mode_is_not_marked_invited(self):
+        """Absent reads as False: the mandatory mode is the older behaviour and
+        the safe default, so a session opened before this key existed keeps the
+        escape hatch it has always had."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        account = UserFactory(password="x" * 12)
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(account.id),
+                "no_match": False,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_provider": "cmd",
+            }
+
+        response = self.client.get("/saml/migration/pending")
+        assert response.json["invited"] is False
+
     def test_creating_a_new_account_stays_shut_in_invite_mode(self):
         """🚫 The whole point of the exception.
 

@@ -1859,6 +1859,7 @@ def _handle_migration_redirect(
     doc_type=None,
     doc_nationality=None,
     eidas_country=None,
+    invited=False,
 ):
     """Store SAML data in session and redirect to migration page.
 
@@ -1882,6 +1883,15 @@ def _handle_migration_redirect(
     session["saml_migration_pending"] = {
         "legacy_user_id": str(user.id) if user else None,
         "no_match": no_match,
+        # Whether this wizard session was started from the optional invite,
+        # which the wizard cannot infer: both modes converge on this redirect
+        # and look identical afterwards. It changes what the wizard OFFERS --
+        # the account-creation escape has no place in a flow the person
+        # entered from inside an account they proved with a password seconds
+        # ago -- and nothing about what it does. migration_skip refuses in
+        # invite mode regardless, so this is the visible half of a guarantee
+        # that does not depend on it.
+        "saml_invited": invited,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
@@ -3453,6 +3463,7 @@ def idp_initiated():
                 first_name,
                 last_name,
                 no_match=(status == "no_match" and not link_intent_user),
+                invited=bool(link_intent_user),
                 provider="cmd",
                 # The same guard the funnel already receives below: only when
                 # the document WAS the identity. For a national the NIC won in
@@ -4022,6 +4033,7 @@ def idp_eidas_initiated():
                 first_name,
                 last_name,
                 no_match=(status == "no_match" and not link_intent_user),
+                invited=bool(link_intent_user),
                 provider="eidas",
                 eidas_country=eidas_country,
             )
@@ -4421,6 +4433,12 @@ def migration_pending():
             "suggested_email": suggested_email,
             "candidate": bool(legacy_user_id),
             "no_match": no_match,
+            # Started from the optional invite. The wizard cannot tell
+            # otherwise -- both modes reach it through the same redirect --
+            # and it decides which escape hatch the screen offers. Absent for
+            # sessions opened before this existed, which read as False: the
+            # mandatory mode is the older behaviour and the safe default here.
+            "invited": bool(pending.get("saml_invited")),
             "first_name": first_name,
             "last_name": last_name,
             # Defaults to CMD so a session opened before this field existed
