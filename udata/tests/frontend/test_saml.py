@@ -10070,25 +10070,30 @@ class InvitedFlowAuditTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_landing_in_somebody_elses_account_is_named(self, mock_client_for, _mock_confirm):
-        """🚩 The outcome nobody would think to look for.
+    def test_an_identity_that_is_already_somebody_elses_is_refused(
+        self, mock_client_for, _mock_confirm
+    ):
+        """🚩 Was a silent account switch, and is now a refusal.
 
-        The person clicked "Associate" from inside their own account, and the
-        CMD they authenticated with already belongs to a DIFFERENT one -- so
-        the portal signs them into that other account. Correct, and today's
-        behaviour, and not at all what they were expecting.
+        Signing the citizen into the account that owns the identity is right
+        for anyone who pressed "sign in with CMD" -- the identity IS that
+        account's. It is wrong for somebody who pressed "link": they end up in
+        an account they never asked about, the one they clicked from stays
+        unlinked, and nothing says so. They walk away believing it worked and
+        find out when the invite comes back.
 
-        This is the population LEDG-2472 exists for. Without a reason of its
-        own it is indistinguishable from an ordinary sign-in.
+        Refusing costs one click to whoever did want that account, and it is
+        the same principle the password screen already applies: never switch
+        accounts in silence.
         """
         self._invite_on()
         asking = UserFactory(password="x" * 12, email="m.silva@camara.pt")
-        UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+        owner = UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
         cache, token = self._ticket_for(asking)
 
         with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
-            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
-                self._cmd_callback(
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as login:
+                response = self._cmd_callback(
                     mock_client_for,
                     cache,
                     relay_token=token,
@@ -10098,10 +10103,43 @@ class InvitedFlowAuditTest(APITestCase):
                     last_name="Silva",
                 )
 
+        assert not login.called, "signed the citizen into an account they never asked about"
+        assert response.status_code == 302
+        assert "saml_error=invite_identity_already_linked" in response.headers["Location"]
+
         lines = [r.getMessage() for r in captured.records]
         assert len(lines) == 1, lines
-        assert "outcome=success" in lines[0], lines
-        assert "reason=invite_identity_elsewhere" in lines[0], lines
+        assert "outcome=rejected" in lines[0], lines
+        assert "reason=invite_identity_already_linked" in lines[0], lines
+
+        # The account that owns the identity is untouched, and so is the one
+        # that asked -- "a sua conta ficou como estava" has to be true.
+        owner.reload()
+        asking.reload()
+        assert owner.extras["auth_nic"] == _hash_nic(self.NIC)
+        assert not (asking.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_ordinary_cmd_sign_in_still_reaches_that_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """Paired with the test above, and the reason the guard is scoped to a
+        ticket: without one, pressing "sign in with CMD" must still work."""
+        self._invite_on()
+        UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as login:
+            self._cmd_callback(
+                mock_client_for,
+                _InMemoryCache(),
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        assert login.called
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")

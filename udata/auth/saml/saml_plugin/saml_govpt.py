@@ -1573,7 +1573,6 @@ def _handle_saml_user_login(
     issuer=None,
     name_id=None,
     status=None,
-    audit_reason=None,
 ):
     """Handle login/redirect after SAML authentication.
 
@@ -1803,12 +1802,7 @@ def _handle_saml_user_login(
     # this line -- so if either guard ever moves, this becomes a success line
     # for a session that was never established. Wrapping the emission in the
     # `if` would be worse: the refusal would then produce no line at all.
-    # ``audit_reason`` overrides the status ONLY for the reason field, never
-    # for anything that decides behaviour: the outcome vocabulary is fixed at
-    # five values and a sixth would be a contract change, so a case worth
-    # counting separately is a reason, not an outcome. One line per callback
-    # still, which is the invariant that makes these countable at all.
-    _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=audit_reason or status)
+    _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=status)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts
     # created without a usable CMD email, or older ones from before this
@@ -3511,6 +3505,37 @@ def idp_initiated():
     #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    # 🚩 THE CITIZEN ASKED TO LINK, AND THIS IDENTITY IS ALREADY SOMEBODY'S.
+    #
+    # Signing them into that other account is what used to happen, and it is
+    # the right answer for anyone who pressed "sign in with CMD" -- the
+    # identity IS that account's. It is the wrong answer for somebody who
+    # pressed "link": they are put into an account they did not ask about,
+    # the one they clicked from stays unlinked, and nothing says so. They
+    # walk away believing it worked, and find out when the invite comes back.
+    #
+    # Same principle as the password screen refusing a different account:
+    # never switch accounts in silence. Refusing here costs one click to
+    # whoever did want that account -- the sign-in button is still there --
+    # and saves everyone else from a change they never asked for.
+    #
+    # No identity in the redirect: the code is generic on purpose, because the
+    # query string lands in browser history, Referer headers and proxy logs.
+    if link_intent_user and status == "existing_saml":
+        return _reject_saml_login(
+            f"[SAML cmd] refused an invited link: the identity already belongs to "
+            f"another account (asked by user_id={link_intent_user.id})",
+            _(
+                "Não foi possível associar: esta identidade já está associada a outra "
+                "conta do portal. A sua conta ficou como estava."
+            ),
+            log_level="info",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="invite_identity_already_linked",
+        )
+
     session["saml_name_id"] = name_id_value
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
@@ -3541,11 +3566,6 @@ def idp_initiated():
         # It is the population LEDG-2472 exists for -- two accounts, one
         # person -- and without a reason of its own it is indistinguishable
         # from an ordinary sign-in in the audit log.
-        audit_reason=(
-            "invite_identity_elsewhere"
-            if (link_intent_user and status == "existing_saml")
-            else None
-        ),
         # Only when the document was the identity. For a national the NIC won
         # in the composition above, so recording the document here would
         # describe something other than what auth_nic actually holds.
@@ -4082,6 +4102,25 @@ def idp_eidas_initiated():
     #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    # Same guard, same reasoning as the CMD route above -- see the comment
+    # there. Duplicated per route because that is how every other rejection in
+    # this file is placed, and the tests run the scenario through both
+    # handlers so a divergence between the copies turns one of them red.
+    if link_intent_user and status == "existing_saml":
+        return _reject_saml_login(
+            f"[SAML eidas] refused an invited link: the identity already belongs to "
+            f"another account (asked by user_id={link_intent_user.id})",
+            _(
+                "Não foi possível associar: esta identidade já está associada a outra "
+                "conta do portal. A sua conta ficou como estava."
+            ),
+            log_level="info",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="invite_identity_already_linked",
+        )
+
     session["saml_name_id"] = name_id_value
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
@@ -4110,11 +4149,6 @@ def idp_eidas_initiated():
         # It is the population LEDG-2472 exists for -- two accounts, one
         # person -- and without a reason of its own it is indistinguishable
         # from an ordinary sign-in in the audit log.
-        audit_reason=(
-            "invite_identity_elsewhere"
-            if (link_intent_user and status == "existing_saml")
-            else None
-        ),
         # No asserted_email: the eIDAS Minimum Data Set has no such attribute.
         asserted_first_name=first_name,
         asserted_last_name=last_name,
