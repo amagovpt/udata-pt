@@ -988,6 +988,27 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
         # The raw text is still kept, so nothing the source said is lost.
         assert dataset.extras["last_update_remote"] == "2026/09/18"
 
+    def test_remote_url_and_uri_agree_when_the_source_drops_the_landing_page(self, rmock, tmp_path):
+        """Both fields hold the landing page, so both have to follow the source.
+
+        Clearing one and leaving the other would keep feeding dcat:landingPage a URL the
+        feed no longer publishes.
+        """
+        source = self._source()
+        self._harvest(rmock, tmp_path, source, periodicity="Mensal")
+
+        xml = re.sub(
+            r"<bdd_url>.*?</bdd_url>", "", _catalog_xml(["0001"], periodicity="Mensal"), flags=re.S
+        )
+        rmock.get(INE_URL, text=xml)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.harvest()
+
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        assert dataset.harvest.uri is None
+        assert dataset.harvest.remote_url is None
+
     def test_harvest_backend_is_the_display_name(self, rmock, tmp_path):
         """Stamped by hand here, because this backend never reaches the base class helper."""
         _job, dataset = self._harvest(rmock, tmp_path, self._source())

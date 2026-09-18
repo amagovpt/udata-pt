@@ -42,19 +42,31 @@
   - **What changes in an already harvested catalogue.** The first harvest after the deploy
     rewrites all ~13000 `ine` datasets -- that is the change detection working, not a
     fault -- and no resource id moves, so the `/api/1/datasets/r/<id>` download permalinks
-    survive. The `ine-pt` and `ine.pt` tags are replaced by `www-ine-pt`, so the old
+    survive. "Once" holds for every indicator the `ine` backend owns alone; the HVD subset
+    is claimed by both INE harvesters, which share `www.ine.pt` as their harvest domain and
+    store a different description for the same indicator, so those datasets keep being
+    rewritten by whichever ran last. That predates this change and only the consolidation
+    of the two backends fixes it. The `ine-pt` and `ine.pt` tags are replaced by `www-ine-pt`, so the old
     facets disappear and any saved search or link using `?tag=ine-pt` stops returning
     results; there is no tag redirect. `harvest.modified_at` moves *backwards*, possibly
     by years, and it is what `Dataset.last_modified` exposes through the API and the feed.
     Resource titles become "Dados (JSON)"/"Metainfo (JSON)" with their URLs untouched.
-  - ⚠️ **Two things the bulk write path does not do for itself.** The `ine` backend writes
-    through pymongo, so `post_save` never fires: the new frequency and tag reach the
-    search facets only after a reindex following the first new harvest. For the same
-    reason `Dataset.clean()` does not run, so `quality_cached` keeps its stored
-    `update_frequency: False` and the visible quality score does not rise until the
-    datasets are saved by some other path. `inehvd` goes through `save()` and is unaffected
-    by both. Restart the Celery worker and beat after the deploy -- the harvester code is
-    read in-process.
+  - ⚠️ **What the bulk write path does not do for itself.** The `ine` backend writes
+    through pymongo, so `post_save` never fires and `Dataset.clean()` never runs. Three
+    consequences, all of them pre-existing and none of them fixed here:
+    - The new frequency, tags and extras reach the search index only through a **full**
+      reindex. An incremental one does not see them: the bulk write leaves
+      `last_modified_internal` untouched, which is the field `udata search index
+      --from-datetime` filters on. Until that reindex the facets disagree with the
+      database, and the `ine-pt` -> `www-ine-pt` rename makes that visible.
+    - `quality_cached` keeps its stored `update_frequency: False`, so the visible quality
+      score does not rise with the new frequency until the datasets are written by some
+      other path.
+    - `Dataset.last_update` keeps being the time of the harvest even though
+      `harvest.modified_at` is now the source's date, so the two disagree for `ine`
+      datasets.
+    `inehvd` goes through `save()` and is unaffected by all three. Restart the Celery
+    worker and beat after the deploy -- the harvester code is read in-process.
 
 - **chore(harvest): the `dgtIne` backend is gone, and so is every registration that pointed at it**
   - The module had already been deleted; what stayed behind was the part that breaks things.

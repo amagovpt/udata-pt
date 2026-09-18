@@ -3,6 +3,7 @@ import logging
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
@@ -233,8 +234,15 @@ INE_PERIODICITY: dict[str, UpdateFrequency] = {
 }
 
 # Warn once per unseen value: a single INE harvest walks ~13k indicators, and an unmapped
-# periodicity would otherwise log once per dataset.
+# periodicity would otherwise log once per dataset. Reset per harvest by
+# `reset_ine_periodicity_warnings`, so a value that is still unmapped is reported again on
+# the next run instead of being silenced for the lifetime of the Celery worker.
 _warned_periodicities: set[str] = set()
+
+
+def reset_ine_periodicity_warnings() -> None:
+    """Let the next harvest report unmapped periodicities again."""
+    _warned_periodicities.clear()
 
 
 def map_ine_periodicity(text: str | None) -> UpdateFrequency:
@@ -250,7 +258,10 @@ def map_ine_periodicity(text: str | None) -> UpdateFrequency:
     if not text:
         return UpdateFrequency.UNKNOWN
 
-    key = text.strip().casefold()
+    # NFC first: the map's keys are composed, and the feed's encoding is not something to
+    # trust — `INEBackend._normalize_tag` decomposes for the same reason. Without this, a
+    # decomposed "Não periódica" would miss the lookup and send 1026 indicators to UNKNOWN.
+    key = unicodedata.normalize("NFC", text).strip().casefold()
     if not key:
         return UpdateFrequency.UNKNOWN
 

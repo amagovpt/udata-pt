@@ -30,17 +30,18 @@ from .tools.harvester_utils import (
     map_ine_periodicity,
     normalize_url_slashes,
     parse_ine_date,
+    reset_ine_periodicity_warnings,
     sync_resources,
 )
+
+# The HVD subset of the catalogue, published as a separate feed. A fact of the source
+# rather than an operator choice, so a module constant and not a per-source extra config.
+INE_HVD_FEED_URL = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
 
 # Metadata the INE catalogue publishes per indicator and that we store as extras. Kept as
 # a tuple so `_has_changed` and `_apply_metadata_to_dataset` iterate the same set: a key
 # written by one and ignored by the other is how enrichment silently fails to reach the
 # ~13k datasets already in the database.
-# The HVD subset of the catalogue, published as a separate feed. A fact of the source
-# rather than an operator choice, so a module constant and not a per-source extra config.
-INE_HVD_FEED_URL = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
-
 INE_SOURCE_EXTRAS = (
     "geo_lastlevel",
     "source_description",
@@ -607,17 +608,18 @@ class INEBackend(BaseBackend):
         # line would leave it empty rather than let the base class fill it in.
         dataset.harvest.backend = self.display_name
 
-        # URL remota do dataset no portal de origem
-        if md.get("remote_url"):
-            dataset.harvest.remote_url = md["remote_url"]
+        # The landing page the source publishes, for both fields that hold it. Written
+        # unconditionally, `None` included: keeping a URL the source no longer publishes
+        # would leave `remote_url` and `uri` disagreeing for good, and would go on feeding
+        # `dcat:landingPage` a link the feed has dropped.
+        dataset.harvest.remote_url = md.get("remote_url") or None
 
         # Identificador DCT (Dublin Core Terms)
         dataset.harvest.dct_identifier = f"ine:{remote_id}"
 
-        # The landing page the source itself publishes, not one we compose. Written
-        # unconditionally, `None` included: leaving a previously invented URI in place
-        # while the dict carries none would make `_has_changed` fire on every harvest and
-        # rewrite the dataset nightly, forever.
+        # Not the `/indicador/<id>` we used to compose. Same unconditional write as
+        # `remote_url` above: a stale URI the dict no longer carries would make
+        # `_has_changed` fire on every harvest and rewrite the dataset nightly, forever.
         dataset.harvest.uri = md.get("remote_url") or None
 
         # Data de criação (apenas se for novo)
@@ -729,6 +731,7 @@ class INEBackend(BaseBackend):
     # inner_harvest (2 fases)
     # --------------------------
     def inner_harvest(self):
+        reset_ine_periodicity_warnings()
         try:
             self._inner_harvest()
         finally:

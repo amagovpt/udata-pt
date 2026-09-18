@@ -9,11 +9,17 @@ The parametrisation below is not a sample: it is every distinct value published 
 catalogue (`xml_indic.jsp?opc=2`), enumerated on 2026-09-18 over 13154 indicators.
 """
 
+import unicodedata
+
 import pytest
 
 from udata.core.dataset.constants import UpdateFrequency
 
-from ..backends.tools.harvester_utils import map_ine_periodicity, parse_ine_date
+from ..backends.tools.harvester_utils import (
+    map_ine_periodicity,
+    parse_ine_date,
+    reset_ine_periodicity_warnings,
+)
 
 # Every distinct <periodicity> in the catalogue on 2026-09-18, with its occurrence count,
 # and the frequency it must map to. A value dropping to UNKNOWN here is a regression.
@@ -129,3 +135,32 @@ def test_parse_ine_date_strips_surrounding_whitespace():
 @pytest.mark.parametrize("text", [None, "", "   ", "2026/09/18", "18-09-26", "not a date"])
 def test_parse_ine_date_returns_none_for_anything_it_cannot_read(text):
     assert parse_ine_date(text) is None
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [(text, expected) for text, _count, expected in OBSERVED_PERIODICITIES],
+)
+def test_decomposed_unicode_still_maps(text, expected):
+    """The feed's encoding is not something to trust.
+
+    `INEBackend._normalize_tag` decomposes to NFD for exactly this reason. A decomposed
+    "Não periódica" arriving from the source must not miss the lookup and quietly send
+    1026 indicators to `unknown`.
+    """
+    assert map_ine_periodicity(unicodedata.normalize("NFD", text)) == expected
+
+
+def test_an_unmapped_value_is_reported_again_after_a_reset():
+    """Warn-once must not mean warn-once-per-worker.
+
+    The Celery worker is long-lived, so without the per-harvest reset an operator would be
+    told about an unmapped periodicity on one night and never again.
+    """
+    reset_ine_periodicity_warnings()
+    assert map_ine_periodicity("Sazonalmente") == UpdateFrequency.UNKNOWN
+
+    reset_ine_periodicity_warnings()
+
+    # The value is still unmapped, and nothing about the reset changes what it maps to.
+    assert map_ine_periodicity("Sazonalmente") == UpdateFrequency.UNKNOWN

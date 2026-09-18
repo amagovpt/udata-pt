@@ -7,7 +7,11 @@ from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
 
-from .tools.harvester_utils import map_ine_periodicity, sync_resources
+from .tools.harvester_utils import (
+    map_ine_periodicity,
+    reset_ine_periodicity_warnings,
+    sync_resources,
+)
 
 
 class INEHvdBackend(BaseBackend):
@@ -42,6 +46,7 @@ class INEHvdBackend(BaseBackend):
         Fetches the main source XML, parses the available indicators (datasets),
         and initiates the processing for each identified dataset ID.
         """
+        reset_ine_periodicity_warnings()
         try:
             from ineDatasets import datasetIds
         except ImportError:
