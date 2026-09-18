@@ -9564,8 +9564,27 @@ class LinkStartRouteTest(APITestCase):
         )
         self.login(user)
 
-        response = self.client.get("/saml/link/start")
-        assert response.status_code == 200
+        # 🚩 The AuthnRequest itself is mocked away, and that is the point of
+        # this assertion rather than a shortcut around it. What is under test
+        # is the GUARD -- that a dismissal does not close the door -- and
+        # building a real request drags in pysaml2, which needs the `xmlsec1`
+        # binary. That binary is on a developer machine and not on the CI
+        # runner, so asserting a 200 here passed locally and failed in CI with
+        # a 500 that said nothing about the invite.
+        #
+        # The other tests in this class stop at a refusal and never reach it.
+        # This is the only one that walks the whole way through.
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._begin_cmd_authn_request"
+        ) as begin_request:
+            begin_request.return_value = "<form/>"
+            self.client.get("/saml/link/start")
+
+        assert begin_request.called, (
+            "the route refused somebody who dismissed the notice -- dismissing is "
+            "'not now', and the way back has to stay open"
+        )
+        assert begin_request.call_args.kwargs["link_user_id"] == str(user.id)
 
 
 class LinkIntentTest(APITestCase):
