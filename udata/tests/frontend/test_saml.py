@@ -9897,3 +9897,125 @@ class WizardOpenInInviteModeTest(APITestCase):
         assert self.client.post("/saml/migration/confirm", json={}).status_code == 403
         assert self.client.post("/saml/migration/skip", json={}).status_code == 403
         assert self.client.post("/saml/migration/resend-confirmation").status_code == 403
+
+
+class InvitedFlowAuditTest(APITestCase):
+    """Two events the invited flow produces that the log could not name.
+
+    The outcome vocabulary stays at five values -- a sixth would be a contract
+    change for anything counting these lines -- so both are `reason`, which is
+    exactly what `reason` is for (LEDG-2473).
+    """
+
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+    NIC = "12345678"
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _cmd_callback(self, mock_client_for, cache, relay_token="", **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        with patch("udata.app.cache", cache):
+            return self.client.post(
+                "/saml/sso",
+                data={"SAMLResponse": encoded, "RelayState": relay_token},
+                follow_redirects=False,
+            )
+
+    def _ticket_for(self, account):
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+        return cache, token
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_invited_link_is_countable(self, mock_client_for, _mock_confirm):
+        """ "How many people accepted the invite?" has to have an answer, and
+        migration_candidate/no_match cannot give it -- both also happen to
+        people who never saw an invite."""
+        self._invite_on()
+        cache, token = self._ticket_for(UserFactory(password="x" * 12))
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_callback(
+                mock_client_for,
+                cache,
+                relay_token=token,
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        lines = [r.getMessage() for r in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=migration_pending" in lines[0], lines
+        assert "reason=invite_link" in lines[0], lines
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_landing_in_somebody_elses_account_is_named(self, mock_client_for, _mock_confirm):
+        """🚩 The outcome nobody would think to look for.
+
+        The person clicked "Associate" from inside their own account, and the
+        CMD they authenticated with already belongs to a DIFFERENT one -- so
+        the portal signs them into that other account. Correct, and today's
+        behaviour, and not at all what they were expecting.
+
+        This is the population LEDG-2472 exists for. Without a reason of its
+        own it is indistinguishable from an ordinary sign-in.
+        """
+        self._invite_on()
+        asking = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+        UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+        cache, token = self._ticket_for(asking)
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_callback(
+                    mock_client_for,
+                    cache,
+                    relay_token=token,
+                    email="maria@gmail.com",
+                    nic=self.NIC,
+                    first_name="Maria",
+                    last_name="Silva",
+                )
+
+        lines = [r.getMessage() for r in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=success" in lines[0], lines
+        assert "reason=invite_identity_elsewhere" in lines[0], lines
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_ordinary_sign_in_keeps_its_reason(self, mock_client_for, _mock_confirm):
+        """Paired with the test above: an override that leaked onto every line
+        would rename a population instead of naming one."""
+        self._invite_on()
+        UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_callback(
+                    mock_client_for,
+                    _InMemoryCache(),
+                    email="maria@gmail.com",
+                    nic=self.NIC,
+                    first_name="Maria",
+                    last_name="Silva",
+                )
+
+        lines = [r.getMessage() for r in captured.records]
+        assert len(lines) == 1, lines
+        assert "reason=existing_saml" in lines[0], lines

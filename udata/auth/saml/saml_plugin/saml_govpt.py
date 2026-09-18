@@ -1554,6 +1554,7 @@ def _handle_saml_user_login(
     issuer=None,
     name_id=None,
     status=None,
+    audit_reason=None,
 ):
     """Handle login/redirect after SAML authentication.
 
@@ -1783,7 +1784,12 @@ def _handle_saml_user_login(
     # this line -- so if either guard ever moves, this becomes a success line
     # for a session that was never established. Wrapping the emission in the
     # `if` would be worse: the refusal would then produce no line at all.
-    _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=status)
+    # ``audit_reason`` overrides the status ONLY for the reason field, never
+    # for anything that decides behaviour: the outcome vocabulary is fixed at
+    # five values and a sixth would be a contract change, so a case worth
+    # counting separately is a reason, not an outcome. One line per callback
+    # still, which is the invariant that makes these countable at all.
+    _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=audit_reason or status)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts
     # created without a usable CMD email, or older ones from before this
@@ -3490,6 +3496,26 @@ def idp_initiated():
         issuer=issuer,
         name_id=name_id_value,
         status=status,
+        # 🚩 The one outcome the invited flow has that nobody would think to
+        # look for. The person clicked "Associate" from inside their own
+        # account, and the CMD they authenticated with turns out to belong to
+        # a DIFFERENT account -- so the portal signs them into that other one
+        # instead. The identity IS that account's, so this is correct and it
+        # is also today's behaviour; what it is not is expected by somebody
+        # who started from somewhere else.
+        #
+        # (The condition needs no comparison: _resolve_link_intent refuses an
+        # account that already holds an identity, so an intent that survived
+        # alongside `existing_saml` necessarily points at a different one.)
+        #
+        # It is the population LEDG-2472 exists for -- two accounts, one
+        # person -- and without a reason of its own it is indistinguishable
+        # from an ordinary sign-in in the audit log.
+        audit_reason=(
+            "invite_identity_elsewhere"
+            if (link_intent_user and status == "existing_saml")
+            else None
+        ),
         # Only when the document was the identity. For a national the NIC won
         # in the composition above, so recording the document here would
         # describe something other than what auth_nic actually holds.
@@ -4038,6 +4064,26 @@ def idp_eidas_initiated():
         issuer=issuer,
         name_id=name_id_value,
         status=status,
+        # 🚩 The one outcome the invited flow has that nobody would think to
+        # look for. The person clicked "Associate" from inside their own
+        # account, and the CMD they authenticated with turns out to belong to
+        # a DIFFERENT account -- so the portal signs them into that other one
+        # instead. The identity IS that account's, so this is correct and it
+        # is also today's behaviour; what it is not is expected by somebody
+        # who started from somewhere else.
+        #
+        # (The condition needs no comparison: _resolve_link_intent refuses an
+        # account that already holds an identity, so an intent that survived
+        # alongside `existing_saml` necessarily points at a different one.)
+        #
+        # It is the population LEDG-2472 exists for -- two accounts, one
+        # person -- and without a reason of its own it is indistinguishable
+        # from an ordinary sign-in in the audit log.
+        audit_reason=(
+            "invite_identity_elsewhere"
+            if (link_intent_user and status == "existing_saml")
+            else None
+        ),
         # No asserted_email: the eIDAS Minimum Data Set has no such attribute.
         asserted_first_name=first_name,
         asserted_last_name=last_name,
