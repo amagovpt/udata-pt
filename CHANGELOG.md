@@ -21,14 +21,25 @@
     today, and it is the natural next step if a source ever does need a credential. Keeping
     the key in server settings was rejected too: it belongs to whoever runs the source, and
     settings would make rotating it a deploy.
-  - **Both channels the config had are closed here, not just the one a reader can pull.**
-    The serialization is one. The other is Sentry: `BaseBackend._request_with_retry` keeps
-    the request headers as a local of the frame that re-raises every connection failure, and
-    frame locals are sent. The SDK's own scrubber walks those frames and lists
+  - **The channel a reader pulls is closed; the one the process pushes is now covered twice.**
+    The serialization is the first. The second is Sentry: `BaseBackend._request_with_retry`
+    keeps the request headers as a local of the frame that re-raises every connection
+    failure, and frame locals are sent. The SDK's own scrubber walks those frames and lists
     `authorization`, `apikey` and `token`, but it does not descend by default -- the key it
-    sees at the top is `headers` -- so it is now built with `recursive=True`. A decision that
+    sees at the top is `headers` -- so it is now built with `recursive=True`. That alone is
+    best-effort: it matches key names exactly (`X-API-Key` is not `x_api_key`) and each of
+    its sections swallows its own errors, so a cyclic or very deep frame local aborts the
+    walk and the event is sent anyway. So this module's own walk, which drops what it cannot
+    scrub rather than sending it, now redacts by normalized key name as well. A decision that
     said "keep the key in `config`" while that stayed open would have pointed the next
     operator at a field that still leaked.
+  - ⚠️ **What is still not covered, and is a separate problem:** an API key that reaches an
+    event as part of a *string* rather than as the value of a named key. Two shapes exist --
+    the raw header block that `http.client` keeps as a local while sending, and an error
+    message a remote server builds by echoing back the `Authorization` it received, which
+    `CkanBackend.get_action` copies into a `HarvestError`. Neither is reachable by a name
+    match; both need the harvest error path to redact at the source, the way the URL already
+    does.
   - **An empty dict rather than a masked one.** A mask can only hide the keys we already know
     about, and the failure being fixed is precisely that the next credential key will have a
     name nobody listed. An allowlist built from each backend's declared specs was rejected
@@ -43,13 +54,14 @@
     `apikey` found in a source stored before this version should still be treated as
     compromised and rotated at the remote, since it was readable without a session for as
     long as it was there.
-  - ⚠️ Two visible changes, neither losing data. A signed-in user without `edit` on a source
-    -- an organization editor, say -- now sees an empty configuration tab in the admin;
-    `PUT` already answered them 403. And the 201 from `POST /harvest/sources/` returns
-    `config: {}` to a creator who has `organization.permissions["harvest"]` but not
-    `HarvestSourceAdminPermission` on the new source: they wrote the config and do not read
-    it back in the same response. The frontend needs no change -- whoever saves has `edit`,
-    receives the whole config, and the admin screen's merge keeps the keys it does not model.
+  - ⚠️ **The visible change is for organization editors**, who keep `preview` but never had
+    `edit`: the configuration tab of a source they do not administer now reads empty, and the
+    config they send when previewing that source from the admin screen no longer carries a
+    key they cannot see. `PUT` already answered them 403, so nothing they could save is lost,
+    and creating a source is unaffected -- it needs `organization.permissions["harvest"]`,
+    which is the organization *admin* need, so a creator always reads their own config back.
+    The frontend needs no change: whoever saves has `edit`, receives the whole config, and
+    the admin screen's merge keeps the keys it does not model.
 
 - **fix(harvest): the OGC backend catalogues three distributions per dataset, not seven**
   - The TML source publishes thirteen distributions per collection. Six are HTML and were
