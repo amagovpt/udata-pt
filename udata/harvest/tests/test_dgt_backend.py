@@ -1,7 +1,10 @@
 """DGT harvester: resource identity (LEDG-2251) and licence derivation (LEDG-2518)."""
 
+import json
+
 import pytest
 
+from udata.core.dataset.factories import LicenseFactory
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.dgt import DGTBackend, license_id_from_legal_constraints
@@ -225,3 +228,105 @@ class DGTLicenseResolutionTest:
     def test_empty_and_missing_have_no_license(self):
         assert license_id_from_legal_constraints([]) is None
         assert license_id_from_legal_constraints(["Sem restrições", "Sem restrições"]) is None
+
+
+def _index_record(remote_id, legal_constraints, title="Carta geológica"):
+    """One record shaped the way the SNIG `fast=index` response shapes it."""
+    record = {
+        "geonet:info": {"uuid": remote_id},
+        "defaultTitle": title,
+        "defaultAbstract": "Cartografia temática",
+        "keyword": ["geo"],
+        "link": f"nome|desc|{ZIP_URL}|WWW:LINK|zip",
+    }
+    if legal_constraints is not None:
+        record["legalConstraints"] = legal_constraints
+    return record
+
+
+def _index_payload(records):
+    return json.dumps({"metadata": records})
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTLicenseHarvestTest(PytestOnlyDBTestCase):
+    """The licence a real harvest ends up writing on the dataset."""
+
+    def _licenses(self):
+        # The test database carries no licences, and LicenseFactory would give
+        # each one a random id, so the ones under test are seeded by id.
+        LicenseFactory(id="notspecified", title="License Not Specified")
+        LicenseFactory(id="cc-by", title="Creative Commons Attribution 4.0 - CC BY 4.0")
+        LicenseFactory(
+            id="cc-by-nc-nd",
+            title="Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 - CC BY-NC-ND 4.0",
+        )
+
+    def _harvest(self, rmock, legal_constraints, remote_id=REMOTE_ID):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, legal_constraints)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_snit_record_is_cc_by(self, rmock):
+        self._licenses()
+        dataset = self._harvest(rmock, [SNIT_TEXT, "Sem restrições"])
+        assert dataset.license.id == "cc-by"
+
+    def test_ipr_record_is_notspecified(self, rmock):
+        # The LNEG complaint: the source declares no licence, so neither do we.
+        self._licenses()
+        dataset = self._harvest(rmock, [PUBLIC_ACCESS, "Direitos de Propriedade Intelectual"])
+        assert dataset.license.id == "notspecified"
+
+    def test_missing_legal_constraints_is_notspecified(self, rmock):
+        self._licenses()
+        dataset = self._harvest(rmock, None)
+        assert dataset.license.id == "notspecified"
+
+    def test_nc_nd_record_gets_the_nc_nd_license(self, rmock):
+        self._licenses()
+        dataset = self._harvest(
+            rmock,
+            [
+                PUBLIC_ACCESS,
+                "Licença de utilização - CC BY-NC-ND 4.0 "
+                "(https://creativecommons.org/licenses/by-nc-nd/4.0/)",
+            ],
+        )
+        assert dataset.license.id == "cc-by-nc-nd"
+
+    def test_manual_license_survives_a_source_without_one(self, rmock):
+        # A producer corrected the licence in the back office. Before this
+        # change every harvest stamped cc-by back over it.
+        self._licenses()
+        self._harvest(rmock, [PUBLIC_ACCESS, "Direitos de Propriedade Intelectual"])
+        dataset = harvested_dataset(REMOTE_ID)
+        dataset.license = LicenseFactory(id="cc-by-nc", title="CC BY-NC 4.0")
+        dataset.save()
+
+        dataset = self._harvest(rmock, [PUBLIC_ACCESS, "Direitos de Propriedade Intelectual"])
+
+        assert dataset.license.id == "cc-by-nc"
+
+    def test_source_license_overrides_what_the_dataset_carries(self, rmock):
+        self._licenses()
+        self._harvest(rmock, [PUBLIC_ACCESS, "Direitos de Propriedade Intelectual"])
+
+        dataset = self._harvest(rmock, [SNIT_TEXT, "Sem restrições"])
+
+        assert dataset.license.id == "cc-by"
+
+    def test_legal_constraints_are_stored_in_extras(self, rmock):
+        self._licenses()
+        constraints = [PUBLIC_ACCESS, "Direitos de Propriedade Intelectual"]
+        dataset = self._harvest(rmock, constraints)
+        assert dataset.extras["harvest:legal_constraints"] == constraints
+
+    def test_a_source_without_constraints_stores_an_empty_list(self, rmock):
+        self._licenses()
+        dataset = self._harvest(rmock, None)
+        assert dataset.extras["harvest:legal_constraints"] == []

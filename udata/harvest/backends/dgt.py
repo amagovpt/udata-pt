@@ -212,7 +212,7 @@ class DGTBackend(BaseBackend):
 
         # Set basic dataset fields
         dataset.title = data["title"]
-        dataset.license = License.guess("cc-by")
+        dataset.license = self._license_for(dataset, item, data)
         dataset.tags = ["snig.dgterritorio.gov.pt"]
         dataset.description = data["description"]
 
@@ -248,5 +248,34 @@ class DGTBackend(BaseBackend):
 
         # Add extra metadata
         dataset.extras["harvest:name"] = self.source.name
+        # Kept so the licence decision can be audited without going back to the
+        # source. An empty list says the source published nothing, which is not
+        # the same as a record harvested before this was read.
+        dataset.extras["harvest:legal_constraints"] = data.get("legal_constraints") or []
 
         return dataset
+
+    def _license_for(self, dataset, item: HarvestItem, data: dict):
+        """The licence the source grants, falling back the way CKAN does.
+
+        Source first, then whatever the dataset already carries, then the
+        portal default. The middle step is what lets a producer correct the
+        licence in the back office and keep the correction: before this, every
+        harvest stamped `cc-by` over it. It never falls back to `cc-by` -- that
+        constant was the bug, and `notspecified` is what the portal says when
+        it does not know.
+        """
+        license_id = license_id_from_legal_constraints(data.get("legal_constraints") or [])
+        resolved = License.objects(id=license_id).first() if license_id else None
+        if license_id and resolved is None:
+            # The portal does not carry this licence yet. Visible on purpose:
+            # silently landing on a near neighbour is how a record ends up
+            # granting more than its source does.
+            self.logger.warning(
+                "DGT record %s declares licence %r, which the portal does not have",
+                item.remote_id,
+                license_id,
+            )
+        # `default` has to be a document: Dataset.license is a ReferenceField
+        # and a raw string raises (LEDG-2315).
+        return resolved or dataset.license or License.default()
