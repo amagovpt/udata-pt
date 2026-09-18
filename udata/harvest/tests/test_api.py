@@ -1055,6 +1055,45 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         assert200(response)
         assert response.json["url"] == url
 
+    def test_get_source_anonymous_hides_config(self):
+        """Neither source route may hand the source config to a reader.
+
+        `config` is free-form -- `HarvestConfigField.pre_validate` only checks
+        `filters`, `extra_configs` and `features` -- and the CKAN family reads
+        `config["apikey"]` into an `Authorization` header, so serializing it
+        raw published the API key of every authenticated source to anyone
+        (LEDG-2514).
+        """
+        source = HarvestSourceFactory(
+            backend="ckan", config={"apikey": "sup3rs3cr3t", "filters": []}
+        )
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["config"] == {}
+        assert b"sup3rs3cr3t" not in response.data
+
+        response = self.get(url_for("api.harvest_sources"))
+        assert200(response)
+        listed = next(s for s in response.json["data"] if s["id"] == str(source.id))
+        assert listed["config"] == {}
+        assert b"sup3rs3cr3t" not in response.data
+
+    def test_get_source_owner_sees_full_config(self):
+        """Whoever may rewrite the config still needs to read it whole.
+
+        The admin harvester screen merges the form values onto the stored
+        config precisely because it holds keys no screen models, so an owner
+        who got `{}` back would wipe them on the next save.
+        """
+        user = self.login()
+        config = {"apikey": "sup3rs3cr3t", "filters": []}
+        source = HarvestSourceFactory(backend="ckan", config=config, owner=user)
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["config"] == config
+
     def test_get_job_anonymous_hides_url_credentials(self):
         """Reading a job without a session must not disclose the source password.
 
