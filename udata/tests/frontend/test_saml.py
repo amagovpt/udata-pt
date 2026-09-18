@@ -10058,3 +10058,49 @@ class InvitedFlowAuditTest(APITestCase):
         lines = [r.getMessage() for r in captured.records]
         assert len(lines) == 1, lines
         assert "reason=existing_saml" in lines[0], lines
+
+
+class MigrationInviteFlagIsWiredToTheEnvironmentTest(APITestCase):
+    """🚨 A flag that is declared and never read is a feature that ships off.
+
+    `udata.cfg` is loaded AFTER `settings.Defaults` and overrides it, so a flag
+    declared in Defaults and not read here is pinned to its default no matter
+    what the deployment sets. The feature then ships, the environment variable
+    is set, nothing happens, and nothing says why -- which is how LEDG-2438
+    spent two days marked as done without ever having worked.
+
+    This reads the config file's source, and deliberately so: no behavioural
+    test can see the difference, because a missing line and a line reading
+    `False` produce the same running app. Same reasoning as the frontend's
+    migration-flag-guard, which reads source for an invariant about what the
+    code does NOT do.
+    """
+
+    CONFIG = "udata.cfg"
+
+    def _source(self):
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[3] / self.CONFIG
+        assert path.exists(), f"config not found: {path}"
+        return path.read_text(encoding="utf-8")
+
+    def test_the_invite_flag_is_read_from_the_environment(self):
+        source = self._source()
+        assert 'MIGRATION_INVITE_ENABLED = _env_bool("MIGRATION_INVITE_ENABLED"' in source, (
+            "MIGRATION_INVITE_ENABLED is not read from the environment in udata.cfg, so "
+            "setting it in .env does nothing and the invite can never be turned on"
+        )
+
+    def test_its_default_agrees_with_the_one_in_settings(self):
+        """Two mentions of one value, not two defaults.
+
+        MIGRATION_MODE_ENABLED has three that disagree -- True here, absent
+        from Defaults, False in the reader's `.get` -- and that divergence is a
+        recorded trap. This asserts the new flag did not acquire one.
+        """
+        from udata.settings import Defaults
+
+        source = self._source()
+        assert 'MIGRATION_INVITE_ENABLED = _env_bool("MIGRATION_INVITE_ENABLED", False)' in source
+        assert Defaults.MIGRATION_INVITE_ENABLED is False

@@ -894,7 +894,7 @@ class MigrationInviteFieldTest(APITestCase):
 
 
 class MigrationLinkAvailableFieldTest(APITestCase):
-    """"Not now" must never mean "never let me".
+    """ "Not now" must never mean "never let me".
 
     🚩 This field exists because `migration_invite` goes FALSE the moment
     somebody dismisses the notice -- which is what it is for. A permanent
