@@ -1,8 +1,11 @@
 import os
+import re
+import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 
 import pytest
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.organization.factories import OrganizationFactory
@@ -10,11 +13,13 @@ from udata.core.user.factories import UserFactory
 from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
-from ..backends.ine import INEBackend, INEDownloadIncomplete
+from ..backends.ine import INE_HVD_FEED_URL, INEBackend, INEDownloadIncomplete
 from .factories import HarvestSourceFactory
 
 INE_URL = "https://www.ine.pt/ine/xml_indic.jsp?opc=2&lang=PT"
-INE_HVD_URL = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
+# Bound to the backend constant on purpose: if the feed URL moves, these fixtures
+# follow it instead of silently mocking an endpoint nothing requests any more.
+INE_HVD_URL = INE_HVD_FEED_URL
 
 COMPLETE_XML = (
     "<?xml version='1.0' encoding='UTF-8'?>\n"
@@ -133,16 +138,52 @@ class INEPrefetchDatasetsTest(PytestOnlyDBTestCase):
         assert dataset.organization == org
 
 
-def _catalog_xml(ids, revision=""):
+def _catalog_xml(
+    ids,
+    revision="",
+    periodicity=None,
+    last_update=None,
+    last_period=None,
+    geo_lastlevel=None,
+    source_description=None,
+    update_type=None,
+    metainfo_url=None,
+):
+    """Build a catalogue fixture.
+
+    Every metadata kwarg defaults to `None` meaning "element not emitted", so the fixtures
+    of the tests written before the source metadata was read stay byte-for-byte identical.
+    """
+    metainfo = f"<metainfo_url><![CDATA[{metainfo_url}]]></metainfo_url>" if metainfo_url else ""
+
+    dates = ""
+    if last_update or last_period:
+        parts = ""
+        if last_period:
+            parts += f"<last_period_available><![CDATA[{last_period}]]></last_period_available>"
+        if last_update:
+            parts += f"<last_update><![CDATA[{last_update}]]></last_update>"
+        dates = f"\n        <dates>{parts}</dates>"
+
+    extra = dates
+    if periodicity is not None:
+        extra += f"\n        <periodicity><![CDATA[{periodicity}]]></periodicity>"
+    if geo_lastlevel:
+        extra += f"\n        <geo_lastlevel><![CDATA[{geo_lastlevel}]]></geo_lastlevel>"
+    if source_description:
+        extra += f"\n        <source><![CDATA[{source_description}]]></source>"
+    if update_type:
+        extra += f"\n        <update_type><![CDATA[{update_type}]]></update_type>"
+
     indicators = "\n".join(
         f"""<indicator id='{i}'>
         <title><![CDATA[Indicador {i}]]></title>
         <description><![CDATA[Descrição {i}{revision}]]></description>
-        <html><bdd_url><![CDATA[https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod={i}]]></bdd_url></html>
+        <html><bdd_url><![CDATA[https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod={i}]]></bdd_url>{metainfo}</html>
         <json>
         <json_dataset><![CDATA[https://www.ine.pt/js/{i}.json]]></json_dataset>
         </json>
-        <keywords>INE,<![CDATA[Estatística]]></keywords>
+        <keywords>INE,<![CDATA[Estatística]]></keywords>{extra}
         </indicator>"""
         for i in ids
     )
@@ -805,3 +846,317 @@ class INEHarvestLogCredentialsTest(PytestOnlyDBTestCase):
         assert "sup3rs3cr3t" not in logged
         assert "harvestuser" not in logged
         assert "https://***@www.ine.pt" in logged
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESourceMetadataTest(PytestOnlyDBTestCase):
+    """Metadata the catalogue publishes and the backend used to hardcode or ignore."""
+
+    def _harvest(self, rmock, tmp_path, source, **kwargs):
+        rmock.get(INE_URL, text=_catalog_xml(["0001"], **kwargs))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        job = backend.harvest()
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        return job, dataset
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def test_periodicity_becomes_frequency(self, rmock, tmp_path):
+        # Leading whitespace on purpose: 13152 of the 13154 published values carry it.
+        _job, dataset = self._harvest(rmock, tmp_path, self._source(), periodicity=" Decenal")
+
+        assert dataset.frequency == UpdateFrequency.DECENNIAL
+        assert dataset.frequency != UpdateFrequency.UNKNOWN
+
+    def test_sexenal_becomes_other_rather_than_unknown(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source(), periodicity="Sexenal")
+
+        assert dataset.frequency == UpdateFrequency.OTHER
+
+    def test_unrecognised_periodicity_stays_unknown_without_failing_the_item(self, rmock, tmp_path):
+        job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="De vez em quando"
+        )
+
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+        # Degrades, never fails the item.
+        assert [item.status for item in job.items] == ["done"]
+
+    def test_missing_periodicity_stays_unknown(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source())
+
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+    def test_uri_is_the_published_bdd_url_and_extras_come_from_the_source(self, rmock, tmp_path):
+        _job, dataset = self._harvest(
+            rmock,
+            tmp_path,
+            self._source(),
+            periodicity="Mensal",
+            last_update="18-09-2026",
+            last_period="S3A202608",
+            geo_lastlevel="Portugal",
+            source_description="INE, Índice de preços",
+            update_type="A",
+            metainfo_url="https://www.ine.pt/xurl/metax/0001/PT",
+        )
+
+        # The landing page the source publishes, not the composed /indicador/<id>.
+        assert dataset.harvest.uri == (
+            "https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_indicadores&indOcorrCod=0001"
+        )
+        assert "ine.pt/indicador/" not in dataset.harvest.uri
+        assert dataset.extras["geo_lastlevel"] == "Portugal"
+        assert dataset.extras["source_description"] == "INE, Índice de preços"
+        assert dataset.extras["last_period_available"] == "S3A202608"
+        assert dataset.extras["last_update_remote"] == "18-09-2026"
+        assert dataset.extras["update_type"] == "A"
+        assert dataset.extras["metainfo_url"] == "https://www.ine.pt/xurl/metax/0001/PT"
+
+    def test_optional_update_type_is_absent_when_the_source_omits_it(self, rmock, tmp_path):
+        """Published for ~5% of indicators, so its absence is the normal case."""
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Anual", geo_lastlevel="Portugal"
+        )
+
+        assert "update_type" not in dataset.extras
+        assert dataset.extras["geo_lastlevel"] == "Portugal"
+
+    def test_source_tag_is_derived_from_the_source_hostname(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source())
+
+        # Derived from the source URL, not a literal: www.ine.pt -> www-ine-pt.
+        assert "www-ine-pt" in dataset.tags
+        assert "ine-pt" not in dataset.tags
+
+    def test_source_tag_follows_a_source_on_another_host(self, rmock, tmp_path):
+        """The tag tracks the configured source, which is what "derived" has to mean."""
+        source = HarvestSourceFactory(
+            backend="ine",
+            url="https://ine.example.test/ine/xml_indic.jsp?opc=2",
+            organization=OrganizationFactory(),
+        )
+        rmock.get("https://ine.example.test/ine/xml_indic.jsp?opc=2", text=_catalog_xml(["0001"]))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.harvest()
+
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        assert "ine-example-test" in dataset.tags
+
+    def test_modified_at_is_the_source_last_update_not_the_harvest_time(self, rmock, tmp_path):
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        # 4 February, not 2 April: the shared date parser would read this one month-first.
+        assert dataset.harvest.modified_at.year == 2026
+        assert dataset.harvest.modified_at.month == 2
+        assert dataset.harvest.modified_at.day == 4
+
+    def test_modified_at_survives_a_second_harvest_without_source_changes(self, rmock, tmp_path):
+        """Criterion 2: the stored date must not drift to "now" on the next run."""
+        source = self._source()
+        _job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"
+        )
+        first = dataset.harvest.modified_at
+
+        job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        assert [item.status for item in job.items] == ["skipped"]
+        assert dataset.harvest.modified_at == first
+
+    def test_missing_last_update_falls_back_to_the_harvest_time(self, rmock, tmp_path):
+        _job, dataset = self._harvest(rmock, tmp_path, self._source(), periodicity="Anual")
+
+        assert dataset.harvest.modified_at is not None
+
+    def test_unparseable_last_update_falls_back_to_the_harvest_time(self, rmock, tmp_path):
+        job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Anual", last_update="2026/09/18"
+        )
+
+        assert dataset.harvest.modified_at is not None
+        assert [item.status for item in job.items] == ["done"]
+        # The raw text is still kept, so nothing the source said is lost.
+        assert dataset.extras["last_update_remote"] == "2026/09/18"
+
+    def test_remote_url_and_uri_agree_when_the_source_drops_the_landing_page(self, rmock, tmp_path):
+        """Both fields hold the landing page, so both have to follow the source.
+
+        Clearing one and leaving the other would keep feeding dcat:landingPage a URL the
+        feed no longer publishes.
+        """
+        source = self._source()
+        self._harvest(rmock, tmp_path, source, periodicity="Mensal")
+
+        xml = re.sub(
+            r"<bdd_url>.*?</bdd_url>", "", _catalog_xml(["0001"], periodicity="Mensal"), flags=re.S
+        )
+        rmock.get(INE_URL, text=xml)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.harvest()
+
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        assert dataset.harvest.uri is None
+        assert dataset.harvest.remote_url is None
+
+    def test_harvest_backend_is_the_display_name(self, rmock, tmp_path):
+        """Stamped by hand here, because this backend never reaches the base class helper."""
+        _job, dataset = self._harvest(rmock, tmp_path, self._source())
+
+        assert dataset.harvest.backend == INEBackend.display_name
+        assert dataset.harvest.backend != "ine"
+        assert dataset.harvest.backend
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEHasChangedTest(PytestOnlyDBTestCase):
+    """Change detection has to see the metadata the backend only just started writing.
+
+    `_has_changed` compared title, description, tags and resources. A dataset harvested by
+    the previous code matches on all four, so without the new comparisons the ~13k INE
+    datasets already stored would be reported unchanged and skipped forever, and the
+    enrichment would never reach production.
+
+    These call `_has_changed` directly rather than only asserting on a full harvest: the
+    source tag changes in this ticket too, so an end-to-end test would go green through the
+    tags branch even if the new comparisons had never been written.
+    """
+
+    FIXTURE = dict(
+        periodicity="Mensal",
+        last_update="04-02-2026",
+        last_period="S3A202608",
+        geo_lastlevel="Portugal",
+        source_description="INE, Índice de preços",
+        update_type="A",
+        metainfo_url="https://www.ine.pt/xurl/metax/0001/PT",
+    )
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def _harvest(self, rmock, tmp_path, source):
+        rmock.get(INE_URL, text=_catalog_xml(["0001"], **self.FIXTURE))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def _backend_and_md(self, source):
+        backend = INEBackend(source)
+        element = ET.fromstring(_catalog_xml(["0001"], **self.FIXTURE)).find("indicator")
+        return backend, backend._extract_metadata(element)
+
+    def _dataset(self, source):
+        return Dataset.objects(
+            __raw__={"harvest.source_id": str(source.id), "harvest.remote_id": "0001"}
+        ).first()
+
+    def _as_the_old_code_left_it(self, source, rmock, tmp_path, **overrides):
+        """A stored dataset in the shape the previous implementation produced."""
+        self._harvest(rmock, tmp_path, source)
+        dataset = self._dataset(source)
+        Dataset.objects(id=dataset.id).update(**overrides)
+        return self._dataset(source)
+
+    def test_a_dataset_already_carrying_the_source_metadata_is_unchanged(self, rmock, tmp_path):
+        """The baseline: without it, the tests below would prove nothing."""
+        source = self._source()
+        self._harvest(rmock, tmp_path, source)
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(self._dataset(source), md, "0001") is False
+
+    def test_missing_extras_alone_are_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(source, rmock, tmp_path, set__extras={})
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_stale_frequency_alone_is_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(source, rmock, tmp_path, set__frequency="unknown")
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_invented_uri_alone_is_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(
+            source, rmock, tmp_path, set__harvest__uri="https://www.ine.pt/indicador/0001"
+        )
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_existing_dataset_without_the_new_metadata_is_rewritten_on_the_next_harvest(
+        self, rmock, tmp_path
+    ):
+        """Criterion 4, end to end: detected as changed *and* actually enriched."""
+        source = self._source()
+        self._as_the_old_code_left_it(
+            source,
+            rmock,
+            tmp_path,
+            set__frequency="unknown",
+            set__extras={},
+            set__harvest__uri="https://www.ine.pt/indicador/0001",
+        )
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["done"]
+        dataset = self._dataset(source)
+        assert dataset.frequency == UpdateFrequency.MONTHLY
+        assert dataset.extras["geo_lastlevel"] == "Portugal"
+        assert dataset.extras["metainfo_url"] == "https://www.ine.pt/xurl/metax/0001/PT"
+        assert "indicador/0001" not in dataset.harvest.uri
+
+    def test_the_enriching_harvest_keeps_the_resource_ids(self, rmock, tmp_path):
+        """Criterion 7: the rewrite that adds the metadata must not move a permalink."""
+        source = self._source()
+        self._as_the_old_code_left_it(
+            source, rmock, tmp_path, set__frequency="unknown", set__extras={}
+        )
+        before = [r.id for r in self._dataset(source).resources]
+        assert before
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["done"]
+        assert [r.id for r in self._dataset(source).resources] == before
+
+    def test_an_indicator_without_bdd_url_settles_instead_of_churning(self, rmock, tmp_path):
+        """No landing page published means no URI stored — and no nightly rewrite.
+
+        Every indicator publishes bdd_url today, but if one stopped, a stored URI the feed
+        no longer backs would otherwise differ from the extracted dict on every single
+        harvest and rewrite the dataset forever.
+        """
+        source = self._source()
+        xml = _catalog_xml(["0001"], **self.FIXTURE)
+        xml = re.sub(r"<bdd_url>.*?</bdd_url>", "", xml, flags=re.S)
+        rmock.get(INE_URL, text=xml)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.harvest()
+
+        rmock.get(INE_URL, text=xml)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        job = backend.harvest()
+
+        assert [item.status for item in job.items] == ["skipped"]
