@@ -1,10 +1,145 @@
+import re
 from urllib.parse import parse_qs, urlparse
 
+from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
 
 from .tools.harvester_utils import sync_resources
+
+# The SNIG index publishes the licence as free text inside `legalConstraints`.
+# It is never fed to `License.guess`: that falls back to a Damerau-Levenshtein
+# match over every licence slug and title, and free text of a thousand
+# characters would resolve to whatever happens to be closest. Instead a
+# canonical Creative Commons code is extracted first -- from a licence URL, or
+# from the code spelled out in the text -- and only that is looked up.
+
+# Tolerates the two defects the source really carries: the domain misspelled
+# `creativecoomons` (two o's, one m), and a version path written `by4.0`
+# without the separating slash.
+CC_LICENSE_URL_RE = re.compile(
+    r"creativec(?:o|oo)m{1,2}ons\.org/licenses/(by(?:-nc)?(?:-sa|-nd)?)/?\d", re.IGNORECASE
+)
+
+# `CC-BY-4.0`, `CC BY 4.0`, `CC BY-NC-ND 4.0`, `CC-BY-SA-4.0`, `(CC-BY)`.
+CC_LICENSE_CODE_RE = re.compile(r"CC[\s-]?BY(?:[\s-]?NC)?(?:[\s-]?ND|[\s-]?SA)?", re.IGNORECASE)
+
+
+# A restriction on commercial use that is part of the grant itself, as the
+# Azores (SRAAC/DRPM) records word it. Deliberately narrow around the WORD
+# "comercial": the SNIT records say "interdita a sua comercializacao" about
+# what the portal shows, and matching that would turn the largest slice of the
+# source on a restriction that is not aimed at the data.
+NON_COMMERCIAL_GRANT_RE = re.compile(
+    r"(?:usos?|fins|utiliza[\u00e7c][\u00e3a]o)\s+n[\u00e3a]o[\s-]*comercia"
+    r"|proibid[ao]s?\b[^.]{0,200}\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
+    r"|(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial\b[^.]{0,200}\bproibid"
+    r"|n[\u00e3a]o\s+(?:\u00e9\s+)?(?:permitid|autorizad)[ao]\b[^.]{0,200}\b(?:uso|utiliza[\u00e7c][\u00e3a]o)\s+comercial"
+    r"|non[\s-]?commercial\s+use\s+only",
+    re.IGNORECASE,
+)
+
+# The source decides how long its own prose is, so the bounds are ours to set.
+# Three of the patterns above are of the form `<word>[^.]{0,200}<word>`: the
+# gap is bounded because an unbounded `[^.]*` is quadratic in the length of a
+# run without a full stop, and legal prose with the stops removed turned into
+# 7.9s of CPU per 128 KiB record -- reachable through the harvest preview
+# endpoint, which runs synchronously on an HTTP worker.
+MAX_CONSTRAINT_ENTRIES = 20
+MAX_CONSTRAINT_LENGTH = 5000
+# Past this the record is not decided at all rather than decided on a prefix:
+# truncating could cut off the very restriction that withholds the licence.
+MAX_DECIDABLE_LENGTH = 20000
+
+# The licence THIS backend last wrote. Without it, a licence the harvester
+# derived and one a producer corrected by hand are the same value in the
+# database, and the fallback below cannot tell them apart.
+DERIVED_LICENSE_EXTRA = "harvest:derived_license"
+
+CC_CODE_TO_LICENSE_ID = {
+    "by": "cc-by",
+    "by-sa": "cc-by-sa",
+    "by-nc": "cc-by-nc",
+    "by-nc-nd": "cc-by-nc-nd",
+    # Neither of these exists in the portal's licence list, deliberately: a
+    # record carrying one resolves to an id that is looked up, not found, and
+    # logged -- which is visible, unlike silently landing on a near neighbour.
+    "by-nd": "cc-by-nd",
+    "by-nc-sa": "cc-by-nc-sa",
+}
+
+# Codes that already say "no commercial use" or "no derivatives" on their own.
+RESTRICTIVE_CC_CODES = frozenset({"by-nc", "by-nc-nd", "by-nd", "by-nc-sa"})
+
+
+def _cc_codes(entry: str) -> set[str]:
+    """Every Creative Commons code this entry declares.
+
+    Both branches are read rather than the first that answers: a text granting
+    CC BY-NC while linking creativecommons.org/licenses/by/4.0 as boilerplate
+    would otherwise be read as the more permissive of the two, purely because
+    the URL happens to be looked at first.
+    """
+    codes = {match.group(1).lower() for match in CC_LICENSE_URL_RE.finditer(entry)}
+    for match in CC_LICENSE_CODE_RE.finditer(entry):
+        # `CC BY-NC-ND`, `CC-BY-NC-ND` and `CCBY-NC-ND` are one code written
+        # three ways. The prefix is stripped after the separators collapse, so
+        # the spelling without one normalizes too instead of becoming garbage
+        # that is silently dropped.
+        code = re.sub(r"[\s-]+", "-", match.group(0).strip()).lower()
+        codes.add(re.sub(r"^cc-?", "", code))
+    return codes
+
+
+def _grant_is_restricted(text: str) -> bool:
+    """Whether the record's own grant forbids commercial use.
+
+    Where the restriction appears is what decides. The Azores records grant
+    CC BY and restrict commercial use of the DATA in the same breath, so the
+    grant does not hold. The SNIT records forbid commercialising what the SNIT
+    PORTAL shows and then grant CC BY over the geographic information itself,
+    which is a restriction on the viewer, not on the data -- and CC BY 4.0
+    permits commercial use by definition, so reading it the other way would
+    make the record contradict itself.
+
+    Read over the record's entries joined together rather than one by one:
+    ISO 19115 separates use constraints from other constraints, so a grant and
+    the restriction qualifying it routinely arrive as two different strings.
+    The check runs whether the code came from a URL or from the text, because
+    the Azores wording ends with the CC BY URL.
+    """
+    return bool(NON_COMMERCIAL_GRANT_RE.search(text))
+
+
+def license_id_from_legal_constraints(constraints: list[str]) -> str | None:
+    """The udata licence id the source grants, or None when it grants none.
+
+    None is not "cc-by by default" -- that constant is the bug this replaces.
+    The caller turns it into the portal's default licence.
+    """
+    text = " ".join(constraints)
+    if len(text) > MAX_DECIDABLE_LENGTH:
+        # Fail closed: no licence, rather than one read off a prefix.
+        return None
+
+    restricted = _grant_is_restricted(text)
+
+    found = set()
+    for entry in constraints:
+        codes = {code for code in _cc_codes(entry) if code in CC_CODE_TO_LICENSE_ID}
+        if len(codes) != 1:
+            # Nothing recognisable, or one entry naming two different
+            # licences, which grants neither.
+            continue
+        code = codes.pop()
+        if code not in RESTRICTIVE_CC_CODES and restricted:
+            continue
+        found.add(CC_CODE_TO_LICENSE_ID[code])
+
+    if len(found) == 1:
+        return found.pop()
+    return None
 
 
 class DGTBackend(BaseBackend):
@@ -18,6 +153,34 @@ class DGTBackend(BaseBackend):
         import logging
 
         self.logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _legal_constraints(record: dict) -> list[str]:
+        """Normalize the record's `legalConstraints` into a list of strings.
+
+        The GeoNetwork index publishes it as a list for most records and as a
+        bare string for some, and omits it entirely for others. Everything
+        downstream reads the licence out of these strings, so the shape is
+        settled once, here, rather than at every reading.
+        """
+        constraints = record.get("legalConstraints")
+        if isinstance(constraints, str):
+            constraints = [constraints]
+        elif not isinstance(constraints, list):
+            return []
+
+        entries = []
+        for entry in constraints[:MAX_CONSTRAINT_ENTRIES]:
+            if not isinstance(entry, str):
+                continue
+            # Sanitized here for the same reason ine.py and inehvd.py sanitize
+            # what they put in extras: extras are marshalled raw by the API and
+            # copied into the search document, and nothing downstream cleans
+            # them -- pre_save only covers title and description.
+            entry = sanitize_strict(entry).strip()[:MAX_CONSTRAINT_LENGTH]
+            if entry:
+                entries.append(entry)
+        return entries
 
     def inner_harvest(self):
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
@@ -58,6 +221,7 @@ class DGTBackend(BaseBackend):
                 "description": each.get("defaultAbstract"),
                 "resources": each.get("link"),
                 "keywords": each.get("keyword"),
+                "legal_constraints": self._legal_constraints(each),
             }
             # if each.get("publicationDate"):
             #    item["date"] = datetime.strptime(each.get("publicationDate"),
@@ -101,7 +265,7 @@ class DGTBackend(BaseBackend):
 
         # Set basic dataset fields
         dataset.title = data["title"]
-        dataset.license = License.guess("cc-by")
+        dataset.license = self._license_for(dataset, item, data)
         dataset.tags = ["snig.dgterritorio.gov.pt"]
         dataset.description = data["description"]
 
@@ -137,5 +301,54 @@ class DGTBackend(BaseBackend):
 
         # Add extra metadata
         dataset.extras["harvest:name"] = self.source.name
+        # Kept so the licence decision can be audited without going back to the
+        # source. An empty list says the source published nothing, which is not
+        # the same as a record harvested before this was read.
+        dataset.extras["harvest:legal_constraints"] = data.get("legal_constraints") or []
 
         return dataset
+
+    def _license_for(self, dataset, item: HarvestItem, data: dict):
+        """The licence the source grants, falling back the way CKAN does.
+
+        Source first, then a correction a producer made by hand, then the
+        portal default. It never falls back to `cc-by` -- that constant was the
+        bug, and `notspecified` is what the portal says when it does not know.
+
+        The middle step is the delicate one. Keeping whatever the dataset
+        already carries is what lets a producer's correction survive a harvest,
+        but applied blindly it also makes the licence irrevocable: a source that
+        stops granting CC BY would never take it back, because the value we
+        wrote ourselves last night is indistinguishable from an editorial
+        decision. So what this backend derived is recorded, and only a licence
+        that differs from it is treated as somebody's correction.
+        """
+        license_id = license_id_from_legal_constraints(data.get("legal_constraints") or [])
+        resolved = License.objects(id=license_id).first() if license_id else None
+        if license_id and resolved is None:
+            # The portal does not carry this licence yet. Visible on purpose:
+            # silently landing on a near neighbour is how a record ends up
+            # granting more than its source does.
+            self.logger.warning(
+                "DGT record %r declares licence %r, which the portal does not have",
+                item.remote_id,
+                license_id,
+            )
+
+        if resolved is not None:
+            dataset.extras[DERIVED_LICENSE_EXTRA] = resolved.id
+            return resolved
+
+        # The source grants nothing. Anything on the dataset that is not what
+        # we last wrote is a correction, and stays.
+        current = dataset.license
+        if current is not None and current.id != dataset.extras.get(DERIVED_LICENSE_EXTRA):
+            dataset.extras.pop(DERIVED_LICENSE_EXTRA, None)
+            return current
+
+        # `default` has to be a document: Dataset.license is a ReferenceField
+        # and a raw string raises (LEDG-2315).
+        default = License.default()
+        if default is not None:
+            dataset.extras[DERIVED_LICENSE_EXTRA] = default.id
+        return default
