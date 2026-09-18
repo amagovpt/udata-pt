@@ -9254,3 +9254,65 @@ class SAMLFunnelAuditOutcomeTest(APITestCase):
 
         active.reload()
         assert active.login_count == 1
+
+
+class MigrationInviteFlagTest(APITestCase):
+    """The two flags, and the one combination that needs arbitrating.
+
+    MIGRATION_MODE_ENABLED answers "is linking mandatory?" and
+    MIGRATION_INVITE_ENABLED answers "do we invite?". Four combinations, and
+    the whole reason for a second flag is that a single one cannot express
+    the third row of this table: invite without forcing.
+
+    🚨 The default is asserted here too, and not as an afterthought. A True
+    default would put every test in this file that only switches the mandatory
+    flag off into invite mode without saying so -- and those tests assert that
+    an unmatched identity CREATES an account, which is exactly what invite
+    mode stops doing. The flag defaulting to False is what keeps their
+    meaning; enabling it is a deployment decision.
+    """
+
+    def _invite(self, mandatory, invite):
+        from udata.auth.saml.saml_plugin.saml_govpt import _invite_enabled
+
+        with self.app.app_context():
+            self.app.config["MIGRATION_MODE_ENABLED"] = mandatory
+            self.app.config["MIGRATION_INVITE_ENABLED"] = invite
+            return _invite_enabled()
+
+    def test_neither_flag_is_todays_behaviour(self):
+        assert self._invite(mandatory=False, invite=False) is False
+
+    def test_invite_only_is_what_we_want_now(self):
+        assert self._invite(mandatory=False, invite=True) is True
+
+    def test_mandatory_only_leaves_the_invite_off(self):
+        assert self._invite(mandatory=True, invite=False) is False
+
+    def test_mandatory_wins_over_the_invite(self):
+        """The arbitration, and the only row a reader could get wrong.
+
+        Inviting somebody to do optionally what the portal is about to refuse
+        them for not having done is not a state worth having. Decided here so
+        no call site has to combine two flags on the spot -- every branch
+        downstream reads one function and gets a decision.
+        """
+        assert self._invite(mandatory=True, invite=True) is False
+
+    def test_the_only_default_is_false(self):
+        """One default, in one place -- the opposite of the flag it sits next to.
+
+        MIGRATION_MODE_ENABLED has three divergent defaults (udata.cfg True,
+        class Testing True, and the reader's own `.get(..., False)`), which is
+        a recorded trap. Asserting the settings default and the reader's
+        fallback AGREE is what stops this flag acquiring a second one.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _invite_enabled
+        from udata.settings import Defaults
+
+        assert Defaults.MIGRATION_INVITE_ENABLED is False
+
+        with self.app.app_context():
+            self.app.config["MIGRATION_MODE_ENABLED"] = False
+            self.app.config.pop("MIGRATION_INVITE_ENABLED", None)
+            assert _invite_enabled() is False

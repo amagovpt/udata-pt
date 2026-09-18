@@ -183,6 +183,30 @@ class Defaults(object):
         "no-reply@data.gouv.fr"  # Should be a contact email for account rescue
     )
 
+    # CMD/eIDAS account linking — TWO flags, one question each.
+    #
+    #   MIGRATION_MODE_ENABLED   -> "is linking mandatory?"
+    #   MIGRATION_INVITE_ENABLED -> "do we invite?"
+    #
+    # They are separate because a single flag cannot express the state the
+    # portal is actually in: inviting without forcing. Hanging a fourth
+    # question on MIGRATION_MODE_ENABLED would mean reading `not
+    # _migration_enabled()` as "we are in invite mode", which makes a negation
+    # stand for a feature. The practical payoff decides it: turning the invite
+    # off restores today's behaviour WITHOUT turning the mandatory mode on.
+    #
+    # DEFAULT False, and deliberately not True even though the portal turns it
+    # on. A True default would put every test that only switches the mandatory
+    # flag off into invite mode without saying so, and the ACS would divert
+    # where those tests expect an account to be created. Enabling it is a
+    # deployment decision, exactly as it already is for the mandatory flag.
+    #
+    # This is the ONLY default for this flag. MIGRATION_MODE_ENABLED has three
+    # divergent ones (udata.cfg True, class Testing True, the reader's own
+    # `.get(..., False)`), which is a recorded trap in LEDG-2430 — not a
+    # pattern to copy.
+    MIGRATION_INVITE_ENABLED = False
+
     # Inactive users settings
     YEARS_OF_INACTIVITY_BEFORE_DELETION = None
     DAYS_BEFORE_ACCOUNT_INACTIVITY_NOTIFY_DELAY = 30

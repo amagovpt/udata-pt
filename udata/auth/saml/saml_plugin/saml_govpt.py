@@ -3884,6 +3884,25 @@ def _migration_enabled():
     return current_app.config.get("MIGRATION_MODE_ENABLED", False)
 
 
+def _invite_enabled():
+    """True when the OPTIONAL linking invite is on, and the mandatory mode is not.
+
+    Two flags, one question each: MIGRATION_MODE_ENABLED asks "is linking
+    mandatory?", MIGRATION_INVITE_ENABLED asks "do we invite?". Of the four
+    combinations only one needs arbitrating, and it is arbitrated here rather
+    than at each call site: with BOTH on, the mandatory mode wins. Inviting
+    somebody to do optionally what the portal is about to refuse them for not
+    having done is not a state worth having, and leaving the precedence to be
+    re-derived by each reader is how two of them end up disagreeing.
+
+    So every branch downstream reads exactly one of the two functions and gets
+    a decision, never a pair of flags to combine on the spot.
+    """
+    if _migration_enabled():
+        return False
+    return bool(current_app.config.get("MIGRATION_INVITE_ENABLED", False))
+
+
 @autenticacao_gov.route("/saml/migration/check", methods=["GET"])
 @csrf.exempt
 def migration_check():
