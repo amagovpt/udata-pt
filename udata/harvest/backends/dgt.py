@@ -19,6 +19,22 @@ class DGTBackend(BaseBackend):
 
         self.logger = logging.getLogger(__name__)
 
+    @staticmethod
+    def _legal_constraints(record: dict) -> list[str]:
+        """Normalize the record's `legalConstraints` into a list of strings.
+
+        The GeoNetwork index publishes it as a list for most records and as a
+        bare string for some, and omits it entirely for others. Everything
+        downstream reads the licence out of these strings, so the shape is
+        settled once, here, rather than at every reading.
+        """
+        constraints = record.get("legalConstraints")
+        if isinstance(constraints, str):
+            constraints = [constraints]
+        elif not isinstance(constraints, list):
+            return []
+        return [entry.strip() for entry in constraints if isinstance(entry, str) and entry.strip()]
+
     def inner_harvest(self):
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
         # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
@@ -58,6 +74,7 @@ class DGTBackend(BaseBackend):
                 "description": each.get("defaultAbstract"),
                 "resources": each.get("link"),
                 "keywords": each.get("keyword"),
+                "legal_constraints": self._legal_constraints(each),
             }
             # if each.get("publicationDate"):
             #    item["date"] = datetime.strptime(each.get("publicationDate"),

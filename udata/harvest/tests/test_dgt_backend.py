@@ -1,4 +1,4 @@
-"""Resource identity across DGT harvests (LEDG-2251)."""
+"""DGT harvester: resource identity (LEDG-2251) and licence derivation (LEDG-2518)."""
 
 import pytest
 
@@ -59,3 +59,31 @@ class DGTResourceIdentityTest(PytestOnlyDBTestCase):
 
         assert resource_urls(REMOTE_ID) == [WMS_URL]
         assert resource_ids(REMOTE_ID) == [wms_id]
+
+
+class DGTLegalConstraintsFieldTest:
+    """`legalConstraints` comes in three shapes from the GeoNetwork index."""
+
+    def test_a_list_is_kept_as_is(self):
+        record = {
+            "legalConstraints": [
+                "Acesso público sem restrições",
+                "Direitos de Propriedade Intelectual",
+            ]
+        }
+        assert DGTBackend._legal_constraints(record) == [
+            "Acesso público sem restrições",
+            "Direitos de Propriedade Intelectual",
+        ]
+
+    def test_a_bare_string_becomes_a_list(self):
+        record = {"legalConstraints": "Sem restrições"}
+        assert DGTBackend._legal_constraints(record) == ["Sem restrições"]
+
+    def test_a_missing_field_is_empty(self):
+        assert DGTBackend._legal_constraints({}) == []
+        assert DGTBackend._legal_constraints({"legalConstraints": None}) == []
+
+    def test_blank_and_non_string_entries_are_dropped(self):
+        record = {"legalConstraints": ["  Sem restrições  ", "", "   ", None, 42]}
+        assert DGTBackend._legal_constraints(record) == ["Sem restrições"]
