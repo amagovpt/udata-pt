@@ -26,10 +26,12 @@ from flask import session
 
 from udata.app import limiter
 from udata.auth.saml.saml_plugin.saml_govpt import (
+    _consume_link_intent,
     _consume_outstanding_relay,
     _hash_nic,
     _new_relay_state_token,
     _normalize_idp_metadata_certs,
+    _store_link_intent,
     _store_outstanding_relay,
 )
 from udata.core.user.factories import UserFactory
@@ -9509,3 +9511,110 @@ class MigrationInviteDismissTest(APITestCase):
         self.app.config["MIGRATION_INVITE_ENABLED"] = True
         linked = UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")})
         assert self._offered(linked) is False
+
+
+class LinkStartRouteTest(APITestCase):
+    """The door that had to be built, and the ticket that rides with it.
+
+    🚨 The reason these routes exist at all: /saml/login is decorated
+    @anonymous_user_required, which is right for a way IN and exactly wrong
+    for somebody who just signed in with a password and wants to add an
+    identity. Without a door of their own the invite's button bounces off the
+    sign-in route and nothing happens -- and nothing is the failure that looks
+    like the feature was never wired.
+    """
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def test_an_anonymous_caller_is_refused(self):
+        self._invite_on()
+        assert self.client.get("/saml/link/start").status_code == 401
+        assert self.client.get("/saml/eidas/link/start").status_code == 401
+
+    def test_the_door_is_shut_when_the_invite_is_off(self):
+        """Not decoration: the flag may have been turned off since the notice
+        was rendered, and the button is still on somebody's screen."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        self.login(UserFactory(password="x" * 12))
+        assert self.client.get("/saml/link/start").status_code == 403
+
+    def test_an_already_linked_account_is_refused(self):
+        """The account may have linked in another tab since the invite was
+        rendered. A door that opens on a stale notice links twice."""
+        self._invite_on()
+        self.login(UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")}))
+        assert self.client.get("/saml/link/start").status_code == 409
+
+    def test_a_dismissed_invite_can_still_be_walked_back_into(self):
+        """Dismissing is "not now", never "never let me".
+
+        The permanent way back is an acceptance criterion, and this is the
+        half of it that lives in the backend: the route checks that there is
+        something to link, NOT that a notice is currently being shown.
+        """
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        self._invite_on()
+        user = UserFactory(
+            password="x" * 12,
+            extras={MIGRATION_INVITE_DISMISSED_AT: datetime.utcnow().isoformat()},
+        )
+        self.login(user)
+
+        response = self.client.get("/saml/link/start")
+        assert response.status_code == 200
+
+
+class LinkIntentTest(APITestCase):
+    """The ticket that survives the round-trip, and what it may decide.
+
+    🚨 It cannot travel in the session. The IdP posts the assertion back
+    cross-site, and with SESSION_COOKIE_SAMESITE=Lax the browser does not send
+    the session cookie on that POST -- so current_user at the ACS is anonymous
+    even for somebody who signed in seconds earlier. That is the same fact
+    that made the outstanding bucket ride RelayState, and this rides beside it.
+    """
+
+    def test_the_intent_survives_the_round_trip_and_is_single_use(self):
+        cache = _InMemoryCache()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            token = _new_relay_state_token()
+            _store_link_intent(token, "6510f0aabbccddeeff001122")
+
+            assert _consume_link_intent(token) == "6510f0aabbccddeeff001122"
+            # Single use: a replayed RelayState must not re-open the flow.
+            assert _consume_link_intent(token) is None
+
+    def test_an_unknown_or_empty_token_yields_nothing(self):
+        cache = _InMemoryCache()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            assert _consume_link_intent("") is None
+            assert _consume_link_intent(None) is None
+            assert _consume_link_intent(_new_relay_state_token()) is None
+
+    def test_no_user_means_no_intent_is_written(self):
+        """The sign-in route calls the same builder with no id, and must not
+        leave a ticket behind that a later callback could pick up."""
+        cache = _InMemoryCache()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            token = _new_relay_state_token()
+            _store_link_intent(token, None)
+            assert _consume_link_intent(token) is None
+
+    def test_a_cache_that_is_down_degrades_to_todays_behaviour(self):
+        """No intent means the callback is treated as a plain sign-in.
+
+        Worse than linking, and deliberately better than a 500 on a flow the
+        person cannot retry -- they end up with an account to merge rather
+        than an error page.
+        """
+        broken = MagicMock()
+        broken.set.side_effect = RuntimeError("redis down")
+        broken.get.side_effect = RuntimeError("redis down")
+        with self.app.test_request_context(), patch("udata.app.cache", broken):
+            token = _new_relay_state_token()
+            _store_link_intent(token, "6510f0aabbccddeeff001122")
+            assert _consume_link_intent(token) is None

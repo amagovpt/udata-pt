@@ -422,6 +422,13 @@ _REPLAY_CACHE_KEY = "saml_consumed:{kind}:{response_id}"
 _OUTSTANDING_RELAY_KEY = "saml_outstanding_relay:{token}"
 _OUTSTANDING_RELAY_TTL = 600  # 10 minutes — enough for the user to complete CMD
 _OUTSTANDING_RELAY_TOKEN_BYTES = 32
+# Keyed by the same RelayState token as the outstanding bucket, and for the
+# same reason: the session cookie does not survive the IdP's cross-site POST,
+# so anything the callback needs to know about how the round-trip STARTED has
+# to travel in the SAML form payload. Holds the id of the account that asked
+# to link, and nothing else — see _store_link_intent for what that is and is
+# not allowed to decide.
+_LINK_INTENT_KEY = "saml_link_intent:{token}"
 
 # CMD (autenticacao.gov MDC) attribute URIs — used both in the AuthnRequest
 # RequestedAttributes and in the SSO postback extraction.
@@ -683,6 +690,70 @@ def _store_outstanding_relay(relay_token, reqid, kind):
             "falling back to session cookie only",
             exc_info=True,
         )
+
+
+def _store_link_intent(relay_token, user_id):
+    """Remember that this SAML round-trip was started to LINK an account.
+
+    🚨 The session cannot carry this. The IdP returns the assertion in a
+    cross-site POST, and with ``SESSION_COOKIE_SAMESITE=Lax`` the browser does
+    not send the session cookie on it — so ``current_user`` at the ACS is
+    anonymous even for somebody who was signed in a moment ago. That is the
+    same fact that made ``_store_outstanding_relay`` necessary, and this rides
+    the same RelayState-keyed bucket for the same reason.
+
+    🔑 WHAT THIS IS ALLOWED TO DECIDE, and it is deliberately small: it says
+    "whoever comes back this way is linking, not signing up", and nothing
+    else. It does NOT authorise binding the identity to that account. Proof of
+    ownership stays where it already is — the wizard, by password or by a link
+    mailed to the account's own address — so a stolen intent buys an attacker
+    a screen asking for the victim's password.
+
+    Single use, and the same TTL as the outstanding bucket it travels beside:
+    ten minutes is a CMD sign-in, not a window somebody can sit on.
+    """
+    if not relay_token or not user_id:
+        return
+    from udata.app import cache
+
+    try:
+        cache.set(
+            _LINK_INTENT_KEY.format(token=relay_token),
+            str(user_id),
+            timeout=_OUTSTANDING_RELAY_TTL,
+        )
+    except Exception:
+        # Non-fatal, and the degraded behaviour is today's: with no intent the
+        # ACS treats the sign-in as any other, which may create an account the
+        # person then has to merge. Worse than linking, better than a 500 on a
+        # flow they cannot retry.
+        current_app.logger.warning(
+            "SAML: failed to persist link intent; the callback will be treated as a plain sign-in",
+            exc_info=True,
+        )
+
+
+def _consume_link_intent(relay_token):
+    """Return and delete the link intent stored under ``relay_token``.
+
+    Returns None when the token is empty, unknown, already used, or the cache
+    is unavailable — in every one of those cases the caller must fall back to
+    the ordinary sign-in path rather than guess, which is why there is no
+    second source to consult.
+    """
+    if not isinstance(relay_token, str) or not relay_token:
+        return None
+    from udata.app import cache
+
+    key = _LINK_INTENT_KEY.format(token=relay_token)
+    try:
+        user_id = cache.get(key)
+        if user_id:
+            cache.delete(key)
+        return user_id or None
+    except Exception:
+        current_app.logger.warning("SAML: failed to read link intent", exc_info=True)
+        return None
 
 
 def _consume_outstanding_relay(relay_token):
@@ -2734,6 +2805,21 @@ def saml_client_for(metadata_file):
 @autenticacao_gov.route("/saml/login")
 @anonymous_user_required
 def sp_initiated():
+    """Start a CMD sign-in. Anonymous callers only -- this is a way IN."""
+    return _begin_cmd_authn_request()
+
+
+def _begin_cmd_authn_request(link_user_id=None):
+    """Build and return the CMD AuthnRequest form.
+
+    Shared by the sign-in route and the linking route so the request itself --
+    the requested attributes, the assurance level, the outstanding bucket --
+    has ONE definition. Two copies of this is how the two ACS handlers already
+    drifted apart once, and that divergence is what LEDG-2506 cost.
+
+    ``link_user_id`` is the only difference between the two callers: present,
+    it records that the callback belongs to an account asking to link.
+    """
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
@@ -2883,6 +2969,7 @@ def sp_initiated():
     # POST and emptying the bucket on the callback. RelayState rides
     # the form payload end-to-end so the bucket survives that path too.
     _store_outstanding_relay(relay_token, reqid, kind="cmd")
+    _store_link_intent(relay_token, link_user_id)
     # TEMP DIAG (remove after PPR is green): confirm bucket landed in Redis.
     try:
         from udata.app import cache as _diag_cache
@@ -2900,6 +2987,66 @@ def sp_initiated():
         list(session.get(_OUTSTANDING_SESSION_KEY, {}).keys()),
     )
     return _extract_saml_form_data(info["data"])
+
+
+#################################################################
+# Starts a CMD/eIDAS link from an account that is already signed in.
+##
+#################################################################
+
+
+def _refuse_link_start():
+    """The checks both linking routes share, or None when the caller may pass.
+
+    🚨 These routes exist BECAUSE ``sp_initiated`` cannot serve this: it is
+    decorated ``@anonymous_user_required``, which is correct for a way in and
+    exactly wrong for somebody who just signed in with a password and wants to
+    add an identity. Without a door of their own, the invite's button bounces
+    off the sign-in route and nothing happens.
+
+    Refusing here is the same question the invite asked, asked again at the
+    moment it matters: the invite may have been rendered minutes ago, the flag
+    may have been turned off since, and the account may have linked in another
+    tab. A door that opens on a stale notice is a door that links an account
+    twice.
+    """
+    from flask_login import current_user
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Authentication required"}), 401
+
+    if not _invite_enabled():
+        return jsonify({"error": "Linking invite is not enabled"}), 403
+
+    # Deliberately NOT _invite_offered_to: a dismissal means "not now", not
+    # "never let me". The permanent way back has to keep working for somebody
+    # who dismissed the notice last week and changed their mind today.
+    if not _needs_identity_link(current_user):
+        return jsonify({"error": "Account has nothing to link"}), 409
+
+    return None
+
+
+@autenticacao_gov.route("/saml/link/start")
+def link_initiated():
+    """Start a CMD sign-in whose callback links, rather than signs up."""
+    from flask_login import current_user
+
+    refusal = _refuse_link_start()
+    if refusal:
+        return refusal
+    return _begin_cmd_authn_request(link_user_id=str(current_user.id))
+
+
+@autenticacao_gov.route("/saml/eidas/link/start")
+def link_eidas_initiated():
+    """Start an eIDAS sign-in whose callback links, rather than signs up."""
+    from flask_login import current_user
+
+    refusal = _refuse_link_start()
+    if refusal:
+        return refusal
+    return _begin_eidas_authn_request(link_user_id=str(current_user.id))
 
 
 #################################################################
@@ -3434,6 +3581,12 @@ def eidas_client_for(metadata_file):
 @autenticacao_gov.route("/saml/eidas/login")
 @anonymous_user_required
 def sp_eidas_initiated():
+    """Start an eIDAS sign-in. Anonymous callers only -- this is a way IN."""
+    return _begin_eidas_authn_request()
+
+
+def _begin_eidas_authn_request(link_user_id=None):
+    """Build and return the eIDAS AuthnRequest form. See its CMD twin."""
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
@@ -3500,6 +3653,7 @@ def sp_eidas_initiated():
     reqid, info = saml_client.prepare_for_authenticate(**args)
     _remember_outstanding(reqid, kind="eidas")
     _store_outstanding_relay(relay_token, reqid, kind="eidas")
+    _store_link_intent(relay_token, link_user_id)
     return _extract_saml_form_data(info["data"])
 
 
