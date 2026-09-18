@@ -528,6 +528,23 @@ class INEBackend(BaseBackend):
         if current_sig != (new_md.get("resource_sig") or set()):
             return True
 
+        # Everything below is metadata the backend only started writing once it stopped
+        # hardcoding it. Without these comparisons the enrichment would never reach the
+        # datasets already in the database: they match on title, description, tags and
+        # resources, so they would be reported unchanged and skipped forever.
+        current_frequency = dataset.frequency or UpdateFrequency.UNKNOWN
+        if current_frequency != new_md.get("frequency", UpdateFrequency.UNKNOWN):
+            return True
+
+        new_extras = new_md.get("extras") or {}
+        for key in INE_SOURCE_EXTRAS:
+            if (dataset.extras.get(key) or None) != (new_extras.get(key) or None):
+                return True
+
+        current_uri = (dataset.harvest.uri if dataset.harvest else None) or None
+        if current_uri != (new_md.get("remote_url") or None):
+            return True
+
         return False
 
     # --------------------------

@@ -1,4 +1,6 @@
 import os
+import re
+import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 
 import pytest
@@ -983,3 +985,147 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
         assert [item.status for item in job.items] == ["done"]
         # The raw text is still kept, so nothing the source said is lost.
         assert dataset.extras["last_update_remote"] == "2026/09/18"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEHasChangedTest(PytestOnlyDBTestCase):
+    """Change detection has to see the metadata the backend only just started writing.
+
+    `_has_changed` compared title, description, tags and resources. A dataset harvested by
+    the previous code matches on all four, so without the new comparisons the ~13k INE
+    datasets already stored would be reported unchanged and skipped forever, and the
+    enrichment would never reach production.
+
+    These call `_has_changed` directly rather than only asserting on a full harvest: the
+    source tag changes in this ticket too, so an end-to-end test would go green through the
+    tags branch even if the new comparisons had never been written.
+    """
+
+    FIXTURE = dict(
+        periodicity="Mensal",
+        last_update="04-02-2026",
+        last_period="S3A202608",
+        geo_lastlevel="Portugal",
+        source_description="INE, Índice de preços",
+        update_type="A",
+        metainfo_url="https://www.ine.pt/xurl/metax/0001/PT",
+    )
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def _harvest(self, rmock, tmp_path, source):
+        rmock.get(INE_URL, text=_catalog_xml(["0001"], **self.FIXTURE))
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        return backend.harvest()
+
+    def _backend_and_md(self, source):
+        backend = INEBackend(source)
+        element = ET.fromstring(_catalog_xml(["0001"], **self.FIXTURE)).find("indicator")
+        return backend, backend._extract_metadata(element)
+
+    def _dataset(self, source):
+        return Dataset.objects(
+            __raw__={"harvest.source_id": str(source.id), "harvest.remote_id": "0001"}
+        ).first()
+
+    def _as_the_old_code_left_it(self, source, rmock, tmp_path, **overrides):
+        """A stored dataset in the shape the previous implementation produced."""
+        self._harvest(rmock, tmp_path, source)
+        dataset = self._dataset(source)
+        Dataset.objects(id=dataset.id).update(**overrides)
+        return self._dataset(source)
+
+    def test_a_dataset_already_carrying_the_source_metadata_is_unchanged(self, rmock, tmp_path):
+        """The baseline: without it, the tests below would prove nothing."""
+        source = self._source()
+        self._harvest(rmock, tmp_path, source)
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(self._dataset(source), md, "0001") is False
+
+    def test_missing_extras_alone_are_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(source, rmock, tmp_path, set__extras={})
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_stale_frequency_alone_is_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(source, rmock, tmp_path, set__frequency="unknown")
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_invented_uri_alone_is_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(
+            source, rmock, tmp_path, set__harvest__uri="https://www.ine.pt/indicador/0001"
+        )
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_existing_dataset_without_the_new_metadata_is_rewritten_on_the_next_harvest(
+        self, rmock, tmp_path
+    ):
+        """Criterion 4, end to end: detected as changed *and* actually enriched."""
+        source = self._source()
+        self._as_the_old_code_left_it(
+            source,
+            rmock,
+            tmp_path,
+            set__frequency="unknown",
+            set__extras={},
+            set__harvest__uri="https://www.ine.pt/indicador/0001",
+        )
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["done"]
+        dataset = self._dataset(source)
+        assert dataset.frequency == UpdateFrequency.MONTHLY
+        assert dataset.extras["geo_lastlevel"] == "Portugal"
+        assert dataset.extras["metainfo_url"] == "https://www.ine.pt/xurl/metax/0001/PT"
+        assert "indicador/0001" not in dataset.harvest.uri
+
+    def test_the_enriching_harvest_keeps_the_resource_ids(self, rmock, tmp_path):
+        """Criterion 7: the rewrite that adds the metadata must not move a permalink."""
+        source = self._source()
+        self._as_the_old_code_left_it(
+            source, rmock, tmp_path, set__frequency="unknown", set__extras={}
+        )
+        before = [r.id for r in self._dataset(source).resources]
+        assert before
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["done"]
+        assert [r.id for r in self._dataset(source).resources] == before
+
+    def test_an_indicator_without_bdd_url_settles_instead_of_churning(self, rmock, tmp_path):
+        """No landing page published means no URI stored — and no nightly rewrite.
+
+        Every indicator publishes bdd_url today, but if one stopped, a stored URI the feed
+        no longer backs would otherwise differ from the extracted dict on every single
+        harvest and rewrite the dataset forever.
+        """
+        source = self._source()
+        xml = _catalog_xml(["0001"], **self.FIXTURE)
+        xml = re.sub(r"<bdd_url>.*?</bdd_url>", "", xml, flags=re.S)
+        rmock.get(INE_URL, text=xml)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.harvest()
+
+        rmock.get(INE_URL, text=xml)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        job = backend.harvest()
+
+        assert [item.status for item in job.items] == ["skipped"]
