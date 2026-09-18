@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- **feat(harvest): the INE harvesters read their metadata from the catalogue instead of hardcoding it**
+  - Both INE backends read the same catalogue and both fixed in code what the source
+    publishes, so every INE dataset reached the portal with `frequency = unknown`, a
+    modification date that was really the time of the last harvest, a landing page we
+    composed ourselves, and extras only one of the two ever wrote.
+  - `<periodicity>` now becomes a real `frequency`, through a mapping shared by both
+    backends. The map is closed over what the feed actually publishes: the full catalogue
+    was enumerated on 2026-09-18 and carries 15 distinct values over 13154 indicators. Two
+    of its properties drive the normalisation and are easy to get wrong -- 13152 of the
+    values arrive surrounded by whitespace (`<![CDATA[ Mensal]]>`), and the same value is
+    published in more than one capitalisation (`Decenal`/`decenal`, `Não periódica`/`Não
+    Periódica`). `Sexenal` maps to `other`, not `unknown`: `UpdateFrequency` has no
+    six-yearly member, but the source does state a frequency and `unknown` reads as "none
+    given". The previous per-backend map recognised five values, which left `Decenal`
+    alone -- 1786 indicators -- falling through to `unknown`.
+  - `harvest.modified_at` is now the `<dates><last_update>` the source publishes rather
+    than `now()`, so a catalogue that did not change stops looking freshly modified after
+    every nightly run. The date is parsed day-first with an exact `dd-mm-yyyy` format
+    instead of through `safe_harvest_datetime`, which reaches `dateutil` without
+    `dayfirst` and reads `04-02-2026` as 2 April: measured over the catalogue, 4930 of the
+    13154 dates are ambiguous that way and 4615 would have been stored as a different day.
+  - `harvest.uri` is now the `bdd_url` the source publishes (`.../xurl/indx/<id>/PT`),
+    not the `/indicador/<id>` we composed, and `metainfo_url`, `geo_lastlevel`,
+    `source_description`, `last_period_available`, `last_update_remote` and the optional
+    `update_type` are stored as extras by both backends.
+  - Change detection had to grow with it. It compared title, description, tags and
+    resources -- all of which a dataset harvested by the old code already matches -- so
+    without comparing the new fields the enrichment would have reached new datasets only
+    and never appeared in production.
+  - The source tag is derived from the source URL instead of being a literal, which also
+    ends the disagreement between the two backends (`ine-pt` in one, `ine.pt` in the
+    other). `harvest.backend` on `ine` datasets becomes the display name, as every other
+    backend already stores; it is still assigned by hand because this backend bypasses
+    `process_dataset` for its bulk write path and so never reaches the base class helper.
+  - `dadosGov` is dropped from `HARVESTER_BACKENDS`: it has no entry point and no module,
+    so the activation list named a backend that cannot be instantiated. Every remaining
+    entry now resolves through `get_backend`.
+  - **What changes in an already harvested catalogue.** The first harvest after the deploy
+    rewrites all ~13000 `ine` datasets -- that is the change detection working, not a
+    fault -- and no resource id moves, so the `/api/1/datasets/r/<id>` download permalinks
+    survive. The `ine-pt` and `ine.pt` tags are replaced by `www-ine-pt`, so the old
+    facets disappear and any saved search or link using `?tag=ine-pt` stops returning
+    results; there is no tag redirect. `harvest.modified_at` moves *backwards*, possibly
+    by years, and it is what `Dataset.last_modified` exposes through the API and the feed.
+    Resource titles become "Dados (JSON)"/"Metainfo (JSON)" with their URLs untouched.
+  - ⚠️ **Two things the bulk write path does not do for itself.** The `ine` backend writes
+    through pymongo, so `post_save` never fires: the new frequency and tag reach the
+    search facets only after a reindex following the first new harvest. For the same
+    reason `Dataset.clean()` does not run, so `quality_cached` keeps its stored
+    `update_frequency: False` and the visible quality score does not rise until the
+    datasets are saved by some other path. `inehvd` goes through `save()` and is unaffected
+    by both. Restart the Celery worker and beat after the deploy -- the harvester code is
+    read in-process.
+
 - **chore(harvest): the `dgtIne` backend is gone, and so is every registration that pointed at it**
   - The module had already been deleted; what stayed behind was the part that breaks things.
     `get_all_backends()` is `{ep.load().name: ep.load() for ep in entry_points(group="udata.harvesters")}`
