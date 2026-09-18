@@ -9618,3 +9618,208 @@ class LinkIntentTest(APITestCase):
             token = _new_relay_state_token()
             _store_link_intent(token, "6510f0aabbccddeeff001122")
             assert _consume_link_intent(token) is None
+
+
+class InvitedLinkDoesNotCreateASecondAccountTest(APITestCase):
+    """The invariant the whole ticket exists for: one person, one account.
+
+    🚨 The case that matters is the THIRD one here, and it is the one the
+    ticket originally left open. A citizen's CMD carries the address they gave
+    the State; their portal account carries the one they registered with years
+    ago. There is no reason for those to match, and when they do not -- and
+    nobody else holds the CMD's address -- the resolver recognises nothing,
+    answers `no_match`, and a brand-new account is minted.
+
+    That is the invite promising "soon, one account per person" and its own
+    button creating the second one.
+    """
+
+    NIC = "12345678"
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _cmd_callback(self, mock_client_for, cache, relay_token="", **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        with patch("udata.app.cache", cache):
+            return self.client.post(
+                "/saml/sso",
+                data={"SAMLResponse": encoded, "RelayState": relay_token},
+                follow_redirects=False,
+            )
+
+    def _link(self, mock_client_for, account, **attrs):
+        """Walk the invited flow: ticket issued, then the callback arrives."""
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+        return self._cmd_callback(mock_client_for, cache, relay_token=token, **attrs)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_cmd_address_that_differs_and_is_free_does_not_mint_an_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The third row of the ticket's table, and the one that was open."""
+        from udata.core.user.models import User
+
+        self._invite_on()
+        account = UserFactory(
+            password="x" * 12, email="m.silva@camara.pt", first_name="M", last_name="Silva"
+        )
+        before = len(list(User.objects))
+
+        response = self._link(
+            mock_client_for,
+            account,
+            email="maria@gmail.com",
+            nic=self.NIC,
+            first_name="Maria",
+            last_name="Silva Ferreira",
+        )
+
+        assert len(list(User.objects)) == before, (
+            "the invited link minted a second account -- the exact outcome the invite promises "
+            "to prevent"
+        )
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_wizard_is_pointed_at_the_account_that_asked(self, mock_client_for, _mock_confirm):
+        """Knowing WHICH account is the difference the ticket buys.
+
+        Without it the wizard opens on "help me find mine" and asks somebody
+        who is already signed in to prove who they are from scratch.
+        """
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+
+        with self.client.session_transaction() as sess:
+            sess.clear()
+
+        self._link(
+            mock_client_for,
+            account,
+            email="maria@gmail.com",
+            nic=self.NIC,
+            first_name="Maria",
+            last_name="Silva",
+        )
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+        assert pending["legacy_user_id"] == str(account.id)
+        assert pending["no_match"] is False
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_eidas_link_never_mints_an_account_either(self, mock_client_for, _mock_confirm):
+        """eIDAS needs this more, not less: the Minimum Data Set carries no
+        email at all, so an invited eIDAS link is ALWAYS a no_match."""
+        from udata.core.user.models import User
+
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+        before = len(list(User.objects))
+
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            person_identifier="ES/PT/9999", given_name="Maria", family_name="Silva"
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(
+            _build_saml_response_xml(
+                person_identifier="ES/PT/9999", given_name="Maria", family_name="Silva"
+            ).encode("utf-8")
+        ).decode("utf-8")
+
+        with (
+            patch("udata.app.cache", cache),
+            patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for", mock_client_for),
+        ):
+            response = self.client.post(
+                "/saml/eidas/sso",
+                data={"SAMLResponse": encoded, "RelayState": token},
+                follow_redirects=False,
+            )
+
+        assert len(list(User.objects)) == before
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_without_a_ticket_a_genuinely_new_citizen_still_gets_an_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The other half of the guarantee, and the one a careless fix breaks.
+
+        Diverting everybody would send first-time citizens into a wizard for
+        an account they do not have. The ticket is what tells the two apart.
+        """
+        from udata.core.user.models import User
+
+        self._invite_on()
+        before = len(list(User.objects))
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_callback(
+                mock_client_for,
+                _InMemoryCache(),
+                email="novo@example.pt",
+                nic="87654321",
+                first_name="Novo",
+                last_name="Cidadao",
+            )
+
+        assert len(list(User.objects)) == before + 1
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_ticket_for_an_account_linked_meanwhile_is_ignored(
+        self, mock_client_for, _mock_confirm
+    ):
+        """Ten minutes pass while the citizen is at autenticacao.gov, and in
+        that time another tab can have linked the account. Binding a second
+        identity there would be the duplicate wearing the costume of the fix.
+        """
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+
+        account.extras["auth_nic"] = _hash_nic("99999999")
+        account.save()
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_callback(
+                mock_client_for,
+                cache,
+                relay_token=token,
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        with self.client.session_transaction() as sess:
+            assert "saml_migration_pending" not in sess

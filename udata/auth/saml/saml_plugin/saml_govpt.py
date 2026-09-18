@@ -733,6 +733,44 @@ def _store_link_intent(relay_token, user_id):
         )
 
 
+def _resolve_link_intent(relay_token):
+    """The account that started this round-trip to link, if it still qualifies.
+
+    Consumes the ticket and re-checks the account against the database, which
+    is not belt-and-braces: up to ten minutes passed while the citizen was at
+    autenticacao.gov, and in that time the account can have been deleted,
+    deactivated, or linked from another tab. Every failure returns None, and
+    None means "treat this as an ordinary sign-in" -- today's behaviour, never
+    an error page on a flow the person cannot retry.
+    """
+    from mongoengine.errors import ValidationError
+
+    from udata.core.user.models import User
+
+    user_id = _consume_link_intent(relay_token)
+    if not user_id:
+        return None
+
+    try:
+        user = User.objects(id=user_id, deleted=None).first()
+    except (ValidationError, TypeError):
+        # The id comes out of a cache entry we wrote, so a malformed one means
+        # a corrupted or hand-edited value rather than caller input -- and it
+        # still must not 500 the callback.
+        return None
+
+    if not user or not user.is_active:
+        return None
+
+    # Linked in the meantime -- in another tab, or by a link clicked from an
+    # email. Binding a second identity here would be the duplicate this whole
+    # flow exists to prevent, wearing the costume of the fix.
+    if not _needs_identity_link(user):
+        return None
+
+    return user
+
+
 def _consume_link_intent(relay_token):
     """Return and delete the link intent stored under ``relay_token``.
 
@@ -3096,6 +3134,10 @@ def idp_initiated():
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
     _diag_redis_bucket = _consume_outstanding_relay(relay_token)
+    # Consumed HERE, beside the outstanding bucket, and not further down where
+    # it is used: the ticket is single-use and must die with the round-trip
+    # that carried it, whatever branch this request goes on to take.
+    link_intent_user = _resolve_link_intent(relay_token)
     outstanding.update(_diag_redis_bucket)
     # TEMP DIAG (remove after PPR is green): see what AMA actually echoed and
     # whether we matched it in Redis. `in_response_to` is parsed from raw XML
@@ -3372,21 +3414,32 @@ def idp_initiated():
         )
 
     if status in ("migration_candidate", "no_match"):
-        if _migration_enabled():
+        # 🚨 `no_match` is in this branch for the invited flow too, and that is
+        # the whole point. The case that creates the duplicate is the citizen
+        # whose CMD carries a DIFFERENT address from their portal account, one
+        # nobody else holds: the resolver recognises nothing, answers no_match,
+        # and today a brand-new account is minted. The portal has no way to
+        # know it is the same person -- except the ticket, which says so.
+        #
+        # With a ticket the candidate is KNOWN, so the wizard is pointed
+        # straight at that account instead of asking "help me find mine". It
+        # still has to be proven: the wizard mails the validation link to that
+        # account's OWN address, never one typed here.
+        if _migration_enabled() or link_intent_user:
             _audit_saml(
                 "migration_pending",
                 "cmd",
                 issuer=issuer,
                 name_id=name_id_value,
-                reason=status,
+                reason="invite_link" if link_intent_user else status,
             )
             return _handle_migration_redirect(
-                user,
+                link_intent_user or user,
                 user_email,
                 user_identifier,
                 first_name,
                 last_name,
-                no_match=(status == "no_match"),
+                no_match=(status == "no_match" and not link_intent_user),
                 provider="cmd",
                 # The same guard the funnel already receives below: only when
                 # the document WAS the identity. For a national the NIC won in
@@ -3699,6 +3752,8 @@ def idp_eidas_initiated():
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
     outstanding.update(_consume_outstanding_relay(relay_token))
+    # See its CMD twin: consumed with the round-trip, not with the branch.
+    link_intent_user = _resolve_link_intent(relay_token)
     last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
@@ -3915,21 +3970,25 @@ def idp_eidas_initiated():
         )
 
     if status in ("migration_candidate", "no_match"):
-        if _migration_enabled():
+        # Same branch, same reasoning as the CMD route above -- and eIDAS needs
+        # it more, not less: the Minimum Data Set carries NO email at all, so
+        # an invited eIDAS link is always a no_match and would ALWAYS have
+        # minted a second account without the ticket.
+        if _migration_enabled() or link_intent_user:
             _audit_saml(
                 "migration_pending",
                 "eidas",
                 issuer=issuer,
                 name_id=name_id_value,
-                reason=status,
+                reason="invite_link" if link_intent_user else status,
             )
             return _handle_migration_redirect(
-                user,
+                link_intent_user or user,
                 user_email,
                 user_nic,
                 first_name,
                 last_name,
-                no_match=(status == "no_match"),
+                no_match=(status == "no_match" and not link_intent_user),
                 provider="eidas",
                 eidas_country=eidas_country,
             )
