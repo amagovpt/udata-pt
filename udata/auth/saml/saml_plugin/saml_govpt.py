@@ -3903,10 +3903,39 @@ def _invite_enabled():
     return bool(current_app.config.get("MIGRATION_INVITE_ENABLED", False))
 
 
+def _needs_identity_link(user):
+    """True for a traditional account that holds no CMD/eIDAS identity yet.
+
+    "Signs in with a password, and nothing government-issued is bound to the
+    account." Both halves are load-bearing:
+
+    - no linked identity, so there IS something to link. `_has_linked_nic`
+      and not a bare presence check, because a plain or legacy-encrypted
+      ``auth_nic`` can never match a login lookup: the account behaves as
+      unlinked and must be treated as such;
+    - a password, so there IS a way in that does not go through the IdP. An
+      account created by SAML has no password, has nothing to invite, and
+      would be told to link an identity it already signed in with.
+
+    Extracted from ``migration_check``, where it was correct and unnamed, so
+    the invite can ask the same question without copying the expression. Two
+    readers of one predicate, not two predicates that agree today.
+    """
+    return bool(not _has_linked_nic(user) and user.password)
+
+
 @autenticacao_gov.route("/saml/migration/check", methods=["GET"])
 @csrf.exempt
 def migration_check():
-    """Check if the currently authenticated user is a legacy user that needs migration."""
+    """Check if the currently authenticated user is a legacy user that needs migration.
+
+    🚨 ``needs_migration`` means MANDATORY, and it is not a synonym for "could
+    link". The frontend's /auth/login route reads this field and LOGS THE USER
+    OUT when it is true, which is right for the mandatory mode and would be a
+    regression for an invite that is supposed to be dismissible. So this
+    endpoint keeps answering about the mandatory mode only, in both states of
+    the flag, and the invite travels on the caller's own /me instead.
+    """
     if not _migration_enabled():
         return jsonify({"needs_migration": False})
 
@@ -3915,9 +3944,7 @@ def migration_check():
     if not current_user.is_authenticated:
         return jsonify({"needs_migration": False})
 
-    has_nic = _has_linked_nic(current_user)
-    needs = bool(not has_nic and current_user.password)
-    return jsonify({"needs_migration": needs})
+    return jsonify({"needs_migration": _needs_identity_link(current_user)})
 
 
 @autenticacao_gov.route("/saml/migration/pending", methods=["GET"])

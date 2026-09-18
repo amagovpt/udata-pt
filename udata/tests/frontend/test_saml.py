@@ -9316,3 +9316,81 @@ class MigrationInviteFlagTest(APITestCase):
             self.app.config["MIGRATION_MODE_ENABLED"] = False
             self.app.config.pop("MIGRATION_INVITE_ENABLED", None)
             assert _invite_enabled() is False
+
+
+class NeedsIdentityLinkTest(APITestCase):
+    """The predicate migration_check already computed, now under a name.
+
+    The point of this class is that naming it changed nothing. Both halves are
+    pinned -- an account with a linked identity and an account with no
+    password are excluded for DIFFERENT reasons, and a mutation that drops
+    either half has to turn something red here.
+
+    🚨 And migration_check itself is pinned in both states of the mandatory
+    flag, because its answer is not cosmetic: the frontend's /auth/login route
+    logs the user out when `needs_migration` is true. An invite that leaked
+    into this field would sign people out of a notice they are allowed to
+    dismiss.
+    """
+
+    def _needs(self, user):
+        from udata.auth.saml.saml_plugin.saml_govpt import _needs_identity_link
+
+        with self.app.app_context():
+            return _needs_identity_link(user)
+
+    def test_traditional_account_without_identity_is_invitable(self):
+        assert self._needs(UserFactory(password="x" * 12)) is True
+
+    def test_account_with_a_linked_identity_is_not(self):
+        linked = UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")})
+        assert self._needs(linked) is False
+
+    def test_a_plain_auth_nic_does_not_count_as_linked(self):
+        """A value that can never match a login lookup is not a link.
+
+        The account behaves as unlinked at sign-in, so treating it as linked
+        here would hide the invite from precisely the accounts that need it.
+        """
+        stale = UserFactory(password="x" * 12, extras={"auth_nic": "12345678"})
+        assert self._needs(stale) is True
+
+    def test_an_account_with_no_password_has_nothing_to_invite(self):
+        """Created by SAML: there is no password-based way in to upgrade.
+
+        Built WITHOUT the password kwarg, not with `password=None`: the
+        factory hashes whatever it is given, so `None` comes back as a real
+        hash and the account looks password-backed.
+        """
+        saml_born = UserFactory()
+        assert saml_born.password is None
+        assert self._needs(saml_born) is False
+
+    def test_migration_check_answer_is_unchanged_with_the_flag_off(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        response = self.client.get("/saml/migration/check")
+        assert response.status_code == 200
+        assert response.json == {"needs_migration": False}
+
+    def test_migration_check_still_answers_the_mandatory_question(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        user = UserFactory(password="x" * 12)
+        self.login(user)
+
+        response = self.client.get("/saml/migration/check")
+        assert response.status_code == 200
+        assert response.json == {"needs_migration": True}
+
+    def test_the_invite_never_leaks_into_needs_migration(self):
+        """The regression this endpoint is one config change away from.
+
+        With the invite on and the mandatory mode off, `needs_migration` must
+        stay false -- otherwise every invited user is signed out at the login
+        they were supposed to be invited during.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        self.login(UserFactory(password="x" * 12))
+
+        response = self.client.get("/saml/migration/check")
+        assert response.json == {"needs_migration": False}
