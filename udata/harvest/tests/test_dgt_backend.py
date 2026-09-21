@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import LicenseFactory
 from udata.models import License
 from udata.tests.api import PytestOnlyDBTestCase
@@ -17,6 +18,7 @@ from ..backends.dgt import (
     format_from_link,
     license_id_from_legal_constraints,
 )
+from ..backends.tools.harvester_utils import map_iso_maintenance_frequency
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -844,3 +846,70 @@ class DGTPublicationDateTest(PytestOnlyDBTestCase):
         self._harvest(rmock, publicationDate="2021-06-15")
         dataset = self._harvest(rmock, publicationDate="2021-06-15")
         assert dataset.harvest.created_at == datetime(2021, 6, 15)
+
+
+class DGTFrequencyMappingTest:
+    """`map_iso_maintenance_frequency` over the codelist the source uses."""
+
+    @pytest.mark.parametrize(
+        "published,expected",
+        [
+            # The eight values the DGT index actually carries, by frequency.
+            ("asNeeded", UpdateFrequency.PUNCTUAL),
+            ("notPlanned", UpdateFrequency.NOT_PLANNED),
+            ("unknown", UpdateFrequency.UNKNOWN),
+            ("daily", UpdateFrequency.DAILY),
+            ("continual", UpdateFrequency.CONTINUOUS),
+            ("annually", UpdateFrequency.ANNUAL),
+            ("biannually", UpdateFrequency.SEMIANNUAL),
+            ("irregular", UpdateFrequency.IRREGULAR),
+            # The rest of the codelist.
+            ("weekly", UpdateFrequency.WEEKLY),
+            ("fortnightly", UpdateFrequency.BIWEEKLY),
+            ("monthly", UpdateFrequency.MONTHLY),
+            ("quarterly", UpdateFrequency.QUARTERLY),
+            ("biennially", UpdateFrequency.BIENNIAL),
+            ("semimonthly", UpdateFrequency.SEMIMONTHLY),
+            ("periodic", UpdateFrequency.OTHER),
+        ],
+    )
+    def test_the_codelist_maps_onto_the_vocabulary(self, published, expected):
+        assert map_iso_maintenance_frequency(published) == expected
+
+    @pytest.mark.parametrize("published", ["asNeeded", "AS_NEEDED", " as needed ", "ASNEEDED"])
+    def test_casing_and_separators_do_not_matter(self, published):
+        assert map_iso_maintenance_frequency(published) == UpdateFrequency.PUNCTUAL
+
+    @pytest.mark.parametrize("published", [None, "", "   ", "sempre que der jeito", "n/a"])
+    def test_anything_unnamed_is_unknown(self, published):
+        assert map_iso_maintenance_frequency(published) == UpdateFrequency.UNKNOWN
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTFrequencyHarvestTest(PytestOnlyDBTestCase):
+    """The frequency a real harvest writes on the dataset."""
+
+    def _harvest(self, rmock, **fields):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(REMOTE_ID, None, **fields)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(REMOTE_ID)
+
+    def test_the_sources_frequency_reaches_the_dataset(self, rmock):
+        dataset = self._harvest(rmock, updateFrequency="asNeeded")
+        assert dataset.frequency == UpdateFrequency.PUNCTUAL
+
+    def test_the_lneg_record_is_not_planned(self, rmock):
+        dataset = self._harvest(rmock, updateFrequency="notPlanned")
+        assert dataset.frequency == UpdateFrequency.NOT_PLANNED
+
+    def test_a_record_without_a_frequency_is_unknown(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+    def test_an_unmapped_frequency_does_not_fail_the_item(self, rmock):
+        dataset = self._harvest(rmock, updateFrequency="sempre que der jeito")
+        assert dataset.frequency == UpdateFrequency.UNKNOWN

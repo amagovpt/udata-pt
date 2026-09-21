@@ -275,6 +275,86 @@ def map_ine_periodicity(text: str | None) -> UpdateFrequency:
     return frequency
 
 
+# ISO 19115 publishes the update frequency as the `MD_MaintenanceFrequencyCode`
+# codelist, which the SNIG index copies verbatim into `updateFrequency`. The
+# codelist is closed, so the map below is the whole of it rather than only the
+# values seen in one sample -- unlike `INE_PERIODICITY` above, which maps free
+# Portuguese text and can only ever be closed over what was observed.
+#
+# Filled on 42.4% of the DGT index (509 of 1200 records enumerated for
+# LEDG-2530): asNeeded 317, notPlanned 135, unknown 18, daily 14, continual 13,
+# annually 9, biannually 4, irregular 1.
+#
+# Four of the codelist terms have no same-named member in `UpdateFrequency` and
+# are mapped explicitly:
+#   `asNeeded`   -> PUNCTUAL, which the enum itself annotates `# EU:AS_NEEDED`
+#   `continual`  -> CONTINUOUS, annotated `# EU:UPDATE_CONT`
+#   `annually`   -> ANNUAL
+#   `biannually` -> SEMIANNUAL. ISO 19115 defines it as "data is updated twice
+#                   each year", and udata already reads the legacy id
+#                   `biannual` as SEMIANNUAL. The English word is also used for
+#                   "every two years", so this is the one entry worth checking
+#                   against the source if a record looks wrong.
+ISO_MAINTENANCE_FREQUENCY: dict[str, UpdateFrequency] = {
+    "continual": UpdateFrequency.CONTINUOUS,
+    "daily": UpdateFrequency.DAILY,
+    "weekly": UpdateFrequency.WEEKLY,
+    "fortnightly": UpdateFrequency.BIWEEKLY,
+    "monthly": UpdateFrequency.MONTHLY,
+    "quarterly": UpdateFrequency.QUARTERLY,
+    "biannually": UpdateFrequency.SEMIANNUAL,
+    "annually": UpdateFrequency.ANNUAL,
+    "asneeded": UpdateFrequency.PUNCTUAL,
+    "irregular": UpdateFrequency.IRREGULAR,
+    "notplanned": UpdateFrequency.NOT_PLANNED,
+    "unknown": UpdateFrequency.UNKNOWN,
+    # Later additions to the codelist (ISO 19115-1), published by some
+    # GeoNetwork catalogues.
+    "semimonthly": UpdateFrequency.SEMIMONTHLY,
+    "biennially": UpdateFrequency.BIENNIAL,
+    # "periodically at some interval", with no interval given: the source does
+    # state a frequency, so OTHER rather than UNKNOWN -- `Dataset.has_frequency`
+    # counts UNKNOWN as no frequency at all.
+    "periodic": UpdateFrequency.OTHER,
+}
+
+# Warn once per unseen value, reset per harvest, for the same reason as
+# `_warned_periodicities` above.
+_warned_maintenance_frequencies: set[str] = set()
+
+
+def reset_maintenance_frequency_warnings() -> None:
+    """Let the next harvest report unmapped maintenance frequencies again."""
+    _warned_maintenance_frequencies.clear()
+
+
+def map_iso_maintenance_frequency(text: str | None) -> UpdateFrequency:
+    """Map an ISO 19115 `MD_MaintenanceFrequencyCode` onto `UpdateFrequency`.
+
+    Returns `UpdateFrequency.UNKNOWN` for empty, missing or unrecognised values
+    and never raises: a frequency we cannot name must not fail the item.
+
+    The codelist terms are camelCase (`asNeeded`, `notPlanned`), and catalogues
+    differ on the casing, so the lookup is on the case-folded text with any
+    separator removed -- `asNeeded`, `as needed` and `AS_NEEDED` are one value.
+    """
+    if not text:
+        return UpdateFrequency.UNKNOWN
+
+    key = re.sub(r"[\s_-]+", "", unicodedata.normalize("NFC", text).strip().casefold())
+    if not key:
+        return UpdateFrequency.UNKNOWN
+
+    frequency = ISO_MAINTENANCE_FREQUENCY.get(key)
+    if frequency is None:
+        if key not in _warned_maintenance_frequencies:
+            _warned_maintenance_frequencies.add(key)
+            log.warning("Unmapped ISO maintenance frequency: %r", text.strip())
+        return UpdateFrequency.UNKNOWN
+
+    return frequency
+
+
 # INE publishes `<dates><last_update>` as dd-mm-yyyy.
 INE_DATE_FORMAT = "%d-%m-%Y"
 

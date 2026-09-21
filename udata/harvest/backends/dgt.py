@@ -7,7 +7,13 @@ from udata.harvest.models import HarvestItem
 from udata.models import License
 from udata.utils import safe_harvest_datetime
 
-from .tools.harvester_utils import OGC_SERVICE_FORMATS, guess_url_format, sync_resources
+from .tools.harvester_utils import (
+    OGC_SERVICE_FORMATS,
+    guess_url_format,
+    map_iso_maintenance_frequency,
+    reset_maintenance_frequency_warnings,
+    sync_resources,
+)
 
 # The SNIG index publishes the licence as free text inside `legalConstraints`.
 # It is never fed to `License.guess`: that falls back to a Damerau-Levenshtein
@@ -332,6 +338,20 @@ class DGTBackend(BaseBackend):
         }
 
     @staticmethod
+    def _update_frequency(record: dict) -> str | None:
+        """The record's `updateFrequency`, as the source spells it.
+
+        Filled on 42.4% of the index. Comes as a bare string; a list is
+        tolerated for the same reason the dates and the bounding box are, and
+        the first entry is taken -- unlike the dates, several frequencies have
+        no order to pick from.
+        """
+        value = record.get("updateFrequency")
+        if isinstance(value, list):
+            value = next((entry for entry in value if isinstance(entry, str)), None)
+        return value if isinstance(value, str) else None
+
+    @staticmethod
     def _publication_dates(record: dict) -> list[str]:
         """The dates the source offers for when the dataset was published.
 
@@ -357,6 +377,11 @@ class DGTBackend(BaseBackend):
         return []
 
     def inner_harvest(self):
+        # An unmapped frequency is warned about once per harvest, not once per
+        # dataset; without the reset it would be silenced for the lifetime of
+        # the Celery worker instead.
+        reset_maintenance_frequency_warnings()
+
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
         # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
         res = self.get(self.source.url, headers=headers)
@@ -398,6 +423,7 @@ class DGTBackend(BaseBackend):
                 "legal_constraints": self._legal_constraints(each),
             }
             item["created_at"] = self._publication_dates(each)
+            item["update_frequency"] = self._update_frequency(each)
 
             # `link` comes as a list for records with several resources and as
             # a bare string for records with one, the same two shapes
@@ -462,6 +488,11 @@ class DGTBackend(BaseBackend):
             # published on the first of the three, not on whichever the index
             # happened to list first.
             dataset.harvest.created_at = min(published)
+
+        # `unknown` when the source says nothing, which is what the model
+        # already defaults to and what `Dataset.has_frequency` reads as "none
+        # given".
+        dataset.frequency = map_iso_maintenance_frequency(data.get("update_frequency"))
 
         # Add keywords as tags
         if data.get("keywords"):
