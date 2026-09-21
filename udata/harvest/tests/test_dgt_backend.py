@@ -343,21 +343,31 @@ class DGTLinkFormatTest:
         assert format_from_link(None, None, LNEG_URL) == "remote"
 
     @pytest.mark.parametrize(
-        "protocol,mimetype,url",
+        "protocol,mimetype,url,expected",
         [
-            ("WWW:LINK-1.0-http--link", "text/html", LNEG_URL),
-            ("OGC API - Features", "OGC API - Features", OGC_API_URL),
-            ("OGC:WMS", "application/vnd.ogc.wms_xml", WMS_URL),
-            ("", "text/plain", ZIP_URL),
-            (None, None, LNEG_URL),
-            (None, None, "https://cdd.dgterritorio.gov.pt/dgt-fe/mapa?collection=LAZ"),
-            (None, None, "https://geo.dgterritorio.gov.pt/pt/idea-api/collections/Ortofoto_2024"),
-            ("n.a", "n.a", ""),
+            ("WWW:LINK-1.0-http--link", "text/html", LNEG_URL, "html"),
+            ("OGC API - Features", "OGC API - Features", OGC_API_URL, "ogcapi-features"),
+            ("OGC:WMS", "application/vnd.ogc.wms_xml", WMS_URL, "wms"),
+            ("", "text/plain", ZIP_URL, "zip"),
+            (None, None, LNEG_URL, "remote"),
+            (None, None, "https://cdd.dgterritorio.gov.pt/dgt-fe/mapa?collection=LAZ", "remote"),
+            (
+                None,
+                None,
+                "https://geo.dgterritorio.gov.pt/pt/idea-api/collections/Ortofoto_2024",
+                "remote",
+            ),
+            ("n.a", "n.a", "", "remote"),
         ],
     )
-    def test_no_resolved_format_is_a_url_fragment(self, protocol, mimetype, url):
-        """Criterion 1, over every branch of the resolution."""
+    def test_no_resolved_format_is_a_url_fragment(self, protocol, mimetype, url, expected):
+        """Criterion 1, over every branch of the resolution.
+
+        The expected value is asserted alongside it: `"/" not in x` on its own
+        would pass against a function that always returned `"remote"`.
+        """
         resolved = format_from_link(protocol, mimetype, url)
+        assert resolved == expected
         assert "/" not in resolved and "?" not in resolved, resolved
 
 
@@ -413,6 +423,17 @@ class DGTLinkParsingTest:
         parsed = DGTBackend._parse_link(f"nome|desc|{ZIP_URL}|WWW:LINK|zip")
         assert parsed["url"] == ZIP_URL
         assert parsed["format"] == "zip"
+
+    def test_a_pipe_in_the_description_does_not_shift_the_url(self):
+        # Read from the right: the four trailing fields are fixed, the free
+        # text is the only part that can hold a separator. Positionally from
+        # the left, the URL would be read as "B" and `URLField` would fail the
+        # whole item.
+        parsed = DGTBackend._parse_link(f"Nome|Carta de A|B|{ZIP_URL}|WWW:LINK|text/csv|1")
+        assert parsed["url"] == ZIP_URL
+        assert parsed["title"] == "Nome"
+        assert parsed["description"] == "Carta de A|B"
+        assert parsed["format"] == "text/csv"
 
     def test_a_link_with_no_url_names_no_resource(self):
         assert DGTBackend._parse_link("nome|desc") is None
@@ -836,6 +857,15 @@ class DGTPublicationDateTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, publicationDate="não é uma data")
         assert dataset.harvest.created_at is None
 
+    def test_a_numeric_timestamp_does_not_fail_the_item(self, rmock):
+        """`dateutil` raises OverflowError here, not ParserError."""
+        dataset = self._harvest(rmock, publicationDate="1623715200000")
+        assert dataset.harvest.created_at is None
+
+    def test_an_unreadable_publication_date_falls_back_to_the_reference_date(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="não é uma data", referenceDate="2020-12-31")
+        assert dataset.harvest.created_at == datetime(2020, 12, 31)
+
     def test_a_future_date_is_refused(self, rmock):
         ahead = (datetime.now(UTC) + timedelta(days=365)).strftime("%Y-%m-%d")
         dataset = self._harvest(rmock, publicationDate=ahead)
@@ -1005,8 +1035,22 @@ class DGTSpatialHarvestTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock)
         assert dataset.spatial is None
 
-    def test_an_unusable_geobox_does_not_fail_the_item(self, rmock):
-        dataset = self._harvest(rmock, geoBox="lixo")
+    @pytest.mark.parametrize(
+        "published",
+        [
+            "lixo",
+            # `float` reads these without complaint, and a non-finite corner
+            # reaches the model intact and fails the item at save time -- the
+            # swap guard cannot catch it, since every NaN comparison is false.
+            "nan|nan|nan|nan",
+            "-inf|37.0|-7.0|inf",
+            # Projected metres, not degrees: several thousand degrees off the
+            # map, and nothing downstream would reject it.
+            "-120000|-300000|165000|280000",
+        ],
+    )
+    def test_an_unusable_geobox_does_not_fail_the_item(self, rmock, published):
+        dataset = self._harvest(rmock, geoBox=published)
         assert dataset.spatial is None
 
     def test_several_boxes_become_several_polygons(self, rmock):

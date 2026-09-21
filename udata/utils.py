@@ -235,7 +235,12 @@ def safe_harvest_datetime(value: Any, field: str, refuse_future: bool = False) -
         return None
     try:
         parsed = to_naive_datetime(value)
-    except ParserError:
+    except (ParserError, OverflowError, TypeError):
+        # `dateutil` raises OverflowError, not ParserError, for a run of digits
+        # too long to be a year -- an epoch-milliseconds timestamp in a date
+        # field is exactly that -- and TypeError for a value that is not text
+        # at all. Neither should reach the caller: the point of this helper is
+        # that an unreadable date degrades the dataset instead of failing it.
         log.warning(f"Unparseable {field} value: '{value}'")
         return None
     if refuse_future and parsed:

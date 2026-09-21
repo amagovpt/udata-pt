@@ -313,13 +313,30 @@ class DGTBackend(BaseBackend):
         repeating the title of its dataset. They are filled on a minority of
         links (16.2% and 19.3% of the sample), so the caller keeps the dataset
         title as the fallback.
+
+        A name or description containing a `|` is read from the right instead:
+        the four trailing fields are structurally fixed, while the free text is
+        the only part that can hold a separator. Reading positionally from the
+        left would take the description's own tail as the URL, which
+        `URLField` then refuses -- failing the item over a punctuation mark the
+        producer typed. No such link was in the 733 sampled, but nothing in the
+        format prevents one.
         """
         if not isinstance(link, str):
             return None
 
         parts = link.split("|")
-        # Pad rather than reject: a shorter entry is still usable if it has a URL.
-        parts += [""] * (6 - len(parts))
+        if len(parts) > 6:
+            # `name|desc with | inside|url|protocol|mime|order`: everything up
+            # to the last four fields is the free text, split once.
+            head, parts = parts[:-4], parts[-4:]
+            name, _, description = "|".join(head).partition("|")
+            parts = [name, description] + parts
+        else:
+            # Pad rather than reject: a shorter entry is still usable if it has
+            # a URL.
+            parts += [""] * (6 - len(parts))
+
         url = parts[2].strip()
         if not url:
             return None
@@ -350,7 +367,9 @@ class DGTBackend(BaseBackend):
         for a few (5 of 400 sampled), which is why several boxes are kept
         rather than the first: a MultiPolygon holds them all.
 
-        Anything that is not four numbers is dropped rather than guessed at.
+        Anything that is not four coordinates on Earth is dropped rather
+        than guessed at -- including `nan` and `inf`, which `float` reads
+        without complaint and which would fail the item at save time.
         """
         value = record.get("geoBox")
         if isinstance(value, str):
@@ -366,9 +385,25 @@ class DGTBackend(BaseBackend):
             if len(parts) != 4:
                 continue
             try:
-                boxes.append(tuple(float(part) for part in parts))
+                minx, miny, maxx, maxy = (float(part) for part in parts)
             except ValueError:
                 continue
+            # Geographic coordinates, in degrees. A source publishing
+            # projected metres would otherwise put a dataset several thousand
+            # degrees off the map, and nothing downstream would reject it --
+            # `spatial.geom` carries no 2dsphere index.
+            #
+            # This is also what rejects `nan` and `inf`, which `float` parses
+            # happily: every comparison against NaN is false, so the bounds
+            # below refuse it, and the infinities fall outside them. A
+            # non-finite corner would otherwise reach `SpatialCoverage.geom`
+            # intact and fail the item at save time, where no handler here
+            # could catch it.
+            if not (-180 <= minx <= 180 and -180 <= maxx <= 180):
+                continue
+            if not (-90 <= miny <= 90 and -90 <= maxy <= 90):
+                continue
+            boxes.append((minx, miny, maxx, maxy))
         return boxes
 
     @staticmethod
@@ -386,19 +421,22 @@ class DGTBackend(BaseBackend):
         return value if isinstance(value, str) else None
 
     @staticmethod
-    def _publication_dates(record: dict) -> list[str]:
-        """The dates the source offers for when the dataset was published.
+    def _publication_dates(record: dict) -> list[list[str]]:
+        """The dates the source offers, grouped by field, best field first.
 
         `publicationDate` is what the index means by it and is filled on 81.2%
         of the records; `referenceDate` is on every one of them and stands in
-        for the rest. Only one of the two is read -- a reference date is not a
-        publication date, and mixing them would make the earliest of the pair
-        win regardless of which field it came from.
+        for the rest. The groups are kept apart rather than merged -- a
+        reference date is not a publication date, and pooling them would let
+        the earliest win regardless of which field it came from -- and the
+        caller falls through to the next group when a group yields no readable
+        date, so a garbage `publicationDate` does not cost a usable
+        `referenceDate`.
 
         Both fields come as a bare string for most records and as a list for a
-        few (1 of 400 sampled on 2026-09-21 carried three publication dates),
-        so the shape is settled here and the caller picks the earliest.
+        few (1 of 400 sampled on 2026-09-21 carried three publication dates).
         """
+        groups = []
         for field in ("publicationDate", "referenceDate"):
             value = record.get(field)
             if isinstance(value, str):
@@ -407,8 +445,8 @@ class DGTBackend(BaseBackend):
                 continue
             dates = [entry for entry in value if isinstance(entry, str) and entry.strip()]
             if dates:
-                return dates
-        return []
+                groups.append(dates)
+        return groups
 
     def inner_harvest(self):
         # An unmapped frequency is warned about once per harvest, not once per
@@ -508,35 +546,48 @@ class DGTBackend(BaseBackend):
         # `AttributeError` for every record carrying a date, had the block in
         # `inner_harvest` that feeds it ever been uncommented. The harvest
         # metadata is what the property reads, and what `rdf.py` writes.
-        published = [
-            parsed
-            for parsed in (
-                safe_harvest_datetime(value, "DGT publicationDate", refuse_future=True)
-                for value in data.get("created_at") or []
-            )
-            if parsed
-        ]
-        if published:
+        for group in data.get("created_at") or []:
+            published = [
+                parsed
+                for parsed in (
+                    safe_harvest_datetime(value, "DGT publication date", refuse_future=True)
+                    for value in group
+                )
+                if parsed
+            ]
+            if not published:
+                # Nothing readable in this field; try the next one.
+                continue
             if not dataset.harvest:
                 dataset.harvest = HarvestDatasetMetadata()
             # The earliest of them: a record publishing three dates was first
             # published on the first of the three, not on whichever the index
             # happened to list first.
             dataset.harvest.created_at = min(published)
+            break
 
-        # `unknown` when the source says nothing, which is what the model
-        # already defaults to and what `Dataset.has_frequency` reads as "none
-        # given".
+        # `unknown` when the source says nothing. The field itself has no
+        # default and was `None` on these datasets until now; both read as
+        # "no frequency given" to `Dataset.has_frequency`, but the API starts
+        # serialising `"unknown"` where it served `null`.
+        #
+        # Written on every harvest, like `ine`, `inehvd`, `maaf` and `odspt`
+        # do, so a frequency set by hand in the back office is replaced by what
+        # the source says. Deliberate -- the ticket asks for `unknown` when the
+        # source is silent -- but it is the one field here without the
+        # `DERIVED_LICENSE_EXTRA` style of guard the licence has.
         dataset.frequency = map_iso_maintenance_frequency(data.get("update_frequency"))
 
         boxes = data.get("geo_boxes")
         if boxes:
-            try:
-                # Replaces the whole coverage: `SpatialCoverage.clean` refuses
-                # `zones` and `geom` together, so the two cannot be merged.
-                dataset.spatial = SpatialCoverage(geom=bbox_to_multipolygon(boxes))
-            except (TypeError, ValueError) as e:
-                self.logger.warning("DGT: unusable geoBox on %s: %s", item.remote_id, e)
+            # Replaces the whole coverage: `SpatialCoverage.clean` refuses
+            # `zones` and `geom` together, so the two cannot be merged.
+            #
+            # Not wrapped in a try: `_geo_boxes` has already rejected anything
+            # that is not four finite coordinates in range, and what the model
+            # would raise for a bad geometry is a mongoengine `ValidationError`
+            # at `save()` -- outside any handler that could sit here.
+            dataset.spatial = SpatialCoverage(geom=bbox_to_multipolygon(boxes))
 
         # Add keywords as tags
         if data.get("keywords"):
