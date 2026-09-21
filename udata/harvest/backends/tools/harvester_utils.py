@@ -275,6 +275,49 @@ def map_ine_periodicity(text: str | None) -> UpdateFrequency:
     return frequency
 
 
+# A degenerate bounding box -- a single point -- still has to be stored as a
+# polygon, because `SpatialCoverage.geom` is a MultiPolygonField. Roughly 11
+# metres at the equator, the same value `cswudata` uses.
+POINT_EPSILON = 0.0001
+
+
+def bbox_to_multipolygon(boxes: list[tuple[float, float, float, float]]) -> dict:
+    """Build a GeoJSON MultiPolygon from one or more `(minx, miny, maxx, maxy)`.
+
+    Each box becomes one ring, wound counter-clockwise and closed, in `[lon,
+    lat]` order. A box whose corners coincide is widened by `POINT_EPSILON`
+    first, since a zero-area ring is not a polygon.
+
+    Extracted from `cswudata._process_spatial`, which builds the same geometry
+    inline from an owslib bbox object; sources that publish the corners as
+    plain numbers -- DGT's `geoBox` -- have nothing to call otherwise.
+    """
+    polygons = []
+    for minx, miny, maxx, maxy in boxes:
+        minx, miny, maxx, maxy = float(minx), float(miny), float(maxx), float(maxy)
+        if minx > maxx:
+            minx, maxx = maxx, minx
+        if miny > maxy:
+            miny, maxy = maxy, miny
+        if minx == maxx and miny == maxy:
+            minx -= POINT_EPSILON
+            miny -= POINT_EPSILON
+            maxx += POINT_EPSILON
+            maxy += POINT_EPSILON
+        polygons.append(
+            [
+                [
+                    [minx, miny],
+                    [maxx, miny],
+                    [maxx, maxy],
+                    [minx, maxy],
+                    [minx, miny],
+                ]
+            ]
+        )
+    return {"type": "MultiPolygon", "coordinates": polygons}
+
+
 # ISO 19115 publishes the update frequency as the `MD_MaintenanceFrequencyCode`
 # codelist, which the SNIG index copies verbatim into `updateFrequency`. The
 # codelist is closed, so the map below is the whole of it rather than only the

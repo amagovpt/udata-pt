@@ -18,7 +18,7 @@ from ..backends.dgt import (
     format_from_link,
     license_id_from_legal_constraints,
 )
-from ..backends.tools.harvester_utils import map_iso_maintenance_frequency
+from ..backends.tools.harvester_utils import bbox_to_multipolygon, map_iso_maintenance_frequency
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -913,3 +913,108 @@ class DGTFrequencyHarvestTest(PytestOnlyDBTestCase):
     def test_an_unmapped_frequency_does_not_fail_the_item(self, rmock):
         dataset = self._harvest(rmock, updateFrequency="sempre que der jeito")
         assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+
+# The LNEG record's own bounding box, verbatim: Neves-Corvo, in the Alentejo.
+LNEG_GEO_BOX = "-8.13|37.46|-7.77|37.68"
+
+
+class DGTGeoBoxTest:
+    """`_geo_boxes` and `bbox_to_multipolygon`."""
+
+    def test_the_lneg_box_is_read_as_four_numbers(self):
+        assert DGTBackend._geo_boxes({"geoBox": LNEG_GEO_BOX}) == [(-8.13, 37.46, -7.77, 37.68)]
+
+    def test_several_boxes_are_all_kept(self):
+        published = [
+            "-8.49706|39.52706|-6.693817|41.819792",
+            "-8.482288|39.532618|-6.822819|41.353713",
+        ]
+        assert len(DGTBackend._geo_boxes({"geoBox": published})) == 2
+
+    @pytest.mark.parametrize(
+        "published",
+        [None, "", "lixo", "-8.13|37.46", "-8.13|37.46|-7.77", "a|b|c|d", {"minx": 1}],
+    )
+    def test_anything_that_is_not_four_numbers_is_dropped(self, published):
+        assert DGTBackend._geo_boxes({"geoBox": published}) == []
+
+    def test_the_ring_is_closed_and_counter_clockwise(self):
+        geom = bbox_to_multipolygon([(-8.13, 37.46, -7.77, 37.68)])
+        assert geom["type"] == "MultiPolygon"
+        (ring,) = geom["coordinates"][0]
+        assert len(ring) == 5
+        assert ring[0] == ring[-1]
+        assert ring == [
+            [-8.13, 37.46],
+            [-7.77, 37.46],
+            [-7.77, 37.68],
+            [-8.13, 37.68],
+            [-8.13, 37.46],
+        ]
+
+    def test_the_axes_are_longitude_then_latitude(self):
+        """What the swap guard cannot catch: lon and lat transposed.
+
+        A closed five-vertex ring looks identical either way round, so the
+        values are asserted. Mainland Portugal sits at lon -6..-10, lat 37..42.
+        """
+        geom = bbox_to_multipolygon(DGTBackend._geo_boxes({"geoBox": LNEG_GEO_BOX}))
+        (ring,) = geom["coordinates"][0]
+        for longitude, latitude in ring:
+            assert -10 < longitude < -6, ring
+            assert 36 < latitude < 43, ring
+
+    def test_an_inverted_box_is_normalized(self):
+        inverted = bbox_to_multipolygon([(-7.77, 37.68, -8.13, 37.46)])
+        upright = bbox_to_multipolygon([(-8.13, 37.46, -7.77, 37.68)])
+        assert inverted == upright
+
+    def test_a_point_becomes_a_polygon_with_area(self):
+        geom = bbox_to_multipolygon([(-8.13, 37.46, -8.13, 37.46)])
+        (ring,) = geom["coordinates"][0]
+        assert len({tuple(vertex) for vertex in ring}) == 4
+        width = ring[1][0] - ring[0][0]
+        height = ring[2][1] - ring[1][1]
+        assert width > 0 and height > 0
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTSpatialHarvestTest(PytestOnlyDBTestCase):
+    """The spatial coverage a real harvest writes on the dataset."""
+
+    def _harvest(self, rmock, remote_id=REMOTE_ID, **fields):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, None, **fields)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_a_record_with_a_geobox_gets_spatial_coverage(self, rmock):
+        dataset = self._harvest(
+            rmock, remote_id=LNEG_REMOTE_ID, link=LNEG_LINK, geoBox=LNEG_GEO_BOX
+        )
+        assert dataset.spatial is not None
+        assert dataset.spatial.geom["type"] == "MultiPolygon"
+        (ring,) = dataset.spatial.geom["coordinates"][0]
+        assert ring[0] == [-8.13, 37.46]
+
+    def test_a_record_without_a_geobox_has_no_coverage(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.spatial is None
+
+    def test_an_unusable_geobox_does_not_fail_the_item(self, rmock):
+        dataset = self._harvest(rmock, geoBox="lixo")
+        assert dataset.spatial is None
+
+    def test_several_boxes_become_several_polygons(self, rmock):
+        dataset = self._harvest(
+            rmock,
+            geoBox=[
+                "-8.49706|39.52706|-6.693817|41.819792",
+                "-8.482288|39.532618|-6.822819|41.353713",
+            ],
+        )
+        assert len(dataset.spatial.geom["coordinates"]) == 2

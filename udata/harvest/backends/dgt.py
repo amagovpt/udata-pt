@@ -1,6 +1,7 @@
 import re
 
 from udata.core.dataset.models import HarvestDatasetMetadata
+from udata.core.spatial.models import SpatialCoverage
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
@@ -9,6 +10,7 @@ from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
     OGC_SERVICE_FORMATS,
+    bbox_to_multipolygon,
     guess_url_format,
     map_iso_maintenance_frequency,
     reset_maintenance_frequency_warnings,
@@ -338,6 +340,38 @@ class DGTBackend(BaseBackend):
         }
 
     @staticmethod
+    def _geo_boxes(record: dict) -> list[tuple[float, float, float, float]]:
+        """The record's bounding boxes, as `(minx, miny, maxx, maxy)` tuples.
+
+        `geoBox` is published as `west|south|east|north` -- checked against the
+        LNEG record `20df57a5-76db-4c5e-ae78-45e423e4a88f`, whose
+        `-8.13|37.46|-7.77|37.68` places Neves-Corvo where it is. It is filled
+        on 99.5% of the index, as a bare string for most records and as a list
+        for a few (5 of 400 sampled), which is why several boxes are kept
+        rather than the first: a MultiPolygon holds them all.
+
+        Anything that is not four numbers is dropped rather than guessed at.
+        """
+        value = record.get("geoBox")
+        if isinstance(value, str):
+            value = [value]
+        elif not isinstance(value, list):
+            return []
+
+        boxes = []
+        for entry in value:
+            if not isinstance(entry, str):
+                continue
+            parts = entry.split("|")
+            if len(parts) != 4:
+                continue
+            try:
+                boxes.append(tuple(float(part) for part in parts))
+            except ValueError:
+                continue
+        return boxes
+
+    @staticmethod
     def _update_frequency(record: dict) -> str | None:
         """The record's `updateFrequency`, as the source spells it.
 
@@ -424,6 +458,7 @@ class DGTBackend(BaseBackend):
             }
             item["created_at"] = self._publication_dates(each)
             item["update_frequency"] = self._update_frequency(each)
+            item["geo_boxes"] = self._geo_boxes(each)
 
             # `link` comes as a list for records with several resources and as
             # a bare string for records with one, the same two shapes
@@ -493,6 +528,15 @@ class DGTBackend(BaseBackend):
         # already defaults to and what `Dataset.has_frequency` reads as "none
         # given".
         dataset.frequency = map_iso_maintenance_frequency(data.get("update_frequency"))
+
+        boxes = data.get("geo_boxes")
+        if boxes:
+            try:
+                # Replaces the whole coverage: `SpatialCoverage.clean` refuses
+                # `zones` and `geom` together, so the two cannot be merged.
+                dataset.spatial = SpatialCoverage(geom=bbox_to_multipolygon(boxes))
+            except (TypeError, ValueError) as e:
+                self.logger.warning("DGT: unusable geoBox on %s: %s", item.remote_id, e)
 
         # Add keywords as tags
         if data.get("keywords"):
