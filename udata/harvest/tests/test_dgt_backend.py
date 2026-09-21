@@ -1,9 +1,11 @@
 """DGT harvester: resource identity (LEDG-2251) and licence derivation (LEDG-2518)."""
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import LicenseFactory
 from udata.models import License
 from udata.tests.api import PytestOnlyDBTestCase
@@ -13,8 +15,10 @@ from ..backends.dgt import (
     MAX_CONSTRAINT_ENTRIES,
     MAX_CONSTRAINT_LENGTH,
     DGTBackend,
+    format_from_link,
     license_id_from_legal_constraints,
 )
+from ..backends.tools.harvester_utils import bbox_to_multipolygon, map_iso_maintenance_frequency
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -255,22 +259,283 @@ class DGTLicenseResolutionTest:
         assert license_id_from_legal_constraints(["Sem restrições", "Sem restrições"]) is None
 
 
-def _index_record(remote_id, legal_constraints, title="Carta geológica"):
-    """One record shaped the way the SNIG `fast=index` response shapes it."""
+def _index_record(remote_id, legal_constraints, title="Carta geológica", link=None, **fields):
+    """One record shaped the way the SNIG `fast=index` response shapes it.
+
+    The default `link` deliberately keeps the five fields it has always had,
+    rather than the six the source really publishes: every licence test below
+    goes through it, so it doubles as the proof that a short link is tolerated.
+    `link` and `**fields` let a test carry a verbatim record instead.
+    """
     record = {
         "geonet:info": {"uuid": remote_id},
         "defaultTitle": title,
         "defaultAbstract": "Cartografia temática",
         "keyword": ["geo"],
-        "link": f"nome|desc|{ZIP_URL}|WWW:LINK|zip",
+        "link": f"nome|desc|{ZIP_URL}|WWW:LINK|zip" if link is None else link,
     }
     if legal_constraints is not None:
         record["legalConstraints"] = legal_constraints
+    record.update(fields)
     return record
 
 
 def _index_payload(records):
     return json.dumps({"metadata": records})
+
+
+# Two records copied verbatim out of the SNIG index on 2026-09-21, via
+# `?_content_type=json&fast=index&resultType=details`. Both are named in
+# LEDG-2530 and both are load-bearing here: the LNEG one is the record the
+# producer complained about, and its URL carries no file extension at all;
+# the hidrografico one is an OGC API endpoint, whose format has no other
+# source than the label the index puts on it.
+LNEG_REMOTE_ID = "20df57a5-76db-4c5e-ae78-45e423e4a88f"
+LNEG_LINK = (
+    "|Página de descarregamento do PDF a partir do Geoportal da Energia e Geologia"
+    "|https://geoportal.lneg.pt/dados_abertos/info_recursosminerais?Id=1704"
+    "|WWW:LINK-1.0-http--link|text/html|1"
+)
+LNEG_URL = "https://geoportal.lneg.pt/dados_abertos/info_recursosminerais?Id=1704"
+
+OGC_API_REMOTE_ID = "d7b1eb8d-7b44-4a2d-adca-97088a6589f9"
+OGC_API_LINK = (
+    "||https://api-features.hidrografico.pt/collections/depcnt_400_800"
+    "|OGC API - Features|OGC API - Features|1"
+)
+OGC_API_URL = "https://api-features.hidrografico.pt/collections/depcnt_400_800"
+
+
+class DGTLinkFormatTest:
+    """`format_from_link`: what the source says first, the URL only last."""
+
+    def test_the_mime_type_names_the_format(self):
+        assert format_from_link("WWW:LINK-1.0-http--link", "text/html", LNEG_URL) == "html"
+
+    def test_an_ogc_api_label_is_read_from_the_link(self):
+        # Neither the URL nor a `SERVICE=` parameter names this one.
+        assert format_from_link("OGC API - Features", "OGC API - Features", OGC_API_URL) == (
+            "ogcapi-features"
+        )
+
+    def test_the_sources_own_transposition_is_tolerated(self):
+        assert format_from_link("OCG API - Maps", "OCG API - Maps", OGC_API_URL) == "ogcapi-maps"
+
+    def test_a_versioned_ogc_protocol_resolves_to_its_service(self):
+        assert format_from_link("OGC:WFS-2.0.0-http-get-capabilities", None, OGC_API_URL) == "wfs"
+
+    def test_the_wms_capabilities_mime_resolves_to_wms(self):
+        assert format_from_link("OGC:WMS", "application/vnd.ogc.wms_xml", WMS_URL) == "wms"
+
+    def test_text_plain_falls_through_to_the_url(self):
+        # 243 of the 733 links sampled carry `text/plain`, in front of WFS
+        # endpoints, zip archives and PDFs alike. Believing it would be worse
+        # than ignoring it.
+        assert format_from_link("", "text/plain", ZIP_URL) == "zip"
+        assert format_from_link("", "text/plain", WMS_URL) == "wms"
+
+    def test_an_unknown_label_falls_through_to_the_url(self):
+        assert format_from_link("something", "n.a", ZIP_URL) == "zip"
+
+    def test_a_url_with_no_extension_is_not_mined_for_one(self):
+        # The bug this replaces: `split(".")[-1]` over the whole URL returned
+        # `pt/dados_abertos/info_recursosminerais?Id=1704`.
+        assert format_from_link(None, None, LNEG_URL) == "remote"
+
+    @pytest.mark.parametrize(
+        "protocol,mimetype,url,expected",
+        [
+            ("WWW:LINK-1.0-http--link", "text/html", LNEG_URL, "html"),
+            ("OGC API - Features", "OGC API - Features", OGC_API_URL, "ogcapi-features"),
+            ("OGC:WMS", "application/vnd.ogc.wms_xml", WMS_URL, "wms"),
+            ("", "text/plain", ZIP_URL, "zip"),
+            (None, None, LNEG_URL, "remote"),
+            (None, None, "https://cdd.dgterritorio.gov.pt/dgt-fe/mapa?collection=LAZ", "remote"),
+            (
+                None,
+                None,
+                "https://geo.dgterritorio.gov.pt/pt/idea-api/collections/Ortofoto_2024",
+                "remote",
+            ),
+            ("n.a", "n.a", "", "remote"),
+        ],
+    )
+    def test_no_resolved_format_is_a_url_fragment(self, protocol, mimetype, url, expected):
+        """Criterion 1, over every branch of the resolution.
+
+        The expected value is asserted alongside it: `"/" not in x` on its own
+        would pass against a function that always returned `"remote"`.
+        """
+        resolved = format_from_link(protocol, mimetype, url)
+        assert resolved == expected
+        assert "/" not in resolved and "?" not in resolved, resolved
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTResourceFormatTest(PytestOnlyDBTestCase):
+    """The format a real harvest ends up writing on the resource."""
+
+    def _harvest(self, rmock, remote_id, link):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, None, link=link)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_the_lneg_record_no_longer_gets_a_url_fragment(self, rmock):
+        dataset = self._harvest(rmock, LNEG_REMOTE_ID, LNEG_LINK)
+        (resource,) = dataset.resources
+        assert resource.url == LNEG_URL
+        assert resource.format == "html"
+
+    def test_an_ogc_api_record_is_catalogued_by_its_label(self, rmock):
+        dataset = self._harvest(rmock, OGC_API_REMOTE_ID, OGC_API_LINK)
+        (resource,) = dataset.resources
+        assert resource.url == OGC_API_URL
+        assert resource.format == "ogcapi-features"
+
+
+class DGTLinkParsingTest:
+    """`DGTBackend._parse_link`: the six fields, and what a short one does."""
+
+    def test_the_six_fields_are_read(self):
+        parsed = DGTBackend._parse_link(LNEG_LINK)
+        assert parsed["url"] == LNEG_URL
+        assert parsed["description"] == (
+            "Página de descarregamento do PDF a partir do Geoportal da Energia e Geologia"
+        )
+        assert parsed["type"] == "WWW:LINK-1.0-http--link"
+        assert parsed["format"] == "text/html"
+
+    def test_an_empty_name_is_none_rather_than_empty(self):
+        # The LNEG record carries a description but no name: field 0 is empty.
+        assert DGTBackend._parse_link(LNEG_LINK)["title"] is None
+
+    def test_a_link_with_neither_name_nor_description(self):
+        parsed = DGTBackend._parse_link(OGC_API_LINK)
+        assert parsed["title"] is None
+        assert parsed["description"] is None
+        assert parsed["url"] == OGC_API_URL
+
+    def test_a_five_field_link_does_not_raise(self):
+        parsed = DGTBackend._parse_link(f"nome|desc|{ZIP_URL}|WWW:LINK|zip")
+        assert parsed["url"] == ZIP_URL
+        assert parsed["format"] == "zip"
+
+    def test_a_pipe_in_the_description_does_not_shift_the_url(self):
+        # Read from the right: the four trailing fields are fixed, the free
+        # text is the only part that can hold a separator. Positionally from
+        # the left, the URL would be read as "B" and `URLField` would fail the
+        # whole item.
+        parsed = DGTBackend._parse_link(f"Nome|Carta de A|B|{ZIP_URL}|WWW:LINK|text/csv|1")
+        assert parsed["url"] == ZIP_URL
+        assert parsed["title"] == "Nome"
+        assert parsed["description"] == "Carta de A|B"
+        assert parsed["format"] == "text/csv"
+
+    def test_a_link_with_no_url_names_no_resource(self):
+        assert DGTBackend._parse_link("nome|desc") is None
+        assert DGTBackend._parse_link("") is None
+        assert DGTBackend._parse_link("||") is None
+
+    def test_a_link_that_is_not_a_string_names_no_resource(self):
+        assert DGTBackend._parse_link(None) is None
+        assert DGTBackend._parse_link({"url": ZIP_URL}) is None
+
+    def test_the_title_is_sanitized(self):
+        # `Dataset.pre_save` sanitizes the dataset title and both descriptions,
+        # but never `resource.title`.
+        parsed = DGTBackend._parse_link(f"<b>Carta</b>|desc|{ZIP_URL}|WWW:LINK|zip")
+        assert parsed["title"] == "Carta"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTResourceMetadataHarvestTest(PytestOnlyDBTestCase):
+    """The title and description a real harvest writes, and the ids it keeps."""
+
+    def _harvest(self, rmock, records):
+        rmock.get(DGT_URL, text=_index_payload(records))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        return DGTBackend(source).harvest()
+
+    def test_a_named_link_uses_the_sources_own_name(self, rmock):
+        link = f"Carta administrativa (SHP)|Descarregamento directo|{ZIP_URL}|WWW:LINK|zip"
+        self._harvest(rmock, [_index_record(REMOTE_ID, None, link=link)])
+        (resource,) = harvested_dataset(REMOTE_ID).resources
+        assert resource.title == "Carta administrativa (SHP)"
+        assert resource.description == "Descarregamento directo"
+
+    def test_the_lneg_description_survives_the_harvest(self, rmock):
+        self._harvest(rmock, [_index_record(LNEG_REMOTE_ID, None, link=LNEG_LINK)])
+        (resource,) = harvested_dataset(LNEG_REMOTE_ID).resources
+        assert resource.description.startswith("Página de descarregamento do PDF")
+        # No name in the source, so the dataset title stands in.
+        assert resource.title == "Carta geológica"
+
+    def test_a_link_without_a_name_keeps_the_dataset_title(self, rmock):
+        self._harvest(rmock, [_index_record(OGC_API_REMOTE_ID, None, link=OGC_API_LINK)])
+        (resource,) = harvested_dataset(OGC_API_REMOTE_ID).resources
+        assert resource.title == "Carta geológica"
+        assert resource.description is None
+
+    def test_the_protocol_never_reaches_the_resource_type(self, rmock):
+        # `Resource.type` is a closed choice field; `OGC:WMS` would fail
+        # validation and take every item of every DGT source with it.
+        link = f"nome|desc|{WMS_URL}|OGC:WMS|application/vnd.ogc.wms_xml|1"
+        job = self._harvest(rmock, [_index_record(REMOTE_ID, None, link=link)])
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        (resource,) = harvested_dataset(REMOTE_ID).resources
+        assert resource.type == "main"
+        assert resource.format == "wms"
+
+    def test_a_malformed_link_does_not_take_the_job_down(self, rmock):
+        """The split used to run unguarded inside `inner_harvest`.
+
+        An `IndexError` there does not fail one item: it raises out of
+        `inner_harvest`, so the job ends `failed` and none of the other records
+        is processed at all.
+        """
+        job = self._harvest(
+            rmock,
+            [
+                _index_record("bad-record-0000-4000-8000-000000000001", None, link="nome|desc"),
+                _index_record(REMOTE_ID, None),
+            ],
+        )
+        assert job.status == "done"
+        assert [item.status for item in job.items] == ["done", "done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        # The good record was processed, the bad one produced no resource.
+        assert len(harvested_dataset(REMOTE_ID).resources) == 1
+        assert harvested_dataset("bad-record-0000-4000-8000-000000000001").resources == []
+
+    def test_new_titles_and_formats_do_not_cost_the_resource_ids(self, rmock):
+        """Criterion 5: `sync_resources` reconciles by URL, so the id survives.
+
+        `DGTResourceIdentityTest` proves this through `id_stability.harvest`,
+        which stubs `inner_harvest` out entirely and so never exercises the
+        pipe-split path this ticket rewrote. This one goes through the real
+        `inner_harvest`, over the two fields it now changes.
+        """
+        first = f"Nome antigo|Descrição antiga|{ZIP_URL}|WWW:LINK|text/plain|1"
+        self._harvest(rmock, [_index_record(REMOTE_ID, None, link=first)])
+        before = resource_ids(REMOTE_ID)
+        assert len(before) == 1
+
+        second = f"Nome novo|Descrição nova|{ZIP_URL}|WWW:LINK-1.0-http--link|application/pdf|1"
+        self._harvest(rmock, [_index_record(REMOTE_ID, None, link=second)])
+        assert resource_ids(REMOTE_ID) == before
+        assert resource_urls(REMOTE_ID) == [ZIP_URL]
+
+        (resource,) = harvested_dataset(REMOTE_ID).resources
+        assert resource.title == "Nome novo"
+        assert resource.description == "Descrição nova"
+        assert resource.format == "pdf"
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
@@ -540,3 +805,260 @@ class DGTLicenseWithdrawalTest(PytestOnlyDBTestCase):
 
         dataset = self._harvest(rmock, [PUBLIC_ACCESS, IPR_ONLY])
         assert dataset.extras[DERIVED_LICENSE_EXTRA] == "notspecified"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTPublicationDateTest(PytestOnlyDBTestCase):
+    """`created_at` from the source, written where the property can read it."""
+
+    def _harvest(self, rmock, remote_id=REMOTE_ID, **fields):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, None, **fields)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_the_publication_date_becomes_the_creation_date(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="2021-06-15")
+        assert dataset.harvest.created_at == datetime(2021, 6, 15)
+        assert dataset.created_at == datetime(2021, 6, 15)
+
+    def test_the_reference_date_stands_in(self, rmock):
+        # The LNEG record is exactly this shape: no publicationDate, a
+        # referenceDate of 2020-12-31.
+        dataset = self._harvest(
+            rmock, remote_id=LNEG_REMOTE_ID, link=LNEG_LINK, referenceDate="2020-12-31"
+        )
+        assert dataset.harvest.created_at == datetime(2020, 12, 31)
+
+    def test_the_publication_date_wins_over_the_reference_date(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="2021-06-15", referenceDate="2019-01-01")
+        assert dataset.harvest.created_at == datetime(2021, 6, 15)
+
+    def test_several_publication_dates_resolve_to_the_earliest(self, rmock):
+        # One record in 400 publishes a list; it was first published on the
+        # earliest of them, not on whichever the index lists first.
+        dataset = self._harvest(rmock, publicationDate=["2022-08-24", "2020-02-01", "2023-10-30"])
+        assert dataset.harvest.created_at == datetime(2020, 2, 1)
+
+    def test_a_record_without_any_date_is_not_failed(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.harvest.created_at is None
+        assert dataset.created_at == dataset.created_at_internal
+
+    def test_an_unparseable_date_is_not_failed(self, rmock):
+        """The old assignment would have raised `AttributeError` here.
+
+        `Dataset.created_at` has no setter, so uncommenting the original block
+        would have failed every record carrying a date -- not just the bad one.
+        """
+        dataset = self._harvest(rmock, publicationDate="não é uma data")
+        assert dataset.harvest.created_at is None
+
+    def test_a_numeric_timestamp_does_not_fail_the_item(self, rmock):
+        """`dateutil` raises OverflowError here, not ParserError."""
+        dataset = self._harvest(rmock, publicationDate="1623715200000")
+        assert dataset.harvest.created_at is None
+
+    def test_an_unreadable_publication_date_falls_back_to_the_reference_date(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="não é uma data", referenceDate="2020-12-31")
+        assert dataset.harvest.created_at == datetime(2020, 12, 31)
+
+    def test_a_future_date_is_refused(self, rmock):
+        ahead = (datetime.now(UTC) + timedelta(days=365)).strftime("%Y-%m-%d")
+        dataset = self._harvest(rmock, publicationDate=ahead)
+        assert dataset.harvest.created_at is None
+
+    def test_the_date_survives_a_re_harvest(self, rmock):
+        """`update_dataset_harvest_info` runs after this and must not clear it."""
+        self._harvest(rmock, publicationDate="2021-06-15")
+        dataset = self._harvest(rmock, publicationDate="2021-06-15")
+        assert dataset.harvest.created_at == datetime(2021, 6, 15)
+
+
+class DGTFrequencyMappingTest:
+    """`map_iso_maintenance_frequency` over the codelist the source uses."""
+
+    @pytest.mark.parametrize(
+        "published,expected",
+        [
+            # The eight values the DGT index actually carries, by frequency.
+            ("asNeeded", UpdateFrequency.PUNCTUAL),
+            ("notPlanned", UpdateFrequency.NOT_PLANNED),
+            ("unknown", UpdateFrequency.UNKNOWN),
+            ("daily", UpdateFrequency.DAILY),
+            ("continual", UpdateFrequency.CONTINUOUS),
+            ("annually", UpdateFrequency.ANNUAL),
+            ("biannually", UpdateFrequency.SEMIANNUAL),
+            ("irregular", UpdateFrequency.IRREGULAR),
+            # The rest of the codelist.
+            ("weekly", UpdateFrequency.WEEKLY),
+            ("fortnightly", UpdateFrequency.BIWEEKLY),
+            ("monthly", UpdateFrequency.MONTHLY),
+            ("quarterly", UpdateFrequency.QUARTERLY),
+            ("biennially", UpdateFrequency.BIENNIAL),
+            ("semimonthly", UpdateFrequency.SEMIMONTHLY),
+            ("periodic", UpdateFrequency.OTHER),
+        ],
+    )
+    def test_the_codelist_maps_onto_the_vocabulary(self, published, expected):
+        assert map_iso_maintenance_frequency(published) == expected
+
+    @pytest.mark.parametrize("published", ["asNeeded", "AS_NEEDED", " as needed ", "ASNEEDED"])
+    def test_casing_and_separators_do_not_matter(self, published):
+        assert map_iso_maintenance_frequency(published) == UpdateFrequency.PUNCTUAL
+
+    @pytest.mark.parametrize("published", [None, "", "   ", "sempre que der jeito", "n/a"])
+    def test_anything_unnamed_is_unknown(self, published):
+        assert map_iso_maintenance_frequency(published) == UpdateFrequency.UNKNOWN
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTFrequencyHarvestTest(PytestOnlyDBTestCase):
+    """The frequency a real harvest writes on the dataset."""
+
+    def _harvest(self, rmock, **fields):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(REMOTE_ID, None, **fields)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(REMOTE_ID)
+
+    def test_the_sources_frequency_reaches_the_dataset(self, rmock):
+        dataset = self._harvest(rmock, updateFrequency="asNeeded")
+        assert dataset.frequency == UpdateFrequency.PUNCTUAL
+
+    def test_the_lneg_record_is_not_planned(self, rmock):
+        dataset = self._harvest(rmock, updateFrequency="notPlanned")
+        assert dataset.frequency == UpdateFrequency.NOT_PLANNED
+
+    def test_a_record_without_a_frequency_is_unknown(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+    def test_an_unmapped_frequency_does_not_fail_the_item(self, rmock):
+        dataset = self._harvest(rmock, updateFrequency="sempre que der jeito")
+        assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+
+# The LNEG record's own bounding box, verbatim: Neves-Corvo, in the Alentejo.
+LNEG_GEO_BOX = "-8.13|37.46|-7.77|37.68"
+
+
+class DGTGeoBoxTest:
+    """`_geo_boxes` and `bbox_to_multipolygon`."""
+
+    def test_the_lneg_box_is_read_as_four_numbers(self):
+        assert DGTBackend._geo_boxes({"geoBox": LNEG_GEO_BOX}) == [(-8.13, 37.46, -7.77, 37.68)]
+
+    def test_several_boxes_are_all_kept(self):
+        published = [
+            "-8.49706|39.52706|-6.693817|41.819792",
+            "-8.482288|39.532618|-6.822819|41.353713",
+        ]
+        assert len(DGTBackend._geo_boxes({"geoBox": published})) == 2
+
+    @pytest.mark.parametrize(
+        "published",
+        [None, "", "lixo", "-8.13|37.46", "-8.13|37.46|-7.77", "a|b|c|d", {"minx": 1}],
+    )
+    def test_anything_that_is_not_four_numbers_is_dropped(self, published):
+        assert DGTBackend._geo_boxes({"geoBox": published}) == []
+
+    def test_the_ring_is_closed_and_counter_clockwise(self):
+        geom = bbox_to_multipolygon([(-8.13, 37.46, -7.77, 37.68)])
+        assert geom["type"] == "MultiPolygon"
+        (ring,) = geom["coordinates"][0]
+        assert len(ring) == 5
+        assert ring[0] == ring[-1]
+        assert ring == [
+            [-8.13, 37.46],
+            [-7.77, 37.46],
+            [-7.77, 37.68],
+            [-8.13, 37.68],
+            [-8.13, 37.46],
+        ]
+
+    def test_the_axes_are_longitude_then_latitude(self):
+        """What the swap guard cannot catch: lon and lat transposed.
+
+        A closed five-vertex ring looks identical either way round, so the
+        values are asserted. Mainland Portugal sits at lon -6..-10, lat 37..42.
+        """
+        geom = bbox_to_multipolygon(DGTBackend._geo_boxes({"geoBox": LNEG_GEO_BOX}))
+        (ring,) = geom["coordinates"][0]
+        for longitude, latitude in ring:
+            assert -10 < longitude < -6, ring
+            assert 36 < latitude < 43, ring
+
+    def test_an_inverted_box_is_normalized(self):
+        inverted = bbox_to_multipolygon([(-7.77, 37.68, -8.13, 37.46)])
+        upright = bbox_to_multipolygon([(-8.13, 37.46, -7.77, 37.68)])
+        assert inverted == upright
+
+    def test_a_point_becomes_a_polygon_with_area(self):
+        geom = bbox_to_multipolygon([(-8.13, 37.46, -8.13, 37.46)])
+        (ring,) = geom["coordinates"][0]
+        assert len({tuple(vertex) for vertex in ring}) == 4
+        width = ring[1][0] - ring[0][0]
+        height = ring[2][1] - ring[1][1]
+        assert width > 0 and height > 0
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTSpatialHarvestTest(PytestOnlyDBTestCase):
+    """The spatial coverage a real harvest writes on the dataset."""
+
+    def _harvest(self, rmock, remote_id=REMOTE_ID, **fields):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, None, **fields)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_a_record_with_a_geobox_gets_spatial_coverage(self, rmock):
+        dataset = self._harvest(
+            rmock, remote_id=LNEG_REMOTE_ID, link=LNEG_LINK, geoBox=LNEG_GEO_BOX
+        )
+        assert dataset.spatial is not None
+        assert dataset.spatial.geom["type"] == "MultiPolygon"
+        (ring,) = dataset.spatial.geom["coordinates"][0]
+        assert ring[0] == [-8.13, 37.46]
+
+    def test_a_record_without_a_geobox_has_no_coverage(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.spatial is None
+
+    @pytest.mark.parametrize(
+        "published",
+        [
+            "lixo",
+            # `float` reads these without complaint, and a non-finite corner
+            # reaches the model intact and fails the item at save time -- the
+            # swap guard cannot catch it, since every NaN comparison is false.
+            "nan|nan|nan|nan",
+            "-inf|37.0|-7.0|inf",
+            # Projected metres, not degrees: several thousand degrees off the
+            # map, and nothing downstream would reject it.
+            "-120000|-300000|165000|280000",
+        ],
+    )
+    def test_an_unusable_geobox_does_not_fail_the_item(self, rmock, published):
+        dataset = self._harvest(rmock, geoBox=published)
+        assert dataset.spatial is None
+
+    def test_several_boxes_become_several_polygons(self, rmock):
+        dataset = self._harvest(
+            rmock,
+            geoBox=[
+                "-8.49706|39.52706|-6.693817|41.819792",
+                "-8.482288|39.532618|-6.822819|41.353713",
+            ],
+        )
+        assert len(dataset.spatial.geom["coordinates"]) == 2
