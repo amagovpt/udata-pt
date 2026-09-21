@@ -2,6 +2,358 @@
 
 ## Unreleased
 
+- **fix(harvest): the DGT backend reads the resource format, the resource title and
+  description, the publication date, the update frequency and the bounding box from the
+  source instead of inventing them**
+  - **The resource format was a fragment of the URL.** The backend took the `SERVICE=`
+    query parameter when there was one and otherwise ran `split(".")[-1]` over the *whole*
+    URL, so any endpoint without a file extension returned the tail of the host name and the
+    query string. That is how the catalogue filled with formats like
+    `pt/dados_abertos/info_recursosminerais?Id=1704` and `pt/idea-api/collections/Ortofoto_2024`
+    -- about 28% of the DGT resources sampled in production, and 98 of the 733 links of a
+    400-record sample of the index. The MIME type and the protocol the source publishes on
+    every link are read first now, and the URL only last, through the `guess_url_format`
+    helper that reads the extension off the last path segment alone. `text/plain` is
+    deliberately not believed: it is the second most common MIME in the index and sits in
+    front of WFS endpoints, zip archives and PDFs alike, so trusting it would replace a
+    wrong answer with a confidently wrong one.
+  - **Each link carries six fields and three were read.** The index writes them as
+    `name|description|url|protocol|mime|order`; fields 0 and 1 were never touched, which is
+    why every harvested resource repeated the title of its own dataset. They are filled on
+    16.2% and 19.3% of the links, and the dataset title now only stands in for the rest.
+    The split was also unguarded -- and an `IndexError` there did not fail one item, it
+    raised out of `inner_harvest` and would have ended the whole job before any other record
+    was processed.
+  - **The publication date had been commented out since the backend was written**, so every
+    dataset carried the date the harvester first saw it. Uncommenting it as written would not
+    have worked: it assigned `Dataset.created_at`, which is a read-only property, so every
+    record carrying a date would have failed with an `AttributeError`. The date goes to
+    `harvest.created_at`, which is what that property actually reads. **This changes existing
+    datasets**: none of the 1044 harvested from DGT carries that field today, so all of them
+    take the date the source declares on the first harvest after this deploys, and the
+    "created" date shown in the portal changes for them.
+  - **The update frequency and the spatial coverage were never written at all.** The source
+    publishes an ISO 19115 maintenance frequency on 42.4% of its records and a bounding box
+    on 99.5% of them; in production, 89 of 100 datasets sampled sat on the frequency default
+    and 92 of 100 had no coverage. Both are mapped explicitly rather than guessed -- four of
+    the ISO terms have no same-named member in the portal's vocabulary. Note that both are
+    rewritten on every harvest, so a frequency or a geographic zone set by hand in the back
+    office is replaced by what the source says.
+  - **Resource ids are unaffected.** The reconciliation by URL keeps the resource that is
+    already stored and writes the new title and format onto it, so the `/api/1/datasets/r/<id>`
+    permalinks survive. There is no migration: every field above is rewritten on the next
+    harvest of each of the 27 sources.
+
+- **fix(harvest): the DGT backend derives the license from `legalConstraints` instead of
+  stamping `cc-by` on every dataset**
+  - The constant ran on every harvest of all 27 DGT sources, over all 1213 datasets, so it
+    was never an initial value: it was a daily rewrite. A producer who corrected the licence
+    in the back office had it stamped over by the next run. Of the 2900 records the sources actually
+    harvest, 840 declare no licence the portal can honour -- and every one of them was
+    published as CC BY 4.0. That is what LNEG reported.
+  - **Where a restriction appears is what decides whether the grant holds.** "Mentions
+    commercial use, therefore not CC BY" would have been the easy rule and the wrong one: it
+    would also turn the SNIT records, which are the largest slice of the source. Those forbid
+    commercialising what the SNIT PORTAL shows and then grant CC BY over the geographic
+    information itself -- a restriction on the viewer, not on the data, and CC BY 4.0 permits
+    commercial use by definition, so reading it the other way makes the record contradict
+    itself. The Azores records, by contrast, grant CC BY and forbid commercial use OF THE
+    DATA in the same sentence, so there the grant does not hold. The check runs on whichever
+    entry produced the licence code, whether it came from a URL or from the text: the Azores
+    wording ends with the CC BY URL, so exempting URLs would have let through exactly the
+    records it guards against.
+  - **The free text is never handed to `License.guess`.** Its fuzzy fallback ranks every
+    licence slug and title by edit distance, so a thousand characters of legal prose would
+    resolve to whatever happens to be nearest. A canonical Creative Commons code is extracted
+    first -- from a licence URL, or from the code spelled out in the text -- and only that is
+    looked up, by exact id. The URL pattern tolerates the two defects the source really
+    carries: the domain misspelled `creativecoomons`, and a version path written `by4.0`
+    without the separating slash.
+  - **Nothing falls back to `cc-by` any more.** Source first, then whatever the dataset
+    already carries, then the portal default -- the same order the CKAN backend uses, which
+    is what lets a producer's correction survive the next harvest. The raw text is kept in
+    `extras["harvest:legal_constraints"]` so a licence decision can be audited without going
+    back to the source.
+  - **Two licences added, and the harvester-written `cc-by` cleared.** The sources publish
+    CC BY-NC and CC BY-NC-ND, which the portal did not carry; they are upserted rather than
+    seeded through the `licenses` command, which drops the whole collection and would take
+    the eleven existing Portuguese-titled licences with it. A second migration clears the
+    `cc-by` on DGT-harvested datasets, because the new fallback would otherwise read the bug
+    as an editorial decision and preserve it forever.
+  - **A source can take back a licence it stopped granting.** Keeping whatever the dataset
+    already carries is what lets a producer's correction survive a harvest, but applied
+    blindly it also makes the licence irrevocable: the value written last night is
+    indistinguishable from an editorial decision, so a source that stopped granting CC BY
+    would never take it back -- the mirror image of the bug being fixed. What this backend
+    derived is recorded in `extras["harvest:derived_license"]`, and only a licence that
+    differs from it is treated as somebody's correction.
+  - **Deploy order matters:** stop `worker` and `beat`, deploy, run `udata db upgrade`, then
+    start them again. A long-running worker keeps the old code in memory, and a harvest that
+    runs before the restart writes `cc-by` straight back over the migration.
+
+- **fix(saml): an invited link whose identity is already taken now stops and says so**
+  - Pressing "link" with a CMD/eIDAS identity that already belongs to another account used
+    to sign the citizen into that other account. That is the right answer for anyone who
+    pressed "sign in" -- the identity IS that account's -- and the wrong one for somebody
+    who pressed "link": they end up in an account they never asked about, the one they
+    clicked from stays unlinked, and nothing says so. They walk away believing it worked
+    and find out when the invite comes back.
+  - Same principle the password screen already applies: never switch accounts in silence.
+    Refusing costs one click to whoever did want that account, since the sign-in button is
+    still there, and saves everyone else a change they never asked for. An ordinary
+    sign-in with the same identity is untouched -- the guard is scoped to a link ticket.
+  - The redirect carries a generic code and no identity: the query string lands in browser
+    history, Referer headers and proxy logs.
+- **fix(saml): the invited link now binds the account the person clicked from**
+  - The wizard re-points the pending migration at whichever account the typed password
+    proves. In the mandatory mode that is the only evidence there is -- the citizen
+    arrives deauthenticated and the candidate was matched by name, which is a guess --
+    so refusing there would lock homonyms out of their own accounts.
+  - In invite mode the portal knows which account they clicked from. Re-pointing silently
+    threw that away, landed the identity on an account they never asked about, and left
+    the one they clicked from unlinked. Not a security hole -- reaching another account
+    still costs that account's password -- but the notice promises "you keep the account
+    you already have", and this is what keeps that true.
+  - Refused after the password check on purpose: a correct password for the wrong account
+    is not a guess and must not spend an attempt from a cap that never resets. The refusal
+    names the expected account, masked, so the screen can explain itself.
+
+- **feat(saml): invite a password account to link a CMD/eIDAS identity, optionally**
+  - Two flags, one question each. `MIGRATION_MODE_ENABLED` asks whether linking is
+    mandatory; `MIGRATION_INVITE_ENABLED` asks whether the portal invites it. A single
+    flag could not express the state the portal is actually in -- inviting without
+    forcing -- and hanging a fourth question on the existing one would mean reading
+    `not _migration_enabled()` as "we are in invite mode", making a negation stand for
+    a feature. The payoff that decides it: turning the invite off restores today's
+    behaviour WITHOUT turning the mandatory mode on. With both on, mandatory wins, and
+    that is arbitrated in one place so no call site combines two flags on the spot.
+  - **The default is `False`, in one place, and deliberately not `True`.** A `True`
+    default would put every test that only switches the mandatory flag off into invite
+    mode without saying so, and those tests assert that an unmatched identity creates an
+    account. Enabling it is a deployment decision, as it already is for the other flag.
+  - **An account that is already signed in had no way to start a SAML flow.**
+    `/saml/login` and `/saml/eidas/login` are `@anonymous_user_required`, which is right
+    for a way IN and exactly wrong for somebody who just signed in with a password and
+    wants to add an identity: the invite's button would have bounced off them and done
+    nothing. `/saml/link/start` and `/saml/eidas/link/start` are those doors, and the
+    AuthnRequest itself is now built in one shared place rather than copied.
+  - **What stops a second account being created.** The callback cannot see who started
+    the flow: the IdP posts the assertion back cross-site and `SESSION_COOKIE_SAMESITE`
+    is `Lax`, so the browser withholds the session cookie. A ticket therefore rides the
+    RelayState-keyed bucket, beside the outstanding one that exists for the same reason.
+    With a ticket present, both `migration_candidate` AND `no_match` divert to the
+    wizard -- the second is the case that mattered, a CMD carrying a different address
+    that nobody else holds, where a brand-new account used to be minted. eIDAS needed it
+    more, not less: its Minimum Data Set carries no email at all.
+  - **The ticket decides routing, never identity.** It says "whoever comes back this way
+    is linking, not signing up" and nothing more; proof of ownership stays with the
+    wizard, by password or by a link mailed to the account's own address. It is single
+    use, expires with the sign-in, and a cache that is down degrades to today's
+    behaviour rather than to an error on a flow that cannot be retried.
+  - The wizard's endpoints now answer in invite mode too, or the callback would hand
+    somebody a wizard whose every endpoint returns 403. One stays shut: `migration_skip`,
+    which creates a new account. In the mandatory mode it is the emergency exit for
+    somebody who would otherwise be locked out of the portal; in invite mode they signed
+    in with a password seconds ago and are locked out of nothing, so there it is only a
+    way to manufacture the duplicate the invite exists to prevent.
+  - **Dismissing is "not now", never "never let me".** The dismissal is stored as a DATE
+    -- a boolean can only express two frequencies and both are wrong -- and the invite
+    returns after eight days. Eight and not seven because a seven-day window always falls
+    on the same weekday, so somebody who only opens the portal on Tuesdays would see it
+    every time or never. `migration_invite` on the caller's own `/me` carries the notice;
+    `migration_link_available` is the same predicate minus the dismissal, so the
+    permanent entry point does not vanish with the notice.
+  - The audit log gains two reasons rather than a sixth outcome: `invite_link` answers
+    "how many people accepted?", and `invite_identity_elsewhere` names the case nobody
+    would look for -- somebody who clicked Associate from their own account and whose
+    CMD already belongs to a different one, so the portal signs them into that other
+    account. Correct, and today's behaviour, and not what they expected.
+- **feat(harvest): the INE harvesters read their metadata from the catalogue instead of hardcoding it**
+  - Both INE backends read the same catalogue and both fixed in code what the source
+    publishes, so every INE dataset reached the portal with `frequency = unknown`, a
+    modification date that was really the time of the last harvest, a landing page we
+    composed ourselves, and extras only one of the two ever wrote.
+  - `<periodicity>` now becomes a real `frequency`, through a mapping shared by both
+    backends. The map is closed over what the feed actually publishes: the full catalogue
+    was enumerated on 2026-09-18 and carries 15 distinct values over 13154 indicators. Two
+    of its properties drive the normalisation and are easy to get wrong -- 13152 of the
+    values arrive surrounded by whitespace (`<![CDATA[ Mensal]]>`), and the same value is
+    published in more than one capitalisation (`Decenal`/`decenal`, `Não periódica`/`Não
+    Periódica`). `Sexenal` maps to `other`, not `unknown`: `UpdateFrequency` has no
+    six-yearly member, but the source does state a frequency and `unknown` reads as "none
+    given". The previous per-backend map recognised five values, which left `Decenal`
+    alone -- 1786 indicators -- falling through to `unknown`.
+  - `harvest.modified_at` is now the `<dates><last_update>` the source publishes rather
+    than `now()`, so a catalogue that did not change stops looking freshly modified after
+    every nightly run. The date is parsed day-first with an exact `dd-mm-yyyy` format
+    instead of through `safe_harvest_datetime`, which reaches `dateutil` without
+    `dayfirst` and reads `04-02-2026` as 2 April: measured over the catalogue, 4930 of the
+    13154 dates are ambiguous that way and 4615 would have been stored as a different day.
+  - `harvest.uri` is now the `bdd_url` the source publishes (`.../xurl/indx/<id>/PT`),
+    not the `/indicador/<id>` we composed, and `metainfo_url`, `geo_lastlevel`,
+    `source_description`, `last_period_available`, `last_update_remote` and the optional
+    `update_type` are stored as extras by both backends.
+  - Change detection had to grow with it. It compared title, description, tags and
+    resources -- all of which a dataset harvested by the old code already matches -- so
+    without comparing the new fields the enrichment would have reached new datasets only
+    and never appeared in production.
+  - The source tag is derived from the source URL instead of being a literal, which also
+    ends the disagreement between the two backends (`ine-pt` in one, `ine.pt` in the
+    other). `harvest.backend` on `ine` datasets becomes the display name, as every other
+    backend already stores; it is still assigned by hand because this backend bypasses
+    `process_dataset` for its bulk write path and so never reaches the base class helper.
+  - `dadosGov` is dropped from `HARVESTER_BACKENDS`: it has no entry point and no module,
+    so the activation list named a backend that cannot be instantiated. Every remaining
+    entry now resolves through `get_backend`.
+  - **What changes in an already harvested catalogue.** The first harvest after the deploy
+    rewrites all ~13000 `ine` datasets -- that is the change detection working, not a
+    fault -- and no resource id moves, so the `/api/1/datasets/r/<id>` download permalinks
+    survive. "Once" holds for every indicator the `ine` backend owns alone; the HVD subset
+    is claimed by both INE harvesters, which share `www.ine.pt` as their harvest domain and
+    store a different description for the same indicator, so those datasets keep being
+    rewritten by whichever ran last. That predates this change and only the consolidation
+    of the two backends fixes it. The `ine-pt` and `ine.pt` tags are replaced by `www-ine-pt`, so the old
+    facets disappear and any saved search or link using `?tag=ine-pt` stops returning
+    results; there is no tag redirect. `harvest.modified_at` moves *backwards*, possibly
+    by years, and it is what `Dataset.last_modified` exposes through the API and the feed.
+    Resource titles become "Dados (JSON)"/"Metainfo (JSON)" with their URLs untouched.
+  - ⚠️ **What the bulk write path does not do for itself.** The `ine` backend writes
+    through pymongo, so `post_save` never fires and `Dataset.clean()` never runs. Three
+    consequences, all of them pre-existing and none of them fixed here:
+    - The new frequency, tags and extras reach the search index only through a **full**
+      reindex. An incremental one does not see them: the bulk write leaves
+      `last_modified_internal` untouched, which is the field `udata search index
+      --from-datetime` filters on. Until that reindex the facets disagree with the
+      database, and the `ine-pt` -> `www-ine-pt` rename makes that visible.
+    - `quality_cached` keeps its stored `update_frequency: False`, so the visible quality
+      score does not rise with the new frequency until the datasets are written by some
+      other path.
+    - `Dataset.last_update` keeps being the time of the harvest even though
+      `harvest.modified_at` is now the source's date, so the two disagree for `ine`
+      datasets.
+    `inehvd` goes through `save()` and is unaffected by all three. Restart the Celery
+    worker and beat after the deploy -- the harvester code is read in-process.
+
+- **chore(harvest): the `dgtIne` backend is gone, and so is every registration that pointed at it**
+  - The module had already been deleted; what stayed behind was the part that breaks things.
+    `get_all_backends()` is `{ep.load().name: ep.load() for ep in entry_points(group="udata.harvesters")}`
+    -- it loads *every* entry point in the group, so one whose module no longer exists does
+    not degrade that one backend, it raises `ModuleNotFoundError` out of the comprehension
+    and takes the whole call with it. `get_backend()`, `get_enabled_backends()` and
+    `GET /api/1/harvest/backends/` all go through it, so every harvest and the admin
+    creation wizard would have gone down together, and not with the clean
+    `ValueError: Backend … unknown` an unregistered name gets. Verified:
+    `EntryPoint("dgtIne", "udata.harvest.backends.dgtIne:DGTINEBackend", "udata.harvesters").load()`
+    -> `ModuleNotFoundError: No module named 'udata.harvest.backends.dgtIne'`.
+  - Removed with it: the `udata.harvesters` entry point in `pyproject.toml`, the name in
+    `HARVESTER_BACKENDS` (`udata.cfg`), and `udata/harvest/tests/test_dgtine_backend.py`,
+    which imported the module and so failed at collection rather than as a test.
+  - Nothing is lost by the removal: `dgtIne` read the same INE HVD catalogue as `ine` and
+    `inehvd`, from `www.ine.pt/ine/catalogo_hvd.jsp?opc=4` hardcoded in the class with
+    `source.url` ignored, and that endpoint serves HTML today, so the backend harvested
+    nothing. The name was misleading too -- nothing in it came from DGT.
+  - **No source to migrate.** Production, read on 2026-09-18 via
+    `GET /api/1/harvest/sources/?deleted=true&page_size=100`: 49 sources, deleted ones
+    included, and **none on `dgtIne`** (27 `dgt`, 7 `ckanpt`, 4 `ckan`, 3 `apambiente`, 2
+    each of `ogc`, `ine` and `dcat`, 1 each of `inehvd` and `odspt`). So there is no data
+    migration here, and no dataset changes owner.
+  - ⚠️ **Each environment has its own `udata.cfg`**, and dropping the name from the one in
+    this repo does not touch the deployed ones. Before promoting to each environment, count
+    sources per backend (`db.harvest_source.aggregate` by `backend`) and drop `"dgtIne"`
+    from that environment's `HARVESTER_BACKENDS`: a source left on a backend that no longer
+    exists fails its next scheduled run. Restart the Celery worker and beat after the
+    deploy, as for any harvest change -- the backend registry is read in-process.
+  - `HARVESTER_BACKENDS` still lists `dadosGov`, a name that has never had an entry point.
+    That one is harmless (an unmatched name in the enable list is just ignored) and belongs
+    to the configuration cleanup of LEDG-2493, not here.
+
+- **fix(harvest): a harvest source's config is no longer served to readers who cannot edit it**
+  - `source_fields["config"]` was a raw passthrough while both GET routes that serve the
+    model are open to anonymous callers, so the CKAN API key -- which `ckan`, `dkan` and
+    `ckanpt` read from `config["apikey"]` into an `Authorization` header -- was public to
+    anyone who could name a source. `config` is free-form: `HarvestConfigField.pre_validate`
+    only checks `filters`, `extra_configs` and `features`, so nothing stopped a credential
+    from being stored there, and nothing redacted it on the way out. This is the residue the
+    URL work left standing, named in two entries below as a separate ticket; it is closed
+    here.
+  - **Where a source's credential lives, decided: in `config`, behind the `edit` gate.**
+    That is the rule already fixed for `url` -- whoever may rewrite a field reads it whole,
+    nobody else reads it at all -- and the gate is the one that already guards `PUT`, so the
+    people who need the key are exactly the people who still see it. A dedicated write-only
+    field was considered and rejected for now: `PUT` replaces the whole `DictField`, so a
+    secret the GET does not return would be wiped by the next save from the admin screen
+    unless the server grew merge semantics for it. That is feature work with no consumer
+    today, and it is the natural next step if a source ever does need a credential. Keeping
+    the key in server settings was rejected too: it belongs to whoever runs the source, and
+    settings would make rotating it a deploy.
+  - **The channel a reader pulls is closed; the one the process pushes is now covered twice.**
+    The serialization is the first. The second is Sentry: `BaseBackend._request_with_retry`
+    keeps the request headers as a local of the frame that re-raises every connection
+    failure, and frame locals are sent. The SDK's own scrubber walks those frames and lists
+    `authorization`, `apikey` and `token`, but it does not descend by default -- the key it
+    sees at the top is `headers` -- so it is now built with `recursive=True`. That alone is
+    best-effort: it matches key names exactly (`X-API-Key` is not `x_api_key`) and each of
+    its sections swallows its own errors, so a cyclic or very deep frame local aborts the
+    walk and the event is sent anyway. So this module's own walk, which drops what it cannot
+    scrub rather than sending it, now redacts by normalized key name as well. A decision that
+    said "keep the key in `config`" while that stayed open would have pointed the next
+    operator at a field that still leaked.
+  - ⚠️ **What is still not covered, and is a separate problem:** an API key that reaches an
+    event as part of a *string* rather than as the value of a named key. Two shapes exist --
+    the raw header block that `http.client` keeps as a local while sending, and an error
+    message a remote server builds by echoing back the `Authorization` it received, which
+    `CkanBackend.get_action` copies into a `HarvestError`. Neither is reachable by a name
+    match; both need the harvest error path to redact at the source, the way the URL already
+    does.
+  - **An empty dict rather than a masked one.** A mask can only hide the keys we already know
+    about, and the failure being fixed is precisely that the next credential key will have a
+    name nobody listed. An allowlist built from each backend's declared specs was rejected
+    for the same reason: a backend that declares `apikey` as an extra config would make the
+    credential "declared" and serve it again.
+  - **Production inventory, read anonymously on 2026-09-18** via
+    `GET /api/1/harvest/sources/?deleted=true&page_size=100` -- the very route this change
+    closes, so repeating it now needs a session: **49 sources, 44 active**; the only config
+    keys in use anywhere are `filters` (13 sources) and `features` (1); **no credential-shaped
+    key at all**, in any environment-visible source. Eleven sources run a backend that reads
+    `apikey` (`ckan`, `ckanpt`) and none has one set. **So nothing has to be rotated.** Any
+    `apikey` found in a source stored before this version should still be treated as
+    compromised and rotated at the remote, since it was readable without a session for as
+    long as it was there.
+  - ⚠️ **The visible change is for organization editors**, who keep `preview` but never had
+    `edit`: the configuration tab of a source they do not administer now reads empty, and the
+    config they send when previewing that source from the admin screen no longer carries a
+    key they cannot see. `PUT` already answered them 403, so nothing they could save is lost,
+    and creating a source is unaffected -- it needs `organization.permissions["harvest"]`,
+    which is the organization *admin* need, so a creator always reads their own config back.
+    The frontend needs no change: whoever saves has `edit`, receives the whole config, and
+    the admin screen's merge keeps the keys it does not model.
+
+- **fix(harvest): the OGC backend catalogues three distributions per dataset, not seven**
+  - The TML source publishes thirteen distributions per collection. Six are HTML and were
+    already dropped, but the other seven all became resources, so every harvested dataset
+    carried four downloads nobody asked for -- the server landing page, the collection
+    document as JSON and as JSON-LD, and the queryables -- next to the three that matter:
+    the two item downloads and the collection schema.
+  - **The label is resolved once and drives both the selection and the title.** Reading them
+    from different fields is exactly how this would have failed quietly: the source leaves
+    `name` unset on all 2418 of its distributions and puts the label in `description`, so a
+    check written against `name` would have matched nothing, left all 186 datasets without a
+    single resource, and still reported the harvest as successful.
+  - **The MIME filter keeps running first.** The source also publishes an "Items as HTML"
+    distribution, which carries the prefix the selection looks for; checking the label before
+    the format would catalogue it and leave four resources instead of three.
+  - **The two item downloads are renamed after the dataset.** "Items as GeoJSON" says nothing
+    about the data once the resource is read outside its collection, so it is published as
+    "<dataset title> como GeoJSON". The collection schema keeps the label the source gave it.
+  - **An upstream rename is logged rather than absorbed.** The labels belong to the source,
+    so if it renames them every distribution is dropped, the dataset is left without
+    resources and the job still reports success. A dataset that matches nothing now logs a
+    warning naming the labels it was offered, so the cause is in the log before a user
+    reports the missing downloads.
+  - The four dropped resources lose their `/api/1/datasets/r/<id>` permalink, which is the
+    point of the change. The three that stay keep theirs: `sync_resources` matches on URL, so
+    renaming a resource refreshes the existing object rather than minting a new id.
+
 - **feat(saml): the member state that asserted an eIDAS identity is now recorded**
   - The eIDAS profile recommends the PersonIdentifier be shaped
     `<origin>/<destination>/<id>`, so a Czech citizen signing in here arrives as `CZ/PT/<uuid>`.

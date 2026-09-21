@@ -3,8 +3,9 @@ import sys
 
 import pytest
 import requests
+from sentry_sdk.scrubber import EventScrubber
 
-from udata.sentry import _MAX_SCRUB_DEPTH, init_app, scrub_url_credentials
+from udata.sentry import _FILTERED, _MAX_SCRUB_DEPTH, init_app, scrub_url_credentials
 from udata.tests import PytestOnlyTestCase
 
 # The proof of concept from LEDG-2477: a harvest source whose URL legitimately
@@ -224,6 +225,67 @@ class ScrubURLCredentialsTest:
         assert scrub_url_credentials(event, {}) is None
 
 
+class ScrubSecretKeysTest:
+    """`scrub_url_credentials` also redacts values whose *key* names a secret.
+
+    The SDK's `EventScrubber` covers the same ground with `recursive=True`, but
+    it matches key names exactly and is best-effort; this walk normalizes the
+    name and drops an event it cannot finish (LEDG-2514).
+    """
+
+    def test_an_authorization_header_is_redacted_wherever_it_sits(self):
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {"vars": {"headers": {"Authorization": PASSWORD}}},
+                            ]
+                        }
+                    }
+                ]
+            },
+            "extra": {"request_headers": {"authorization": PASSWORD}},
+        }
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert PASSWORD not in json.dumps(scrubbed, default=str)
+
+    @pytest.mark.parametrize(
+        "key",
+        ["Authorization", "X-API-Key", "api_key", "apikey", "APIKEY", "access-token", "secret"],
+    )
+    def test_a_secret_key_is_matched_whatever_its_spelling(self, key):
+        """A header dict carries whichever separator the remote server used,
+        and the SDK's denylist only matches one spelling of each."""
+        event = {"extra": {"headers": {key: PASSWORD}}}
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert scrubbed["extra"]["headers"][key] == _FILTERED
+
+    def test_an_ordinary_key_keeps_its_value(self):
+        """The redaction is by name, so everything else stays readable --
+        an event scrubbed into uselessness gets reported as a Sentry bug."""
+        event = {"extra": {"headers": {"content-type": "application/json", "token_count": 12}}}
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert scrubbed["extra"]["headers"]["content-type"] == "application/json"
+        assert scrubbed["extra"]["headers"]["token_count"] == 12
+
+    def test_a_secret_holding_a_structure_goes_whole(self):
+        """`[Filtered]` replaces the subtree: a dict under a secret-named key
+        is not descended into and partially kept."""
+        event = {"extra": {"credentials": {"user": "harvestuser", "pass": PASSWORD}}}
+
+        scrubbed = scrub_url_credentials(event, {})
+
+        assert scrubbed["extra"]["credentials"] == _FILTERED
+
+
 class SentryInitAppTest(PytestOnlyTestCase):
     def test_init_app_wires_the_scrubber_into_the_sdk(self, mocker):
         """Defining the scrubber is not enough -- it has to be passed to
@@ -238,3 +300,72 @@ class SentryInitAppTest(PytestOnlyTestCase):
         # `before_send` is never called for transactions, and
         # `traces_sample_rate` means there is one per request and per task.
         assert init.call_args.kwargs["before_send_transaction"] is scrub_url_credentials
+
+    def test_init_app_makes_the_sdk_scrubber_recursive(self, mocker):
+        """The SDK builds a scrubber of its own when none is passed, so the
+        only thing that separates a covered event from an exposed one is
+        `recursive` -- and nothing fails if the argument disappears."""
+        init = mocker.patch("sentry_sdk.init")
+        self.app.config["SENTRY_DSN"] = "https://abc123@sentry.example.com/1"
+
+        init_app(self.app)
+
+        assert init.call_args.kwargs["event_scrubber"].recursive is True
+
+    def test_a_secret_header_in_a_frame_variable_is_scrubbed(self, mocker):
+        """The harvest API key reaches Sentry one level below a frame variable.
+
+        `BaseBackend._request_with_retry` holds the request headers -- with
+        `Authorization: <apikey>` for the CKAN family -- as a local of the
+        frame that re-raises every connection failure, and Sentry sends frame
+        locals. The key the SDK sees at the top is `headers`, which is on
+        nobody's denylist; the secret-named key is inside it, so only a
+        recursive scrubber reaches it (LEDG-2514).
+        """
+        init = mocker.patch("sentry_sdk.init")
+        self.app.config["SENTRY_DSN"] = "https://abc123@sentry.example.com/1"
+        init_app(self.app)
+        # The scrubber this app actually hands the SDK, not one built here.
+        scrubber = init.call_args.kwargs["event_scrubber"]
+
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "function": "_request_with_retry",
+                                    "vars": {
+                                        "headers": {
+                                            "Authorization": PASSWORD,
+                                            "content-type": "application/json",
+                                        },
+                                        "url": "https://www.ine.pt/api",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+
+        scrubber.scrub_event(event)
+
+        frame = event["exception"]["values"][0]["stacktrace"]["frames"][0]
+        assert PASSWORD not in json.dumps(frame, default=str)
+        # Only the secret goes: the rest of the frame stays readable.
+        assert frame["vars"]["headers"]["content-type"] == "application/json"
+        assert frame["vars"]["url"] == "https://www.ine.pt/api"
+
+    def test_the_sdk_default_scrubber_would_miss_it(self):
+        """Why `recursive=True` is the fix and not a precaution: the scrubber
+        the SDK builds when nothing is passed walks the same frames and has
+        `authorization` on its denylist, and still leaves the key in place."""
+        vars_ = {"headers": {"Authorization": PASSWORD}}
+        event = {"exception": {"values": [{"stacktrace": {"frames": [{"vars": vars_}]}}]}}
+
+        EventScrubber().scrub_event(event)
+
+        assert vars_["headers"]["Authorization"] == PASSWORD

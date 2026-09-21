@@ -422,6 +422,13 @@ _REPLAY_CACHE_KEY = "saml_consumed:{kind}:{response_id}"
 _OUTSTANDING_RELAY_KEY = "saml_outstanding_relay:{token}"
 _OUTSTANDING_RELAY_TTL = 600  # 10 minutes — enough for the user to complete CMD
 _OUTSTANDING_RELAY_TOKEN_BYTES = 32
+# Keyed by the same RelayState token as the outstanding bucket, and for the
+# same reason: the session cookie does not survive the IdP's cross-site POST,
+# so anything the callback needs to know about how the round-trip STARTED has
+# to travel in the SAML form payload. Holds the id of the account that asked
+# to link, and nothing else — see _store_link_intent for what that is and is
+# not allowed to decide.
+_LINK_INTENT_KEY = "saml_link_intent:{token}"
 
 # CMD (autenticacao.gov MDC) attribute URIs — used both in the AuthnRequest
 # RequestedAttributes and in the SSO postback extraction.
@@ -683,6 +690,120 @@ def _store_outstanding_relay(relay_token, reqid, kind):
             "falling back to session cookie only",
             exc_info=True,
         )
+
+
+def _store_link_intent(relay_token, user_id):
+    """Remember that this SAML round-trip was started to LINK an account.
+
+    🚨 The session cannot carry this. The IdP returns the assertion in a
+    cross-site POST, and with ``SESSION_COOKIE_SAMESITE=Lax`` the browser does
+    not send the session cookie on it — so ``current_user`` at the ACS is
+    anonymous even for somebody who was signed in a moment ago. That is the
+    same fact that made ``_store_outstanding_relay`` necessary, and this rides
+    the same RelayState-keyed bucket for the same reason.
+
+    🔑 WHAT THIS IS ALLOWED TO DECIDE, and it is deliberately small: it says
+    "whoever comes back this way is linking, not signing up", and nothing
+    else. It does NOT authorise binding the identity to that account. Proof of
+    ownership stays where it already is — the wizard, by password or by a link
+    mailed to the account's own address — so a stolen intent buys an attacker
+    a screen asking for the victim's password.
+
+    Single use, and the same TTL as the outstanding bucket it travels beside:
+    ten minutes is a CMD sign-in, not a window somebody can sit on.
+    """
+    if not relay_token or not user_id:
+        return
+    from udata.app import cache
+
+    try:
+        cache.set(
+            _LINK_INTENT_KEY.format(token=relay_token),
+            str(user_id),
+            timeout=_OUTSTANDING_RELAY_TTL,
+        )
+    except Exception:
+        # Non-fatal, and the degraded behaviour is today's: with no intent the
+        # ACS treats the sign-in as any other, which may create an account the
+        # person then has to merge. Worse than linking, better than a 500 on a
+        # flow they cannot retry.
+        current_app.logger.warning(
+            "SAML: failed to persist link intent; the callback will be treated as a plain sign-in",
+            exc_info=True,
+        )
+
+
+def _resolve_link_intent(relay_token):
+    """The account that started this round-trip to link, if it still qualifies.
+
+    Consumes the ticket and re-checks the account against the database, which
+    is not belt-and-braces: up to ten minutes passed while the citizen was at
+    autenticacao.gov, and in that time the account can have been deleted,
+    deactivated, or linked from another tab. Every failure returns None, and
+    None means "treat this as an ordinary sign-in" -- today's behaviour, never
+    an error page on a flow the person cannot retry.
+    """
+    from mongoengine.errors import ValidationError
+
+    from udata.core.user.models import User
+
+    # 🚩 OFF HAS TO MEAN OFF, INCLUDING MID-FLIGHT. The ticket lives for ten
+    # minutes, which is a window in which a deploy can turn the invite off
+    # while somebody is at autenticacao.gov. Honouring it then would send them
+    # to a wizard whose every endpoint now answers 403 -- a dead end, and the
+    # one shape this whole ticket exists to avoid.
+    #
+    # Read BEFORE the ticket is consumed, deliberately: with the feature off
+    # there is nothing to consume for, and leaving the entry to expire on its
+    # own keeps this read free of side effects.
+    if not _invite_enabled():
+        return None
+
+    user_id = _consume_link_intent(relay_token)
+    if not user_id:
+        return None
+
+    try:
+        user = User.objects(id=user_id, deleted=None).first()
+    except (ValidationError, TypeError):
+        # The id comes out of a cache entry we wrote, so a malformed one means
+        # a corrupted or hand-edited value rather than caller input -- and it
+        # still must not 500 the callback.
+        return None
+
+    if not user or not user.is_active:
+        return None
+
+    # Linked in the meantime -- in another tab, or by a link clicked from an
+    # email. Binding a second identity here would be the duplicate this whole
+    # flow exists to prevent, wearing the costume of the fix.
+    if not _needs_identity_link(user):
+        return None
+
+    return user
+
+
+def _consume_link_intent(relay_token):
+    """Return and delete the link intent stored under ``relay_token``.
+
+    Returns None when the token is empty, unknown, already used, or the cache
+    is unavailable — in every one of those cases the caller must fall back to
+    the ordinary sign-in path rather than guess, which is why there is no
+    second source to consult.
+    """
+    if not isinstance(relay_token, str) or not relay_token:
+        return None
+    from udata.app import cache
+
+    key = _LINK_INTENT_KEY.format(token=relay_token)
+    try:
+        user_id = cache.get(key)
+        if user_id:
+            cache.delete(key)
+        return user_id or None
+    except Exception:
+        current_app.logger.warning("SAML: failed to read link intent", exc_info=True)
+        return None
 
 
 def _consume_outstanding_relay(relay_token):
@@ -1055,6 +1176,31 @@ MIGRATION_LINK_TTL = timedelta(minutes=30)
 MIGRATION_LINK_SEND_COUNT = "migration_link_send_count"
 MAX_MIGRATION_LINK_SENDS = 5
 MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
+
+# How long a dismissal of the optional linking invite lasts before the invite
+# comes back. The acceptance criterion asks for a frequency rule that is
+# WRITTEN rather than implied, so here it is, with its reasoning:
+#
+# - on every sign-in is not a rule, it is nagging, and it trains people to
+#   dismiss the notice without reading a word of it. And it would BE every day:
+#   login_user() marks no permanent session, so the cookie dies with the
+#   browser and somebody who works in the portal each morning signs in each
+#   morning;
+# - once and never again loses, in silence, everyone who was merely busy that
+#   day -- and they find out when the portal starts requiring a single account
+#   per person (LEDG-1277), which is far too late to be told;
+# - eight days, the product owner's decision, is about weekly: often enough
+#   that nobody reaches the deadline having seen it once, rare enough that
+#   dismissing it never becomes a reflex.
+#
+# 🔑 EIGHT AND NOT SEVEN, which is the part worth writing down: a seven-day
+# window always falls on the same weekday, so somebody who only opens the
+# portal on Tuesdays would see it every single time or never. Eight rotates.
+#
+# It is a constant and not configuration on purpose: a per-deployment value
+# would be one more thing that can differ between environments while nothing
+# tells you it did.
+MIGRATION_INVITE_REMIND_AFTER = timedelta(days=8)
 
 # Which flow put a link record on an account. Absent means the wizard, which
 # is every record written before this existed, so the default must stay the
@@ -1719,6 +1865,7 @@ def _handle_migration_redirect(
     doc_type=None,
     doc_nationality=None,
     eidas_country=None,
+    invited=False,
 ):
     """Store SAML data in session and redirect to migration page.
 
@@ -1742,6 +1889,15 @@ def _handle_migration_redirect(
     session["saml_migration_pending"] = {
         "legacy_user_id": str(user.id) if user else None,
         "no_match": no_match,
+        # Whether this wizard session was started from the optional invite,
+        # which the wizard cannot infer: both modes converge on this redirect
+        # and look identical afterwards. It changes what the wizard OFFERS --
+        # the account-creation escape has no place in a flow the person
+        # entered from inside an account they proved with a password seconds
+        # ago -- and nothing about what it does. migration_skip refuses in
+        # invite mode regardless, so this is the visible half of a guarantee
+        # that does not depend on it.
+        "saml_invited": invited,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
@@ -2716,6 +2872,21 @@ def saml_client_for(metadata_file):
 @autenticacao_gov.route("/saml/login")
 @anonymous_user_required
 def sp_initiated():
+    """Start a CMD sign-in. Anonymous callers only -- this is a way IN."""
+    return _begin_cmd_authn_request()
+
+
+def _begin_cmd_authn_request(link_user_id=None):
+    """Build and return the CMD AuthnRequest form.
+
+    Shared by the sign-in route and the linking route so the request itself --
+    the requested attributes, the assurance level, the outstanding bucket --
+    has ONE definition. Two copies of this is how the two ACS handlers already
+    drifted apart once, and that divergence is what LEDG-2506 cost.
+
+    ``link_user_id`` is the only difference between the two callers: present,
+    it records that the callback belongs to an account asking to link.
+    """
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
@@ -2865,6 +3036,7 @@ def sp_initiated():
     # POST and emptying the bucket on the callback. RelayState rides
     # the form payload end-to-end so the bucket survives that path too.
     _store_outstanding_relay(relay_token, reqid, kind="cmd")
+    _store_link_intent(relay_token, link_user_id)
     # TEMP DIAG (remove after PPR is green): confirm bucket landed in Redis.
     try:
         from udata.app import cache as _diag_cache
@@ -2882,6 +3054,66 @@ def sp_initiated():
         list(session.get(_OUTSTANDING_SESSION_KEY, {}).keys()),
     )
     return _extract_saml_form_data(info["data"])
+
+
+#################################################################
+# Starts a CMD/eIDAS link from an account that is already signed in.
+##
+#################################################################
+
+
+def _refuse_link_start():
+    """The checks both linking routes share, or None when the caller may pass.
+
+    🚨 These routes exist BECAUSE ``sp_initiated`` cannot serve this: it is
+    decorated ``@anonymous_user_required``, which is correct for a way in and
+    exactly wrong for somebody who just signed in with a password and wants to
+    add an identity. Without a door of their own, the invite's button bounces
+    off the sign-in route and nothing happens.
+
+    Refusing here is the same question the invite asked, asked again at the
+    moment it matters: the invite may have been rendered minutes ago, the flag
+    may have been turned off since, and the account may have linked in another
+    tab. A door that opens on a stale notice is a door that links an account
+    twice.
+    """
+    from flask_login import current_user
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Authentication required"}), 401
+
+    if not _invite_enabled():
+        return jsonify({"error": "Linking invite is not enabled"}), 403
+
+    # Deliberately NOT _invite_offered_to: a dismissal means "not now", not
+    # "never let me". The permanent way back has to keep working for somebody
+    # who dismissed the notice last week and changed their mind today.
+    if not _needs_identity_link(current_user):
+        return jsonify({"error": "Account has nothing to link"}), 409
+
+    return None
+
+
+@autenticacao_gov.route("/saml/link/start")
+def link_initiated():
+    """Start a CMD sign-in whose callback links, rather than signs up."""
+    from flask_login import current_user
+
+    refusal = _refuse_link_start()
+    if refusal:
+        return refusal
+    return _begin_cmd_authn_request(link_user_id=str(current_user.id))
+
+
+@autenticacao_gov.route("/saml/eidas/link/start")
+def link_eidas_initiated():
+    """Start an eIDAS sign-in whose callback links, rather than signs up."""
+    from flask_login import current_user
+
+    refusal = _refuse_link_start()
+    if refusal:
+        return refusal
+    return _begin_eidas_authn_request(link_user_id=str(current_user.id))
 
 
 #################################################################
@@ -2931,6 +3163,10 @@ def idp_initiated():
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
     _diag_redis_bucket = _consume_outstanding_relay(relay_token)
+    # Consumed HERE, beside the outstanding bucket, and not further down where
+    # it is used: the ticket is single-use and must die with the round-trip
+    # that carried it, whatever branch this request goes on to take.
+    link_intent_user = _resolve_link_intent(relay_token)
     outstanding.update(_diag_redis_bucket)
     # TEMP DIAG (remove after PPR is green): see what AMA actually echoed and
     # whether we matched it in Redis. `in_response_to` is parsed from raw XML
@@ -3207,21 +3443,33 @@ def idp_initiated():
         )
 
     if status in ("migration_candidate", "no_match"):
-        if _migration_enabled():
+        # 🚨 `no_match` is in this branch for the invited flow too, and that is
+        # the whole point. The case that creates the duplicate is the citizen
+        # whose CMD carries a DIFFERENT address from their portal account, one
+        # nobody else holds: the resolver recognises nothing, answers no_match,
+        # and today a brand-new account is minted. The portal has no way to
+        # know it is the same person -- except the ticket, which says so.
+        #
+        # With a ticket the candidate is KNOWN, so the wizard is pointed
+        # straight at that account instead of asking "help me find mine". It
+        # still has to be proven: the wizard mails the validation link to that
+        # account's OWN address, never one typed here.
+        if _migration_enabled() or link_intent_user:
             _audit_saml(
                 "migration_pending",
                 "cmd",
                 issuer=issuer,
                 name_id=name_id_value,
-                reason=status,
+                reason="invite_link" if link_intent_user else status,
             )
             return _handle_migration_redirect(
-                user,
+                link_intent_user or user,
                 user_email,
                 user_identifier,
                 first_name,
                 last_name,
-                no_match=(status == "no_match"),
+                no_match=(status == "no_match" and not link_intent_user),
+                invited=bool(link_intent_user),
                 provider="cmd",
                 # The same guard the funnel already receives below: only when
                 # the document WAS the identity. For a national the NIC won in
@@ -3257,6 +3505,37 @@ def idp_initiated():
     #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    # 🚩 THE CITIZEN ASKED TO LINK, AND THIS IDENTITY IS ALREADY SOMEBODY'S.
+    #
+    # Signing them into that other account is what used to happen, and it is
+    # the right answer for anyone who pressed "sign in with CMD" -- the
+    # identity IS that account's. It is the wrong answer for somebody who
+    # pressed "link": they are put into an account they did not ask about,
+    # the one they clicked from stays unlinked, and nothing says so. They
+    # walk away believing it worked, and find out when the invite comes back.
+    #
+    # Same principle as the password screen refusing a different account:
+    # never switch accounts in silence. Refusing here costs one click to
+    # whoever did want that account -- the sign-in button is still there --
+    # and saves everyone else from a change they never asked for.
+    #
+    # No identity in the redirect: the code is generic on purpose, because the
+    # query string lands in browser history, Referer headers and proxy logs.
+    if link_intent_user and status == "existing_saml":
+        return _reject_saml_login(
+            f"[SAML cmd] refused an invited link: the identity already belongs to "
+            f"another account (asked by user_id={link_intent_user.id})",
+            _(
+                "Não foi possível associar: esta identidade já está associada a outra "
+                "conta do portal. A sua conta ficou como estava."
+            ),
+            log_level="info",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="invite_identity_already_linked",
+        )
+
     session["saml_name_id"] = name_id_value
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
@@ -3272,6 +3551,21 @@ def idp_initiated():
         issuer=issuer,
         name_id=name_id_value,
         status=status,
+        # 🚩 The one outcome the invited flow has that nobody would think to
+        # look for. The person clicked "Associate" from inside their own
+        # account, and the CMD they authenticated with turns out to belong to
+        # a DIFFERENT account -- so the portal signs them into that other one
+        # instead. The identity IS that account's, so this is correct and it
+        # is also today's behaviour; what it is not is expected by somebody
+        # who started from somewhere else.
+        #
+        # (The condition needs no comparison: _resolve_link_intent refuses an
+        # account that already holds an identity, so an intent that survived
+        # alongside `existing_saml` necessarily points at a different one.)
+        #
+        # It is the population LEDG-2472 exists for -- two accounts, one
+        # person -- and without a reason of its own it is indistinguishable
+        # from an ordinary sign-in in the audit log.
         # Only when the document was the identity. For a national the NIC won
         # in the composition above, so recording the document here would
         # describe something other than what auth_nic actually holds.
@@ -3416,6 +3710,12 @@ def eidas_client_for(metadata_file):
 @autenticacao_gov.route("/saml/eidas/login")
 @anonymous_user_required
 def sp_eidas_initiated():
+    """Start an eIDAS sign-in. Anonymous callers only -- this is a way IN."""
+    return _begin_eidas_authn_request()
+
+
+def _begin_eidas_authn_request(link_user_id=None):
+    """Build and return the eIDAS AuthnRequest form. See its CMD twin."""
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
@@ -3482,6 +3782,7 @@ def sp_eidas_initiated():
     reqid, info = saml_client.prepare_for_authenticate(**args)
     _remember_outstanding(reqid, kind="eidas")
     _store_outstanding_relay(relay_token, reqid, kind="eidas")
+    _store_link_intent(relay_token, link_user_id)
     return _extract_saml_form_data(info["data"])
 
 
@@ -3527,6 +3828,8 @@ def idp_eidas_initiated():
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
     outstanding.update(_consume_outstanding_relay(relay_token))
+    # See its CMD twin: consumed with the round-trip, not with the branch.
+    link_intent_user = _resolve_link_intent(relay_token)
     last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
@@ -3743,21 +4046,26 @@ def idp_eidas_initiated():
         )
 
     if status in ("migration_candidate", "no_match"):
-        if _migration_enabled():
+        # Same branch, same reasoning as the CMD route above -- and eIDAS needs
+        # it more, not less: the Minimum Data Set carries NO email at all, so
+        # an invited eIDAS link is always a no_match and would ALWAYS have
+        # minted a second account without the ticket.
+        if _migration_enabled() or link_intent_user:
             _audit_saml(
                 "migration_pending",
                 "eidas",
                 issuer=issuer,
                 name_id=name_id_value,
-                reason=status,
+                reason="invite_link" if link_intent_user else status,
             )
             return _handle_migration_redirect(
-                user,
+                link_intent_user or user,
                 user_email,
                 user_nic,
                 first_name,
                 last_name,
-                no_match=(status == "no_match"),
+                no_match=(status == "no_match" and not link_intent_user),
+                invited=bool(link_intent_user),
                 provider="eidas",
                 eidas_country=eidas_country,
             )
@@ -3794,6 +4102,25 @@ def idp_eidas_initiated():
     #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    # Same guard, same reasoning as the CMD route above -- see the comment
+    # there. Duplicated per route because that is how every other rejection in
+    # this file is placed, and the tests run the scenario through both
+    # handlers so a divergence between the copies turns one of them red.
+    if link_intent_user and status == "existing_saml":
+        return _reject_saml_login(
+            f"[SAML eidas] refused an invited link: the identity already belongs to "
+            f"another account (asked by user_id={link_intent_user.id})",
+            _(
+                "Não foi possível associar: esta identidade já está associada a outra "
+                "conta do portal. A sua conta ficou como estava."
+            ),
+            log_level="info",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="invite_identity_already_linked",
+        )
+
     session["saml_name_id"] = name_id_value
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
@@ -3807,6 +4134,21 @@ def idp_eidas_initiated():
         issuer=issuer,
         name_id=name_id_value,
         status=status,
+        # 🚩 The one outcome the invited flow has that nobody would think to
+        # look for. The person clicked "Associate" from inside their own
+        # account, and the CMD they authenticated with turns out to belong to
+        # a DIFFERENT account -- so the portal signs them into that other one
+        # instead. The identity IS that account's, so this is correct and it
+        # is also today's behaviour; what it is not is expected by somebody
+        # who started from somewhere else.
+        #
+        # (The condition needs no comparison: _resolve_link_intent refuses an
+        # account that already holds an identity, so an intent that survived
+        # alongside `existing_saml` necessarily points at a different one.)
+        #
+        # It is the population LEDG-2472 exists for -- two accounts, one
+        # person -- and without a reason of its own it is indistinguishable
+        # from an ordinary sign-in in the audit log.
         # No asserted_email: the eIDAS Minimum Data Set has no such attribute.
         asserted_first_name=first_name,
         asserted_last_name=last_name,
@@ -3884,10 +4226,174 @@ def _migration_enabled():
     return current_app.config.get("MIGRATION_MODE_ENABLED", False)
 
 
+def _invite_enabled():
+    """True when the OPTIONAL linking invite is on, and the mandatory mode is not.
+
+    Two flags, one question each: MIGRATION_MODE_ENABLED asks "is linking
+    mandatory?", MIGRATION_INVITE_ENABLED asks "do we invite?". Of the four
+    combinations only one needs arbitrating, and it is arbitrated here rather
+    than at each call site: with BOTH on, the mandatory mode wins. Inviting
+    somebody to do optionally what the portal is about to refuse them for not
+    having done is not a state worth having, and leaving the precedence to be
+    re-derived by each reader is how two of them end up disagreeing.
+
+    So every branch downstream reads exactly one of the two functions and gets
+    a decision, never a pair of flags to combine on the spot.
+    """
+    if _migration_enabled():
+        return False
+    return bool(current_app.config.get("MIGRATION_INVITE_ENABLED", False))
+
+
+def _needs_identity_link(user):
+    """True for a traditional account that holds no CMD/eIDAS identity yet.
+
+    "Signs in with a password, and nothing government-issued is bound to the
+    account." Both halves are load-bearing:
+
+    - no linked identity, so there IS something to link. `_has_linked_nic`
+      and not a bare presence check, because a plain or legacy-encrypted
+      ``auth_nic`` can never match a login lookup: the account behaves as
+      unlinked and must be treated as such;
+    - a password, so there IS a way in that does not go through the IdP. An
+      account created by SAML has no password, has nothing to invite, and
+      would be told to link an identity it already signed in with.
+
+    Extracted from ``migration_check``, where it was correct and unnamed, so
+    the invite can ask the same question without copying the expression. Two
+    readers of one predicate, not two predicates that agree today.
+    """
+    return bool(not _has_linked_nic(user) and user.password)
+
+
+def _wizard_open():
+    """True when the linking wizard is reachable at all, in either mode.
+
+    The wizard's endpoints were gated on the mandatory flag because that was
+    the only way anyone reached them. The invite is a second way in, so the
+    gate has to name both -- otherwise the ACS hands somebody a wizard whose
+    every endpoint answers 403, which is a dead end wearing the costume of a
+    flow.
+
+    🚫 ONE ENDPOINT IS DELIBERATELY NOT HERE: ``migration_skip``, which creates
+    a brand-new account. In the mandatory mode it is the emergency exit for
+    somebody who cannot prove the old account is theirs and would otherwise be
+    locked out of the portal entirely. In invite mode they signed in with a
+    password seconds ago and are locked out of nothing -- so there it is not a
+    safety net, it is a way to manufacture the second account the invite
+    exists to prevent. The button goes from the screen AND the endpoint keeps
+    refusing: one of those alone is a UI change, not a guarantee.
+    """
+    return _migration_enabled() or _invite_enabled()
+
+
+def _invite_dismissed(user):
+    """True while a dismissal of the linking invite is still in force.
+
+    Reads the stamp rather than a flag, so "dismissed" has an expiry instead
+    of being permanent (see MIGRATION_INVITE_REMIND_AFTER for the rule and
+    why it exists). An absent or unparseable stamp means never dismissed,
+    which is the safe direction: the person sees an optional notice they can
+    dismiss again, rather than silently never being told.
+    """
+    from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+    dismissed_at = _parse_isoformat((user.extras or {}).get(MIGRATION_INVITE_DISMISSED_AT))
+    if dismissed_at is None:
+        return False
+    return datetime.utcnow() - dismissed_at < MIGRATION_INVITE_REMIND_AFTER
+
+
+def _invite_offered_to(user):
+    """The whole invite predicate, in one place, for one account.
+
+    Four conditions, and each one is somebody's bug if it goes missing: the
+    invite is on (and the mandatory mode is not, which _invite_enabled already
+    settles), the account has something to link, and it has not just said
+    "not now".
+
+    Every reader asks this function -- the /me field and the route that starts
+    a link -- so the notice and the door it opens can never disagree about
+    whether this account is being invited.
+    """
+    if not _invite_enabled():
+        return False
+    if not user or not user.is_authenticated:
+        return False
+    return _needs_identity_link(user) and not _invite_dismissed(user)
+
+
+def _link_available_to(user):
+    """Whether this account may still reach the linking flow at all.
+
+    🔑 THE SAME PREDICATE AS ``_invite_offered_to`` MINUS THE DISMISSAL, and
+    that single difference is the whole reason it exists.
+
+    Dismissing means "not now", never "never let me". A permanent way in that
+    asked ``_invite_offered_to`` would vanish the moment somebody pressed
+    "Not now" — so the notice would have closed the door behind itself, and
+    changing your mind would mean waiting out the window.
+
+    It is the same asymmetry ``_refuse_link_start`` already applies at the door
+    itself, which checks that there is something to link and not that a notice
+    is on screen. Two readers of one rule, so the button and the route it opens
+    can never disagree.
+    """
+    if not _invite_enabled():
+        return False
+    if not user or not user.is_authenticated:
+        return False
+    return _needs_identity_link(user)
+
+
+@autenticacao_gov.route("/saml/migration/invite/dismiss", methods=["POST"])
+@csrf.exempt
+def migration_invite_dismiss():
+    """Record that this account is not linking right now.
+
+    Authenticated and self-scoped: the caller can only dismiss their OWN
+    invite, because the account is read from the session and never from the
+    request. The body is ignored entirely.
+
+    Answers 200 whether or not the invite was actually being offered. There is
+    nothing to protect here -- the caller already knows whether they were
+    shown a notice -- and a refusal would only turn a harmless double-click
+    into an error the frontend has to explain.
+    """
+    from flask_login import current_user
+
+    from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+    from udata.core.user.models import User
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Authentication required"}), 401
+
+    # A targeted single-field write, and the honest reason is narrower than
+    # "a save would clobber the document": MongoEngine sends a delta, so for
+    # an account that already has `extras` a save lands on the same one key.
+    # The difference is the account that has NONE -- assigning a fresh dict
+    # makes the delta the WHOLE dict, and a concurrent write (auth_nic, say,
+    # which is a credential) is lost. This form has no such edge, needs no
+    # empty-dict dance, and is what the rest of this module already does for a
+    # single key on an account somebody else may be touching.
+    User.objects(id=current_user.id).update_one(
+        **{f"set__extras__{MIGRATION_INVITE_DISMISSED_AT}": datetime.utcnow().isoformat()}
+    )
+    return jsonify({"dismissed": True})
+
+
 @autenticacao_gov.route("/saml/migration/check", methods=["GET"])
 @csrf.exempt
 def migration_check():
-    """Check if the currently authenticated user is a legacy user that needs migration."""
+    """Check if the currently authenticated user is a legacy user that needs migration.
+
+    🚨 ``needs_migration`` means MANDATORY, and it is not a synonym for "could
+    link". The frontend's /auth/login route reads this field and LOGS THE USER
+    OUT when it is true, which is right for the mandatory mode and would be a
+    regression for an invite that is supposed to be dismissible. So this
+    endpoint keeps answering about the mandatory mode only, in both states of
+    the flag, and the invite travels on the caller's own /me instead.
+    """
     if not _migration_enabled():
         return jsonify({"needs_migration": False})
 
@@ -3896,9 +4402,7 @@ def migration_check():
     if not current_user.is_authenticated:
         return jsonify({"needs_migration": False})
 
-    has_nic = _has_linked_nic(current_user)
-    needs = bool(not has_nic and current_user.password)
-    return jsonify({"needs_migration": needs})
+    return jsonify({"needs_migration": _needs_identity_link(current_user)})
 
 
 @autenticacao_gov.route("/saml/migration/pending", methods=["GET"])
@@ -3907,7 +4411,7 @@ def migration_pending():
     """Check if there is a pending migration in the session."""
     from udata.core.user.models import find_user_by_email_ci
 
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -3975,6 +4479,12 @@ def migration_pending():
             "suggested_email": suggested_email,
             "candidate": bool(legacy_user_id),
             "no_match": no_match,
+            # Started from the optional invite. The wizard cannot tell
+            # otherwise -- both modes reach it through the same redirect --
+            # and it decides which escape hatch the screen offers. Absent for
+            # sessions opened before this existed, which read as False: the
+            # mandatory mode is the older behaviour and the safe default here.
+            "invited": bool(pending.get("saml_invited")),
             "first_name": first_name,
             "last_name": last_name,
             # Defaults to CMD so a session opened before this field existed
@@ -4004,7 +4514,7 @@ def migration_send_link():
     in — the link is what grants the session, exactly as on the
     account-creation branch (see migration_skip).
     """
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -4254,7 +4764,7 @@ def migration_confirm_link(token):
     user, record, state = _migration_link_token_status(token)
     origin = (record or {}).get(MIGRATION_LINK_ORIGIN)
 
-    if not _migration_enabled() and origin != MIGRATION_LINK_ORIGIN_REGISTRATION:
+    if not _wizard_open() and origin != MIGRATION_LINK_ORIGIN_REGISTRATION:
         return redirect(f"{wizard_url}?flash=migration_link_invalid")
 
     if state == "already_done":
@@ -4310,9 +4820,9 @@ def migration_confirm():
     mails the validation link and migration_confirm_link — the single place
     that binds the identity and starts a session — consumes the click.
     """
-    from udata.core.user.models import find_user_by_email_ci
+    from udata.core.user.models import User, find_user_by_email_ci
 
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -4360,6 +4870,39 @@ def migration_confirm():
 
     else:
         return jsonify({"error": "Invalid method"}), 400
+
+    # 🚩 IN INVITE MODE THE CANDIDATE IS NOT UP FOR RE-POINTING, and this is
+    # the one place the two modes must differ.
+    #
+    # In the mandatory mode the citizen arrives DEAUTHENTICATED: the portal has
+    # no idea which account is theirs, so the proved password is the only
+    # evidence there is, and re-pointing to it is the only thing that can be
+    # done. In invite mode they clicked from INSIDE an account and the ticket
+    # says which — so re-pointing silently throws away evidence the portal
+    # already holds, and lands the identity on an account they never asked
+    # about while the one they clicked from stays unlinked. They would find out
+    # by signing in with CMD later and not recognising what they see.
+    #
+    # It is not a security hole -- reaching another account still costs that
+    # account's password, so nothing is taken from anybody. It is the notice
+    # promising "you keep the account you already have" and then not.
+    #
+    # Refused AFTER the password check on purpose: a correct password for the
+    # wrong account is not a guess, and must not spend an attempt from a cap
+    # that never resets.
+    invited_target = pending.get("legacy_user_id") if pending.get("saml_invited") else None
+    if invited_target and str(user.id) != invited_target:
+        expected = User.objects(id=invited_target).first()
+        return jsonify(
+            {
+                "error": "Different account",
+                "code": "invited_account_mismatch",
+                # Masked, like everywhere else an address is echoed: the caller
+                # owns this one, but the habit is what stops the next reader
+                # printing one they do not.
+                "expected_email": _mask_email(expected.email) if expected else None,
+            }
+        ), 409
 
     # The account whose password was proved is the one to link, and by design
     # it may not be the candidate the assertion matched by name. Re-pointing
@@ -4585,7 +5128,7 @@ def migration_resend_confirmation():
     and the stock ``security.send_confirmation`` view carries no rate limit of
     its own to fall back on.
     """
-    if not _migration_enabled():
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     awaiting = session.get("saml_confirmation_pending")
