@@ -248,7 +248,19 @@ source_fields = api.model(
             enum=lambda: list(get_enabled_backends().keys()),
             required=True,
         ),
-        "config": fields.Raw(description="The configuration as key-value pairs"),
+        # `config` is free-form: `HarvestConfigField.pre_validate` only checks
+        # `filters`, `extra_configs` and `features`, so any other key is stored
+        # and served verbatim -- and the CKAN family reads `config["apikey"]`
+        # into an `Authorization` header, so this field does carry a
+        # credential. Same gate as `url`, for the same reason: whoever may
+        # rewrite the config reads it whole and nobody else reads any of it.
+        # An empty dict rather than a masked one, because a mask can only hide
+        # the keys we already know about and the next credential key will have
+        # a name nobody listed (LEDG-2514).
+        "config": fields.Raw(
+            attribute=lambda s: s.config if s.permissions["edit"].can() else {},
+            description="The configuration as key-value pairs, served only to readers who may edit the source",  # noqa
+        ),
         "created_at": fields.ISODateTime(
             description="The source creation date", required=True, readonly=True
         ),
@@ -447,9 +459,11 @@ class SourceAPI(API):
 
         What makes it safe is that no secret reaches the payload, not that
         nobody is looking: `url` is redacted here and in `harvests.csv` for
-        anyone without `edit`, `HarvestError` and `HarvestLog` are redacted as
-        they are built and again as they are serialized, and the source URL
-        copied onto harvested dataservices is redacted at the copy.
+        anyone without `edit`, `config` is served only to those same readers
+        because it carries the CKAN `apikey`, `HarvestError` and `HarvestLog`
+        are redacted as they are built and again as they are serialized, and
+        the source URL copied onto harvested dataservices is redacted at the
+        copy.
         `@api.secure` would not have replaced any of that -- it only demands an
         account, and anyone can create one, so a registered reader would have
         seen exactly what an anonymous one did.
@@ -465,7 +479,7 @@ class SourceAPI(API):
         redacting anyway: a link that only works because it carries somebody
         else's password is the defect, not a feature.
 
-        See LEDG-2477, LEDG-2500 and LEDG-2502.
+        See LEDG-2477, LEDG-2500, LEDG-2502 and LEDG-2514.
         """
         return source
 

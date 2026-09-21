@@ -26,10 +26,12 @@ from flask import session
 
 from udata.app import limiter
 from udata.auth.saml.saml_plugin.saml_govpt import (
+    _consume_link_intent,
     _consume_outstanding_relay,
     _hash_nic,
     _new_relay_state_token,
     _normalize_idp_metadata_certs,
+    _store_link_intent,
     _store_outstanding_relay,
 )
 from udata.core.user.factories import UserFactory
@@ -9254,3 +9256,1051 @@ class SAMLFunnelAuditOutcomeTest(APITestCase):
 
         active.reload()
         assert active.login_count == 1
+
+
+class MigrationInviteFlagTest(APITestCase):
+    """The two flags, and the one combination that needs arbitrating.
+
+    MIGRATION_MODE_ENABLED answers "is linking mandatory?" and
+    MIGRATION_INVITE_ENABLED answers "do we invite?". Four combinations, and
+    the whole reason for a second flag is that a single one cannot express
+    the third row of this table: invite without forcing.
+
+    🚨 The default is asserted here too, and not as an afterthought. A True
+    default would put every test in this file that only switches the mandatory
+    flag off into invite mode without saying so -- and those tests assert that
+    an unmatched identity CREATES an account, which is exactly what invite
+    mode stops doing. The flag defaulting to False is what keeps their
+    meaning; enabling it is a deployment decision.
+    """
+
+    def _invite(self, mandatory, invite):
+        from udata.auth.saml.saml_plugin.saml_govpt import _invite_enabled
+
+        with self.app.app_context():
+            self.app.config["MIGRATION_MODE_ENABLED"] = mandatory
+            self.app.config["MIGRATION_INVITE_ENABLED"] = invite
+            return _invite_enabled()
+
+    def test_neither_flag_is_todays_behaviour(self):
+        assert self._invite(mandatory=False, invite=False) is False
+
+    def test_invite_only_is_what_we_want_now(self):
+        assert self._invite(mandatory=False, invite=True) is True
+
+    def test_mandatory_only_leaves_the_invite_off(self):
+        assert self._invite(mandatory=True, invite=False) is False
+
+    def test_mandatory_wins_over_the_invite(self):
+        """The arbitration, and the only row a reader could get wrong.
+
+        Inviting somebody to do optionally what the portal is about to refuse
+        them for not having done is not a state worth having. Decided here so
+        no call site has to combine two flags on the spot -- every branch
+        downstream reads one function and gets a decision.
+        """
+        assert self._invite(mandatory=True, invite=True) is False
+
+    def test_the_only_default_is_false(self):
+        """One default, in one place -- the opposite of the flag it sits next to.
+
+        MIGRATION_MODE_ENABLED has three divergent defaults (udata.cfg True,
+        class Testing True, and the reader's own `.get(..., False)`), which is
+        a recorded trap. Asserting the settings default and the reader's
+        fallback AGREE is what stops this flag acquiring a second one.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _invite_enabled
+        from udata.settings import Defaults
+
+        assert Defaults.MIGRATION_INVITE_ENABLED is False
+
+        with self.app.app_context():
+            self.app.config["MIGRATION_MODE_ENABLED"] = False
+            self.app.config.pop("MIGRATION_INVITE_ENABLED", None)
+            assert _invite_enabled() is False
+
+
+class NeedsIdentityLinkTest(APITestCase):
+    """The predicate migration_check already computed, now under a name.
+
+    The point of this class is that naming it changed nothing. Both halves are
+    pinned -- an account with a linked identity and an account with no
+    password are excluded for DIFFERENT reasons, and a mutation that drops
+    either half has to turn something red here.
+
+    🚨 And migration_check itself is pinned in both states of the mandatory
+    flag, because its answer is not cosmetic: the frontend's /auth/login route
+    logs the user out when `needs_migration` is true. An invite that leaked
+    into this field would sign people out of a notice they are allowed to
+    dismiss.
+    """
+
+    def _needs(self, user):
+        from udata.auth.saml.saml_plugin.saml_govpt import _needs_identity_link
+
+        with self.app.app_context():
+            return _needs_identity_link(user)
+
+    def test_traditional_account_without_identity_is_invitable(self):
+        assert self._needs(UserFactory(password="x" * 12)) is True
+
+    def test_account_with_a_linked_identity_is_not(self):
+        linked = UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")})
+        assert self._needs(linked) is False
+
+    def test_a_plain_auth_nic_does_not_count_as_linked(self):
+        """A value that can never match a login lookup is not a link.
+
+        The account behaves as unlinked at sign-in, so treating it as linked
+        here would hide the invite from precisely the accounts that need it.
+        """
+        stale = UserFactory(password="x" * 12, extras={"auth_nic": "12345678"})
+        assert self._needs(stale) is True
+
+    def test_an_account_with_no_password_has_nothing_to_invite(self):
+        """Created by SAML: there is no password-based way in to upgrade.
+
+        Built WITHOUT the password kwarg, not with `password=None`: the
+        factory hashes whatever it is given, so `None` comes back as a real
+        hash and the account looks password-backed.
+        """
+        saml_born = UserFactory()
+        assert saml_born.password is None
+        assert self._needs(saml_born) is False
+
+    def test_migration_check_answer_is_unchanged_with_the_flag_off(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        response = self.client.get("/saml/migration/check")
+        assert response.status_code == 200
+        assert response.json == {"needs_migration": False}
+
+    def test_migration_check_still_answers_the_mandatory_question(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        user = UserFactory(password="x" * 12)
+        self.login(user)
+
+        response = self.client.get("/saml/migration/check")
+        assert response.status_code == 200
+        assert response.json == {"needs_migration": True}
+
+    def test_the_invite_never_leaks_into_needs_migration(self):
+        """The regression this endpoint is one config change away from.
+
+        With the invite on and the mandatory mode off, `needs_migration` must
+        stay false -- otherwise every invited user is signed out at the login
+        they were supposed to be invited during.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        self.login(UserFactory(password="x" * 12))
+
+        response = self.client.get("/saml/migration/check")
+        assert response.json == {"needs_migration": False}
+
+
+class MigrationInviteDismissTest(APITestCase):
+    """ "Not now" has to be a state, and it has to expire.
+
+    Without it the invite comes back on every sign-in and teaches people to
+    click it away without reading -- which is the outcome the notice exists to
+    avoid. With it permanent, everyone who was merely busy that day is lost in
+    silence, and finds out when the portal starts requiring a single account
+    per person.
+
+    So the stamp is a DATE, and these tests pin both ends of the rule: it holds
+    for a month, and then the invite comes back.
+    """
+
+    def _offered(self, user):
+        from udata.auth.saml.saml_plugin.saml_govpt import _invite_offered_to
+
+        with self.app.app_context():
+            return _invite_offered_to(user)
+
+    def _invitable(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        return UserFactory(password="x" * 12)
+
+    def test_an_invitable_account_is_offered_the_invite(self):
+        assert self._offered(self._invitable()) is True
+
+    def test_dismissing_requires_being_signed_in(self):
+        """Self-scoped: the account comes from the session, never from a body."""
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        response = self.client.post("/saml/migration/invite/dismiss")
+        assert response.status_code == 401
+
+    def test_dismissing_writes_the_stamp_and_hides_the_invite(self):
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        self.login(user)
+
+        response = self.client.post("/saml/migration/invite/dismiss")
+        assert response.status_code == 200
+        assert response.json == {"dismissed": True}
+
+        user.reload()
+        assert user.extras[MIGRATION_INVITE_DISMISSED_AT]
+        assert self._offered(user) is False
+
+    def test_the_invite_comes_back_after_the_written_window(self):
+        """The half a boolean could not express."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_INVITE_REMIND_AFTER
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        long_ago = datetime.utcnow() - MIGRATION_INVITE_REMIND_AFTER - timedelta(days=1)
+        user.extras[MIGRATION_INVITE_DISMISSED_AT] = long_ago.isoformat()
+        user.save()
+
+        assert self._offered(user) is True
+
+    def test_a_stamp_just_inside_the_window_still_holds(self):
+        """Paired with the test above: without this one, a rule that expired
+        immediately would pass just as well."""
+        from udata.auth.saml.saml_plugin.saml_govpt import MIGRATION_INVITE_REMIND_AFTER
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        recent = datetime.utcnow() - MIGRATION_INVITE_REMIND_AFTER + timedelta(days=1)
+        user.extras[MIGRATION_INVITE_DISMISSED_AT] = recent.isoformat()
+        user.save()
+
+        assert self._offered(user) is False
+
+    def test_an_unreadable_stamp_means_never_dismissed(self):
+        """Degrades towards showing an optional, dismissible notice rather than
+        towards never telling the person anything."""
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        user = self._invitable()
+        user.extras[MIGRATION_INVITE_DISMISSED_AT] = "não é uma data"
+        user.save()
+
+        assert self._offered(user) is True
+
+    def test_dismissing_leaves_the_rest_of_extras_alone(self):
+        """Hiding a notice touches one key, and this account holds a credential.
+
+        🚩 What this does NOT prove is the atomic write: MongoEngine sends a
+        delta, so a `save()` on an account that already has `extras` lands on
+        the same single key and keeps this test green. That was checked by
+        mutation rather than assumed, and the narrower reason the targeted
+        write is still the right form is written where it is used.
+        """
+        user = self._invitable()
+        user.extras["auth_nic"] = _hash_nic("12345678")
+        user.save()
+        self.login(user)
+
+        assert self.client.post("/saml/migration/invite/dismiss").status_code == 200
+
+        user.reload()
+        assert user.extras["auth_nic"] == _hash_nic("12345678")
+
+    def test_the_invite_is_not_offered_with_the_flag_off(self):
+        user = UserFactory(password="x" * 12)
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        assert self._offered(user) is False
+
+    def test_the_invite_is_not_offered_to_an_already_linked_account(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        linked = UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")})
+        assert self._offered(linked) is False
+
+
+class LinkStartRouteTest(APITestCase):
+    """The door that had to be built, and the ticket that rides with it.
+
+    🚨 The reason these routes exist at all: /saml/login is decorated
+    @anonymous_user_required, which is right for a way IN and exactly wrong
+    for somebody who just signed in with a password and wants to add an
+    identity. Without a door of their own the invite's button bounces off the
+    sign-in route and nothing happens -- and nothing is the failure that looks
+    like the feature was never wired.
+    """
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def test_an_anonymous_caller_is_refused(self):
+        self._invite_on()
+        assert self.client.get("/saml/link/start").status_code == 401
+        assert self.client.get("/saml/eidas/link/start").status_code == 401
+
+    def test_the_door_is_shut_when_the_invite_is_off(self):
+        """Not decoration: the flag may have been turned off since the notice
+        was rendered, and the button is still on somebody's screen."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        self.login(UserFactory(password="x" * 12))
+        assert self.client.get("/saml/link/start").status_code == 403
+
+    def test_an_already_linked_account_is_refused(self):
+        """The account may have linked in another tab since the invite was
+        rendered. A door that opens on a stale notice links twice."""
+        self._invite_on()
+        self.login(UserFactory(password="x" * 12, extras={"auth_nic": _hash_nic("12345678")}))
+        assert self.client.get("/saml/link/start").status_code == 409
+
+    def test_a_dismissed_invite_can_still_be_walked_back_into(self):
+        """Dismissing is "not now", never "never let me".
+
+        The permanent way back is an acceptance criterion, and this is the
+        half of it that lives in the backend: the route checks that there is
+        something to link, NOT that a notice is currently being shown.
+        """
+        from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+        self._invite_on()
+        user = UserFactory(
+            password="x" * 12,
+            extras={MIGRATION_INVITE_DISMISSED_AT: datetime.utcnow().isoformat()},
+        )
+        self.login(user)
+
+        # 🚩 The AuthnRequest itself is mocked away, and that is the point of
+        # this assertion rather than a shortcut around it. What is under test
+        # is the GUARD -- that a dismissal does not close the door -- and
+        # building a real request drags in pysaml2, which needs the `xmlsec1`
+        # binary. That binary is on a developer machine and not on the CI
+        # runner, so asserting a 200 here passed locally and failed in CI with
+        # a 500 that said nothing about the invite.
+        #
+        # The other tests in this class stop at a refusal and never reach it.
+        # This is the only one that walks the whole way through.
+        with patch(
+            "udata.auth.saml.saml_plugin.saml_govpt._begin_cmd_authn_request"
+        ) as begin_request:
+            begin_request.return_value = "<form/>"
+            self.client.get("/saml/link/start")
+
+        assert begin_request.called, (
+            "the route refused somebody who dismissed the notice -- dismissing is "
+            "'not now', and the way back has to stay open"
+        )
+        assert begin_request.call_args.kwargs["link_user_id"] == str(user.id)
+
+
+class LinkIntentTest(APITestCase):
+    """The ticket that survives the round-trip, and what it may decide.
+
+    🚨 It cannot travel in the session. The IdP posts the assertion back
+    cross-site, and with SESSION_COOKIE_SAMESITE=Lax the browser does not send
+    the session cookie on that POST -- so current_user at the ACS is anonymous
+    even for somebody who signed in seconds earlier. That is the same fact
+    that made the outstanding bucket ride RelayState, and this rides beside it.
+    """
+
+    def test_the_intent_survives_the_round_trip_and_is_single_use(self):
+        cache = _InMemoryCache()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            token = _new_relay_state_token()
+            _store_link_intent(token, "6510f0aabbccddeeff001122")
+
+            assert _consume_link_intent(token) == "6510f0aabbccddeeff001122"
+            # Single use: a replayed RelayState must not re-open the flow.
+            assert _consume_link_intent(token) is None
+
+    def test_an_unknown_or_empty_token_yields_nothing(self):
+        cache = _InMemoryCache()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            assert _consume_link_intent("") is None
+            assert _consume_link_intent(None) is None
+            assert _consume_link_intent(_new_relay_state_token()) is None
+
+    def test_no_user_means_no_intent_is_written(self):
+        """The sign-in route calls the same builder with no id, and must not
+        leave a ticket behind that a later callback could pick up."""
+        cache = _InMemoryCache()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            token = _new_relay_state_token()
+            _store_link_intent(token, None)
+            assert _consume_link_intent(token) is None
+
+    def test_a_cache_that_is_down_degrades_to_todays_behaviour(self):
+        """No intent means the callback is treated as a plain sign-in.
+
+        Worse than linking, and deliberately better than a 500 on a flow the
+        person cannot retry -- they end up with an account to merge rather
+        than an error page.
+        """
+        broken = MagicMock()
+        broken.set.side_effect = RuntimeError("redis down")
+        broken.get.side_effect = RuntimeError("redis down")
+        with self.app.test_request_context(), patch("udata.app.cache", broken):
+            token = _new_relay_state_token()
+            _store_link_intent(token, "6510f0aabbccddeeff001122")
+            assert _consume_link_intent(token) is None
+
+
+class InvitedLinkDoesNotCreateASecondAccountTest(APITestCase):
+    """The invariant the whole ticket exists for: one person, one account.
+
+    🚨 The case that matters is the THIRD one here, and it is the one the
+    ticket originally left open. A citizen's CMD carries the address they gave
+    the State; their portal account carries the one they registered with years
+    ago. There is no reason for those to match, and when they do not -- and
+    nobody else holds the CMD's address -- the resolver recognises nothing,
+    answers `no_match`, and a brand-new account is minted.
+
+    That is the invite promising "soon, one account per person" and its own
+    button creating the second one.
+    """
+
+    NIC = "12345678"
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _cmd_callback(self, mock_client_for, cache, relay_token="", **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        with patch("udata.app.cache", cache):
+            return self.client.post(
+                "/saml/sso",
+                data={"SAMLResponse": encoded, "RelayState": relay_token},
+                follow_redirects=False,
+            )
+
+    def _link(self, mock_client_for, account, **attrs):
+        """Walk the invited flow: ticket issued, then the callback arrives."""
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+        return self._cmd_callback(mock_client_for, cache, relay_token=token, **attrs)
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_cmd_address_that_differs_and_is_free_does_not_mint_an_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The third row of the ticket's table, and the one that was open."""
+        from udata.core.user.models import User
+
+        self._invite_on()
+        account = UserFactory(
+            password="x" * 12, email="m.silva@camara.pt", first_name="M", last_name="Silva"
+        )
+        before = len(list(User.objects))
+
+        response = self._link(
+            mock_client_for,
+            account,
+            email="maria@gmail.com",
+            nic=self.NIC,
+            first_name="Maria",
+            last_name="Silva Ferreira",
+        )
+
+        assert len(list(User.objects)) == before, (
+            "the invited link minted a second account -- the exact outcome the invite promises "
+            "to prevent"
+        )
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_the_wizard_is_pointed_at_the_account_that_asked(self, mock_client_for, _mock_confirm):
+        """Knowing WHICH account is the difference the ticket buys.
+
+        Without it the wizard opens on "help me find mine" and asks somebody
+        who is already signed in to prove who they are from scratch.
+        """
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+
+        with self.client.session_transaction() as sess:
+            sess.clear()
+
+        self._link(
+            mock_client_for,
+            account,
+            email="maria@gmail.com",
+            nic=self.NIC,
+            first_name="Maria",
+            last_name="Silva",
+        )
+
+        with self.client.session_transaction() as sess:
+            pending = sess["saml_migration_pending"]
+        assert pending["legacy_user_id"] == str(account.id)
+        assert pending["no_match"] is False
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_eidas_link_never_mints_an_account_either(self, mock_client_for, _mock_confirm):
+        """eIDAS needs this more, not less: the Minimum Data Set carries no
+        email at all, so an invited eIDAS link is ALWAYS a no_match."""
+        from udata.core.user.models import User
+
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+        before = len(list(User.objects))
+
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            person_identifier="ES/PT/9999", given_name="Maria", family_name="Silva"
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(
+            _build_saml_response_xml(
+                person_identifier="ES/PT/9999", given_name="Maria", family_name="Silva"
+            ).encode("utf-8")
+        ).decode("utf-8")
+
+        with (
+            patch("udata.app.cache", cache),
+            patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for", mock_client_for),
+        ):
+            response = self.client.post(
+                "/saml/eidas/sso",
+                data={"SAMLResponse": encoded, "RelayState": token},
+                follow_redirects=False,
+            )
+
+        assert len(list(User.objects)) == before
+        assert response.status_code == 302
+        assert "/migrate-account" in response.headers["Location"]
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_without_a_ticket_a_genuinely_new_citizen_still_gets_an_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """The other half of the guarantee, and the one a careless fix breaks.
+
+        Diverting everybody would send first-time citizens into a wizard for
+        an account they do not have. The ticket is what tells the two apart.
+        """
+        from udata.core.user.models import User
+
+        self._invite_on()
+        before = len(list(User.objects))
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_callback(
+                mock_client_for,
+                _InMemoryCache(),
+                email="novo@example.pt",
+                nic="87654321",
+                first_name="Novo",
+                last_name="Cidadao",
+            )
+
+        assert len(list(User.objects)) == before + 1
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_ticket_issued_before_the_invite_was_turned_off_is_ignored(
+        self, mock_client_for, _mock_confirm
+    ):
+        """🚩 Off has to mean off everywhere, including mid-flight.
+
+        The ticket lives for ten minutes, which is a window in which the flag
+        can be turned off by a deploy while somebody is at autenticacao.gov.
+        Honouring it then would send them to a wizard whose every endpoint now
+        answers 403 -- a dead end, and the one shape this ticket exists to
+        avoid.
+
+        Falling back to an ordinary sign-in is not a compromise: it IS the
+        behaviour of a portal with the invite off, which is exactly what the
+        operator asked for by turning it off.
+        """
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+        cache, token = self._ticket_for(account)
+
+        # The deploy lands between the click and the callback.
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_callback(
+                mock_client_for,
+                cache,
+                relay_token=token,
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        with self.client.session_transaction() as sess:
+            assert "saml_migration_pending" not in sess, (
+                "the callback opened a wizard that is now shut -- every endpoint it needs "
+                "answers 403, so the citizen is left with no way forward"
+            )
+
+    def _ticket_for(self, account):
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+        return cache, token
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_a_ticket_for_an_account_linked_meanwhile_is_ignored(
+        self, mock_client_for, _mock_confirm
+    ):
+        """Ten minutes pass while the citizen is at autenticacao.gov, and in
+        that time another tab can have linked the account. Binding a second
+        identity there would be the duplicate wearing the costume of the fix.
+        """
+        self._invite_on()
+        account = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+
+        account.extras["auth_nic"] = _hash_nic("99999999")
+        account.save()
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+            self._cmd_callback(
+                mock_client_for,
+                cache,
+                relay_token=token,
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        with self.client.session_transaction() as sess:
+            assert "saml_migration_pending" not in sess
+
+
+class WizardOpenInInviteModeTest(APITestCase):
+    """The wizard has to answer in invite mode -- except the one door that
+    manufactures the duplicate.
+
+    🚨 Without this the ACS hands somebody a wizard whose every endpoint
+    answers 403: a dead end wearing the costume of a flow, and exactly the
+    shape of defect this project keeps shipping (LEDG-1628, LEDG-2438).
+    """
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _pending_session(self, account):
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(account.id),
+                "no_match": False,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_first_name": "Maria",
+                "saml_last_name": "Silva",
+                "saml_provider": "cmd",
+            }
+
+    def test_the_wizard_answers_in_invite_mode(self):
+        """Not "returns 200" -- returns anything other than the 403 that says
+        the wizard does not exist."""
+        self._invite_on()
+        account = UserFactory(password="x" * 12)
+        self._pending_session(account)
+
+        assert self.client.get("/saml/migration/pending").status_code != 403
+        assert self.client.post("/saml/migration/send-link").status_code != 403
+        assert self.client.post("/saml/migration/confirm", json={}).status_code != 403
+
+    def test_the_wizard_is_told_the_flow_came_from_the_invite(self):
+        """The wizard cannot infer it: both modes reach it through the same
+        redirect and look identical afterwards. It decides which escape hatch
+        the screen offers, so it has to be told."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        account = UserFactory(password="x" * 12)
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(account.id),
+                "no_match": False,
+                "saml_invited": True,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_provider": "cmd",
+            }
+
+        response = self.client.get("/saml/migration/pending")
+        assert response.status_code == 200
+        assert response.json["invited"] is True
+
+    def test_a_session_from_the_mandatory_mode_is_not_marked_invited(self):
+        """Absent reads as False: the mandatory mode is the older behaviour and
+        the safe default, so a session opened before this key existed keeps the
+        escape hatch it has always had."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        account = UserFactory(password="x" * 12)
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(account.id),
+                "no_match": False,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_provider": "cmd",
+            }
+
+        response = self.client.get("/saml/migration/pending")
+        assert response.json["invited"] is False
+
+    def test_creating_a_new_account_stays_shut_in_invite_mode(self):
+        """🚫 The whole point of the exception.
+
+        In the mandatory mode this is the emergency exit for somebody who
+        cannot prove the old account is theirs and would otherwise be locked
+        out of the portal. In invite mode they signed in with a password
+        seconds ago and are locked out of nothing -- so it is not a safety
+        net, it is a way to manufacture the second account.
+        """
+        self._invite_on()
+        self._pending_session(UserFactory(password="x" * 12))
+
+        response = self.client.post("/saml/migration/skip", json={"email": "nova@example.pt"})
+        assert response.status_code == 403
+
+    def test_creating_a_new_account_still_works_in_the_mandatory_mode(self):
+        """Paired with the test above: a guard that refused in BOTH modes would
+        take away the emergency exit from the people who need it."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        self._pending_session(UserFactory(password="x" * 12))
+
+        response = self.client.post("/saml/migration/skip", json={"email": "nova@example.pt"})
+        assert response.status_code != 403
+
+    def test_with_both_flags_off_the_wizard_is_shut_exactly_as_before(self):
+        """Criterion 12: turning the invite off returns today's behaviour,
+        without turning the mandatory mode on."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = False
+        self._pending_session(UserFactory(password="x" * 12))
+
+        assert self.client.get("/saml/migration/pending").status_code == 403
+        assert self.client.post("/saml/migration/send-link").status_code == 403
+        assert self.client.post("/saml/migration/confirm", json={}).status_code == 403
+        assert self.client.post("/saml/migration/skip", json={}).status_code == 403
+        assert self.client.post("/saml/migration/resend-confirmation").status_code == 403
+
+
+class InvitedFlowAuditTest(APITestCase):
+    """Two events the invited flow produces that the log could not name.
+
+    The outcome vocabulary stays at five values -- a sixth would be a contract
+    change for anything counting these lines -- so both are `reason`, which is
+    exactly what `reason` is for (LEDG-2473).
+    """
+
+    AUDIT_LOGGER = "udata.auth.saml.audit"
+    NIC = "12345678"
+
+    def _invite_on(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+
+    def _cmd_callback(self, mock_client_for, cache, relay_token="", **attrs):
+        mock_saml_client = MagicMock()
+        mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+            **attrs
+        )
+        mock_client_for.return_value = mock_saml_client
+        encoded = base64.b64encode(_build_saml_response_xml(**attrs).encode("utf-8")).decode(
+            "utf-8"
+        )
+        with patch("udata.app.cache", cache):
+            return self.client.post(
+                "/saml/sso",
+                data={"SAMLResponse": encoded, "RelayState": relay_token},
+                follow_redirects=False,
+            )
+
+    def _ticket_for(self, account):
+        cache = _InMemoryCache()
+        token = _new_relay_state_token()
+        with self.app.test_request_context(), patch("udata.app.cache", cache):
+            _store_link_intent(token, str(account.id))
+        return cache, token
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_invited_link_is_countable(self, mock_client_for, _mock_confirm):
+        """ "How many people accepted the invite?" has to have an answer, and
+        migration_candidate/no_match cannot give it -- both also happen to
+        people who never saw an invite."""
+        self._invite_on()
+        cache, token = self._ticket_for(UserFactory(password="x" * 12))
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            self._cmd_callback(
+                mock_client_for,
+                cache,
+                relay_token=token,
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        lines = [r.getMessage() for r in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=migration_pending" in lines[0], lines
+        assert "reason=invite_link" in lines[0], lines
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_identity_that_is_already_somebody_elses_is_refused(
+        self, mock_client_for, _mock_confirm
+    ):
+        """🚩 Was a silent account switch, and is now a refusal.
+
+        Signing the citizen into the account that owns the identity is right
+        for anyone who pressed "sign in with CMD" -- the identity IS that
+        account's. It is wrong for somebody who pressed "link": they end up in
+        an account they never asked about, the one they clicked from stays
+        unlinked, and nothing says so. They walk away believing it worked and
+        find out when the invite comes back.
+
+        Refusing costs one click to whoever did want that account, and it is
+        the same principle the password screen already applies: never switch
+        accounts in silence.
+        """
+        self._invite_on()
+        asking = UserFactory(password="x" * 12, email="m.silva@camara.pt")
+        owner = UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+        cache, token = self._ticket_for(asking)
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as login:
+                response = self._cmd_callback(
+                    mock_client_for,
+                    cache,
+                    relay_token=token,
+                    email="maria@gmail.com",
+                    nic=self.NIC,
+                    first_name="Maria",
+                    last_name="Silva",
+                )
+
+        assert not login.called, "signed the citizen into an account they never asked about"
+        assert response.status_code == 302
+        assert "saml_error=invite_identity_already_linked" in response.headers["Location"]
+
+        lines = [r.getMessage() for r in captured.records]
+        assert len(lines) == 1, lines
+        assert "outcome=rejected" in lines[0], lines
+        assert "reason=invite_identity_already_linked" in lines[0], lines
+
+        # The account that owns the identity is untouched, and so is the one
+        # that asked -- "a sua conta ficou como estava" has to be true.
+        owner.reload()
+        asking.reload()
+        assert owner.extras["auth_nic"] == _hash_nic(self.NIC)
+        assert not (asking.extras or {}).get("auth_nic")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_ordinary_cmd_sign_in_still_reaches_that_account(
+        self, mock_client_for, _mock_confirm
+    ):
+        """Paired with the test above, and the reason the guard is scoped to a
+        ticket: without one, pressing "sign in with CMD" must still work."""
+        self._invite_on()
+        UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user") as login:
+            self._cmd_callback(
+                mock_client_for,
+                _InMemoryCache(),
+                email="maria@gmail.com",
+                nic=self.NIC,
+                first_name="Maria",
+                last_name="Silva",
+            )
+
+        assert login.called
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_ordinary_sign_in_keeps_its_reason(self, mock_client_for, _mock_confirm):
+        """Paired with the test above: an override that leaked onto every line
+        would rename a population instead of naming one."""
+        self._invite_on()
+        UserFactory(email="outra@example.pt", extras={"auth_nic": _hash_nic(self.NIC)})
+
+        with self.assertLogs(self.AUDIT_LOGGER, level=logging.INFO) as captured:
+            with patch("udata.auth.saml.saml_plugin.saml_govpt.login_user"):
+                self._cmd_callback(
+                    mock_client_for,
+                    _InMemoryCache(),
+                    email="maria@gmail.com",
+                    nic=self.NIC,
+                    first_name="Maria",
+                    last_name="Silva",
+                )
+
+        lines = [r.getMessage() for r in captured.records]
+        assert len(lines) == 1, lines
+        assert "reason=existing_saml" in lines[0], lines
+
+
+class MigrationInviteFlagIsWiredToTheEnvironmentTest(APITestCase):
+    """🚨 A flag that is declared and never read is a feature that ships off.
+
+    `udata.cfg` is loaded AFTER `settings.Defaults` and overrides it, so a flag
+    declared in Defaults and not read here is pinned to its default no matter
+    what the deployment sets. The feature then ships, the environment variable
+    is set, nothing happens, and nothing says why -- which is how LEDG-2438
+    spent two days marked as done without ever having worked.
+
+    This reads the config file's source, and deliberately so: no behavioural
+    test can see the difference, because a missing line and a line reading
+    `False` produce the same running app. Same reasoning as the frontend's
+    migration-flag-guard, which reads source for an invariant about what the
+    code does NOT do.
+    """
+
+    CONFIG = "udata.cfg"
+
+    def _source(self):
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[3] / self.CONFIG
+        assert path.exists(), f"config not found: {path}"
+        return path.read_text(encoding="utf-8")
+
+    def test_the_invite_flag_is_read_from_the_environment(self):
+        source = self._source()
+        assert 'MIGRATION_INVITE_ENABLED = _env_bool("MIGRATION_INVITE_ENABLED"' in source, (
+            "MIGRATION_INVITE_ENABLED is not read from the environment in udata.cfg, so "
+            "setting it in .env does nothing and the invite can never be turned on"
+        )
+
+    def test_its_default_agrees_with_the_one_in_settings(self):
+        """Two mentions of one value, not two defaults.
+
+        MIGRATION_MODE_ENABLED has three that disagree -- True here, absent
+        from Defaults, False in the reader's `.get` -- and that divergence is a
+        recorded trap. This asserts the new flag did not acquire one.
+        """
+        from udata.settings import Defaults
+
+        source = self._source()
+        assert 'MIGRATION_INVITE_ENABLED = _env_bool("MIGRATION_INVITE_ENABLED", False)' in source
+        assert Defaults.MIGRATION_INVITE_ENABLED is False
+
+
+class InvitedLinkStaysOnTheAccountThatAskedTest(APITestCase):
+    """🚩 The notice promises "you keep the account you already have". This is
+    what keeps that true.
+
+    The wizard identifies the account to link by the password proved on its
+    screen. In the mandatory mode that is the only evidence there is -- the
+    citizen arrives deauthenticated and the portal has no idea who they are.
+
+    In invite mode they clicked from INSIDE an account and the ticket says
+    which. Following the typed address instead lands the identity on an
+    account they never asked about, leaves the one they clicked from unlinked,
+    and tells them nothing. They find out by signing in with CMD later and not
+    recognising what they see.
+
+    Not a security hole: reaching another account still costs that account's
+    password. A broken promise, which is worse in its own way, because nothing
+    looks wrong at the time.
+    """
+
+    def _pending(self, clicked_from, *, invited):
+        with self.client.session_transaction() as sess:
+            sess["saml_migration_pending"] = {
+                "legacy_user_id": str(clicked_from.id),
+                "no_match": False,
+                "saml_invited": invited,
+                "saml_email": "maria@gmail.com",
+                "saml_nic": "12345678",
+                "saml_provider": "cmd",
+            }
+
+    def _confirm_as(self, user, password="x" * 12):
+        return self.client.post(
+            "/saml/migration/confirm",
+            json={"method": "password", "email": user.email, "password": password},
+        )
+
+    def test_the_invited_flow_refuses_a_different_account(self):
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        clicked_from = UserFactory(password="x" * 12, email="maria@camara.pt")
+        other = UserFactory(password="x" * 12, email="maria@gmail.com")
+        self._pending(clicked_from, invited=True)
+
+        response = self._confirm_as(other)
+
+        assert response.status_code == 409
+        assert response.json["code"] == "invited_account_mismatch"
+        # Named so the screen can say which account it is linking, instead of
+        # leaving somebody to guess why a correct password was refused.
+        assert response.json["expected_email"]
+        assert "camara.pt" in response.json["expected_email"]
+
+    def test_the_invited_flow_accepts_the_account_that_asked(self):
+        """Paired with the test above: a guard that refused everybody would
+        pass it and break the whole flow."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        clicked_from = UserFactory(password="x" * 12, email="maria@camara.pt")
+        self._pending(clicked_from, invited=True)
+
+        response = self._confirm_as(clicked_from)
+
+        assert response.status_code != 409
+
+    def test_the_mandatory_flow_still_follows_the_password(self):
+        """🚨 The asymmetry, and the reason this guard is scoped to one mode.
+
+        There the citizen arrives deauthenticated: the candidate was matched by
+        NAME, which is a guess, and the proved password is the only real
+        evidence. Refusing here would lock homonyms out of their own accounts.
+        """
+        self.app.config["MIGRATION_MODE_ENABLED"] = True
+        guessed_by_name = UserFactory(password="x" * 12, email="maria@camara.pt")
+        actually_theirs = UserFactory(password="x" * 12, email="maria@gmail.com")
+        self._pending(guessed_by_name, invited=False)
+
+        response = self._confirm_as(actually_theirs)
+
+        assert response.status_code != 409
+
+    def test_a_wrong_password_is_still_a_wrong_password(self):
+        """The mismatch check sits AFTER the password, so it cannot become a
+        way to learn which addresses exist."""
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        self.app.config["MIGRATION_INVITE_ENABLED"] = True
+        clicked_from = UserFactory(password="x" * 12, email="maria@camara.pt")
+        other = UserFactory(password="x" * 12, email="maria@gmail.com")
+        self._pending(clicked_from, invited=True)
+
+        response = self._confirm_as(other, password="errada")
+
+        assert response.status_code == 400
+        assert response.json["error"] == "Invalid credentials"
