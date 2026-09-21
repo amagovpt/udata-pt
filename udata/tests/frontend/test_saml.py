@@ -1212,6 +1212,109 @@ class SAMLSSOCallbackTest(APITestCase):
         assert me["pending_registration"] is True
         assert me["pending_registration_email"] is None
 
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_first_cmd_sign_in_with_a_free_email_completes_registration(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """A first CMD sign-in whose assertion carries a FREE address still ends
+        on the completion screen, with that address offered as a prefill.
+
+        This is the case the placeholder rule used to miss entirely: with no
+        account holding the address, it was adopted as the account's own,
+        stamped confirmed, and the citizen was let straight into the portal
+        without ever being asked which address they wanted it to hold. Nothing
+        about the identity was wrong -- autenticacao.gov had proved it -- but
+        nothing had proved the mailbox, and that is what the screen is for.
+
+        Deliberately does NOT patch login_user: the prefill is read out of the
+        session the real login establishes, so patching what creates the session
+        would leave the value under test unobserved.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        try:
+            attrs = {
+                "nic": "77778888",
+                "email": "rita.livre@example.org",
+                "first_name": "Rita",
+                "last_name": "Livre",
+            }
+            assert User.objects(email__iexact=attrs["email"]).count() == 0
+
+            mock_saml_client = MagicMock()
+            mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+                **attrs
+            )
+            mock_client_for.return_value = mock_saml_client
+
+            response = self._post_saml_response(_build_saml_response_xml(**attrs))
+
+            assert response.status_code == 302
+            assert response.headers["Location"] == "http://localhost:3000/complete-registration"
+
+            created = User.objects(extras__auth_nic=_hash_nic("77778888")).first()
+            assert created is not None
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(created.email), created.email
+
+            # The asserted address exists nowhere as an account address. This is
+            # the assertion that fails if the adoption ever comes back: a row
+            # holding it would be invisible to every count filtered by the
+            # placeholder prefix.
+            assert User.objects(email__iexact=attrs["email"]).count() == 0
+
+            me = self.client.get("/api/1/me/").json
+            assert me["pending_registration"] is True
+            assert me["pending_registration_email"] == "rita.livre@example.org"
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(me["email"]), me["email"]
+        finally:
+            self.app.config["MIGRATION_MODE_ENABLED"] = True
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
+    def test_an_identity_without_an_identifier_keeps_its_asserted_address(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """An assertion carrying no identifier at all keeps the OLD behaviour,
+        and that is deliberate rather than an oversight.
+
+        Minting a placeholder here would leave the account holding neither an
+        auth_nic nor a real address, so the next sign-in would resolve it by
+        neither route and mint a second account, then a third -- one per login.
+        That is the duplicate class of LEDG-2045, which this repository has
+        already seen come back by a second route.
+
+        One unproven address is the lesser harm, and it is the harm that already
+        exists. Refusing the sign-in outright is the decision parked on
+        LEDG-2436, and is not this change's to take. If that decision lands,
+        this test is the one that should fail.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        try:
+            attrs = {
+                "email": "sem.identificador@example.org",
+                "first_name": "Sem",
+                "last_name": "Identificador",
+            }
+
+            mock_saml_client = MagicMock()
+            mock_saml_client.parse_authn_request_response.return_value = _make_authn_response_mock(
+                **attrs
+            )
+            mock_client_for.return_value = mock_saml_client
+
+            self._post_saml_response(_build_saml_response_xml(**attrs))
+
+            created = User.objects(email__iexact=attrs["email"]).first()
+            assert created is not None, "the identity with no identifier lost its account"
+            assert not _SAML_PLACEHOLDER_EMAIL_RE.match(created.email), created.email
+            assert not (created.extras or {}).get("auth_nic")
+        finally:
+            self.app.config["MIGRATION_MODE_ENABLED"] = True
+
     def test_sso_rejects_missing_saml_response(self):
         """POST to /saml/sso without SAMLResponse should fail."""
         response = self.client.post("/saml/sso", data={})
@@ -1871,6 +1974,45 @@ class SAMLEidasSSOTest(APITestCase):
             # says the MDC attributes were read.
             assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
             assert user.extras.get("auth_nic") == _hash_nic("12345678")
+
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
+    @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
+    def test_first_eidas_sign_in_without_an_email_completes_registration(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Every eIDAS sign-in reaches the completion screen with an empty
+        field, because the Minimum Data Set has no email attribute to prefill
+        it with.
+
+        Pinned separately from the CMD case although both now take the same
+        branch: they arrive at it for different reasons -- CMD because an
+        asserted address is no longer adopted, eIDAS because there was never one
+        to adopt -- and a change that broke only the second would otherwise be
+        caught by nothing.
+        """
+        from udata.core.user.models import User
+
+        self.app.config["MIGRATION_MODE_ENABLED"] = False
+        try:
+            response = self._sso_with(
+                mock_client_for,
+                nic="ES/PT/99990000",
+                first_name="Carmen",
+                last_name="Ibanez",
+            )
+
+            assert response.status_code == 302
+            assert response.headers["Location"].endswith("/complete-registration")
+
+            created = User.objects(extras__auth_nic=_hash_nic("ES/PT/99990000")).first()
+            assert created is not None
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(created.email), created.email
+
+            me = self.client.get("/api/1/me/").json
+            assert me["pending_registration"] is True
+            assert me["pending_registration_email"] is None
+        finally:
+            self.app.config["MIGRATION_MODE_ENABLED"] = True
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.eidas_client_for")
