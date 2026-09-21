@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **fix(harvest): the DGT backend reads the resource format, the resource title and
+  description, the publication date, the update frequency and the bounding box from the
+  source instead of inventing them**
+  - **The resource format was a fragment of the URL.** The backend took the `SERVICE=`
+    query parameter when there was one and otherwise ran `split(".")[-1]` over the *whole*
+    URL, so any endpoint without a file extension returned the tail of the host name and the
+    query string. That is how the catalogue filled with formats like
+    `pt/dados_abertos/info_recursosminerais?Id=1704` and `pt/idea-api/collections/Ortofoto_2024`
+    -- about 28% of the DGT resources sampled in production, and 98 of the 733 links of a
+    400-record sample of the index. The MIME type and the protocol the source publishes on
+    every link are read first now, and the URL only last, through the `guess_url_format`
+    helper that reads the extension off the last path segment alone. `text/plain` is
+    deliberately not believed: it is the second most common MIME in the index and sits in
+    front of WFS endpoints, zip archives and PDFs alike, so trusting it would replace a
+    wrong answer with a confidently wrong one.
+  - **Each link carries six fields and three were read.** The index writes them as
+    `name|description|url|protocol|mime|order`; fields 0 and 1 were never touched, which is
+    why every harvested resource repeated the title of its own dataset. They are filled on
+    16.2% and 19.3% of the links, and the dataset title now only stands in for the rest.
+    The split was also unguarded -- and an `IndexError` there did not fail one item, it
+    raised out of `inner_harvest` and would have ended the whole job before any other record
+    was processed.
+  - **The publication date had been commented out since the backend was written**, so every
+    dataset carried the date the harvester first saw it. Uncommenting it as written would not
+    have worked: it assigned `Dataset.created_at`, which is a read-only property, so every
+    record carrying a date would have failed with an `AttributeError`. The date goes to
+    `harvest.created_at`, which is what that property actually reads. **This changes existing
+    datasets**: none of the 1044 harvested from DGT carries that field today, so all of them
+    take the date the source declares on the first harvest after this deploys, and the
+    "created" date shown in the portal changes for them.
+  - **The update frequency and the spatial coverage were never written at all.** The source
+    publishes an ISO 19115 maintenance frequency on 42.4% of its records and a bounding box
+    on 99.5% of them; in production, 89 of 100 datasets sampled sat on the frequency default
+    and 92 of 100 had no coverage. Both are mapped explicitly rather than guessed -- four of
+    the ISO terms have no same-named member in the portal's vocabulary. Note that both are
+    rewritten on every harvest, so a frequency or a geographic zone set by hand in the back
+    office is replaced by what the source says.
+  - **Resource ids are unaffected.** The reconciliation by URL keeps the resource that is
+    already stored and writes the new title and format onto it, so the `/api/1/datasets/r/<id>`
+    permalinks survive. There is no migration: every field above is rewritten on the next
+    harvest of each of the 27 sources.
+
 - **fix(harvest): the DGT backend derives the license from `legalConstraints` instead of
   stamping `cc-by` on every dataset**
   - The constant ran on every harvest of all 27 DGT sources, over all 1213 datasets, so it
