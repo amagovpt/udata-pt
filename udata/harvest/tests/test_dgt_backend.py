@@ -384,6 +384,136 @@ class DGTResourceFormatTest(PytestOnlyDBTestCase):
         assert resource.format == "ogcapi-features"
 
 
+class DGTLinkParsingTest:
+    """`DGTBackend._parse_link`: the six fields, and what a short one does."""
+
+    def test_the_six_fields_are_read(self):
+        parsed = DGTBackend._parse_link(LNEG_LINK)
+        assert parsed["url"] == LNEG_URL
+        assert parsed["description"] == (
+            "Página de descarregamento do PDF a partir do Geoportal da Energia e Geologia"
+        )
+        assert parsed["type"] == "WWW:LINK-1.0-http--link"
+        assert parsed["format"] == "text/html"
+
+    def test_an_empty_name_is_none_rather_than_empty(self):
+        # The LNEG record carries a description but no name: field 0 is empty.
+        assert DGTBackend._parse_link(LNEG_LINK)["title"] is None
+
+    def test_a_link_with_neither_name_nor_description(self):
+        parsed = DGTBackend._parse_link(OGC_API_LINK)
+        assert parsed["title"] is None
+        assert parsed["description"] is None
+        assert parsed["url"] == OGC_API_URL
+
+    def test_a_five_field_link_does_not_raise(self):
+        parsed = DGTBackend._parse_link(f"nome|desc|{ZIP_URL}|WWW:LINK|zip")
+        assert parsed["url"] == ZIP_URL
+        assert parsed["format"] == "zip"
+
+    def test_a_link_with_no_url_names_no_resource(self):
+        assert DGTBackend._parse_link("nome|desc") is None
+        assert DGTBackend._parse_link("") is None
+        assert DGTBackend._parse_link("||") is None
+
+    def test_a_link_that_is_not_a_string_names_no_resource(self):
+        assert DGTBackend._parse_link(None) is None
+        assert DGTBackend._parse_link({"url": ZIP_URL}) is None
+
+    def test_the_title_is_sanitized(self):
+        # `Dataset.pre_save` sanitizes the dataset title and both descriptions,
+        # but never `resource.title`.
+        parsed = DGTBackend._parse_link(f"<b>Carta</b>|desc|{ZIP_URL}|WWW:LINK|zip")
+        assert parsed["title"] == "Carta"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTResourceMetadataHarvestTest(PytestOnlyDBTestCase):
+    """The title and description a real harvest writes, and the ids it keeps."""
+
+    def _harvest(self, rmock, records):
+        rmock.get(DGT_URL, text=_index_payload(records))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        return DGTBackend(source).harvest()
+
+    def test_a_named_link_uses_the_sources_own_name(self, rmock):
+        link = f"Carta administrativa (SHP)|Descarregamento directo|{ZIP_URL}|WWW:LINK|zip"
+        self._harvest(rmock, [_index_record(REMOTE_ID, None, link=link)])
+        (resource,) = harvested_dataset(REMOTE_ID).resources
+        assert resource.title == "Carta administrativa (SHP)"
+        assert resource.description == "Descarregamento directo"
+
+    def test_the_lneg_description_survives_the_harvest(self, rmock):
+        self._harvest(rmock, [_index_record(LNEG_REMOTE_ID, None, link=LNEG_LINK)])
+        (resource,) = harvested_dataset(LNEG_REMOTE_ID).resources
+        assert resource.description.startswith("Página de descarregamento do PDF")
+        # No name in the source, so the dataset title stands in.
+        assert resource.title == "Carta geológica"
+
+    def test_a_link_without_a_name_keeps_the_dataset_title(self, rmock):
+        self._harvest(rmock, [_index_record(OGC_API_REMOTE_ID, None, link=OGC_API_LINK)])
+        (resource,) = harvested_dataset(OGC_API_REMOTE_ID).resources
+        assert resource.title == "Carta geológica"
+        assert resource.description is None
+
+    def test_the_protocol_never_reaches_the_resource_type(self, rmock):
+        # `Resource.type` is a closed choice field; `OGC:WMS` would fail
+        # validation and take every item of every DGT source with it.
+        link = f"nome|desc|{WMS_URL}|OGC:WMS|application/vnd.ogc.wms_xml|1"
+        job = self._harvest(rmock, [_index_record(REMOTE_ID, None, link=link)])
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        (resource,) = harvested_dataset(REMOTE_ID).resources
+        assert resource.type == "main"
+        assert resource.format == "wms"
+
+    def test_a_malformed_link_does_not_take_the_job_down(self, rmock):
+        """The split used to run unguarded inside `inner_harvest`.
+
+        An `IndexError` there does not fail one item: it raises out of
+        `inner_harvest`, so the job ends `failed` and none of the other records
+        is processed at all.
+        """
+        job = self._harvest(
+            rmock,
+            [
+                _index_record("bad-record-0000-4000-8000-000000000001", None, link="nome|desc"),
+                _index_record(REMOTE_ID, None),
+            ],
+        )
+        assert job.status == "done"
+        assert [item.status for item in job.items] == ["done", "done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        # The good record was processed, the bad one produced no resource.
+        assert len(harvested_dataset(REMOTE_ID).resources) == 1
+        assert harvested_dataset("bad-record-0000-4000-8000-000000000001").resources == []
+
+    def test_new_titles_and_formats_do_not_cost_the_resource_ids(self, rmock):
+        """Criterion 5: `sync_resources` reconciles by URL, so the id survives.
+
+        `DGTResourceIdentityTest` proves this through `id_stability.harvest`,
+        which stubs `inner_harvest` out entirely and so never exercises the
+        pipe-split path this ticket rewrote. This one goes through the real
+        `inner_harvest`, over the two fields it now changes.
+        """
+        first = f"Nome antigo|Descrição antiga|{ZIP_URL}|WWW:LINK|text/plain|1"
+        self._harvest(rmock, [_index_record(REMOTE_ID, None, link=first)])
+        before = resource_ids(REMOTE_ID)
+        assert len(before) == 1
+
+        second = f"Nome novo|Descrição nova|{ZIP_URL}|WWW:LINK-1.0-http--link|application/pdf|1"
+        self._harvest(rmock, [_index_record(REMOTE_ID, None, link=second)])
+        assert resource_ids(REMOTE_ID) == before
+        assert resource_urls(REMOTE_ID) == [ZIP_URL]
+
+        (resource,) = harvested_dataset(REMOTE_ID).resources
+        assert resource.title == "Nome novo"
+        assert resource.description == "Descrição nova"
+        assert resource.format == "pdf"
+
+
 @pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
 class DGTLicenseHarvestTest(PytestOnlyDBTestCase):
     """The licence a real harvest ends up writing on the dataset."""

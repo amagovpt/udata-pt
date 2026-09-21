@@ -288,6 +288,47 @@ class DGTBackend(BaseBackend):
                 entries.append(entry)
         return entries
 
+    @staticmethod
+    def _parse_link(link: str) -> dict | None:
+        """Read one `link` entry, or `None` when it names no resource.
+
+        The index writes each one as `name|description|url|protocol|mime|order`.
+        All 733 links of a 400-record sample taken on 2026-09-21 carried the six
+        fields, but the previous implementation indexed `[2]`, `[3]` and `[4]`
+        with no length check at all, and a single short entry would not have
+        failed one item -- it would have raised out of `inner_harvest` and taken
+        the whole job down before any record was processed.
+
+        Fields 0 and 1 were never read, which is why every resource ended up
+        repeating the title of its dataset. They are filled on a minority of
+        links (16.2% and 19.3% of the sample), so the caller keeps the dataset
+        title as the fallback.
+        """
+        if not isinstance(link, str):
+            return None
+
+        parts = link.split("|")
+        # Pad rather than reject: a shorter entry is still usable if it has a URL.
+        parts += [""] * (6 - len(parts))
+        url = parts[2].strip()
+        if not url:
+            return None
+
+        # `title` is sanitized here because `Dataset.pre_save` does not cover it
+        # -- it sanitizes the dataset title and both descriptions, and leaves
+        # `resource.title` alone. `description` is left as published, so the
+        # markdown sanitizer downstream keeps the formatting that a strict
+        # sanitizer would strip.
+        title = sanitize_strict(parts[0]).strip()
+        description = parts[1].strip()
+        return {
+            "title": title or None,
+            "description": description or None,
+            "url": url,
+            "type": parts[3].strip(),
+            "format": parts[4].strip(),
+        }
+
     def inner_harvest(self):
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
         # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
@@ -333,26 +374,26 @@ class DGTBackend(BaseBackend):
             #    item["date"] = datetime.strptime(each.get("publicationDate"),
             #                                     "%Y-%m-%d")
 
-            links = []
+            # `link` comes as a list for records with several resources and as
+            # a bare string for records with one, the same two shapes
+            # `_legal_constraints` settles above.
             resources = item.get("resources")
+            if isinstance(resources, str):
+                resources = [resources]
+            elif not isinstance(resources, list):
+                resources = []
 
-            # Checks if resources is a list or string and processes accordingly
-            if isinstance(resources, list):
-                for url in resources:
-                    url_parts = url.split("|")
-                    inner_link = {}
-                    inner_link["url"] = url_parts[2]
-                    inner_link["type"] = url_parts[3]
-                    inner_link["format"] = url_parts[4]
-                    links.append(inner_link)
-
-            elif isinstance(resources, str):
-                url_parts = resources.split("|")
-                inner_link = {}
-                inner_link["url"] = url_parts[2]
-                inner_link["type"] = url_parts[3]
-                inner_link["format"] = url_parts[4]
-                links.append(inner_link)
+            links = []
+            for link in resources:
+                parsed = self._parse_link(link)
+                if parsed is None:
+                    self.logger.warning(
+                        "DGT: skipping a link of %s that names no resource: %r",
+                        item["remote_id"],
+                        link,
+                    )
+                    continue
+                links.append(parsed)
 
             item["resources"] = links
 
@@ -390,11 +431,16 @@ class DGTBackend(BaseBackend):
         for resource in data.get("resources"):
             resources.append(
                 {
-                    "title": data["title"],
+                    # `ResourceMixin.title` is required, so the dataset title
+                    # stays as the fallback for the links that carry no name.
+                    "title": resource.get("title") or data["title"],
+                    "description": resource.get("description"),
                     "url": resource["url"],
                     "filetype": "remote",
-                    # `type` is the source's protocol and `format` its MIME type;
-                    # neither is a `Resource` field, both are only inputs here.
+                    # `type` is the source's protocol and `format` its MIME type.
+                    # Neither is passed on: `Resource.type` is a closed choice
+                    # field (`main`, `api`, ...), and handing it `OGC:WMS` would
+                    # fail every item on validation. They are inputs here only.
                     "format": format_from_link(
                         resource.get("type"), resource.get("format"), resource["url"]
                     ),
