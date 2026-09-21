@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **fix(saml): a first CMD/eIDAS sign-in no longer takes the address the assertion
+  carried as the account's own — it asks for one**
+  - **autenticação.gov proves the identity; it does not prove the mailbox.** When the
+    assertion carried an address nobody else held, that address became the account's
+    login identity and was stamped as confirmed on the spot. Nobody ever proved
+    possession of it, and the citizen was never asked which address they wanted the
+    portal to hold. Every first sign-in now lands on the registration completion
+    screen, which is where that question belongs.
+  - **The address is still offered, as a prefill rather than a decision.** It is served
+    on `/me` as `pending_registration_email`, so the common case stays one click; an
+    eIDAS sign-in arrives with the field empty, because the Minimum Data Set has no
+    email attribute to fill it with. This is the product rule that the completion
+    screen asks for an *address*, not for a *flow*.
+  - **An identity carrying no identifier deliberately keeps the old behaviour.** With
+    neither a linked identifier nor a real address, the account would be found by
+    neither route on the next sign-in and a second one would be minted, then a third —
+    one per login, which is a duplicate class this codebase has already seen return by
+    a second route. One unproven address is the lesser harm, and it is the harm that
+    already exists; refusing such a sign-in outright is a separate, still-open decision.
+  - **No data migration.** Accounts already created with an asserted address stay as
+    they are: after the fact there is no way to tell an address its owner would have
+    chosen from one that was imposed on them.
+  - **Three existing tests asserted the opposite** and were rewritten. Two of them only
+    used the address incidentally, to show the attributes had been parsed; the third
+    pinned the homepage banner that this change replaces with the screen.
+
 - **fix(harvest): the DGT backend reads the resource format, the resource title and
   description, the publication date, the update frequency and the bounding box from the
   source instead of inventing them**
