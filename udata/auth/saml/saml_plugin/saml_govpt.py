@@ -1042,16 +1042,36 @@ def _create_saml_user(
     """
     from udata.core.user.models import find_user_by_email_ci
 
-    # Generate a placeholder email when the IdP does not provide one, or
-    # when the CMD email is already taken by an existing account (the
-    # user explicitly chose to create a new one in the wizard).
+    # Generate a placeholder email, which is what sends the account to the
+    # registration completion screen: the funnel redirects there on
+    # `has_placeholder_email` and nothing else.
+    #
+    # Minted for an identity that carries an identifier EVEN WHEN the assertion
+    # supplied a free address, which is the whole point. autenticação.gov
+    # vouches for the IDENTITY; it says nothing about the mailbox. Adopting the
+    # asserted address made it the account's login identity and stamped
+    # confirmed_at on it, so nobody ever proved possession -- and the person was
+    # never asked which address they wanted the portal to hold. The address is
+    # still offered back, as a PREFILL on that screen (see saml_asserted_email),
+    # so the common case stays one click; what changes is that it is a
+    # suggestion rather than a decision taken on their behalf.
+    #
+    # 🚨 `user_nic` GUARDS THIS, and dropping it re-opens LEDG-2045. Without an
+    # identifier the account holds no auth_nic, and with a placeholder it holds
+    # no real address either -- so the next sign-in finds it by neither route
+    # and mints a second one, then a third, one per login. That population is
+    # measured at zero and LEDG-2503 closed the door it came through, but the
+    # guarantee lives in the IdP, not here, and LEDG-2436 is still parked. An
+    # identity with no identifier therefore keeps the old behaviour: one
+    # unproven address beats a new account every login. Refusing it outright is
+    # LEDG-2436's decision to take, not this one's.
     #
     # Case-insensitively, like the resolver that decided this identity has no
     # account of its own. An exact check here saw "maria@x.pt" as free while
     # "Maria@x.pt" already existed, and minted a second row holding the real
     # address -- a duplicate with no placeholder prefix, invisible to every
     # count filtered by it and to migrate-nics.
-    if not user_email or find_user_by_email_ci(user_email):
+    if user_nic or not user_email or find_user_by_email_ci(user_email):
         import uuid
 
         from udata.core.user.constants import (
