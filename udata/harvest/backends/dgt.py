@@ -1,12 +1,11 @@
 import re
-from urllib.parse import parse_qs, urlparse
 
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
 
-from .tools.harvester_utils import sync_resources
+from .tools.harvester_utils import OGC_SERVICE_FORMATS, guess_url_format, sync_resources
 
 # The SNIG index publishes the licence as free text inside `legalConstraints`.
 # It is never fed to `License.guess`: that falls back to a Damerau-Levenshtein
@@ -51,6 +50,113 @@ MAX_CONSTRAINT_LENGTH = 5000
 # Past this the record is not decided at all rather than decided on a prefix:
 # truncating could cut off the very restriction that withholds the licence.
 MAX_DECIDABLE_LENGTH = 20000
+
+# Each `link` the SNIG index publishes carries a protocol in field 3 and a MIME
+# type in field 4, both free text. Enumerated over the 733 links of a 400-record
+# sample on 2026-09-21, field 4 alone spells the same handful of services in
+# nine different ways -- `application/vnd.ogc.wms_xml` (327), `text/plain` (243),
+# `text/html` (39), `OGC API - Features` (27), `WMS` (20), `wms` (12), `wfs` (12),
+# `WFS` (11), `OGC API Maps` (9), `OCG API - Maps` (9, the source's own
+# transposition), `WMTS` (8), `OGC:WFS-2.0.0-http-get-capabilities` (5),
+# `OGC:WFS` (4) and `n.a` (1). The map is closed over what is actually
+# published; re-run that enumeration before assuming a value is absent.
+LINK_FORMATS: dict[str, str] = {
+    "application/vnd.ogc.wms_xml": "wms",
+    "application/vnd.ogc.wfs_xml": "wfs",
+    "application/vnd.google-earth.kml+xml": "kml",
+    "application/vnd.google-earth.kmz": "kmz",
+    "application/geo+json": "geojson",
+    "application/json": "json",
+    "application/pdf": "pdf",
+    "application/xml": "xml",
+    "application/zip": "zip",
+    "text/csv": "csv",
+    "text/html": "html",
+    "text/xml": "xml",
+    "image/tiff": "tiff",
+    # Bare service names, in the casings the source uses.
+    "wms": "wms",
+    "wfs": "wfs",
+    "wcs": "wcs",
+    "wmts": "wmts",
+    "csw": "csw",
+    # OGC API endpoints carry no extension and no `SERVICE=` parameter, so the
+    # label is the only thing that names them.
+    "ogc api - features": "ogcapi-features",
+    "ogc api features": "ogcapi-features",
+    "ogc api - maps": "ogcapi-maps",
+    "ogc api maps": "ogcapi-maps",
+    # `OCG` for `OGC` on 9 of the 733 links sampled. Tolerated for the same
+    # reason `CC_LICENSE_URL_RE` tolerates `creativecoomons`: the defect is in
+    # the source and is not ours to wait on.
+    "ocg api - maps": "ogcapi-maps",
+    "ocg api maps": "ogcapi-maps",
+}
+
+# Values that name no format at all, and must fall through to the URL rather
+# than be believed. `text/plain` is the second most common MIME in the index
+# and sits in front of WFS endpoints (161 of 243 sampled), zip archives (48),
+# PDFs, HTML pages and XML feeds alike -- reading it as `txt` would replace a
+# wrong answer with a confidently wrong one.
+UNINFORMATIVE_LINK_FORMATS = frozenset(
+    {"text/plain", "application/octet-stream", "n.a", "n/a", "na", "unknown", "-"}
+)
+
+# What a format may look like once resolved: a short token, never a fragment of
+# a URL. `guess_url_format` already guarantees this for its own return values;
+# the check is applied to every branch so that criterion -- no harvested format
+# containing `/` or `?` -- holds even if one of the maps above grows a bad entry.
+FORMAT_RE = re.compile(r"^[a-z0-9][a-z0-9.+:-]{0,19}$")
+
+# The value `guess_url_format` falls back to, so a resource nothing is known
+# about reads the same here as it does in the other backends.
+DEFAULT_FORMAT = "remote"
+
+
+def _named_format(value: str | None) -> str | None:
+    """Resolve one of the source's own labels, or `None` if it names nothing."""
+    if not value:
+        return None
+
+    key = value.strip().casefold()
+    if not key or key in UNINFORMATIVE_LINK_FORMATS:
+        return None
+
+    named = LINK_FORMATS.get(key)
+    if named:
+        return named
+
+    # `OGC:WMS`, but also `OGC:WMS-1.3.0-http-get-capabilities` and
+    # `OGC:WFS-2.0.0-http-get-capabilities`: the service is the segment between
+    # the prefix and the version.
+    if key.startswith("ogc:"):
+        service = key[len("ogc:") :].split("-", 1)[0]
+        if service in OGC_SERVICE_FORMATS:
+            return service
+
+    return None
+
+
+def format_from_link(protocol: str | None, mimetype: str | None, url: str) -> str:
+    """Derive a resource format from what the source says about the link.
+
+    The MIME type is tried first, then the protocol, and the URL only last.
+    Reading the URL first is what filled the catalogue with formats like
+    `pt/idea-api/collections/Ortofoto_2024_SMG`: the previous implementation ran
+    `split(".")[-1]` over the *whole* URL, so any endpoint without a file
+    extension returned the tail of the host name and the query string. 98 of the
+    733 links sampled on 2026-09-21 (13.4%) resolved that way. `guess_url_format`
+    reads the extension off the last path segment only, which is the same bug
+    LEDG-2250 fixed for `apambiente`.
+    """
+    for value in (mimetype, protocol):
+        named = _named_format(value)
+        if named:
+            return named if FORMAT_RE.match(named) else DEFAULT_FORMAT
+
+    guessed = guess_url_format(url, fallback=DEFAULT_FORMAT)
+    return guessed if FORMAT_RE.match(guessed) else DEFAULT_FORMAT
+
 
 # The licence THIS backend last wrote. Without it, a licence the harvester
 # derived and one a producer corrected by hand are the same value in the
@@ -282,18 +388,16 @@ class DGTBackend(BaseBackend):
         resources = []
 
         for resource in data.get("resources"):
-            parsed = urlparse(resource["url"])
-            try:
-                format = str(parse_qs(parsed.query)["service"][0])
-            except KeyError:
-                format = resource["url"].split(".")[-1]
-
             resources.append(
                 {
                     "title": data["title"],
                     "url": resource["url"],
                     "filetype": "remote",
-                    "format": format,
+                    # `type` is the source's protocol and `format` its MIME type;
+                    # neither is a `Resource` field, both are only inputs here.
+                    "format": format_from_link(
+                        resource.get("type"), resource.get("format"), resource["url"]
+                    ),
                 }
             )
 

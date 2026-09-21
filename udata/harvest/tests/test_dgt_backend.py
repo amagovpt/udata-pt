@@ -13,6 +13,7 @@ from ..backends.dgt import (
     MAX_CONSTRAINT_ENTRIES,
     MAX_CONSTRAINT_LENGTH,
     DGTBackend,
+    format_from_link,
     license_id_from_legal_constraints,
 )
 from .factories import HarvestSourceFactory
@@ -255,22 +256,132 @@ class DGTLicenseResolutionTest:
         assert license_id_from_legal_constraints(["Sem restrições", "Sem restrições"]) is None
 
 
-def _index_record(remote_id, legal_constraints, title="Carta geológica"):
-    """One record shaped the way the SNIG `fast=index` response shapes it."""
+def _index_record(remote_id, legal_constraints, title="Carta geológica", link=None, **fields):
+    """One record shaped the way the SNIG `fast=index` response shapes it.
+
+    The default `link` deliberately keeps the five fields it has always had,
+    rather than the six the source really publishes: every licence test below
+    goes through it, so it doubles as the proof that a short link is tolerated.
+    `link` and `**fields` let a test carry a verbatim record instead.
+    """
     record = {
         "geonet:info": {"uuid": remote_id},
         "defaultTitle": title,
         "defaultAbstract": "Cartografia temática",
         "keyword": ["geo"],
-        "link": f"nome|desc|{ZIP_URL}|WWW:LINK|zip",
+        "link": f"nome|desc|{ZIP_URL}|WWW:LINK|zip" if link is None else link,
     }
     if legal_constraints is not None:
         record["legalConstraints"] = legal_constraints
+    record.update(fields)
     return record
 
 
 def _index_payload(records):
     return json.dumps({"metadata": records})
+
+
+# Two records copied verbatim out of the SNIG index on 2026-09-21, via
+# `?_content_type=json&fast=index&resultType=details`. Both are named in
+# LEDG-2530 and both are load-bearing here: the LNEG one is the record the
+# producer complained about, and its URL carries no file extension at all;
+# the hidrografico one is an OGC API endpoint, whose format has no other
+# source than the label the index puts on it.
+LNEG_REMOTE_ID = "20df57a5-76db-4c5e-ae78-45e423e4a88f"
+LNEG_LINK = (
+    "|Página de descarregamento do PDF a partir do Geoportal da Energia e Geologia"
+    "|https://geoportal.lneg.pt/dados_abertos/info_recursosminerais?Id=1704"
+    "|WWW:LINK-1.0-http--link|text/html|1"
+)
+LNEG_URL = "https://geoportal.lneg.pt/dados_abertos/info_recursosminerais?Id=1704"
+
+OGC_API_REMOTE_ID = "d7b1eb8d-7b44-4a2d-adca-97088a6589f9"
+OGC_API_LINK = (
+    "||https://api-features.hidrografico.pt/collections/depcnt_400_800"
+    "|OGC API - Features|OGC API - Features|1"
+)
+OGC_API_URL = "https://api-features.hidrografico.pt/collections/depcnt_400_800"
+
+
+class DGTLinkFormatTest:
+    """`format_from_link`: what the source says first, the URL only last."""
+
+    def test_the_mime_type_names_the_format(self):
+        assert format_from_link("WWW:LINK-1.0-http--link", "text/html", LNEG_URL) == "html"
+
+    def test_an_ogc_api_label_is_read_from_the_link(self):
+        # Neither the URL nor a `SERVICE=` parameter names this one.
+        assert format_from_link("OGC API - Features", "OGC API - Features", OGC_API_URL) == (
+            "ogcapi-features"
+        )
+
+    def test_the_sources_own_transposition_is_tolerated(self):
+        assert format_from_link("OCG API - Maps", "OCG API - Maps", OGC_API_URL) == "ogcapi-maps"
+
+    def test_a_versioned_ogc_protocol_resolves_to_its_service(self):
+        assert format_from_link("OGC:WFS-2.0.0-http-get-capabilities", None, OGC_API_URL) == "wfs"
+
+    def test_the_wms_capabilities_mime_resolves_to_wms(self):
+        assert format_from_link("OGC:WMS", "application/vnd.ogc.wms_xml", WMS_URL) == "wms"
+
+    def test_text_plain_falls_through_to_the_url(self):
+        # 243 of the 733 links sampled carry `text/plain`, in front of WFS
+        # endpoints, zip archives and PDFs alike. Believing it would be worse
+        # than ignoring it.
+        assert format_from_link("", "text/plain", ZIP_URL) == "zip"
+        assert format_from_link("", "text/plain", WMS_URL) == "wms"
+
+    def test_an_unknown_label_falls_through_to_the_url(self):
+        assert format_from_link("something", "n.a", ZIP_URL) == "zip"
+
+    def test_a_url_with_no_extension_is_not_mined_for_one(self):
+        # The bug this replaces: `split(".")[-1]` over the whole URL returned
+        # `pt/dados_abertos/info_recursosminerais?Id=1704`.
+        assert format_from_link(None, None, LNEG_URL) == "remote"
+
+    @pytest.mark.parametrize(
+        "protocol,mimetype,url",
+        [
+            ("WWW:LINK-1.0-http--link", "text/html", LNEG_URL),
+            ("OGC API - Features", "OGC API - Features", OGC_API_URL),
+            ("OGC:WMS", "application/vnd.ogc.wms_xml", WMS_URL),
+            ("", "text/plain", ZIP_URL),
+            (None, None, LNEG_URL),
+            (None, None, "https://cdd.dgterritorio.gov.pt/dgt-fe/mapa?collection=LAZ"),
+            (None, None, "https://geo.dgterritorio.gov.pt/pt/idea-api/collections/Ortofoto_2024"),
+            ("n.a", "n.a", ""),
+        ],
+    )
+    def test_no_resolved_format_is_a_url_fragment(self, protocol, mimetype, url):
+        """Criterion 1, over every branch of the resolution."""
+        resolved = format_from_link(protocol, mimetype, url)
+        assert "/" not in resolved and "?" not in resolved, resolved
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTResourceFormatTest(PytestOnlyDBTestCase):
+    """The format a real harvest ends up writing on the resource."""
+
+    def _harvest(self, rmock, remote_id, link):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, None, link=link)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_the_lneg_record_no_longer_gets_a_url_fragment(self, rmock):
+        dataset = self._harvest(rmock, LNEG_REMOTE_ID, LNEG_LINK)
+        (resource,) = dataset.resources
+        assert resource.url == LNEG_URL
+        assert resource.format == "html"
+
+    def test_an_ogc_api_record_is_catalogued_by_its_label(self, rmock):
+        dataset = self._harvest(rmock, OGC_API_REMOTE_ID, OGC_API_LINK)
+        (resource,) = dataset.resources
+        assert resource.url == OGC_API_URL
+        assert resource.format == "ogcapi-features"
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
