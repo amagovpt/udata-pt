@@ -8651,7 +8651,7 @@ class SAMLForeignCitizenLoginTest(APITestCase):
                     last_name="Rocha",
                     **self.DOC,
                 )
-            created = User.objects(email="ana@example.pt").first()
+            created = User.objects(extras__auth_nic=hash_nic("MDC/TR/PT/X9912345")).first()
             assert created is not None
             ids.append(created.id)
 
@@ -8695,7 +8695,7 @@ class SAMLForeignCitizenLoginTest(APITestCase):
                     doc_nationality="PT",
                     doc_number="X9912345",
                 )
-            created = User.objects(email="ines@example.pt").first()
+            created = User.objects(extras__auth_nic=hash_nic("MDC/TR/PT/X9912345")).first()
             assert created is not None
             ids.append(created.id)
 
@@ -8733,7 +8733,7 @@ class SAMLForeignCitizenLoginTest(APITestCase):
                 **self.DOC,
             )
 
-        created = User.objects(email="bruno@example.pt").first()
+        created = User.objects(extras__auth_nic=hash_nic("16273849")).first()
         assert created is not None
         assert created.extras["auth_nic"] == hash_nic("16273849")
         assert created.extras["auth_nic"] != hash_nic("MDC/TR/PT/X9912345")
@@ -8838,7 +8838,7 @@ class SAMLForeignDocExtrasTest(APITestCase):
             doc_number="AB998877",
         )
 
-        created = User.objects(email="elena@example.pt").first()
+        created = User.objects(extras__auth_nic=_hash_nic("MDC/PAS/RO/AB998877")).first()
         assert created is not None
         assert created.extras["auth_doc_type"] == "PAS"
         assert created.extras["auth_doc_nationality"] == "RO"
@@ -8869,7 +8869,7 @@ class SAMLForeignDocExtrasTest(APITestCase):
             doc_number="Z1234567",
         )
 
-        created = User.objects(email="fabio@example.pt").first()
+        created = User.objects(extras__auth_nic=_hash_nic("90817263")).first()
         assert created is not None
         assert "auth_doc_type" not in created.extras
         assert "auth_doc_nationality" not in created.extras
