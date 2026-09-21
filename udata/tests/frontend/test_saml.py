@@ -930,8 +930,12 @@ class SAMLSSOCallbackTest(APITestCase):
 
             def track_login(user):
                 call_order.append("login_user")
-                # Verify user was created with correct SAML attributes
-                assert user.email == "order_test@example.pt"
+                # Verify user was created with correct SAML attributes.
+                # The asserted address is NOT one of them any more: it is
+                # offered back as a prefill on the completion screen instead of
+                # becoming the account's own address. What this test is about --
+                # that the attributes were parsed before the login -- is the NIC.
+                assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
                 assert user.extras.get("auth_nic") == _hash_nic("33333333")
                 return True
 
@@ -1862,7 +1866,10 @@ class SAMLEidasSSOTest(APITestCase):
 
             assert mock_login.call_count == 1
             user = mock_login.call_args[0][0]
-            assert user.email == "citizen@example.pt"
+            # Same reason as the sequencing test above: the asserted address is
+            # a prefill now, not the account's address. The identifier is what
+            # says the MDC attributes were read.
+            assert _SAML_PLACEHOLDER_EMAIL_RE.match(user.email), user.email
             assert user.extras.get("auth_nic") == _hash_nic("12345678")
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
@@ -3117,11 +3124,20 @@ class SAMLMigrationWizardTest(APITestCase):
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.requires_confirmation", return_value=False)
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
-    def test_new_account_redirect_informs_user(self, mock_client_for, mock_requires_conf):
-        """Scenario 4 (direct): with the wizard disabled, no match at all
-        still creates the account outright and the redirect carries
-        cmd_new_account=1 so the frontend can inform the user. With the
-        wizard enabled this population goes through it instead."""
+    def test_new_account_completes_registration_instead_of_entering(
+        self, mock_client_for, mock_requires_conf
+    ):
+        """Scenario 4 (direct): with the wizard disabled, no match at all still
+        creates the account outright -- but it is created with a placeholder
+        address and sent to complete registration, NOT let into the portal
+        carrying the address the assertion happened to supply.
+
+        This test used to assert the opposite (a cmd_new_account=1 banner on the
+        homepage), which is what made the defect invisible: the assertion's
+        address became the account's login identity, was stamped confirmed, and
+        the person was never asked which address they wanted the portal to hold.
+        With the wizard enabled this population goes through it instead.
+        """
         self.app.config["MIGRATION_MODE_ENABLED"] = False
         response = self._sso_with(
             mock_client_for,
@@ -3131,7 +3147,17 @@ class SAMLMigrationWizardTest(APITestCase):
             last_name="Novo",
         )
         assert response.status_code == 302
-        assert "cmd_new_account=1" in response.headers["Location"]
+        assert response.headers["Location"].endswith("/complete-registration")
+        assert "cmd_new_account=1" not in response.headers["Location"]
+
+        from udata.core.user.models import User
+
+        created = User.objects(extras__auth_nic=_hash_nic("13131313")).first()
+        assert created is not None
+        assert _SAML_PLACEHOLDER_EMAIL_RE.match(created.email), created.email
+        # The address the assertion carried must not exist as an account at all:
+        # adopting it is precisely what this change stops.
+        assert User.objects(email__iexact="novo@example.pt").count() == 0
 
     @patch("udata.auth.saml.saml_plugin.saml_govpt.saml_client_for")
     def test_email_match_links_only_after_password_confirmation(self, mock_client_for):
