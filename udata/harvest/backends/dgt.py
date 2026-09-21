@@ -1,9 +1,11 @@
 import re
 
+from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
+from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import OGC_SERVICE_FORMATS, guess_url_format, sync_resources
 
@@ -329,6 +331,31 @@ class DGTBackend(BaseBackend):
             "format": parts[4].strip(),
         }
 
+    @staticmethod
+    def _publication_dates(record: dict) -> list[str]:
+        """The dates the source offers for when the dataset was published.
+
+        `publicationDate` is what the index means by it and is filled on 81.2%
+        of the records; `referenceDate` is on every one of them and stands in
+        for the rest. Only one of the two is read -- a reference date is not a
+        publication date, and mixing them would make the earliest of the pair
+        win regardless of which field it came from.
+
+        Both fields come as a bare string for most records and as a list for a
+        few (1 of 400 sampled on 2026-09-21 carried three publication dates),
+        so the shape is settled here and the caller picks the earliest.
+        """
+        for field in ("publicationDate", "referenceDate"):
+            value = record.get(field)
+            if isinstance(value, str):
+                value = [value]
+            elif not isinstance(value, list):
+                continue
+            dates = [entry for entry in value if isinstance(entry, str) and entry.strip()]
+            if dates:
+                return dates
+        return []
+
     def inner_harvest(self):
         headers = {"content-type": "application/json", "Accept-Charset": "utf-8"}
         # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
@@ -370,9 +397,7 @@ class DGTBackend(BaseBackend):
                 "keywords": each.get("keyword"),
                 "legal_constraints": self._legal_constraints(each),
             }
-            # if each.get("publicationDate"):
-            #    item["date"] = datetime.strptime(each.get("publicationDate"),
-            #                                     "%Y-%m-%d")
+            item["created_at"] = self._publication_dates(each)
 
             # `link` comes as a list for records with several resources and as
             # a bare string for records with one, the same two shapes
@@ -416,8 +441,27 @@ class DGTBackend(BaseBackend):
         dataset.tags = ["snig.dgterritorio.gov.pt"]
         dataset.description = data["description"]
 
-        if data.get("date"):
-            dataset.created_at = data["date"]
+        # `Dataset.created_at` is a read-only property -- it reads
+        # `harvest.issued_at or harvest.created_at or created_at_internal` --
+        # so the assignment that used to stand here would have raised
+        # `AttributeError` for every record carrying a date, had the block in
+        # `inner_harvest` that feeds it ever been uncommented. The harvest
+        # metadata is what the property reads, and what `rdf.py` writes.
+        published = [
+            parsed
+            for parsed in (
+                safe_harvest_datetime(value, "DGT publicationDate", refuse_future=True)
+                for value in data.get("created_at") or []
+            )
+            if parsed
+        ]
+        if published:
+            if not dataset.harvest:
+                dataset.harvest = HarvestDatasetMetadata()
+            # The earliest of them: a record publishing three dates was first
+            # published on the first of the three, not on whichever the index
+            # happened to list first.
+            dataset.harvest.created_at = min(published)
 
         # Add keywords as tags
         if data.get("keywords"):

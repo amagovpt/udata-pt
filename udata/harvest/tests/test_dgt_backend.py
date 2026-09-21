@@ -1,6 +1,7 @@
 """DGT harvester: resource identity (LEDG-2251) and licence derivation (LEDG-2518)."""
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -781,3 +782,65 @@ class DGTLicenseWithdrawalTest(PytestOnlyDBTestCase):
 
         dataset = self._harvest(rmock, [PUBLIC_ACCESS, IPR_ONLY])
         assert dataset.extras[DERIVED_LICENSE_EXTRA] == "notspecified"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["dgt"])
+class DGTPublicationDateTest(PytestOnlyDBTestCase):
+    """`created_at` from the source, written where the property can read it."""
+
+    def _harvest(self, rmock, remote_id=REMOTE_ID, **fields):
+        rmock.get(DGT_URL, text=_index_payload([_index_record(remote_id, None, **fields)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(remote_id)
+
+    def test_the_publication_date_becomes_the_creation_date(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="2021-06-15")
+        assert dataset.harvest.created_at == datetime(2021, 6, 15)
+        assert dataset.created_at == datetime(2021, 6, 15)
+
+    def test_the_reference_date_stands_in(self, rmock):
+        # The LNEG record is exactly this shape: no publicationDate, a
+        # referenceDate of 2020-12-31.
+        dataset = self._harvest(
+            rmock, remote_id=LNEG_REMOTE_ID, link=LNEG_LINK, referenceDate="2020-12-31"
+        )
+        assert dataset.harvest.created_at == datetime(2020, 12, 31)
+
+    def test_the_publication_date_wins_over_the_reference_date(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="2021-06-15", referenceDate="2019-01-01")
+        assert dataset.harvest.created_at == datetime(2021, 6, 15)
+
+    def test_several_publication_dates_resolve_to_the_earliest(self, rmock):
+        # One record in 400 publishes a list; it was first published on the
+        # earliest of them, not on whichever the index lists first.
+        dataset = self._harvest(rmock, publicationDate=["2022-08-24", "2020-02-01", "2023-10-30"])
+        assert dataset.harvest.created_at == datetime(2020, 2, 1)
+
+    def test_a_record_without_any_date_is_not_failed(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.harvest.created_at is None
+        assert dataset.created_at == dataset.created_at_internal
+
+    def test_an_unparseable_date_is_not_failed(self, rmock):
+        """The old assignment would have raised `AttributeError` here.
+
+        `Dataset.created_at` has no setter, so uncommenting the original block
+        would have failed every record carrying a date -- not just the bad one.
+        """
+        dataset = self._harvest(rmock, publicationDate="não é uma data")
+        assert dataset.harvest.created_at is None
+
+    def test_a_future_date_is_refused(self, rmock):
+        ahead = (datetime.now(UTC) + timedelta(days=365)).strftime("%Y-%m-%d")
+        dataset = self._harvest(rmock, publicationDate=ahead)
+        assert dataset.harvest.created_at is None
+
+    def test_the_date_survives_a_re_harvest(self, rmock):
+        """`update_dataset_harvest_info` runs after this and must not clear it."""
+        self._harvest(rmock, publicationDate="2021-06-15")
+        dataset = self._harvest(rmock, publicationDate="2021-06-15")
+        assert dataset.harvest.created_at == datetime(2021, 6, 15)
