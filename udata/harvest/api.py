@@ -197,7 +197,15 @@ validation_fields = api.model(
         "state": fields.String(
             description="Is it validated or not", enum=list(VALIDATION_STATES), required=True
         ),
-        "by": fields.Nested(
+        # Tolerant, because nothing keeps this reference honest: mongoengine
+        # refuses `reverse_delete_rule` on an EmbeddedDocument field, the
+        # official deletion path (`User.mark_as_deleted`) keeps the document
+        # rather than removing it, and there is no user purge — so a validator
+        # only ever disappears through a direct write to the database, where no
+        # hook of ours runs. Before this, one such source answered 500 with an
+        # empty body for the *whole* listing, which nginx reported as a 502
+        # (LEDG-2535).
+        "by": fields.TolerantNested(
             user_ref_fields,
             allow_null=True,
             readonly=True,

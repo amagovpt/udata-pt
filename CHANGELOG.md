@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+- **fix(harvest): a harvest source whose validator was removed from the database no longer
+  takes the whole sources listing down**
+  - **One bad document answered for all of them.** Marshalling a source dereferences
+    `validation.by`; when that user is gone from the database mongoengine raises, uwsgi
+    answers 500 with an empty body, and nginx in front reports the empty 500 as a 502. The
+    listing carried every other source with it, so the harvesters backoffice came up empty
+    rather than missing one row.
+  - **Nothing on our side keeps that reference honest**, which is why tolerating it is the
+    fix rather than a patch over one. mongoengine refuses `reverse_delete_rule` on an
+    EmbeddedDocument field, the deletion path the application offers keeps the user
+    document instead of removing it, and there is no user purge — the reference only ever
+    goes dangling through a direct write to the database, where no hook of ours runs. The
+    field is now served as `null` and the error logged for Sentry, the same trade the
+    activity feed already makes.
+  - **A migration clears what is already stored**, in all three places a source points at
+    something that can vanish: the validator, the owner and the producer organization. It
+    has to be run in every environment, and for `owner` and `organization` it is the
+    *only* repair — unlike `validation.by`, both are dereferenced by the permission checks
+    behind the `url` and `config` attributes, long before any field could tolerate them,
+    so a source pointing at a removed user or organization keeps failing the request until
+    the migration has run there. The organization was not part of the incident; it is in
+    because it fails identically, and was demonstrated to still take the listing down.
+
+- **refactor(harvest)!: the APAmbiente harvester is merged into the generic CSW backend,
+  which now reads the licence, the dates, the keywords and every link from the source**
+  - **Two backends spoke CSW through owslib with the same code**, one a strict subset of
+    the other. The Portal do Ambiente source moves onto the generic one, which for those
+    ~3900 datasets means the record's keywords become tags, its bounding box becomes the
+    spatial coverage, its `modified` becomes the dataset date, and every link it announces
+    becomes a resource instead of only the first. The producer tag `apambiente.pt` and the
+    ids of the resources whose URL did not change are both kept.
+  - **The deleted backend could not stop paginating.** It started at record 0 and looped
+    while `startposition <= matches`, so the `nextrecord = 0` that comes with the last page
+    sent it back to the first. Latent rather than harmless: it needs the server to answer
+    that way on a run somebody is watching. The surviving backend breaks on that answer and
+    on a position that does not advance, and three tests now hold it to it.
+  - **Every harvested dataset claimed CC BY 4.0, which no record granted.** Both backends
+    set the licence to a constant. It is read from `dc:rights` now, and a record declaring
+    nothing gets `notspecified` -- the same answer, and the same reasoning, as the DGT
+    harvester. A migration clears the licence the harvester wrote on the datasets it had
+    already collected, logging every id it touches: without it the new fallback would read
+    the old bug as a producer's editorial decision and keep it forever. **Roughly 3900
+    datasets change from CC BY 4.0 to "não especificada" in the portal.**
+  - **A correction a producer makes by hand still survives the next harvest**, because what
+    the harvester itself derived is recorded alongside it and only a licence that differs
+    from that is treated as somebody's correction. That guard is now shared with the DGT
+    backend rather than copied.
+  - **Three defects fixed on the way**, all of them latent because no source ran on the
+    generic backend yet: a record carrying a creation date failed outright, because the
+    date was assigned to a read-only property and the surrounding handler did not catch
+    what that raises; a record announcing a single `dc:URI` silently discarded every
+    `dct:references` entry, and with it the resource the dataset was published with; and a
+    resource format longer than three characters was rewritten to `wms`, which published
+    spreadsheets as map services.
+  - **The metadata document is no longer a resource.** The Esri Geoportal announces the
+    record's own metadata page alongside the data; it describes the dataset, so it becomes
+    the remote URL rather than something the visitor is invited to download.
+  - **Two resource changes are visible and irreversible.** A record's metadata document
+    stops being a resource, so wherever one was published its download permalink
+    (`/api/1/datasets/r/<id>`) stops resolving; and a link whose path the catalogue had
+    duplicated is republished repaired, which is a new resource with a new id -- the old
+    permalink was returning 404 anyway, which is the defect that repair exists for. Every other
+    resource keeps its id, because they are still reconciled by URL.
+  - **Operationally:** the `apambiente` backend no longer exists and a migration rewrites
+    its sources onto `cswudata`, keeping each source's id so its schedule is untouched.
+    **Reinstall the package rather than only restarting it:** the harvester backends are
+    loaded from entry points recorded at install time, and every one of them is imported
+    together, so a stale `apambiente` entry pointing at a deleted module breaks the whole
+    backend registry -- every harvest and the admin's source screen with it. Then run the
+    migrations and **restart the Celery worker and beat**, which hold those entry points in
+    memory. On the
+    first harvest after the deploy the datasets' recorded backend name changes from
+    "Harvester Portal do Ambiente" to "CSW Harvester", and their displayed creation date
+    becomes the one the source publishes.
+
 - **fix(saml): a first CMD/eIDAS sign-in no longer takes the address the assertion
   carried as the account's own — it asks for one**
   - **autenticação.gov proves the identity; it does not prove the mailbox.** When the

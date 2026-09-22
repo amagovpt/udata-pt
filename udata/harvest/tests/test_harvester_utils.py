@@ -1,16 +1,17 @@
-"""Resource URL, format and identity for the APAmbiente CSW harvester.
+"""Pure URL and format helpers shared by the harvester backends.
 
-URL and format mapping come from LEDG-2250, resource identity from LEDG-2251.
+Both defects these cover were reported against the APAmbiente catalogue
+(LEDG-2250), but the helpers are generic: the tests moved here with the
+functions, when the CSW backends were merged.
 """
 
 import pytest
 
-from udata.tests.api import PytestOnlyDBTestCase
-
-from ..backends.apambiente import PortalAmbienteBackend, build_resource_url
-from ..backends.tools.harvester_utils import collapse_duplicated_path, guess_url_format
-from .factories import HarvestSourceFactory
-from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
+from ..backends.tools.harvester_utils import (
+    build_resource_url,
+    collapse_duplicated_path,
+    guess_url_format,
+)
 
 GEODOCS = "https://sniambgeoviewer.apambiente.pt/GeoDocs/geoportaldocs"
 
@@ -108,71 +109,17 @@ class GuessUrlFormatTest:
         assert guess_url_format("https://host/no-extension", fallback="unknown") == "unknown"
 
 
-CSW_URL = "https://sniambgeoportal.apambiente.pt/geoportal/csw"
-REMOTE_ID = "{DCFDE102-CAE9-415B-9D70-43EC25677DC7}"
-WMS_SERVICE_URL = (
-    "https://inspire.apambiente.pt/getogc/services/INSPIRE/PF_CELE/MapServer/WMSServer"
-)
+class BuildResourceUrlPreservesQueryTest:
+    """Only the path is repaired: geoportals nest URLs in query strings."""
 
+    def test_a_nested_url_in_the_query_survives(self):
+        url = "https://host/proxy?url=https://other.example/data.csv"
+        assert build_resource_url(url) == url
 
-def _payload(url, title="Metas de redução de emissões", record_type="dataset"):
-    return {
-        "remote_id": REMOTE_ID,
-        "title": title,
-        "description": "Descrição do registo",
-        "url": url,
-        "type": record_type,
-    }
+    def test_a_getmap_request_survives(self):
+        url = "https://geoportal.example.pt/wms?SERVICE=WMS&REQUEST=GetMap&LAYERS=a"
+        assert build_resource_url(url) == url
 
-
-@pytest.mark.options(HARVESTER_BACKENDS=["apambiente"])
-class ApambienteResourceIdentityTest(PytestOnlyDBTestCase):
-    """The single resource of each record must keep its id across harvests.
-
-    It used to be dropped and rebuilt on every run, so its download permalink
-    changed every night (LEDG-2251).
-    """
-
-    def _source(self):
-        return HarvestSourceFactory(backend="apambiente", url=CSW_URL)
-
-    def test_reharvest_keeps_the_resource_id(self):
-        source = self._source()
-        harvest(PortalAmbienteBackend, source, REMOTE_ID, items=_payload(EXPECTED_URL))
-        before = resource_ids(REMOTE_ID)
-        assert len(before) == 1
-
-        harvest(PortalAmbienteBackend, source, REMOTE_ID, items=_payload(EXPECTED_URL))
-
-        assert resource_ids(REMOTE_ID) == before
-
-    def test_title_change_keeps_the_resource_id(self):
-        source = self._source()
-        harvest(PortalAmbienteBackend, source, REMOTE_ID, items=_payload(EXPECTED_URL))
-        before = resource_ids(REMOTE_ID)
-
-        harvest(
-            PortalAmbienteBackend,
-            source,
-            REMOTE_ID,
-            items=_payload(EXPECTED_URL, title="Metas revistas"),
-        )
-
-        assert resource_ids(REMOTE_ID) == before
-        assert [r.title for r in harvested_dataset(REMOTE_ID).resources] == ["Metas revistas"]
-
-    def test_url_change_upstream_replaces_the_resource(self):
-        # A different URL is a different resource: its id cannot be preserved,
-        # and the stale one must not linger.
-        source = self._source()
-        harvest(PortalAmbienteBackend, source, REMOTE_ID, items=_payload(EXPECTED_URL))
-
-        harvest(
-            PortalAmbienteBackend,
-            source,
-            REMOTE_ID,
-            items=_payload(WMS_SERVICE_URL, record_type="liveData"),
-        )
-
-        assert resource_urls(REMOTE_ID) == [WMS_SERVICE_URL]
-        assert [r.format for r in harvested_dataset(REMOTE_ID).resources] == ["wms"]
+    def test_the_path_is_still_collapsed_with_a_query_present(self):
+        url = "https://host/a//b?url=https://other//y"
+        assert build_resource_url(url) == "https://host/a/b?url=https://other//y"
