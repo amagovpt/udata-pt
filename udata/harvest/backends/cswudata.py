@@ -14,23 +14,97 @@ Usage:
 """
 
 import logging
+import re
 
 import requests
 from owslib.csw import CatalogueServiceWeb
 
-from udata.harvest.backends.base import BaseBackend
+from udata import uris
+from udata.core.dataset.models import HarvestDatasetMetadata
+from udata.harvest.backends.base import BaseBackend, HarvestExtraConfig
 from udata.harvest.exceptions import HarvestException
 from udata.harvest.filters import (
     normalize_string,
     normalize_tag,
-    to_date,
 )
 from udata.harvest.models import HarvestItem
+from udata.i18n import gettext as _
 from udata.models import License, SpatialCoverage
+from udata.utils import safe_harvest_datetime
 
-from .tools.harvester_utils import sync_resources, with_http_retry
+from .tools.harvester_utils import (
+    OGC_SERVICE_FORMATS,
+    bbox_to_multipolygon,
+    build_resource_url,
+    guess_url_format,
+    settle_harvested_license,
+    sync_resources,
+    with_http_retry,
+)
 
 log = logging.getLogger(__name__)
+
+
+def link_hint(res_data: dict) -> str:
+    """What a catalogue says a link is, whichever field it says it in.
+
+    GeoNetwork publishes `dc:URI` entries carrying a `protocol`; the Esri
+    Geoportal publishes `dct:references` carrying a `scheme` instead. They mean
+    the same thing, so both are read -- `protocol` first, since that is the path
+    this backend already took.
+    """
+    return (res_data.get("protocol") or res_data.get("scheme") or "").lower()
+
+
+# The Esri Geoportal announces the record's own metadata document as a link,
+# alongside the data. It describes the dataset, so it belongs on `remote_url`;
+# published as a resource it looks like something to download and is not.
+METADATA_DOCUMENT_MARKER = "metadata:document"
+
+
+def is_metadata_link(hint: str) -> bool:
+    """Whether this link points at the record's metadata rather than its data."""
+    return METADATA_DOCUMENT_MARKER in hint
+
+
+# A format is a short token, not a sentence: `OGC:WMS-1.3.0-http-get-map` must
+# not end up published as the format `wms-1.3.0-http-get-map`.
+FORMAT_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,19}$")
+
+
+def _ogc_service(hint: str) -> str | None:
+    """The OGC service a protocol or scheme names, if it names one.
+
+    GeoNetwork writes `OGC:WMS`, but also `OGC:WMS-1.3.0-http-get-map`: the
+    service is the segment between the prefix and the version, exactly as the
+    DGT backend reads it.
+    """
+    if not hint:
+        return None
+    key = hint.rsplit(":", 1)[-1] if ":" in hint else hint
+    service = key.split("-", 1)[0].strip()
+    return service if service in OGC_SERVICE_FORMATS else None
+
+
+def resource_format(hint: str, record_type: str | None, url: str) -> str:
+    """The format of a resource, from what the catalogue declares about its link.
+
+    The declared protocol or scheme is trusted first: an OGC endpoint carries no
+    file extension at all. Only when it says nothing usable does the URL decide,
+    through the shared helper -- the length heuristic this replaces published
+    `meta_2030_0.xlsx` as a WMS service purely because "xlsx" is four characters
+    (LEDG-2250).
+    """
+    service = _ogc_service(hint)
+    if service:
+        return service
+    if record_type == "liveData":
+        return "wms"
+    # A MIME type, e.g. `image/jpeg`.
+    if hint and "/" in hint:
+        candidate = hint.split("/")[-1].lower()
+        return candidate if FORMAT_RE.match(candidate) else guess_url_format(url)
+    return guess_url_format(url)
 
 
 class CSWUdataBackend(BaseBackend):
@@ -44,6 +118,26 @@ class CSWUdataBackend(BaseBackend):
 
     name = "cswudata"
     display_name = "CSW Harvester"
+
+    extra_configs = (
+        HarvestExtraConfig(
+            _("Default tag"),
+            "default_tag",
+            str,
+            _("A tag added to every dataset of this source, naming its producer."),
+        ),
+    )
+
+    def _default_tag(self) -> str:
+        """The producer tag for this source, from its config or its hostname.
+
+        It used to be read straight off `self.config`, a key the source form has
+        no way of writing: only declared extra configs are ever stored, so the
+        configured value was unreachable and every source silently fell back to
+        the literal "csw". The hostname replaces that fallback because the tag
+        is there to name the producer, and "csw" names the protocol.
+        """
+        return self.get_extra_config_value("default_tag") or self.source.domain
 
     def inner_harvest(self):
         """
@@ -108,20 +202,16 @@ class CSWUdataBackend(BaseBackend):
             for rec_id, record in csw.records.items():
                 resources = []
 
-                # CSW records use 'uris' field for resources, not 'references'
-                uris = getattr(record, "uris", None)
-                if uris:
-                    for uri in uris:
-                        if isinstance(uri, dict) and uri.get("url"):
-                            resources.append(uri)
-
-                # Fallback to references if uris is not available
-                if not resources:
-                    refs = getattr(record, "references", None)
-                    if refs:
-                        for ref in refs:
-                            if isinstance(ref, dict) and ref.get("url"):
-                                resources.append(ref)
+                # `dc:URI` (GeoNetwork) and `dct:references` (Esri Geoportal) are
+                # both read, never one instead of the other: a record carrying a
+                # single URI -- a thumbnail is enough -- used to drop every
+                # reference, and with it the resource the dataset was published
+                # with, whose id then died. `sync_resources` dedupes by URL, so
+                # a link announced in both lists still yields one resource.
+                for field in ("uris", "references"):
+                    for entry in getattr(record, field, None) or []:
+                        if isinstance(entry, dict) and entry.get("url"):
+                            resources.append(entry)
 
                 data = {
                     "id": record.identifier,
@@ -133,6 +223,8 @@ class CSWUdataBackend(BaseBackend):
                     "type": getattr(record, "type", None),
                     "created": getattr(record, "created", None),
                     "modified": getattr(record, "modified", None),
+                    # A list: owslib appends one entry per `dc:rights` element.
+                    "rights": getattr(record, "rights", None) or [],
                 }
 
                 self.process_dataset(data["id"], items=data)
@@ -164,11 +256,10 @@ class CSWUdataBackend(BaseBackend):
 
         # Set basic dataset fields
         dataset.title = normalize_string(data["title"])
-        dataset.license = License.guess("cc-by")
+        dataset.license = self._license_for(dataset, item, data)
 
-        # Process tags - use config tag if available, otherwise use generic 'csw'
-        default_tag = self.config.get("default_tag", "csw")
-        tags = [normalize_tag(default_tag)]
+        # Process tags - the producer tag from the source, then the record's own
+        tags = [normalize_tag(self._default_tag())]
         for tag in data.get("tags", []):
             normalized = normalize_tag(tag)
             if normalized:
@@ -177,30 +268,52 @@ class CSWUdataBackend(BaseBackend):
 
         dataset.description = normalize_string(data["description"])
 
-        # Process creation and modification dates
-        if data.get("created"):
-            dataset.extras["created_at"] = data.get("created")
-            try:
-                dataset.created_at = to_date(data["created"])
-            except (ValueError, TypeError) as e:
-                log.warning(f"Failed to parse created date for {item.remote_id}: {e}")
+        # `Dataset.created_at` is a read-only property -- it reads
+        # `harvest.issued_at or harvest.created_at or created_at_internal` -- so
+        # assigning it raised `AttributeError` for every record carrying a date,
+        # and the `except` below it caught neither. The harvest metadata is what
+        # the property reads, and what `rdf.py` writes.
+        if not dataset.harvest:
+            dataset.harvest = HarvestDatasetMetadata()
 
-        if data.get("modified"):
-            dataset.extras["modified_at"] = data.get("modified")
-            try:
-                dataset.last_modified_internal = to_date(data["modified"])
-            except (ValueError, TypeError) as e:
-                log.warning(f"Failed to parse modified date for {item.remote_id}: {e}")
+        created = safe_harvest_datetime(
+            data.get("created"), "CSW creation date", refuse_future=True
+        )
+        if created:
+            dataset.harvest.created_at = created
 
-        # Populate other extras
-        dataset.extras["dct_identifier"] = data.get("id")
-        dataset.extras["uri"] = data.get("id")
+        modified = safe_harvest_datetime(
+            data.get("modified"), "CSW modification date", refuse_future=True
+        )
+        if modified:
+            # What `Dataset.last_modified` reads for a harvested dataset.
+            dataset.harvest.modified_at = modified
 
-        # Try to find a remote_url
+        dataset.harvest.dct_identifier = data.get("id")
+        dataset.harvest.uri = data.get("id")
+
+        # The record's own page, when the catalogue announces one: a landing
+        # page, or the metadata document itself. Reset first, so a record that
+        # stops announcing one does not keep yesterday's.
+        dataset.harvest.remote_url = None
         for res_data in data.get("resources", []):
-            protocol = res_data.get("protocol", "").lower()
-            if "html" in protocol or "link" in protocol:
-                dataset.extras["remote_url"] = res_data.get("url")
+            hint = link_hint(res_data)
+            if "html" in hint or "link" in hint or is_metadata_link(hint):
+                # Unlike the extra this replaces, `remote_url` is a validated
+                # `URLField`: an unusable link would raise at `save()` and cost
+                # the whole record -- title, description and resources included.
+                # It costs the link instead.
+                candidate = build_resource_url(res_data.get("url"))
+                try:
+                    uris.validate(candidate)
+                except uris.ValidationError:
+                    log.warning(
+                        "CSW record %r announces an unusable landing page %r",
+                        item.remote_id,
+                        (candidate or "")[:200],
+                    )
+                    continue
+                dataset.harvest.remote_url = candidate
                 break
 
         # Process spatial coverage
@@ -216,35 +329,39 @@ class CSWUdataBackend(BaseBackend):
             if not url:
                 continue
 
-            # Determine resource format/type
-            # CSW URIs use 'protocol' field for MIME types or service types
-            protocol = res_data.get("protocol", "")
+            hint = link_hint(res_data)
+            if is_metadata_link(hint):
+                # It describes the dataset; it is not one of its files.
+                continue
+
+            # Repair the separators and self-concatenated paths some catalogues
+            # emit, before anything reads this URL: `sync_resources` matches
+            # resources by URL, so repairing it afterwards would strand the id
+            # of the resource already published (LEDG-2250, LEDG-2251).
+            url = build_resource_url(url)
+            try:
+                # `Resource.url` is a validated `URLField` too, so one unusable
+                # link -- a relative path, a host with no TLD -- would raise at
+                # `save()` and cost the whole record. Dropping the link keeps
+                # the dataset and the other resources.
+                uris.validate(url)
+            except uris.ValidationError:
+                log.warning(
+                    "CSW record %r announces an unusable resource link %r",
+                    item.remote_id,
+                    (url or "")[:200],
+                )
+                continue
+
             name = res_data.get("name", "")
-
-            # Check for WMS/WFS services
-            if protocol and ("wms" in protocol.lower() or "wfs" in protocol.lower()):
-                res_type = protocol.split(":")[-1].lower() if ":" in protocol else "wms"
-            elif data.get("type") == "liveData":
-                res_type = "wms"
-            # Try to extract format from protocol (e.g., 'image/jpeg' -> 'jpeg')
-            elif protocol and "/" in protocol:
-                res_type = protocol.split("/")[-1].lower()
-            else:
-                # Fallback to URL extension
-                res_type = url.split(".")[-1].lower() if "." in url else "remote"
-                if len(res_type) > 5:
-                    # Extension too long or invalid
-                    res_type = "remote"
-
-            # Use resource name if available, otherwise use dataset title
-            resource_title = name if name else dataset.title
 
             resources.append(
                 {
-                    "title": resource_title,
+                    # Use the resource name if the catalogue gives one.
+                    "title": name if name else dataset.title,
                     "url": url,
                     "filetype": "remote",
-                    "format": res_type,
+                    "format": resource_format(hint, data.get("type"), url),
                 }
             )
 
@@ -256,80 +373,56 @@ class CSWUdataBackend(BaseBackend):
 
         return dataset
 
-    def _process_spatial(self, dataset, data):
-        """
-        Process spatial coverage from CSW bounding box.
+    def _license_for(self, dataset, item: HarvestItem, data: dict):
+        """The licence the source grants, or the portal default.
 
-        Args:
-            dataset: The dataset object to update with spatial information.
-            data: Dictionary containing the bbox information.
+        This backend used to stamp `cc-by` on every record it collected, which
+        published a licence the catalogues do not grant -- the same complaint
+        that was raised against the DGT harvester. `dc:rights` is read instead,
+        and a record that declares nothing gets `notspecified`.
+
+        Note that `License.guess` falls back to a Damerau-Levenshtein match over
+        every licence slug and title, so a `dc:rights` that is free prose can
+        still resolve to a near neighbour. That risk is accepted here because
+        the field is short and usually a URL, and it stays revocable: the next
+        harvest overwrites whatever this derived.
+        """
+        # Capped: `License.guess` falls back to an edit-distance ranking over
+        # every licence slug and title, so unbounded prose from a remote
+        # catalogue is both a poor match and a cost paid on every record.
+        rights = [
+            text.strip()[:200]
+            for text in data.get("rights") or []
+            if isinstance(text, str) and text.strip()
+        ]
+        resolved = License.guess(*rights) if rights else None
+        if rights and resolved is None:
+            # Visible on purpose: a licence the portal cannot name is a record
+            # that will read as `notspecified` until somebody adds it.
+            log.warning(
+                "CSW record %r declares rights %r, which resolve to no known licence",
+                item.remote_id,
+                rights,
+            )
+
+        return settle_harvested_license(dataset, resolved)
+
+    def _process_spatial(self, dataset, data):
+        """Store the record's bounding box as the dataset's spatial coverage.
+
+        The geometry is built by the shared helper, which was extracted from
+        this very method for the DGT backend and left unused here; the owslib
+        bbox object is the only part specific to CSW.
         """
         bbox = data.get("bbox")
         if not bbox:
             return
 
         try:
-            # Extract coordinates ensuring float type
-            minx = float(bbox.minx)
-            miny = float(bbox.miny)
-            maxx = float(bbox.maxx)
-            maxy = float(bbox.maxy)
-
-            # Ensure correct min/max order
-            if minx > maxx:
-                minx, maxx = maxx, minx
-            if miny > maxy:
-                miny, maxy = maxy, miny
-
-            dataset.spatial = SpatialCoverage()
-
-            if minx == maxx and miny == maxy:
-                # It's a point – create a tiny polygon around it since
-                # SpatialCoverage.geom is a MultiPolygonField and only
-                # accepts "MultiPolygon" type geometries.
-                epsilon = 0.0001  # ~11 meters at the equator
-                minx -= epsilon
-                miny -= epsilon
-                maxx += epsilon
-                maxy += epsilon
-                polygon_coordinates = [
-                    [
-                        [minx, miny],
-                        [maxx, miny],
-                        [maxx, maxy],
-                        [minx, maxy],
-                        [minx, miny],
-                    ]
-                ]
-                dataset.spatial.geom = {
-                    "type": "MultiPolygon",
-                    "coordinates": [polygon_coordinates],
-                }
-                log.debug(
-                    f"Processed spatial coverage as MultiPolygon (from point): [{minx}, {miny}]"
-                )
-            else:
-                # Construct GeoJSON Polygon (counter-clockwise)
-                # [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]
-                polygon_coordinates = [
-                    # Ring Exterior
-                    [
-                        [minx, miny],
-                        [maxx, miny],
-                        [maxx, maxy],
-                        [minx, maxy],
-                        [minx, miny],
-                    ]
-                ]
-                # MultiPolygon coordinates: [ [ [[x,y]...] ] ]
-                coordinates = [polygon_coordinates]
-                dataset.spatial.geom = {
-                    "type": "MultiPolygon",
-                    "coordinates": coordinates,
-                }
-                log.debug(
-                    f"Processed spatial coverage as MultiPolygon: bbox=[{minx}, {miny}, {maxx}, {maxy}]"
-                )
+            dataset.spatial = SpatialCoverage(
+                geom=bbox_to_multipolygon([(bbox.minx, bbox.miny, bbox.maxx, bbox.maxy)])
+            )
         except (ValueError, AttributeError, TypeError) as e:
+            # A bbox missing a corner, or carrying text where a number belongs,
+            # costs the coverage and not the dataset.
             log.warning(f"Failed to process spatial coverage: {e}")
-            pass
