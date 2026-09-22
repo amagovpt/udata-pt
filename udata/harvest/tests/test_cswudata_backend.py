@@ -422,3 +422,60 @@ class CswUdataLicenseTest(PytestOnlyDBTestCase):
         again = self._harvest()
 
         assert again.license.id == "notspecified"
+
+
+def owslib_bbox(minx, miny, maxx, maxy):
+    """The shape owslib hands over for `ows:BoundingBox`."""
+    return SimpleNamespace(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataSpatialTest(PytestOnlyDBTestCase):
+    """The bounding box becomes the coverage, through the shared helper.
+
+    The geometry assertions are written out in full rather than compared with
+    `bbox_to_multipolygon`, so they would catch the helper and this backend
+    drifting together.
+    """
+
+    def _harvest(self, bbox):
+        source = HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([_file()]) | {"bbox": bbox})
+        return harvested_dataset(REMOTE_ID)
+
+    def test_bbox_becomes_a_closed_counter_clockwise_ring(self):
+        dataset = self._harvest(owslib_bbox("-9.5", "36.9", "-6.2", "42.2"))
+
+        assert dataset.spatial.geom == {
+            "type": "MultiPolygon",
+            "coordinates": [
+                [
+                    [
+                        [-9.5, 36.9],
+                        [-6.2, 36.9],
+                        [-6.2, 42.2],
+                        [-9.5, 42.2],
+                        [-9.5, 36.9],
+                    ]
+                ]
+            ],
+        }
+
+    def test_point_bbox_is_widened(self):
+        # A zero-area ring is not a polygon, and `SpatialCoverage.geom` only
+        # accepts MultiPolygon.
+        dataset = self._harvest(owslib_bbox(-8.0, 40.0, -8.0, 40.0))
+
+        ring = dataset.spatial.geom["coordinates"][0][0]
+        assert ring[0] == [-8.0001, 39.9999]
+        assert ring[2] == [-7.9999, 40.0001]
+
+    def test_swapped_corners_are_reordered(self):
+        dataset = self._harvest(owslib_bbox(-6.2, 42.2, -9.5, 36.9))
+
+        assert dataset.spatial.geom["coordinates"][0][0][0] == [-9.5, 36.9]
+
+    def test_unreadable_bbox_costs_the_coverage_not_the_dataset(self):
+        dataset = self._harvest(owslib_bbox("oeste", "sul", "este", "norte"))
+
+        assert dataset.spatial is None

@@ -31,6 +31,7 @@ from udata.models import License, SpatialCoverage
 from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
+    bbox_to_multipolygon,
     build_resource_url,
     guess_url_format,
     settle_harvested_license,
@@ -348,79 +349,21 @@ class CSWUdataBackend(BaseBackend):
         return settle_harvested_license(dataset, resolved)
 
     def _process_spatial(self, dataset, data):
-        """
-        Process spatial coverage from CSW bounding box.
+        """Store the record's bounding box as the dataset's spatial coverage.
 
-        Args:
-            dataset: The dataset object to update with spatial information.
-            data: Dictionary containing the bbox information.
+        The geometry is built by the shared helper, which was extracted from
+        this very method for the DGT backend and left unused here; the owslib
+        bbox object is the only part specific to CSW.
         """
         bbox = data.get("bbox")
         if not bbox:
             return
 
         try:
-            # Extract coordinates ensuring float type
-            minx = float(bbox.minx)
-            miny = float(bbox.miny)
-            maxx = float(bbox.maxx)
-            maxy = float(bbox.maxy)
-
-            # Ensure correct min/max order
-            if minx > maxx:
-                minx, maxx = maxx, minx
-            if miny > maxy:
-                miny, maxy = maxy, miny
-
-            dataset.spatial = SpatialCoverage()
-
-            if minx == maxx and miny == maxy:
-                # It's a point – create a tiny polygon around it since
-                # SpatialCoverage.geom is a MultiPolygonField and only
-                # accepts "MultiPolygon" type geometries.
-                epsilon = 0.0001  # ~11 meters at the equator
-                minx -= epsilon
-                miny -= epsilon
-                maxx += epsilon
-                maxy += epsilon
-                polygon_coordinates = [
-                    [
-                        [minx, miny],
-                        [maxx, miny],
-                        [maxx, maxy],
-                        [minx, maxy],
-                        [minx, miny],
-                    ]
-                ]
-                dataset.spatial.geom = {
-                    "type": "MultiPolygon",
-                    "coordinates": [polygon_coordinates],
-                }
-                log.debug(
-                    f"Processed spatial coverage as MultiPolygon (from point): [{minx}, {miny}]"
-                )
-            else:
-                # Construct GeoJSON Polygon (counter-clockwise)
-                # [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]
-                polygon_coordinates = [
-                    # Ring Exterior
-                    [
-                        [minx, miny],
-                        [maxx, miny],
-                        [maxx, maxy],
-                        [minx, maxy],
-                        [minx, miny],
-                    ]
-                ]
-                # MultiPolygon coordinates: [ [ [[x,y]...] ] ]
-                coordinates = [polygon_coordinates]
-                dataset.spatial.geom = {
-                    "type": "MultiPolygon",
-                    "coordinates": coordinates,
-                }
-                log.debug(
-                    f"Processed spatial coverage as MultiPolygon: bbox=[{minx}, {miny}, {maxx}, {maxy}]"
-                )
+            dataset.spatial = SpatialCoverage(
+                geom=bbox_to_multipolygon([(bbox.minx, bbox.miny, bbox.maxx, bbox.maxy)])
+            )
         except (ValueError, AttributeError, TypeError) as e:
+            # A bbox missing a corner, or carrying text where a number belongs,
+            # costs the coverage and not the dataset.
             log.warning(f"Failed to process spatial coverage: {e}")
-            pass
