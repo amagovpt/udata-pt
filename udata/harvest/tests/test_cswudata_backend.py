@@ -67,3 +67,45 @@ class CswUdataResourceIdentityTest(PytestOnlyDBTestCase):
 
         assert resource_urls(REMOTE_ID) == [WMS_URL]
         assert resource_ids(REMOTE_ID) == [wms_id]
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataDefaultTagTest(PytestOnlyDBTestCase):
+    """Every dataset carries a tag naming its producer, plus the record's own.
+
+    The producer tag used to be read from a `default_tag` key on the source
+    config, which the source form has no way of writing -- only declared extra
+    configs are stored -- so it was unreachable and every source fell back to
+    the literal "csw" (LEDG-2492).
+    """
+
+    def _source(self, default_tag=None):
+        config = {"extra_configs": [{"key": "default_tag", "value": default_tag}]}
+        return HarvestSourceFactory(
+            backend="cswudata", url=CSW_URL, config=config if default_tag else {}
+        )
+
+    def test_configured_default_tag_is_written(self):
+        source = self._source(default_tag="apambiente.pt")
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([_file()]))
+
+        # Stored slugified, as every tag is: the dotted form is what a human
+        # types into the source form.
+        assert "apambiente-pt" in harvested_dataset(REMOTE_ID).tags
+
+    def test_hostname_is_the_fallback_tag(self):
+        source = self._source()
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([_file()]))
+
+        assert "geoportal-example-pt" in harvested_dataset(REMOTE_ID).tags
+
+    def test_subjects_become_tags(self):
+        source = self._source(default_tag="apambiente.pt")
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([_file()]))
+
+        # `_payload` carries the record's own subjects; they join the producer tag
+        # instead of replacing it.
+        assert set(harvested_dataset(REMOTE_ID).tags) == {"apambiente-pt", "ambiente"}

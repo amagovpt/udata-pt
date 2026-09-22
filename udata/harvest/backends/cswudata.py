@@ -18,7 +18,7 @@ import logging
 import requests
 from owslib.csw import CatalogueServiceWeb
 
-from udata.harvest.backends.base import BaseBackend
+from udata.harvest.backends.base import BaseBackend, HarvestExtraConfig
 from udata.harvest.exceptions import HarvestException
 from udata.harvest.filters import (
     normalize_string,
@@ -26,6 +26,7 @@ from udata.harvest.filters import (
     to_date,
 )
 from udata.harvest.models import HarvestItem
+from udata.i18n import gettext as _
 from udata.models import License, SpatialCoverage
 
 from .tools.harvester_utils import sync_resources, with_http_retry
@@ -44,6 +45,26 @@ class CSWUdataBackend(BaseBackend):
 
     name = "cswudata"
     display_name = "CSW Harvester"
+
+    extra_configs = (
+        HarvestExtraConfig(
+            _("Default tag"),
+            "default_tag",
+            str,
+            _("A tag added to every dataset of this source, naming its producer."),
+        ),
+    )
+
+    def _default_tag(self) -> str:
+        """The producer tag for this source, from its config or its hostname.
+
+        It used to be read straight off `self.config`, a key the source form has
+        no way of writing: only declared extra configs are ever stored, so the
+        configured value was unreachable and every source silently fell back to
+        the literal "csw". The hostname replaces that fallback because the tag
+        is there to name the producer, and "csw" names the protocol.
+        """
+        return self.get_extra_config_value("default_tag") or self.source.domain
 
     def inner_harvest(self):
         """
@@ -166,9 +187,8 @@ class CSWUdataBackend(BaseBackend):
         dataset.title = normalize_string(data["title"])
         dataset.license = License.guess("cc-by")
 
-        # Process tags - use config tag if available, otherwise use generic 'csw'
-        default_tag = self.config.get("default_tag", "csw")
-        tags = [normalize_tag(default_tag)]
+        # Process tags - the producer tag from the source, then the record's own
+        tags = [normalize_tag(self._default_tag())]
         for tag in data.get("tags", []):
             normalized = normalize_tag(tag)
             if normalized:
