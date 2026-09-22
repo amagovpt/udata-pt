@@ -55,5 +55,21 @@ def migrate(db):
             log.info(f"Unsetting owner on HarvestSource {source.id}: {e}")
             HarvestSource.objects(pk=source.pk).update_one(unset__owner=True)
 
+    # `organization` is `owner`'s twin, and fails in exactly the same place: the
+    # permission checks read `source.organization` before any field is
+    # serialized, so no tolerant field reaches it either. It is not a user
+    # reference, and the incident was not about it — but it is the same corridor,
+    # and leaving it out would mean shipping a fix for "a dangling reference
+    # takes the listing down" with a proven identical hole still open.
+    org_count = 0
+    for source in HarvestSource.objects(organization__ne=None).no_cache():
+        try:
+            source.organization
+        except mongoengine.errors.DoesNotExist as e:
+            org_count += 1
+            log.info(f"Unsetting organization on HarvestSource {source.id}: {e}")
+            HarvestSource.objects(pk=source.pk).update_one(unset__organization=True)
+
     log.info(f"Unset {by_count} dangling validation.by in HarvestSource objects")
     log.info(f"Unset {owner_count} dangling owner in HarvestSource objects")
+    log.info(f"Unset {org_count} dangling organization in HarvestSource objects")

@@ -13,6 +13,7 @@ and repairing the data is the whole fix.
 import pytest
 from mongoengine.connection import get_db
 
+from udata.core.organization.factories import OrganizationFactory
 from udata.core.user.factories import UserFactory
 from udata.tests.api import PytestOnlyDBTestCase
 
@@ -68,6 +69,20 @@ class HarvestSourcesUserIntegrityMigrationTest(PytestOnlyDBTestCase):
         source.reload()
         assert source.owner is None
 
+    def test_dangling_organization_is_unset(self):
+        # Not a user reference, and not what the incident was about — but the
+        # same corridor: the permission checks read `organization` before any
+        # field is serialized, so the tolerant field never reaches it and only
+        # this migration repairs it.
+        organization = OrganizationFactory()
+        source = HarvestSourceFactory(organization=organization)
+        get_db().organization.delete_one({"_id": organization.id})
+
+        self._migrate()
+
+        source.reload()
+        assert source.organization is None
+
     def test_both_dangling_references_on_one_source_are_unset(self):
         # The realistic worst case, and the one that pins the two passes
         # together: they touch the same document, so neither may leave it in a
@@ -85,16 +100,20 @@ class HarvestSourcesUserIntegrityMigrationTest(PytestOnlyDBTestCase):
         assert source.validation.state == VALIDATION_ACCEPTED
 
     def test_live_references_are_kept(self):
-        source, user = self._validated_source()
+        # Two sources, because `Owned` treats `owner` and `organization` as
+        # mutually exclusive and nulls one when the other is set.
         owner = UserFactory()
-        source.owner = owner
-        source.save()
+        owned, validator = self._validated_source(owner=owner)
+        organization = OrganizationFactory()
+        run_by_org = HarvestSourceFactory(organization=organization)
 
         self._migrate()
 
-        source.reload()
-        assert source.validation.by == user
-        assert source.owner == owner
+        owned.reload()
+        run_by_org.reload()
+        assert owned.validation.by == validator
+        assert owned.owner == owner
+        assert run_by_org.organization == organization
 
     def test_is_idempotent(self):
         source, user = self._validated_source()
