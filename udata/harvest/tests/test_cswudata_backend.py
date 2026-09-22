@@ -1,10 +1,12 @@
 """Resource identity across generic CSW harvests (LEDG-2251)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from udata.tests.api import PytestOnlyDBTestCase
 
-from ..backends.cswudata import CSWUdataBackend
+from ..backends.cswudata import CSWUdataBackend, resource_format
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -109,3 +111,171 @@ class CswUdataDefaultTagTest(PytestOnlyDBTestCase):
         # `_payload` carries the record's own subjects; they join the producer tag
         # instead of replacing it.
         assert set(harvested_dataset(REMOTE_ID).tags) == {"apambiente-pt", "ambiente"}
+
+
+GEODOCS = "https://sniambgeoviewer.apambiente.pt/GeoDocs/geoportaldocs"
+
+# Verbatim `dct:references` value of a real Esri Geoportal record: the path is
+# concatenated with itself, and the resulting link 404s upstream (LEDG-2250).
+DUPLICATED_REFERENCE = (
+    f"{GEODOCS}/_Clima/PortalAcaoClimatica_Emissoes2030/meta_2030_0.xlsx"
+    "_Clima/PortalAcaoClimatica_Emissoes2030/meta_2030_0.xlsx"
+)
+REPAIRED_URL = f"{GEODOCS}/_Clima/PortalAcaoClimatica_Emissoes2030/meta_2030_0.xlsx"
+
+ESRI_DATA_SCHEME = "urn:x-esri:specification:ServiceType:ArcIMS:Metadata:Server"
+
+
+class ResourceFormatTest:
+    """`resource_format` reads the declared link before falling back to the URL."""
+
+    def test_ogc_protocol_names_the_service(self):
+        assert resource_format("ogc:wfs", "dataset", WMS_URL) == "wfs"
+
+    def test_bare_wms_protocol_without_a_prefix(self):
+        assert resource_format("wms", "dataset", WMS_URL) == "wms"
+
+    def test_live_data_record_is_wms(self):
+        assert resource_format("", "liveData", WMS_URL) == "wms"
+
+    def test_mime_type_protocol(self):
+        assert resource_format("image/jpeg", "dataset", "https://host/tile") == "jpeg"
+
+    def test_extension_less_url_falls_back_to_remote(self):
+        assert resource_format("", "dataset", "https://host/no-extension") == "remote"
+
+    def test_a_four_letter_extension_survives(self):
+        # The heuristic this replaced rewrote anything longer than three
+        # characters to `wms`, publishing spreadsheets as map services.
+        assert resource_format("", "dataset", REPAIRED_URL) == "xlsx"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataResourceFormatTest(PytestOnlyDBTestCase):
+    def _source(self):
+        return HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+
+    def test_duplicated_reference_is_repaired_and_typed_xlsx(self):
+        source = self._source()
+        reference = {"url": DUPLICATED_REFERENCE, "scheme": ESRI_DATA_SCHEME}
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([reference]))
+
+        assert resource_urls(REMOTE_ID) == [REPAIRED_URL]
+        assert [r.format for r in harvested_dataset(REMOTE_ID).resources] == ["xlsx"]
+
+    def test_scheme_is_read_like_protocol(self):
+        # The Esri Geoportal declares the link type under `scheme`; this backend
+        # only ever looked at `protocol`, so the service went out untyped.
+        source = self._source()
+        reference = {"url": WMS_URL, "scheme": "OGC:WMS"}
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([reference]))
+
+        assert [r.format for r in harvested_dataset(REMOTE_ID).resources] == ["wms"]
+
+    def test_both_link_shapes_become_resources(self):
+        source = self._source()
+        payload = _payload([_wms(), {"url": FILE_URL, "scheme": ESRI_DATA_SCHEME}])
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=payload)
+
+        assert sorted(resource_urls(REMOTE_ID)) == sorted([WMS_URL, FILE_URL])
+
+
+class FakeCatalogue:
+    """Enough of `owslib`'s `CatalogueServiceWeb` to drive `inner_harvest`.
+
+    The real client is not exercised on purpose: what these tests are about is
+    the loop around it -- which records it collects and when it stops -- not
+    owslib's XML parsing.
+    """
+
+    def __init__(self, url, timeout=None):
+        self.url = url
+        self.operations = []
+        self.results = {}
+        self.records = {}
+        self.calls = []
+        self.pages = []
+
+    def getrecords2(self, maxrecords=10, startposition=1, esn=None):
+        self.calls.append({"maxrecords": maxrecords, "startposition": startposition})
+        if maxrecords == 1:
+            # The probe request: only `matches` is read from it.
+            self.results = {"matches": self.matches, "nextrecord": 1}
+            self.records = {}
+            return
+        records, nextrecord = self.pages.pop(0)
+        self.results = {"matches": self.matches, "nextrecord": nextrecord}
+        self.records = {record.identifier: record for record in records}
+
+
+def csw_record(remote_id=REMOTE_ID, uris=None, references=None, **fields):
+    """A `CswRecord`-shaped object carrying only what `inner_harvest` reads."""
+    return SimpleNamespace(
+        identifier=remote_id,
+        title=fields.get("title", "Registo CSW"),
+        abstract=fields.get("abstract", "Descrição do registo"),
+        subjects=fields.get("subjects", []),
+        bbox=fields.get("bbox"),
+        type=fields.get("type", "dataset"),
+        created=fields.get("created"),
+        modified=fields.get("modified"),
+        uris=uris or [],
+        references=references or [],
+    )
+
+
+def run_inner_harvest(monkeypatch, rmock, source, pages, matches):
+    """Run a real `inner_harvest` against `pages`, returning the fake catalogue."""
+    catalogue = {}
+
+    def build(url, timeout=None):
+        client = FakeCatalogue(url, timeout=timeout)
+        client.matches = matches
+        client.pages = list(pages)
+        catalogue["client"] = client
+        return client
+
+    monkeypatch.setattr("udata.harvest.backends.cswudata.CatalogueServiceWeb", build)
+    # `inner_harvest` resolves redirects with a guarded GET before touching owslib.
+    rmock.get(CSW_URL, text="")
+
+    backend = CSWUdataBackend(source)
+    backend.harvest()
+    return catalogue["client"]
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataRecordLinksTest(PytestOnlyDBTestCase):
+    """`dc:URI` and `dct:references` are both read, never one instead of the other."""
+
+    def _source(self):
+        return HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+
+    def test_references_survive_a_record_that_also_has_a_uri(self, monkeypatch, rmock):
+        # One `dc:URI` -- a thumbnail is enough -- used to discard every
+        # reference, and with it the resource the dataset was published with,
+        # whose id then died on the next harvest.
+        record = csw_record(
+            uris=[{"url": WMS_URL, "protocol": "OGC:WMS"}],
+            references=[{"url": FILE_URL, "scheme": ESRI_DATA_SCHEME}],
+        )
+
+        run_inner_harvest(monkeypatch, rmock, self._source(), [([record], 0)], matches=1)
+
+        assert sorted(resource_urls(REMOTE_ID)) == sorted([WMS_URL, FILE_URL])
+
+    def test_a_link_announced_in_both_lists_yields_one_resource(self, monkeypatch, rmock):
+        # Summing the two lists is only safe because `sync_resources` reconciles
+        # by URL; without that, a catalogue announcing a link in both fields
+        # would publish it twice.
+        record = csw_record(
+            uris=[{"url": FILE_URL, "protocol": "WWW:DOWNLOAD-1.0-http--download"}],
+            references=[{"url": FILE_URL, "scheme": ESRI_DATA_SCHEME}],
+        )
+
+        run_inner_harvest(monkeypatch, rmock, self._source(), [([record], 0)], matches=1)
+
+        assert resource_urls(REMOTE_ID) == [FILE_URL]

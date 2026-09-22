@@ -29,9 +29,44 @@ from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
 from udata.models import License, SpatialCoverage
 
-from .tools.harvester_utils import sync_resources, with_http_retry
+from .tools.harvester_utils import (
+    build_resource_url,
+    guess_url_format,
+    sync_resources,
+    with_http_retry,
+)
 
 log = logging.getLogger(__name__)
+
+
+def link_hint(res_data: dict) -> str:
+    """What a catalogue says a link is, whichever field it says it in.
+
+    GeoNetwork publishes `dc:URI` entries carrying a `protocol`; the Esri
+    Geoportal publishes `dct:references` carrying a `scheme` instead. They mean
+    the same thing, so both are read -- `protocol` first, since that is the path
+    this backend already took.
+    """
+    return (res_data.get("protocol") or res_data.get("scheme") or "").lower()
+
+
+def resource_format(hint: str, record_type: str | None, url: str) -> str:
+    """The format of a resource, from what the catalogue declares about its link.
+
+    The declared protocol or scheme is trusted first: an OGC endpoint carries no
+    file extension at all. Only when it says nothing usable does the URL decide,
+    through the shared helper -- the length heuristic this replaces published
+    `meta_2030_0.xlsx` as a WMS service purely because "xlsx" is four characters
+    (LEDG-2250).
+    """
+    if hint and ("wms" in hint or "wfs" in hint):
+        return hint.split(":")[-1].lower() if ":" in hint else "wms"
+    if record_type == "liveData":
+        return "wms"
+    # A MIME type, e.g. `image/jpeg`.
+    if hint and "/" in hint:
+        return hint.split("/")[-1].lower()
+    return guess_url_format(url)
 
 
 class CSWUdataBackend(BaseBackend):
@@ -129,20 +164,16 @@ class CSWUdataBackend(BaseBackend):
             for rec_id, record in csw.records.items():
                 resources = []
 
-                # CSW records use 'uris' field for resources, not 'references'
-                uris = getattr(record, "uris", None)
-                if uris:
-                    for uri in uris:
-                        if isinstance(uri, dict) and uri.get("url"):
-                            resources.append(uri)
-
-                # Fallback to references if uris is not available
-                if not resources:
-                    refs = getattr(record, "references", None)
-                    if refs:
-                        for ref in refs:
-                            if isinstance(ref, dict) and ref.get("url"):
-                                resources.append(ref)
+                # `dc:URI` (GeoNetwork) and `dct:references` (Esri Geoportal) are
+                # both read, never one instead of the other: a record carrying a
+                # single URI -- a thumbnail is enough -- used to drop every
+                # reference, and with it the resource the dataset was published
+                # with, whose id then died. `sync_resources` dedupes by URL, so
+                # a link announced in both lists still yields one resource.
+                for field in ("uris", "references"):
+                    for entry in getattr(record, field, None) or []:
+                        if isinstance(entry, dict) and entry.get("url"):
+                            resources.append(entry)
 
                 data = {
                     "id": record.identifier,
@@ -236,35 +267,22 @@ class CSWUdataBackend(BaseBackend):
             if not url:
                 continue
 
-            # Determine resource format/type
-            # CSW URIs use 'protocol' field for MIME types or service types
-            protocol = res_data.get("protocol", "")
+            # Repair the separators and self-concatenated paths some catalogues
+            # emit, before anything reads this URL: `sync_resources` matches
+            # resources by URL, so repairing it afterwards would strand the id
+            # of the resource already published (LEDG-2250, LEDG-2251).
+            url = build_resource_url(url)
+
+            hint = link_hint(res_data)
             name = res_data.get("name", "")
-
-            # Check for WMS/WFS services
-            if protocol and ("wms" in protocol.lower() or "wfs" in protocol.lower()):
-                res_type = protocol.split(":")[-1].lower() if ":" in protocol else "wms"
-            elif data.get("type") == "liveData":
-                res_type = "wms"
-            # Try to extract format from protocol (e.g., 'image/jpeg' -> 'jpeg')
-            elif protocol and "/" in protocol:
-                res_type = protocol.split("/")[-1].lower()
-            else:
-                # Fallback to URL extension
-                res_type = url.split(".")[-1].lower() if "." in url else "remote"
-                if len(res_type) > 5:
-                    # Extension too long or invalid
-                    res_type = "remote"
-
-            # Use resource name if available, otherwise use dataset title
-            resource_title = name if name else dataset.title
 
             resources.append(
                 {
-                    "title": resource_title,
+                    # Use the resource name if the catalogue gives one.
+                    "title": name if name else dataset.title,
                     "url": url,
                     "filetype": "remote",
-                    "format": res_type,
+                    "format": resource_format(hint, data.get("type"), url),
                 }
             )
 
