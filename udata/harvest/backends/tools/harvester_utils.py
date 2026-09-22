@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 import requests
 
 from udata.core.dataset.constants import UpdateFrequency
-from udata.models import Resource
+from udata.models import License, Resource
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +160,72 @@ def collapse_duplicated_path(url: str) -> str:
             continue
         return urlunsplit(parts._replace(path=path[: length - half]))
     return url
+
+
+# The licence a harvester backend last wrote. Without it, a licence the
+# harvester derived and one a producer corrected by hand are the same value in
+# the database, and the fallback below cannot tell them apart.
+DERIVED_LICENSE_EXTRA = "harvest:derived_license"
+
+
+def settle_harvested_license(dataset, resolved):
+    """The licence to store, given what the source grants (`resolved`, or `None`).
+
+    Source first, then a correction a producer made by hand, then the portal
+    default. It never falls back to `cc-by` -- that constant was the bug, and
+    `notspecified` is what the portal says when it does not know.
+
+    The middle step is the delicate one. Keeping whatever the dataset already
+    carries is what lets a producer's correction survive a harvest, but applied
+    blindly it also makes the licence irrevocable: a source that stops granting
+    CC BY would never take it back, because the value we wrote ourselves last
+    night is indistinguishable from an editorial decision. So what the harvester
+    derived is recorded, and only a licence that differs from it is treated as
+    somebody's correction.
+
+    Resolving the source's own text into a licence stays with each backend,
+    which is the only part that knows where its source declares one.
+    """
+    if resolved is not None:
+        dataset.extras[DERIVED_LICENSE_EXTRA] = resolved.id
+        return resolved
+
+    # The source grants nothing. Anything on the dataset that is not what we
+    # last wrote is a correction, and stays.
+    current = dataset.license
+    if current is not None and current.id != dataset.extras.get(DERIVED_LICENSE_EXTRA):
+        dataset.extras.pop(DERIVED_LICENSE_EXTRA, None)
+        return current
+
+    # `default` has to be a document: Dataset.license is a ReferenceField and a
+    # raw string raises (LEDG-2315).
+    default = License.default()
+    if default is not None:
+        dataset.extras[DERIVED_LICENSE_EXTRA] = default.id
+    return default
+
+
+def build_resource_url(raw_url: str) -> str:
+    """Turn a raw `dct:references` link into the URL published on the resource.
+
+    The catalogue hands out Windows-style separators and, on at least one
+    record, a path concatenated with itself -- that doubled link 404s while the
+    single one downloads (LEDG-2250). Both defects are repaired here so the
+    resource URL matches what the origin actually serves.
+
+    Only the path is touched. `normalize_url_slashes` collapses every run of
+    slashes in everything after the scheme, which rewrites a URL nested in a
+    query string -- `?url=https://other/y` becomes `?url=https:/other/y` -- and
+    geoportals nest URLs in query strings all the time, in map proxies and
+    `GetMap` requests. That function is left as it is because `_url_key` and
+    three other backends rely on its exact output; what it is wrong about is
+    repairing a URL, which is this one's job.
+    """
+    if not raw_url:
+        return raw_url
+    parts = urlsplit(raw_url.replace("\\", "/"))
+    repaired = urlunsplit(parts._replace(path=re.sub(r"/+", "/", parts.path)))
+    return collapse_duplicated_path(repaired)
 
 
 # Query-string service values that identify an OGC endpoint, e.g.
