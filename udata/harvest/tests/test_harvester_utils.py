@@ -107,3 +107,19 @@ class GuessUrlFormatTest:
 
     def test_fallback_is_configurable(self):
         assert guess_url_format("https://host/no-extension", fallback="unknown") == "unknown"
+
+
+class BuildResourceUrlPreservesQueryTest:
+    """Only the path is repaired: geoportals nest URLs in query strings."""
+
+    def test_a_nested_url_in_the_query_survives(self):
+        url = "https://host/proxy?url=https://other.example/data.csv"
+        assert build_resource_url(url) == url
+
+    def test_a_getmap_request_survives(self):
+        url = "https://geoportal.example.pt/wms?SERVICE=WMS&REQUEST=GetMap&LAYERS=a"
+        assert build_resource_url(url) == url
+
+    def test_the_path_is_still_collapsed_with_a_query_present(self):
+        url = "https://host/a//b?url=https://other//y"
+        assert build_resource_url(url) == "https://host/a/b?url=https://other//y"

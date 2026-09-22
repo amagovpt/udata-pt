@@ -36,7 +36,9 @@ def migrate(db):
     log.info("Moving %s harvest sources onto %s...", LEGACY_BACKEND, TARGET_BACKEND)
 
     migrated = 0
-    for source in HarvestSource.objects(backend=LEGACY_BACKEND):
+    # Materialised: the loop rewrites the very field the query selects on, and a
+    # live cursor may skip or repeat documents when that happens.
+    for source in list(HarvestSource.objects(backend=LEGACY_BACKEND)):
         extra_configs = list(source.config.get("extra_configs") or [])
         present = {entry.get("key") for entry in extra_configs}
 

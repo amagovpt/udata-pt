@@ -14,10 +14,12 @@ Usage:
 """
 
 import logging
+import re
 
 import requests
 from owslib.csw import CatalogueServiceWeb
 
+from udata import uris
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.harvest.backends.base import BaseBackend, HarvestExtraConfig
 from udata.harvest.exceptions import HarvestException
@@ -31,6 +33,7 @@ from udata.models import License, SpatialCoverage
 from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
+    OGC_SERVICE_FORMATS,
     bbox_to_multipolygon,
     build_resource_url,
     guess_url_format,
@@ -64,6 +67,25 @@ def is_metadata_link(hint: str) -> bool:
     return METADATA_DOCUMENT_MARKER in hint
 
 
+# A format is a short token, not a sentence: `OGC:WMS-1.3.0-http-get-map` must
+# not end up published as the format `wms-1.3.0-http-get-map`.
+FORMAT_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,19}$")
+
+
+def _ogc_service(hint: str) -> str | None:
+    """The OGC service a protocol or scheme names, if it names one.
+
+    GeoNetwork writes `OGC:WMS`, but also `OGC:WMS-1.3.0-http-get-map`: the
+    service is the segment between the prefix and the version, exactly as the
+    DGT backend reads it.
+    """
+    if not hint:
+        return None
+    key = hint.rsplit(":", 1)[-1] if ":" in hint else hint
+    service = key.split("-", 1)[0].strip()
+    return service if service in OGC_SERVICE_FORMATS else None
+
+
 def resource_format(hint: str, record_type: str | None, url: str) -> str:
     """The format of a resource, from what the catalogue declares about its link.
 
@@ -73,13 +95,15 @@ def resource_format(hint: str, record_type: str | None, url: str) -> str:
     `meta_2030_0.xlsx` as a WMS service purely because "xlsx" is four characters
     (LEDG-2250).
     """
-    if hint and ("wms" in hint or "wfs" in hint):
-        return hint.split(":")[-1].lower() if ":" in hint else "wms"
+    service = _ogc_service(hint)
+    if service:
+        return service
     if record_type == "liveData":
         return "wms"
     # A MIME type, e.g. `image/jpeg`.
     if hint and "/" in hint:
-        return hint.split("/")[-1].lower()
+        candidate = hint.split("/")[-1].lower()
+        return candidate if FORMAT_RE.match(candidate) else guess_url_format(url)
     return guess_url_format(url)
 
 
@@ -269,11 +293,27 @@ class CSWUdataBackend(BaseBackend):
         dataset.harvest.uri = data.get("id")
 
         # The record's own page, when the catalogue announces one: a landing
-        # page, or the metadata document itself.
+        # page, or the metadata document itself. Reset first, so a record that
+        # stops announcing one does not keep yesterday's.
+        dataset.harvest.remote_url = None
         for res_data in data.get("resources", []):
             hint = link_hint(res_data)
             if "html" in hint or "link" in hint or is_metadata_link(hint):
-                dataset.harvest.remote_url = res_data.get("url")
+                # Unlike the extra this replaces, `remote_url` is a validated
+                # `URLField`: an unusable link would raise at `save()` and cost
+                # the whole record -- title, description and resources included.
+                # It costs the link instead.
+                candidate = build_resource_url(res_data.get("url"))
+                try:
+                    uris.validate(candidate)
+                except uris.ValidationError:
+                    log.warning(
+                        "CSW record %r announces an unusable landing page %r",
+                        item.remote_id,
+                        (candidate or "")[:200],
+                    )
+                    continue
+                dataset.harvest.remote_url = candidate
                 break
 
         # Process spatial coverage
@@ -299,6 +339,20 @@ class CSWUdataBackend(BaseBackend):
             # resources by URL, so repairing it afterwards would strand the id
             # of the resource already published (LEDG-2250, LEDG-2251).
             url = build_resource_url(url)
+            try:
+                # `Resource.url` is a validated `URLField` too, so one unusable
+                # link -- a relative path, a host with no TLD -- would raise at
+                # `save()` and cost the whole record. Dropping the link keeps
+                # the dataset and the other resources.
+                uris.validate(url)
+            except uris.ValidationError:
+                log.warning(
+                    "CSW record %r announces an unusable resource link %r",
+                    item.remote_id,
+                    (url or "")[:200],
+                )
+                continue
+
             name = res_data.get("name", "")
 
             resources.append(
@@ -333,8 +387,13 @@ class CSWUdataBackend(BaseBackend):
         the field is short and usually a URL, and it stays revocable: the next
         harvest overwrites whatever this derived.
         """
+        # Capped: `License.guess` falls back to an edit-distance ranking over
+        # every licence slug and title, so unbounded prose from a remote
+        # catalogue is both a poor match and a cost paid on every record.
         rights = [
-            text for text in data.get("rights") or [] if isinstance(text, str) and text.strip()
+            text.strip()[:200]
+            for text in data.get("rights") or []
+            if isinstance(text, str) and text.strip()
         ]
         resolved = License.guess(*rights) if rights else None
         if rights and resolved is None:

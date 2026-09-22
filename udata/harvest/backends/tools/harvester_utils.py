@@ -212,8 +212,20 @@ def build_resource_url(raw_url: str) -> str:
     record, a path concatenated with itself -- that doubled link 404s while the
     single one downloads (LEDG-2250). Both defects are repaired here so the
     resource URL matches what the origin actually serves.
+
+    Only the path is touched. `normalize_url_slashes` collapses every run of
+    slashes in everything after the scheme, which rewrites a URL nested in a
+    query string -- `?url=https://other/y` becomes `?url=https:/other/y` -- and
+    geoportals nest URLs in query strings all the time, in map proxies and
+    `GetMap` requests. That function is left as it is because `_url_key` and
+    three other backends rely on its exact output; what it is wrong about is
+    repairing a URL, which is this one's job.
     """
-    return collapse_duplicated_path(normalize_url_slashes(raw_url))
+    if not raw_url:
+        return raw_url
+    parts = urlsplit(raw_url.replace("\\", "/"))
+    repaired = urlunsplit(parts._replace(path=re.sub(r"/+", "/", parts.path)))
+    return collapse_duplicated_path(repaired)
 
 
 # Query-string service values that identify an OGC endpoint, e.g.

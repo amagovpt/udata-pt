@@ -549,3 +549,68 @@ class CswUdataPaginationTest(PytestOnlyDBTestCase):
             1,
             101,
         ]
+
+
+class OgcServiceFormatTest:
+    """GeoNetwork protocols carry a version; the format must not."""
+
+    def test_versioned_wms_protocol_is_just_wms(self):
+        assert resource_format("ogc:wms-1.3.0-http-get-map", "dataset", WMS_URL) == "wms"
+
+    def test_versioned_wfs_protocol_is_just_wfs(self):
+        hint = "ogc:wfs-2.0.0-http-get-capabilities"
+        assert resource_format(hint, "dataset", WMS_URL) == "wfs"
+
+    def test_a_download_protocol_leaves_the_url_to_decide(self):
+        hint = "www:download-1.0-http--download"
+        assert resource_format(hint, "dataset", "https://host/a/b.csv") == "csv"
+
+    def test_an_unusable_mime_type_falls_back_to_the_url(self):
+        assert resource_format("application/x-a-very-long-subtype", "dataset", FILE_URL) == "pdf"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataRemoteUrlValidationTest(PytestOnlyDBTestCase):
+    """An unusable landing page costs the link, not the record.
+
+    `harvest.remote_url` is a validated `URLField`, unlike the free-text extra it
+    replaced: assigning it raw would raise at `save()` and fail the whole item.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+
+    def _harvest(self, landing_url):
+        links = [{"url": landing_url, "protocol": "WWW:LINK-1.0-http--link"}, _file()]
+        harvest(CSWUdataBackend, self._source(), REMOTE_ID, items=_payload(links))
+        return harvested_dataset(REMOTE_ID)
+
+    def test_a_relative_landing_page_does_not_fail_the_record(self):
+        # The shape the Esri Geoportal emits for its own document endpoint.
+        # It is unusable both as a landing page and as a resource, and neither
+        # may cost the record: the same link reaches both fields.
+        dataset = self._harvest("/geoportal/rest/document?id=%7BABC%7D")
+
+        assert dataset.harvest.remote_url is None
+        # The record itself survives intact.
+        assert resource_urls(REMOTE_ID) == [FILE_URL]
+
+    def test_an_unusable_resource_link_does_not_fail_the_record(self):
+        source = self._source()
+        links = [{"url": "/relative/data.csv", "scheme": ESRI_DATA_SCHEME}, _file()]
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload(links))
+
+        assert resource_urls(REMOTE_ID) == [FILE_URL]
+
+    def test_a_backslash_landing_page_is_repaired_rather_than_refused(self):
+        dataset = self._harvest("https://geoportal.example.pt\\geoportal\\rest\\doc.html")
+
+        assert dataset.harvest.remote_url == "https://geoportal.example.pt/geoportal/rest/doc.html"
+
+    def test_a_dropped_landing_page_is_cleared(self):
+        self._harvest("https://geoportal.example.pt/doc.html")
+
+        harvest(CSWUdataBackend, self._source(), REMOTE_ID, items=_payload([_file()]))
+
+        assert harvested_dataset(REMOTE_ID).harvest.remote_url is None
