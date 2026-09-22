@@ -1,0 +1,112 @@
+"""The harvest sources lose their references to users that no longer exist (LEDG-2535).
+
+What the migration has to prove: a dangling reference is unset and nothing
+around it is lost -- the validation keeps its state and its date, so the record
+of *that it was validated* survives losing the record of *by whom* -- a live
+reference is left alone, and running twice changes nothing.
+
+`owner` is covered here too, and only here: it is dereferenced by the permission
+checks behind the `url` and `config` attributes, so no tolerant field reaches it
+and repairing the data is the whole fix.
+"""
+
+import pytest
+from mongoengine.connection import get_db
+
+from udata.core.user.factories import UserFactory
+
+# `udata.models` is the aggregator: importing it first is what stops
+# `udata.harvest.models` being reached mid-initialisation. `Harvest` is the
+# alias it publishes for `HarvestSource`.
+from udata.tests.api import PytestOnlyDBTestCase
+
+from ..models import VALIDATION_ACCEPTED, HarvestSourceValidation
+from .factories import HarvestSourceFactory
+from .test_ckanpt_migrations import load_migration
+
+MIGRATION = "2026-09-22-harvest-sources-user-integrity.py"
+
+
+@pytest.mark.usefixtures("app")
+class HarvestSourcesUserIntegrityMigrationTest(PytestOnlyDBTestCase):
+    def _migrate(self):
+        load_migration(MIGRATION).migrate(None)
+
+    def _validated_source(self, **kwargs):
+        user = UserFactory()
+        source = HarvestSourceFactory(
+            validation=HarvestSourceValidation(state=VALIDATION_ACCEPTED, by=user), **kwargs
+        )
+        return source, user
+
+    def _drop_user(self, user):
+        """Remove the user the way the incidents did: straight in the database.
+
+        `User._delete()` would fire the `reverse_delete_rule`s registered
+        against it, which is exactly what did *not* happen to the documents this
+        migration repairs -- and for `owner`, whose rule is NULLIFY, it would
+        leave nothing dangling at all.
+        """
+        get_db().user.delete_one({"_id": user.id})
+
+    def test_dangling_validator_is_unset(self):
+        source, user = self._validated_source()
+        validated_on = source.validation.on
+        self._drop_user(user)
+
+        self._migrate()
+
+        source.reload()
+        assert source.validation.by is None
+        # The validation itself survives losing its author.
+        assert source.validation.state == VALIDATION_ACCEPTED
+        assert source.validation.on == validated_on
+
+    def test_dangling_owner_is_unset(self):
+        owner = UserFactory()
+        source = HarvestSourceFactory(owner=owner)
+        self._drop_user(owner)
+
+        self._migrate()
+
+        source.reload()
+        assert source.owner is None
+
+    def test_both_dangling_references_on_one_source_are_unset(self):
+        # The two passes touch the same document, and the `validation.by` one
+        # saves through the ORM: this is what proves that save does not trip
+        # over the dangling `owner` on its way out.
+        owner = UserFactory()
+        source, validator = self._validated_source(owner=owner)
+        self._drop_user(validator)
+        self._drop_user(owner)
+
+        self._migrate()
+
+        source.reload()
+        assert source.validation.by is None
+        assert source.owner is None
+        assert source.validation.state == VALIDATION_ACCEPTED
+
+    def test_live_references_are_kept(self):
+        source, user = self._validated_source()
+        owner = UserFactory()
+        source.owner = owner
+        source.save()
+
+        self._migrate()
+
+        source.reload()
+        assert source.validation.by == user
+        assert source.owner == owner
+
+    def test_is_idempotent(self):
+        source, user = self._validated_source()
+        self._drop_user(user)
+
+        self._migrate()
+        self._migrate()
+
+        source.reload()
+        assert source.validation.by is None
+        assert source.validation.state == VALIDATION_ACCEPTED
