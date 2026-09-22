@@ -22,10 +22,13 @@ def migrate(db):
     for source in HarvestSource.objects(validation__by__ne=None).no_cache():
         try:
             source.validation.by
-        except mongoengine.errors.DoesNotExist:
+        except mongoengine.errors.DoesNotExist as e:
             by_count += 1
-            source.validation.by = None
-            source.save()
+            # Logged per source, because the counters below say how much was
+            # repaired and nothing says *what*: after this runs, the only record
+            # of who validated these sources is this line.
+            log.info(f"Unsetting validation.by on HarvestSource {source.id}: {e}")
+            HarvestSource.objects(pk=source.pk).update_one(set__validation__by=None)
 
     # `owner` does carry `reverse_delete_rule=NULLIFY`, but that only runs when
     # the user is removed through the ORM, and these references went dangling
@@ -36,16 +39,20 @@ def migrate(db):
     # `validation.by`, it is dereferenced by the permission checks behind the
     # `url` and `config` attributes, well before any field could tolerate it.
     #
-    # An atomic update rather than `save()`, because a dangling `owner` cannot
-    # be saved at all: `Owned.clean` refetches the document whenever `owner`
-    # changes, to remember the previous holder, and reading that previous value
-    # raises the very error being repaired. `update_one` does not run `clean`.
+    # Atomic updates throughout, rather than `save()`. For `owner` there is no
+    # choice: `Owned.clean` refetches the document whenever `owner` changes, to
+    # remember the previous holder, and reading that previous value raises the
+    # very error being repaired. `validation.by` follows for symmetry and
+    # because a repair should not run document validation on data it did not
+    # come to fix — one legacy source failing `validate()` would abort the whole
+    # migration partway, and everything after it would silently go unrepaired.
     owner_count = 0
     for source in HarvestSource.objects(owner__ne=None).no_cache():
         try:
             source.owner
-        except mongoengine.errors.DoesNotExist:
+        except mongoengine.errors.DoesNotExist as e:
             owner_count += 1
+            log.info(f"Unsetting owner on HarvestSource {source.id}: {e}")
             HarvestSource.objects(pk=source.pk).update_one(unset__owner=True)
 
     log.info(f"Unset {by_count} dangling validation.by in HarvestSource objects")

@@ -11,8 +11,11 @@ body for the *whole* sources listing — every other source went down with it, a
 nginx reported the empty 500 as a 502.
 """
 
+import pytest
 from flask import url_for
 
+from udata.api import fields
+from udata.core.user.api_fields import user_ref_fields
 from udata.core.user.factories import UserFactory
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.tests.helpers import assert200
@@ -59,6 +62,13 @@ class OrphanUserRefsInHarvestApiTest(MockBackendsMixin, PytestOnlyAPITestCase):
         # A neighbour with a live validator is untouched — the tolerance is per
         # field, not a blanket null.
         assert by_id[str(healthy.id)]["validation"]["by"]["id"] == str(healthy_user.id)
+
+    def test_tolerant_nested_refuses_to_promise_what_it_may_not_deliver(self):
+        # The field answers null on a dangling reference, so a declaration that
+        # forbids null describes an endpoint that does not exist. Caught at
+        # import time rather than by a client that trusted the schema.
+        with pytest.raises(ValueError):
+            fields.TolerantNested(user_ref_fields)
 
     def test_orphan_validator_does_not_break_the_detail(self):
         orphan = self.orphan_validator_source()

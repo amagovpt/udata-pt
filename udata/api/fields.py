@@ -27,6 +27,7 @@ from flask_restx.fields import String as String
 from flask_restx.fields import StringMixin as StringMixin
 from flask_restx.fields import Url as Url
 from flask_restx.fields import Wildcard as Wildcard
+from flask_restx.fields import get_value as get_value
 from mongoengine.errors import DoesNotExist
 
 from udata.utils import multi_to_dict
@@ -81,10 +82,16 @@ class TolerantNested(Nested):
     belongs to, not just its own entry — with a 500 carrying no body, which a
     proxy in front reports as a 502.
 
-    It has to override `output` rather than `format`: `Nested.output` resolves
-    the value through `get_value` -> `getattr`, whose `default` only swallows
-    `AttributeError`, so the `DoesNotExist` raised by mongoengine's lazy
-    dereference escapes before `format` is ever reached.
+    It has to override `output` rather than `format`, because the failure
+    happens while the value is being resolved: `Nested.output` goes through
+    `get_value` -> `_get_value_for_key` -> `obj[key]`, and the `except` around
+    that only swallows `IndexError`, `TypeError` and `KeyError`, so mongoengine's
+    lazy-dereference error escapes long before `format` could see it.
+
+    Only the resolution is guarded, deliberately. Wrapping the whole of
+    `super().output()` would also swallow a `DoesNotExist` raised from inside
+    the nested model — `QuerySet.get()` raises the same class — and turn a real
+    bug in one endpoint into a silent `null` that matches nothing anywhere else.
 
     Same trade as `udata.core.activity.api`, which filters dangling references
     out of the activity feed: answer with what is readable and log the rest for
@@ -93,12 +100,33 @@ class TolerantNested(Nested):
     it is intact and has to stay in the listing.
     """
 
+    def __init__(self, model, **kwargs):
+        if not kwargs.get("allow_null"):
+            raise ValueError(
+                "TolerantNested serves null when a reference does not resolve, so it has to "
+                "be declared allow_null=True — otherwise its own schema promises an object "
+                "it will sometimes refuse to produce, and every client generated from that "
+                "schema is wrong about it."
+            )
+        super(TolerantNested, self).__init__(model, **kwargs)
+
     def output(self, key, obj, **kwargs):
         try:
-            return super(TolerantNested, self).output(key, obj, **kwargs)
+            get_value(key if self.attribute is None else self.attribute, obj)
         except DoesNotExist as e:
-            log.error(e, exc_info=True)
+            # Named, because the bare mongoengine message carries only the id of
+            # the document that is *gone*. Whoever reads this has to find the one
+            # that is still here and still pointing at it.
+            log.error(
+                "Dangling reference at %s.%s on %s: %s",
+                type(obj).__name__,
+                key,
+                getattr(obj, "id", None),
+                e,
+                exc_info=True,
+            )
             return None
+        return super(TolerantNested, self).output(key, obj, **kwargs)
 
 
 class NextPageUrl(String):

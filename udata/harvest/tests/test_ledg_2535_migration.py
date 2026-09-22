@@ -14,10 +14,6 @@ import pytest
 from mongoengine.connection import get_db
 
 from udata.core.user.factories import UserFactory
-
-# `udata.models` is the aggregator: importing it first is what stops
-# `udata.harvest.models` being reached mid-initialisation. `Harvest` is the
-# alias it publishes for `HarvestSource`.
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..models import VALIDATION_ACCEPTED, HarvestSourceValidation
@@ -73,9 +69,9 @@ class HarvestSourcesUserIntegrityMigrationTest(PytestOnlyDBTestCase):
         assert source.owner is None
 
     def test_both_dangling_references_on_one_source_are_unset(self):
-        # The two passes touch the same document, and the `validation.by` one
-        # saves through the ORM: this is what proves that save does not trip
-        # over the dangling `owner` on its way out.
+        # The realistic worst case, and the one that pins the two passes
+        # together: they touch the same document, so neither may leave it in a
+        # state the other cannot read.
         owner = UserFactory()
         source, validator = self._validated_source(owner=owner)
         self._drop_user(validator)
