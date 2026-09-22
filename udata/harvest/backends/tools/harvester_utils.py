@@ -162,6 +162,17 @@ def collapse_duplicated_path(url: str) -> str:
     return url
 
 
+def build_resource_url(raw_url: str) -> str:
+    """Turn a raw `dct:references` link into the URL published on the resource.
+
+    The catalogue hands out Windows-style separators and, on at least one
+    record, a path concatenated with itself -- that doubled link 404s while the
+    single one downloads (LEDG-2250). Both defects are repaired here so the
+    resource URL matches what the origin actually serves.
+    """
+    return collapse_duplicated_path(normalize_url_slashes(raw_url))
+
+
 # Query-string service values that identify an OGC endpoint, e.g.
 # `...?SERVICE=WMS&REQUEST=GetCapabilities`.
 OGC_SERVICE_FORMATS = frozenset({"wms", "wfs", "wcs", "wmts", "csw"})

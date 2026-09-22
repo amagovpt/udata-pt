@@ -8,9 +8,6 @@ and maps them to udata datasets and resources.
 Classes:
     PortalAmbienteBackend: Custom udata harvester backend for the Environment Portal.
 
-Functions:
-    build_resource_url(raw_url: str) -> str: Turn a `dct:references` link into a resource URL.
-
 Usage:
     This backend is intended to be used as a plugin in a udata instance. It will fetch datasets from the configured
     CSW endpoint, process their metadata, and create or update corresponding datasets and resources in udata.
@@ -23,25 +20,13 @@ from udata.harvest.models import HarvestItem
 from udata.models import License
 
 from .tools.harvester_utils import (
-    collapse_duplicated_path,
+    build_resource_url,
     guess_url_format,
-    normalize_url_slashes,
     sync_resources,
     with_http_retry,
 )
 
 # backend = 'https://sniambgeoportal.apambiente.pt/geoportal/csw'
-
-
-def build_resource_url(raw_url: str) -> str:
-    """Turn a raw `dct:references` link into the URL published on the resource.
-
-    The catalogue hands out Windows-style separators and, on at least one
-    record, a path concatenated with itself — that doubled link 404s while the
-    single one downloads (LEDG-2250). Both defects are repaired here so the
-    resource URL matches what the origin actually serves.
-    """
-    return collapse_duplicated_path(normalize_url_slashes(raw_url))
 
 
 class PortalAmbienteBackend(BaseBackend):
