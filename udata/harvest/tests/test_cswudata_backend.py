@@ -479,3 +479,60 @@ class CswUdataSpatialTest(PytestOnlyDBTestCase):
         dataset = self._harvest(owslib_bbox("oeste", "sul", "este", "norte"))
 
         assert dataset.spatial is None
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataPaginationTest(PytestOnlyDBTestCase):
+    """The record loop has to stop when the server says there is no next record.
+
+    The backend this one absorbs looped instead: it started at 0 and tested
+    `startposition <= matches`, so the `nextrecord = 0` of the last page put it
+    straight back at the first -- an infinite harvest, latent only because the
+    source never returned the shape that triggers it on a run anybody watched.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+
+    def _records(self, first, count=2):
+        # Two records per page, not the hundred the server would send: what is
+        # under test is which positions get requested, and every extra record
+        # is a dataset written to the database for nothing.
+        return [csw_record(remote_id=f"{{REC-{n:04d}}}") for n in range(first, first + count)]
+
+    def test_pagination_stops_when_nextrecord_is_zero(self, monkeypatch, rmock):
+        pages = [
+            (self._records(1), 101),
+            (self._records(101), 201),
+            (self._records(201), 0),
+        ]
+
+        catalogue = run_inner_harvest(monkeypatch, rmock, self._source(), pages, matches=250)
+
+        # The probe (`maxrecords=1`) plus exactly one request per page.
+        assert [call["startposition"] for call in catalogue.calls if call["maxrecords"] == 100] == [
+            1,
+            101,
+            201,
+        ]
+
+    def test_a_zero_nextrecord_on_the_first_page_does_not_loop(self, monkeypatch, rmock):
+        # The shape that made the old backend loop: the server announces many
+        # matches but stops after one page.
+        pages = [(self._records(1), 0)]
+
+        catalogue = run_inner_harvest(monkeypatch, rmock, self._source(), pages, matches=3936)
+
+        assert len([call for call in catalogue.calls if call["maxrecords"] == 100]) == 1
+
+    def test_a_stale_nextrecord_does_not_loop(self, monkeypatch, rmock):
+        # A server that keeps answering with a position at or behind the one
+        # already requested would otherwise be followed forever.
+        pages = [(self._records(1), 101), (self._records(101), 101)]
+
+        catalogue = run_inner_harvest(monkeypatch, rmock, self._source(), pages, matches=250)
+
+        assert [call["startposition"] for call in catalogue.calls if call["maxrecords"] == 100] == [
+            1,
+            101,
+        ]
