@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **fix(harvest): a harvest source whose validator was removed from the database no longer
+  takes the whole sources listing down**
+  - **One bad document answered for all of them.** Marshalling a source dereferences
+    `validation.by`; when that user is gone from the database mongoengine raises, uwsgi
+    answers 500 with an empty body, and nginx in front reports the empty 500 as a 502. The
+    listing carried every other source with it, so the harvesters backoffice came up empty
+    rather than missing one row.
+  - **Nothing on our side keeps that reference honest**, which is why tolerating it is the
+    fix rather than a patch over one. mongoengine refuses `reverse_delete_rule` on an
+    EmbeddedDocument field, the deletion path the application offers keeps the user
+    document instead of removing it, and there is no user purge — the reference only ever
+    goes dangling through a direct write to the database, where no hook of ours runs. The
+    field is now served as `null` and the error logged for Sentry, the same trade the
+    activity feed already makes.
+  - **A migration clears what is already stored**, in both places a source points at a
+    user. It has to be run in every environment, and for `owner` it is the *only* repair:
+    unlike `validation.by`, `owner` is dereferenced by the permission checks behind the
+    `url` and `config` attributes, long before any field could tolerate it, so a source
+    with a dangling owner keeps failing the request until the migration has run there.
+
 - **refactor(harvest)!: the APAmbiente harvester is merged into the generic CSW backend,
   which now reads the licence, the dates, the keywords and every link from the source**
   - **Two backends spoke CSW through owslib with the same code**, one a strict subset of
