@@ -16,11 +16,14 @@
     goes dangling through a direct write to the database, where no hook of ours runs. The
     field is now served as `null` and the error logged for Sentry, the same trade the
     activity feed already makes.
-  - **A migration clears what is already stored**, in both places a source points at a
-    user. It has to be run in every environment, and for `owner` it is the *only* repair:
-    unlike `validation.by`, `owner` is dereferenced by the permission checks behind the
-    `url` and `config` attributes, long before any field could tolerate it, so a source
-    with a dangling owner keeps failing the request until the migration has run there.
+  - **A migration clears what is already stored**, in all three places a source points at
+    something that can vanish: the validator, the owner and the producer organization. It
+    has to be run in every environment, and for `owner` and `organization` it is the
+    *only* repair — unlike `validation.by`, both are dereferenced by the permission checks
+    behind the `url` and `config` attributes, long before any field could tolerate them,
+    so a source pointing at a removed user or organization keeps failing the request until
+    the migration has run there. The organization was not part of the incident; it is in
+    because it fails identically, and was demonstrated to still take the listing down.
 
 - **refactor(harvest)!: the APAmbiente harvester is merged into the generic CSW backend,
   which now reads the licence, the dates, the keywords and every link from the source**
