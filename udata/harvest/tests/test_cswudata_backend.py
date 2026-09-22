@@ -73,6 +73,19 @@ class CswUdataResourceIdentityTest(PytestOnlyDBTestCase):
         assert resource_urls(REMOTE_ID) == [WMS_URL]
         assert resource_ids(REMOTE_ID) == [wms_id]
 
+    def test_url_change_upstream_replaces_the_resource(self):
+        # A different URL is a different resource: its id cannot be preserved,
+        # and the stale one must not linger. Moved here from the APAmbiente
+        # backend's own suite when the two CSW backends were merged.
+        source = self._source()
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([_file()]))
+
+        live = _payload([{"url": WMS_URL, "scheme": "ArcIMS:Metadata:Server"}])
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=live | {"type": "liveData"})
+
+        assert resource_urls(REMOTE_ID) == [WMS_URL]
+        assert [r.format for r in harvested_dataset(REMOTE_ID).resources] == ["wms"]
+
 
 @pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
 class CswUdataDefaultTagTest(PytestOnlyDBTestCase):
