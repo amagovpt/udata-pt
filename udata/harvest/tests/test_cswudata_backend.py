@@ -279,3 +279,67 @@ class CswUdataRecordLinksTest(PytestOnlyDBTestCase):
         run_inner_harvest(monkeypatch, rmock, self._source(), [([record], 0)], matches=1)
 
         assert resource_urls(REMOTE_ID) == [FILE_URL]
+
+
+ESRI_METADATA_SCHEME = "urn:x-esri:specification:ServiceType:ArcIMS:Metadata:Document"
+METADATA_URL = "https://geoportal.example.pt/geoportal/rest/document?id=%7BABC%7D"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataRemoteUrlTest(PytestOnlyDBTestCase):
+    def _source(self):
+        return HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+
+    def test_metadata_document_becomes_remote_url_not_a_resource(self):
+        source = self._source()
+        links = [{"url": METADATA_URL, "scheme": ESRI_METADATA_SCHEME}, _file()]
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload(links))
+
+        dataset = harvested_dataset(REMOTE_ID)
+        assert dataset.harvest.remote_url == METADATA_URL
+        # The metadata document describes the dataset; it is not one of its files.
+        assert resource_urls(REMOTE_ID) == [FILE_URL]
+
+    def test_html_protocol_still_becomes_remote_url(self):
+        source = self._source()
+        landing = {"url": METADATA_URL, "protocol": "WWW:LINK-1.0-http--link"}
+
+        harvest(CSWUdataBackend, source, REMOTE_ID, items=_payload([landing, _file()]))
+
+        assert harvested_dataset(REMOTE_ID).harvest.remote_url == METADATA_URL
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataDatesTest(PytestOnlyDBTestCase):
+    """The record's dates land on the harvest metadata, not on a read-only property."""
+
+    def _source(self):
+        return HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+
+    def _harvest(self, **dates):
+        payload = _payload([_file()]) | dates
+        harvest(CSWUdataBackend, self._source(), REMOTE_ID, items=payload)
+        return harvested_dataset(REMOTE_ID)
+
+    def test_created_and_modified_land_on_the_harvest_metadata(self):
+        # `Dataset.created_at` is a read-only property, so the assignment this
+        # replaced raised `AttributeError` and failed the whole item.
+        dataset = self._harvest(created="2019-03-04", modified="2024-11-20T10:15:00Z")
+
+        assert dataset.harvest.created_at.date().isoformat() == "2019-03-04"
+        assert dataset.harvest.modified_at.date().isoformat() == "2024-11-20"
+        # Both are what the public properties read back.
+        assert dataset.created_at.date().isoformat() == "2019-03-04"
+        assert dataset.last_modified.date().isoformat() == "2024-11-20"
+
+    def test_an_unreadable_date_does_not_fail_the_item(self):
+        dataset = self._harvest(created="não disponível", modified=None)
+
+        assert dataset.harvest.created_at is None
+        assert dataset.harvest.modified_at is None
+
+    def test_a_future_date_is_refused(self):
+        dataset = self._harvest(modified="2999-01-01")
+
+        assert dataset.harvest.modified_at is None

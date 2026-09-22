@@ -18,16 +18,17 @@ import logging
 import requests
 from owslib.csw import CatalogueServiceWeb
 
+from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.harvest.backends.base import BaseBackend, HarvestExtraConfig
 from udata.harvest.exceptions import HarvestException
 from udata.harvest.filters import (
     normalize_string,
     normalize_tag,
-    to_date,
 )
 from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
 from udata.models import License, SpatialCoverage
+from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
     build_resource_url,
@@ -48,6 +49,17 @@ def link_hint(res_data: dict) -> str:
     this backend already took.
     """
     return (res_data.get("protocol") or res_data.get("scheme") or "").lower()
+
+
+# The Esri Geoportal announces the record's own metadata document as a link,
+# alongside the data. It describes the dataset, so it belongs on `remote_url`;
+# published as a resource it looks like something to download and is not.
+METADATA_DOCUMENT_MARKER = "metadata:document"
+
+
+def is_metadata_link(hint: str) -> bool:
+    """Whether this link points at the record's metadata rather than its data."""
+    return METADATA_DOCUMENT_MARKER in hint
 
 
 def resource_format(hint: str, record_type: str | None, url: str) -> str:
@@ -228,30 +240,36 @@ class CSWUdataBackend(BaseBackend):
 
         dataset.description = normalize_string(data["description"])
 
-        # Process creation and modification dates
-        if data.get("created"):
-            dataset.extras["created_at"] = data.get("created")
-            try:
-                dataset.created_at = to_date(data["created"])
-            except (ValueError, TypeError) as e:
-                log.warning(f"Failed to parse created date for {item.remote_id}: {e}")
+        # `Dataset.created_at` is a read-only property -- it reads
+        # `harvest.issued_at or harvest.created_at or created_at_internal` -- so
+        # assigning it raised `AttributeError` for every record carrying a date,
+        # and the `except` below it caught neither. The harvest metadata is what
+        # the property reads, and what `rdf.py` writes.
+        if not dataset.harvest:
+            dataset.harvest = HarvestDatasetMetadata()
 
-        if data.get("modified"):
-            dataset.extras["modified_at"] = data.get("modified")
-            try:
-                dataset.last_modified_internal = to_date(data["modified"])
-            except (ValueError, TypeError) as e:
-                log.warning(f"Failed to parse modified date for {item.remote_id}: {e}")
+        created = safe_harvest_datetime(
+            data.get("created"), "CSW creation date", refuse_future=True
+        )
+        if created:
+            dataset.harvest.created_at = created
 
-        # Populate other extras
-        dataset.extras["dct_identifier"] = data.get("id")
-        dataset.extras["uri"] = data.get("id")
+        modified = safe_harvest_datetime(
+            data.get("modified"), "CSW modification date", refuse_future=True
+        )
+        if modified:
+            # What `Dataset.last_modified` reads for a harvested dataset.
+            dataset.harvest.modified_at = modified
 
-        # Try to find a remote_url
+        dataset.harvest.dct_identifier = data.get("id")
+        dataset.harvest.uri = data.get("id")
+
+        # The record's own page, when the catalogue announces one: a landing
+        # page, or the metadata document itself.
         for res_data in data.get("resources", []):
-            protocol = res_data.get("protocol", "").lower()
-            if "html" in protocol or "link" in protocol:
-                dataset.extras["remote_url"] = res_data.get("url")
+            hint = link_hint(res_data)
+            if "html" in hint or "link" in hint or is_metadata_link(hint):
+                dataset.harvest.remote_url = res_data.get("url")
                 break
 
         # Process spatial coverage
@@ -267,13 +285,16 @@ class CSWUdataBackend(BaseBackend):
             if not url:
                 continue
 
+            hint = link_hint(res_data)
+            if is_metadata_link(hint):
+                # It describes the dataset; it is not one of its files.
+                continue
+
             # Repair the separators and self-concatenated paths some catalogues
             # emit, before anything reads this URL: `sync_resources` matches
             # resources by URL, so repairing it afterwards would strand the id
             # of the resource already published (LEDG-2250, LEDG-2251).
             url = build_resource_url(url)
-
-            hint = link_hint(res_data)
             name = res_data.get("name", "")
 
             resources.append(
