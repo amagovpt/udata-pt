@@ -27,6 +27,7 @@ from flask_restx.fields import String as String
 from flask_restx.fields import StringMixin as StringMixin
 from flask_restx.fields import Url as Url
 from flask_restx.fields import Wildcard as Wildcard
+from mongoengine.errors import DoesNotExist
 
 from udata.utils import multi_to_dict
 
@@ -69,6 +70,35 @@ class Permission(Boolean):
 
     def format(self, field):
         return field.can()
+
+
+class TolerantNested(Nested):
+    """A `Nested` that serves a dangling reference as null instead of failing.
+
+    A `ReferenceField` whose target was removed from the database raises
+    `DoesNotExist` the moment it is dereferenced, and marshalling dereferences
+    it: one such document takes down the whole response — the listing it
+    belongs to, not just its own entry — with a 500 carrying no body, which a
+    proxy in front reports as a 502.
+
+    It has to override `output` rather than `format`: `Nested.output` resolves
+    the value through `get_value` -> `getattr`, whose `default` only swallows
+    `AttributeError`, so the `DoesNotExist` raised by mongoengine's lazy
+    dereference escapes before `format` is ever reached.
+
+    Same trade as `udata.core.activity.api`, which filters dangling references
+    out of the activity feed: answer with what is readable and log the rest for
+    Sentry, rather than fail whole. The difference is granularity — there the
+    item is dropped, here only the field is nulled, because the document around
+    it is intact and has to stay in the listing.
+    """
+
+    def output(self, key, obj, **kwargs):
+        try:
+            return super(TolerantNested, self).output(key, obj, **kwargs)
+        except DoesNotExist as e:
+            log.error(e, exc_info=True)
+            return None
 
 
 class NextPageUrl(String):
