@@ -40,7 +40,7 @@
     stops being a resource, so wherever one was published its download permalink
     (`/api/1/datasets/r/<id>`) stops resolving; and a link whose path the catalogue had
     duplicated is republished repaired, which is a new resource with a new id -- the old
-    permalink was returning 404 anyway, which is what LEDG-2250 was about. Every other
+    permalink was returning 404 anyway, which is the defect that repair exists for. Every other
     resource keeps its id, because they are still reconciled by URL.
   - **Operationally:** the `apambiente` backend no longer exists and a migration rewrites
     its sources onto `cswudata`, keeping each source's id so its schedule is untouched.
