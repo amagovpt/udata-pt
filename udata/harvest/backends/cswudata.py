@@ -33,6 +33,7 @@ from udata.utils import safe_harvest_datetime
 from .tools.harvester_utils import (
     build_resource_url,
     guess_url_format,
+    settle_harvested_license,
     sync_resources,
     with_http_retry,
 )
@@ -197,6 +198,8 @@ class CSWUdataBackend(BaseBackend):
                     "type": getattr(record, "type", None),
                     "created": getattr(record, "created", None),
                     "modified": getattr(record, "modified", None),
+                    # A list: owslib appends one entry per `dc:rights` element.
+                    "rights": getattr(record, "rights", None) or [],
                 }
 
                 self.process_dataset(data["id"], items=data)
@@ -228,7 +231,7 @@ class CSWUdataBackend(BaseBackend):
 
         # Set basic dataset fields
         dataset.title = normalize_string(data["title"])
-        dataset.license = License.guess("cc-by")
+        dataset.license = self._license_for(dataset, item, data)
 
         # Process tags - the producer tag from the source, then the record's own
         tags = [normalize_tag(self._default_tag())]
@@ -314,6 +317,35 @@ class CSWUdataBackend(BaseBackend):
         )
 
         return dataset
+
+    def _license_for(self, dataset, item: HarvestItem, data: dict):
+        """The licence the source grants, or the portal default.
+
+        This backend used to stamp `cc-by` on every record it collected, which
+        published a licence the catalogues do not grant -- the same complaint
+        that was raised against the DGT harvester. `dc:rights` is read instead,
+        and a record that declares nothing gets `notspecified`.
+
+        Note that `License.guess` falls back to a Damerau-Levenshtein match over
+        every licence slug and title, so a `dc:rights` that is free prose can
+        still resolve to a near neighbour. That risk is accepted here because
+        the field is short and usually a URL, and it stays revocable: the next
+        harvest overwrites whatever this derived.
+        """
+        rights = [
+            text for text in data.get("rights") or [] if isinstance(text, str) and text.strip()
+        ]
+        resolved = License.guess(*rights) if rights else None
+        if rights and resolved is None:
+            # Visible on purpose: a licence the portal cannot name is a record
+            # that will read as `notspecified` until somebody adds it.
+            log.warning(
+                "CSW record %r declares rights %r, which resolve to no known licence",
+                item.remote_id,
+                rights,
+            )
+
+        return settle_harvested_license(dataset, resolved)
 
     def _process_spatial(self, dataset, data):
         """

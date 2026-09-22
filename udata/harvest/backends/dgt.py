@@ -9,11 +9,13 @@ from udata.models import License
 from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
+    DERIVED_LICENSE_EXTRA,  # noqa: F401  -- re-exported: the tests import it from here
     OGC_SERVICE_FORMATS,
     bbox_to_multipolygon,
     guess_url_format,
     map_iso_maintenance_frequency,
     reset_maintenance_frequency_warnings,
+    settle_harvested_license,
     sync_resources,
 )
 
@@ -167,11 +169,6 @@ def format_from_link(protocol: str | None, mimetype: str | None, url: str) -> st
     guessed = guess_url_format(url, fallback=DEFAULT_FORMAT)
     return guessed if FORMAT_RE.match(guessed) else DEFAULT_FORMAT
 
-
-# The licence THIS backend last wrote. Without it, a licence the harvester
-# derived and one a producer corrected by hand are the same value in the
-# database, and the fallback below cannot tell them apart.
-DERIVED_LICENSE_EXTRA = "harvest:derived_license"
 
 CC_CODE_TO_LICENSE_ID = {
     "by": "cc-by",
@@ -631,17 +628,9 @@ class DGTBackend(BaseBackend):
     def _license_for(self, dataset, item: HarvestItem, data: dict):
         """The licence the source grants, falling back the way CKAN does.
 
-        Source first, then a correction a producer made by hand, then the
-        portal default. It never falls back to `cc-by` -- that constant was the
-        bug, and `notspecified` is what the portal says when it does not know.
-
-        The middle step is the delicate one. Keeping whatever the dataset
-        already carries is what lets a producer's correction survive a harvest,
-        but applied blindly it also makes the licence irrevocable: a source that
-        stops granting CC BY would never take it back, because the value we
-        wrote ourselves last night is indistinguishable from an editorial
-        decision. So what this backend derived is recorded, and only a licence
-        that differs from it is treated as somebody's correction.
+        Only the first step is specific to DGT: reading the licence out of the
+        record's `legalConstraints`. What happens when the source grants nothing
+        is shared with the other harvesters, in `settle_harvested_license`.
         """
         license_id = license_id_from_legal_constraints(data.get("legal_constraints") or [])
         resolved = License.objects(id=license_id).first() if license_id else None
@@ -655,20 +644,4 @@ class DGTBackend(BaseBackend):
                 license_id,
             )
 
-        if resolved is not None:
-            dataset.extras[DERIVED_LICENSE_EXTRA] = resolved.id
-            return resolved
-
-        # The source grants nothing. Anything on the dataset that is not what
-        # we last wrote is a correction, and stays.
-        current = dataset.license
-        if current is not None and current.id != dataset.extras.get(DERIVED_LICENSE_EXTRA):
-            dataset.extras.pop(DERIVED_LICENSE_EXTRA, None)
-            return current
-
-        # `default` has to be a document: Dataset.license is a ReferenceField
-        # and a raw string raises (LEDG-2315).
-        default = License.default()
-        if default is not None:
-            dataset.extras[DERIVED_LICENSE_EXTRA] = default.id
-        return default
+        return settle_harvested_license(dataset, resolved)

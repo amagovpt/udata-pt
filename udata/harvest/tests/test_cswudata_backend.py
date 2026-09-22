@@ -4,9 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from udata.core.dataset.factories import LicenseFactory
+from udata.models import License
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.cswudata import CSWUdataBackend, resource_format
+from ..backends.tools.harvester_utils import DERIVED_LICENSE_EXTRA
 from .factories import HarvestSourceFactory
 from .id_stability import harvest, harvested_dataset, resource_ids, resource_urls
 
@@ -343,3 +346,79 @@ class CswUdataDatesTest(PytestOnlyDBTestCase):
         dataset = self._harvest(modified="2999-01-01")
 
         assert dataset.harvest.modified_at is None
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["cswudata"])
+class CswUdataLicenseTest(PytestOnlyDBTestCase):
+    """The licence comes from `dc:rights`, never from a constant.
+
+    This backend used to stamp `cc-by` on every record, publishing a licence the
+    catalogues do not grant -- the complaint that was raised against the DGT
+    harvester, on a larger population (LEDG-2518, LEDG-2492).
+    """
+
+    def _licenses(self):
+        # The test database carries no licences, and LicenseFactory would give
+        # each one a random id, so the ones under test are seeded by id.
+        LicenseFactory(id="notspecified", title="License Not Specified")
+        LicenseFactory(
+            id="cc-by",
+            title="Creative Commons Attribution 4.0 - CC BY 4.0",
+            url="https://creativecommons.org/licenses/by/4.0/",
+        )
+        LicenseFactory(id="odbl", title="Open Data Commons Open Database License")
+
+    def _harvest(self, rights=None, remote_id=REMOTE_ID):
+        source = HarvestSourceFactory(backend="cswudata", url=CSW_URL)
+        payload = _payload([_file()]) | {"rights": rights or []}
+        harvest(CSWUdataBackend, source, remote_id, items=payload)
+        return harvested_dataset(remote_id)
+
+    def test_rights_naming_a_license_resolve_it(self):
+        self._licenses()
+
+        dataset = self._harvest(rights=["https://creativecommons.org/licenses/by/4.0/"])
+
+        assert dataset.license.id == "cc-by"
+        assert dataset.extras[DERIVED_LICENSE_EXTRA] == "cc-by"
+
+    def test_no_rights_is_notspecified(self):
+        self._licenses()
+
+        dataset = self._harvest()
+
+        assert dataset.license.id == "notspecified"
+        assert dataset.extras[DERIVED_LICENSE_EXTRA] == "notspecified"
+
+    def test_unresolvable_rights_fall_back_to_the_default(self):
+        self._licenses()
+
+        dataset = self._harvest(rights=["Consultar o produtor"])
+
+        assert dataset.license.id == "notspecified"
+
+    def test_manual_license_survives_a_source_without_rights(self):
+        self._licenses()
+        dataset = self._harvest()
+        # A producer corrects it by hand, which clears the derived marker.
+        # Deliberately not `cc-by`: that was the value the harvester itself used
+        # to stamp, so a test using it would pass against the bug as well.
+        dataset.license = License.objects(id="odbl").first()
+        dataset.extras.pop(DERIVED_LICENSE_EXTRA, None)
+        dataset.save()
+
+        again = self._harvest()
+
+        assert again.license.id == "odbl"
+
+    def test_the_harvesters_own_license_is_revocable(self):
+        # The guard that makes the correction above survive must not also make
+        # the harvester's own value permanent: a source that stops granting a
+        # licence has to be able to take it back.
+        self._licenses()
+        first = self._harvest(rights=["https://creativecommons.org/licenses/by/4.0/"])
+        assert first.license.id == "cc-by"
+
+        again = self._harvest()
+
+        assert again.license.id == "notspecified"
