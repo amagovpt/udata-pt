@@ -36,10 +36,20 @@
   - **The metadata document is no longer a resource.** The Esri Geoportal announces the
     record's own metadata page alongside the data; it describes the dataset, so it becomes
     the remote URL rather than something the visitor is invited to download.
+  - **Two resource changes are visible and irreversible.** A record's metadata document
+    stops being a resource, so wherever one was published its download permalink
+    (`/api/1/datasets/r/<id>`) stops resolving; and a link whose path the catalogue had
+    duplicated is republished repaired, which is a new resource with a new id -- the old
+    permalink was returning 404 anyway, which is what LEDG-2250 was about. Every other
+    resource keeps its id, because they are still reconciled by URL.
   - **Operationally:** the `apambiente` backend no longer exists and a migration rewrites
     its sources onto `cswudata`, keeping each source's id so its schedule is untouched.
-    Run the migrations, then **restart the Celery worker and beat** -- the worker holds the
-    backend entry points in memory and would otherwise look for one that is gone. On the
+    **Reinstall the package rather than only restarting it:** the harvester backends are
+    loaded from entry points recorded at install time, and every one of them is imported
+    together, so a stale `apambiente` entry pointing at a deleted module breaks the whole
+    backend registry -- every harvest and the admin's source screen with it. Then run the
+    migrations and **restart the Celery worker and beat**, which hold those entry points in
+    memory. On the
     first harvest after the deploy the datasets' recorded backend name changes from
     "Harvester Portal do Ambiente" to "CSW Harvester", and their displayed creation date
     becomes the one the source publishes.
