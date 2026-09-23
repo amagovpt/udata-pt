@@ -1,7 +1,10 @@
 import logging
 import re
 
-from udata.core.contact_point.models import check_is_email, check_no_urls
+from email_validator import EmailNotValidError, validate_email
+from flask import current_app
+
+from udata.core.contact_point.models import check_no_urls
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
@@ -492,10 +495,21 @@ class DGTBackend(BaseBackend):
             check_no_urls(name, "name")
         except FieldValidationError:
             return None
-        try:
-            check_is_email(email, "email")
-        except FieldValidationError:
-            email = None
+        if email:
+            # Shape only, never deliverability, as `saml_govpt` does:
+            # email_validator defaults `check_deliverability` to True and
+            # `SECURITY_EMAIL_VALIDATOR_ARGS` is only set in `settings.Testing`,
+            # so the model's own check would run a live MX lookup per record --
+            # and a resolver blip would drop the email on one run and bring it
+            # back on the next, minting a second contact point.
+            validator_args = {
+                "check_deliverability": False,
+                **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS") or {}),
+            }
+            try:
+                validate_email(email, **validator_args)
+            except EmailNotValidError:
+                email = None
         # `ContactPoint.name` and `email` are both bounded at 255.
         return {"name": name[:255], "email": email[:255] if email else None}
 

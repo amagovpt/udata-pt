@@ -9,6 +9,7 @@ from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import requests
+from mongoengine.errors import ValidationError
 
 from udata.core.contact_point.models import ContactPoint
 from udata.core.dataset.constants import UpdateFrequency
@@ -303,9 +304,21 @@ def attach_publisher_contact(backend, dataset, name: str | None, email: str | No
         except ContactPoint.DoesNotExist:
             contact = None
     else:
-        contact, _ = ContactPoint.objects.get_or_create(
-            name=name, email=email, role="publisher", **org_or_owner
-        )
+        try:
+            contact, _ = ContactPoint.objects.get_or_create(
+                name=name, email=email, role="publisher", **org_or_owner
+            )
+        except ValidationError as error:
+            # The model validates on creation -- a URL in the name, a name over 255
+            # characters, and outside `settings.Testing` a live deliverability check
+            # of the email. A contact it refuses costs the contact, not the item.
+            log.warning(
+                "Publisher contact point %r <%r> refused: %s",
+                repr(name)[:200],
+                repr(email)[:200],
+                error,
+            )
+            return
 
     if contact:
         if not dataset.contact_points:

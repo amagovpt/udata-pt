@@ -6,6 +6,7 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from mongoengine.errors import ValidationError
 
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import LicenseFactory
@@ -1212,6 +1213,20 @@ class DGTContactPointTest(PytestOnlyDBTestCase):
         self._harvest(rmock, responsibleParty=[f"Contacto|resource|{IPMA}||não-é-email||||"])
         (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
         assert contact.email is None
+
+    @pytest.mark.options(SECURITY_EMAIL_VALIDATOR_ARGS=None)
+    def test_the_email_is_checked_for_shape_only(self, rmock, mocker):
+        """No MX lookup per record: `SECURITY_EMAIL_VALIDATOR_ARGS` is unset outside Testing."""
+        spy = mocker.patch("udata.harvest.backends.dgt.validate_email")
+        self._harvest(rmock)
+        assert spy.call_args.kwargs["check_deliverability"] is False
+
+    def test_a_contact_point_the_model_refuses_does_not_fail_the_item(self, rmock, mocker):
+        mocker.patch.object(
+            ContactPoint.objects.__class__, "get_or_create", side_effect=ValidationError("nope")
+        )
+        self._harvest(rmock)
+        assert harvested_dataset(SNIG_REMOTE_ID).contact_points == []
 
     def test_a_preview_creates_no_contact_point(self, rmock):
         job = self._harvest(rmock, dryrun=True)
