@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import date
 
 import pytest
 
@@ -580,3 +581,57 @@ class OGCLicenseTest(PytestOnlyDBTestCase):
     def test_no_license_anywhere_is_notspecified(self, rmock):
         dataset = self._harvest(rmock, _item("a", "Rede", []))
         assert dataset.license.id == "notspecified"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCTemporalCoverageTest(PytestOnlyDBTestCase):
+    """`temporalCoverage` becomes the dataset's `DateRange` when it names dates."""
+
+    def _harvest(self, rmock, temporal):
+        item = _tml_item()
+        if temporal is None:
+            item.pop("temporalCoverage")
+        else:
+            item["temporalCoverage"] = temporal
+        rmock.get(OGC_URL, text=_ogc_payload([item]))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_none_slash_none_yields_no_coverage(self, rmock):
+        # What every recorded TML collection publishes.
+        assert _tml_item()["temporalCoverage"] == "None/None"
+        dataset = self._harvest(rmock, "None/None")
+        assert dataset.temporal_coverage is None
+        assert "temporal_coverage" not in dataset.extras
+
+    def test_an_iso_interval_becomes_a_date_range(self, rmock):
+        dataset = self._harvest(rmock, "2020-01-01/2021-12-31")
+        assert dataset.temporal_coverage.start == date(2020, 1, 1)
+        assert dataset.temporal_coverage.end == date(2021, 12, 31)
+
+    @pytest.mark.parametrize("temporal", ["2020-01-01/..", "2020-01-01/None"])
+    def test_an_open_end_keeps_the_start(self, rmock, temporal):
+        dataset = self._harvest(rmock, temporal)
+        assert dataset.temporal_coverage.start == date(2020, 1, 1)
+        assert dataset.temporal_coverage.end is None
+
+    def test_a_single_year_covers_the_year(self, rmock):
+        dataset = self._harvest(rmock, "2020")
+        assert dataset.temporal_coverage.start == date(2020, 1, 1)
+        assert dataset.temporal_coverage.end == date(2020, 12, 31)
+
+    @pytest.mark.parametrize("temporal", ["janeiro a março", "2020-13-45/2021-01-01", None])
+    def test_unreadable_text_does_not_fail_the_item(self, rmock, temporal):
+        dataset = self._harvest(rmock, temporal)
+        assert dataset.temporal_coverage is None
+
+    def test_the_raw_extra_left_by_earlier_harvests_is_removed(self, rmock):
+        dataset = self._harvest(rmock, "None/None")
+        dataset.extras["temporal_coverage"] = "None/None"
+        dataset.save()
+        dataset = self._harvest(rmock, "None/None")
+        assert "temporal_coverage" not in dataset.extras

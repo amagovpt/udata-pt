@@ -1,9 +1,13 @@
 import logging
 
+from dateutil.parser import parse as parse_dt
+
+from udata.core.dataset.rdf import temporal_from_literal
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
 from udata.models import License
+from udata.mongo.datetime_fields import DateRange
 
 from .tools.harvester_utils import (
     attach_publisher_contact,
@@ -24,6 +28,11 @@ SCHEMA_DISTRIBUTION_LABEL = "Schema of collection in JSON"
 # upper-cased format name: `GeoJSON` and `JSON-LD`. The guess itself is shared
 # (`guess_format_from_mime`), so only the spelling is kept here.
 FORMAT_LABELS = {"geojson": "GeoJSON", "jsonld": "JSON-LD"}
+
+# How an interval says it has no start or no end. `..` is what OGC API -
+# Common writes for an open bound; `None` is what the TML source writes, as the
+# Python repr of a missing value.
+OPEN_INTERVAL_BOUNDS = frozenset({"", "..", "none", "null"})
 
 
 class OGCBackend(BaseBackend):
@@ -231,10 +240,15 @@ class OGCBackend(BaseBackend):
             # Fallback if guess failed or no license provided
             dataset.license = License.guess("notspecified")
 
-        # Temporal Coverage
-        temporal = item_data.get("temporal_coverage")
-        if temporal:
-            dataset.extras["temporal_coverage"] = temporal
+        # Only set when it parses, so a coverage entered by hand is not
+        # replaced with nothing by a source that publishes none.
+        coverage = self._temporal_coverage(item_data.get("temporal_coverage"))
+        if coverage:
+            dataset.temporal_coverage = coverage
+        # The raw text used to be kept here instead. `get_dataset` reuses the
+        # stored extras, so without the `pop` every TML dataset already
+        # harvested would keep its `"None/None"`; nothing reads the key.
+        dataset.extras.pop("temporal_coverage", None)
 
         # Provider/Publisher
         provider = item_data.get("provider")
@@ -246,6 +260,38 @@ class OGCBackend(BaseBackend):
             attach_publisher_contact(self, dataset, provider.get("name"), email)
 
         return dataset
+
+    @staticmethod
+    def _temporal_coverage(text) -> DateRange | None:
+        """The collection's `temporalCoverage`, or `None` when it names no dates.
+
+        schema.org writes it as an ISO 8601 interval, `start/end`. Either bound
+        may be open, and the TML source writes both open as `None/None` on
+        every collection, which is no coverage at all. Anything else --
+        a single year or month -- goes through `temporal_from_literal`, the
+        parser the DCAT path uses.
+
+        Never raises: a coverage that does not parse must not fail the item.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+        text = text.strip()
+        try:
+            if text.count("/") == 1:
+                start, end = (
+                    None if bound.strip().casefold() in OPEN_INTERVAL_BOUNDS else bound.strip()
+                    for bound in text.split("/")
+                )
+                if not (start or end):
+                    return None
+                return DateRange(
+                    start=parse_dt(start).date() if start else None,
+                    end=parse_dt(end).date() if end else None,
+                )
+            return temporal_from_literal(text)
+        except (ValueError, OverflowError):
+            log.warning("OGC: unreadable temporalCoverage %r", text[:200])
+            return None
 
     def _distribution_label(self, dist: dict) -> str:
         """The human label a distribution carries, as the resource title reads it.
