@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **feat(harvest): the `dgt`, `ogc` and `odspt` harvesters read what their sources publish
+  instead of constants**
+  - **The TML datasets no longer carry the DGT's tag.** `ogc` tagged every dataset
+    `ogcapi.dgterritorio.gov.pt`, whatever the source, and the one OGC source configured is
+    `geoportal.tmlmobilidade.pt`. `ogc` and `dgt` now tag with the source's own hostname, as
+    `cswudata` and `ckanpt` already did. The tag list is rebuilt on every harvest, so the wrong
+    tag goes on the first run after deploy, with no migration. For the SNIG source the tag does
+    not change: its hostname is the one the constant named.
+  - **The public listing sorts DGT and ODS datasets by the source's dates.** The listing sorts
+    on `created_at_internal`, and neither backend wrote it, so every harvested dataset sorted
+    by the day it was first harvested. DGT now writes the publication date there (the
+    reference date when there is none) and ODS writes `dcat.issued`, else `dcat.created`,
+    which is the precedence `Dataset.created_at` already shows. The order of the listing
+    changes for those datasets on the first harvest. DGT also reads `changeDate` into
+    `harvest.modified_at` and `last_modified_internal`, and ODS records `dcat.created` and
+    `dcat.issued` on the harvest metadata.
+  - **ODS datasets get a real frequency.** They were all harvested as `unknown`, although the
+    SNS source publishes `dcat.accrualperiodicity` on 143 of its 144 datasets. The value goes
+    through the Portuguese periodicity map the INE harvesters use, which gains the spellings
+    this source uses (`Diária`, `Quinzenal`, `Quadrimestral`, `annual`, `monthly`) without
+    changing any value INE already maps. A combination such as `Anual | Mensal` resolves to the
+    most frequent of its parts, and a qualifier in parentheses is ignored. That parsing stays
+    in `odspt`, so the shared map still matches exactly.
+  - **Spatial coverage for OGC and ODS**, from the schema.org `GeoShape` box and from
+    `metas.bbox`, through one shared `bbox_to_spatial_coverage` helper that DGT now uses too.
+    The TML box is read `lon,lat`, the order that source writes, although schema.org
+    specifies `lat,lon`.
+  - **DGT datasets get a publisher contact point** from `responsibleParty`: the entry for the
+    resource first, then the one for the metadata, then `orgNameSNIG` with a name only. The
+    contact point code moves out of `ogc.py` into `attach_publisher_contact`, so both
+    backends share the `dryrun` handling. Address and phone are not kept, since
+    `ContactPoint` has no field for them. A name or email the model would refuse is dropped
+    rather than failing the item.
+  - **OGC**: a collection with no licence of its own takes the catalogue's before falling back
+    to `notspecified`. `temporalCoverage` becomes the dataset's temporal coverage when it names
+    dates. The raw `temporal_coverage` extra, which held `None/None` on every TML dataset, is
+    removed. The collection's `url` becomes `harvest.remote_url` once it validates.
+  - **ODS**: `dcat.creator`, `dcat.contributor` and `dcat.spatial` reach the extras
+    (`ods:creator`, `ods:contributor`, `ods:spatial`), sanitized. `dcat.temporal` is free prose
+    and is not parsed. The French `LICENSES` map is gone: `metas.license` is empty on every
+    SNS dataset, so the default licence was already what stood.
+  - The tests run on one record of each source, recorded verbatim (`dgt/snig_record.json`,
+    `odspt/sns_dataset.json`, and the existing `ogc/tml_collection.jsonld`).
+  - ⚠️ **Restart the Celery `worker` and `beat` after deploying**, or the scheduled harvests
+    keep running the old in-memory code. There is no migration: every field above is written
+    on the next harvest of each source.
+
 - **chore(harvest): the harvester configuration no longer offers backends this portal does not
   run, and the guesses the backends had each written for themselves are now shared**
   - **`maaf` is no longer enabled.** It harvests the French agriculture ministry -- an `fr-lo`
