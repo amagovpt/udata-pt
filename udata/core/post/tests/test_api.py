@@ -74,7 +74,11 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.post(url_for("api.posts"), data)
         assert201(response)
-        assert Post.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        assert len(list(Post.objects)) == 1
         post = Post.objects.first()
         for dataset, expected in zip(post.datasets, data["datasets"]):
             assert str(dataset.id) == expected
@@ -89,7 +93,7 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.put(url_for("api.post", post=post), data)
         assert200(response)
-        assert Post.objects.count() == 1
+        assert len(list(Post.objects)) == 1
         assert Post.objects.first().content == "new content"
 
     def test_post_api_update_with_related_dataset_and_reuse(self):
@@ -119,7 +123,8 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.delete(url_for("api.post", post=post))
         assert204(response)
-        assert Post.objects.count() == 0
+        assert Post.objects(id=post.id).count() == 0
+        assert len(list(Post.objects)) == 0
 
     def test_post_api_publish(self):
         """It should update a post from the API"""
@@ -127,7 +132,7 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.post(url_for("api.publish_post", post=post))
         assert200(response)
-        assert Post.objects.count() == 1
+        assert len(list(Post.objects)) == 1
 
         post.reload()
         assert post.published is not None
@@ -138,7 +143,7 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.delete(url_for("api.publish_post", post=post))
         assert200(response)
-        assert Post.objects.count() == 1
+        assert len(list(Post.objects)) == 1
 
         post.reload()
         assert post.published is None
@@ -152,7 +157,7 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.post(url_for("api.posts"), data)
         assert201(response)
-        assert Post.objects.count() == 1
+        assert len(list(Post.objects)) == 1
         post = Post.objects.first()
         assert post.credit_url is None
 
@@ -177,7 +182,7 @@ class PostsAPITest(APITestCase):
         self.login(AdminFactory())
         response = self.post(url_for("api.posts"), data)
         assert201(response)
-        assert Post.objects.count() == 1
+        assert len(list(Post.objects)) == 1
         post = Post.objects.first()
         assert post.body_type == "blocs"
         assert post.content_as_page.id == page.id

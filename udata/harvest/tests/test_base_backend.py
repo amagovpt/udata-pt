@@ -11,6 +11,8 @@ from udata.core.dataservices.models import HarvestMetadata as HarvestDataservice
 from udata.core.dataset import tasks
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.dataset.models import HarvestDatasetMetadata
+from udata.core.organization.factories import OrganizationFactory
+from udata.core.user.factories import UserFactory
 from udata.harvest.models import HarvestItem
 from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
@@ -126,7 +128,11 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         after = datetime.now(UTC)
 
         assert len(job.items) == nb_datasets
-        assert Dataset.objects.count() == nb_datasets
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a harvest that created too many or too
+        # few documents could go unnoticed.
+        assert len(list(Dataset.objects)) == nb_datasets
         before_naive = before.replace(tzinfo=None)
         after_naive = after.replace(tzinfo=None)
         for dataset in Dataset.objects():
@@ -342,8 +348,8 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         # all datasets except arch : 3 mocks + 1 manual (no_arch)
         assert len(job.items) == (nb_datasets + 1) + (nb_dataservices + 1)
         # all datasets : 3 mocks + 2 manuals (arch and no_arch)
-        assert Dataset.objects.count() == nb_datasets + 2
-        assert Dataservice.objects.count() == nb_dataservices + 2
+        assert len(list(Dataset.objects)) == nb_datasets + 2
+        assert len(list(Dataservice.objects)) == nb_dataservices + 2
 
         archived_items = [i for i in job.items if i.status == "archived"]
         assert len(archived_items) == 2
@@ -464,7 +470,7 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         # 3 (nb_datasets) + 1 (dataset_remote_ids) created by the HarvestSourceFactory
         assert len(job.items) == nb_datasets + 1
         # all datasets : 4 mocks (3 nb_datasets + 1 dataset_remote_ids) + 3 created with DatasetFactory - 2 reused
-        assert Dataset.objects.count() == nb_datasets + 1 + 3 - 2
+        assert len(list(Dataset.objects)) == nb_datasets + 1 + 3 - 2
         assert (
             # and not 3, data_reused was not duplicated
             Dataset.objects(harvest__remote_id="fake-0").count() == 2
@@ -505,8 +511,8 @@ class BaseBackendTest(PytestOnlyDBTestCase):
 
         assert job.status == "done-errors"
         assert len(job.items) == len(dataset_remote_ids) + len(dataservice_remote_ids)
-        assert Dataset.objects.count() == len(set(dataset_remote_ids))
-        assert Dataservice.objects.count() == len(set(dataservice_remote_ids))
+        assert len(list(Dataset.objects)) == len(set(dataset_remote_ids))
+        assert len(list(Dataservice.objects)) == len(set(dataservice_remote_ids))
         seen = set()
         for job in job.items:
             if job.remote_id not in seen:
@@ -515,6 +521,157 @@ class BaseBackendTest(PytestOnlyDBTestCase):
             else:
                 assert job.status == "failed"
                 assert job.remote_id in job.errors[0].message
+
+    @pytest.mark.options(CDATA_BASE_URL="http://localhost")
+    @pytest.mark.parametrize(
+        "owner_param, owner_factory",
+        [("organization", OrganizationFactory), ("owner", UserFactory)],
+    )
+    def test_unique_ownership_same_uri_remote_id(self, owner_param, owner_factory):
+        backend1 = FakeBackend(
+            HarvestSourceFactory(
+                url="https://data.example.com/catalog",
+                config={
+                    "dataset_remote_ids": [
+                        "https://data.example.com/catalog/dataset-repeat",
+                        "https://data.example.com/catalog/dataset-unique",
+                    ],
+                    # dataservices don't check on uri remote_id (bug?)
+                },
+                **{owner_param: owner_factory()},
+            )
+        )
+        job1 = backend1.harvest()
+        assert job1.status == "done"
+        assert len(job1.items) == 2
+
+        backend2 = FakeBackend(
+            HarvestSourceFactory(
+                url="https://other.example.com/catalog",
+                config={
+                    "dataset_remote_ids": [
+                        "https://data.example.com/catalog/dataset-repeat",
+                        "https://other.example.com/catalog/dataset-unique",
+                    ],
+                },
+                **{owner_param: owner_factory()},
+            )
+        )
+        job2 = backend2.harvest()
+        assert job2.status == "done-errors"
+        assert len(job2.items) == 2
+        for item in job2.items:
+            if not item.remote_id.endswith("-repeat"):
+                assert item.status == "done"
+            else:
+                assert item.status == "failed"
+                assert getattr(backend1.source, owner_param).page() in item.errors[0].message
+
+    @pytest.mark.options(CDATA_BASE_URL="http://localhost")
+    @pytest.mark.parametrize(
+        "owner_param, owner_factory",
+        [("organization", OrganizationFactory), ("owner", UserFactory)],
+    )
+    def test_unique_ownership_same_domain(self, owner_param, owner_factory):
+        backend1 = FakeBackend(
+            HarvestSourceFactory(
+                url="https://data.example.com/catalog",
+                config={
+                    "dataset_remote_ids": ["dataset-repeat", "dataset-unique-1"],
+                    "dataservice_remote_ids": ["dataservice-repeat", "dataservice-unique-1"],
+                },
+                **{owner_param: owner_factory()},
+            )
+        )
+        job1 = backend1.harvest()
+        assert job1.status == "done"
+        assert len(job1.items) == 4
+
+        backend2 = FakeBackend(
+            HarvestSourceFactory(
+                url="https://data.example.com/other-catalog",  # same domain as backend1
+                config={
+                    "dataset_remote_ids": ["dataset-repeat", "dataset-unique-2"],
+                    "dataservice_remote_ids": ["dataservice-repeat", "dataservice-unique-2"],
+                },
+                **{owner_param: owner_factory()},
+            )
+        )
+        job2 = backend2.harvest()
+        assert job2.status == "done-errors"
+        assert len(job2.items) == 4
+        for item in job2.items:
+            if not item.remote_id.endswith("-repeat"):
+                assert item.status == "done"
+            else:
+                assert item.status == "failed"
+                assert getattr(backend1.source, owner_param).page() in item.errors[0].message
+
+    @pytest.mark.options(CDATA_BASE_URL="http://localhost")
+    def test_unique_ownership_allows_the_source_to_reharvest_what_it_reowned(self):
+        """A source must keep updating its own records after re-owning them.
+
+        `ckanpt` and `odspt` map each remote publisher onto a local organization
+        and assign it to the dataset, so a harvested record routinely ends up
+        owned by someone other than its own source.
+        """
+        publisher = OrganizationFactory()
+
+        class ReowningBackend(FakeBackend):
+            def inner_process_dataset(self, item):
+                dataset = super().inner_process_dataset(item)
+                dataset.organization = publisher
+                return dataset
+
+        source = HarvestSourceFactory(
+            url="https://data.example.com/catalog",
+            config={"dataset_remote_ids": ["dataset-1", "dataset-2"]},
+            organization=OrganizationFactory(),
+        )
+
+        job1 = ReowningBackend(source).harvest()
+        assert job1.status == "done"
+        assert len(list(Dataset.objects)) == 2
+        assert Dataset.objects.first().organization == publisher
+
+        job2 = ReowningBackend(source).harvest()
+        assert job2.status == "done", [
+            error.message for item in job2.items for error in item.errors
+        ]
+        assert all(item.status == "done" for item in job2.items)
+        assert len(list(Dataset.objects)) == 2
+
+    def test_harvest_error_message_has_no_url_credentials(self):
+        """A failed harvest must not persist the source URL password.
+
+        `URLS_ALLOW_CREDENTIALS` lets a source URL carry `user:password@`, and
+        the text of a `requests` exception embeds the URL of the request that
+        failed. The harvest job is readable without a session, so that
+        password used to be served to anonymous callers (LEDG-2477).
+
+        The exception raised here is the one from the ticket's proof of
+        concept -- an `HTTPError` out of `raise_for_status()`, which lands in
+        the generic `except` of `harvest()`, not in the connection-error
+        branch that `test_dcat_backend` already covers.
+        """
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+
+        class FailingBackend(FakeBackend):
+            def inner_harvest(self):
+                raise requests.exceptions.HTTPError(f"500 Server Error: None for url: {url}")
+
+        source = HarvestSourceFactory(url=url, organization=OrganizationFactory())
+
+        job = FailingBackend(source).harvest()
+        job.reload()
+
+        assert job.status == "failed"
+        assert len(job.errors) == 1
+        error = job.errors[0]
+        assert "sup3rs3cr3t" not in error.message
+        assert "harvestuser" not in error.message
+        assert "https://***@www.ine.pt/broken.xml" in error.message
+        assert "sup3rs3cr3t" not in (error.details or "")
 
 
 class BaseBackendValidateTest(PytestOnlyDBTestCase):

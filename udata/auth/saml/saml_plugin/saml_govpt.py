@@ -6,7 +6,6 @@ import binascii
 import hashlib
 import logging
 import os
-import random
 import re
 import secrets
 import tempfile
@@ -14,8 +13,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+from bson import ObjectId
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
+from email_validator import EmailNotValidError, validate_email
 from flask import (
     Blueprint,
     current_app,
@@ -26,10 +27,18 @@ from flask import (
     session,
     url_for,
 )
+from flask_limiter.util import get_remote_address
 from flask_login import login_user, logout_user
-from flask_security.confirmable import requires_confirmation
+from flask_security.confirmable import requires_confirmation, send_confirmation_instructions
 from flask_security.decorators import anonymous_user_required
-from flask_security.utils import do_flash, get_message, verify_and_update_password
+from flask_security.utils import (
+    check_and_get_token_status,
+    do_flash,
+    get_message,
+    hash_data,
+    verify_and_update_password,
+    verify_hash,
+)
 from saml2 import (
     BINDING_HTTP_POST,
     BINDING_HTTP_REDIRECT,
@@ -82,12 +91,21 @@ ds.ALLOWED_CANONICALIZATIONS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE)
 ds.ALLOWED_TRANSFORMS.add(_C14N_INCLUSIVE_WITH_COMMENTS)
 
+from limits import parse
+
+from udata.api.limits import MIGRATION_SUBMIT_LIMIT
 from udata.app import csrf
+from udata.core.user.constants import (
+    AUTH_CITIZEN_DECLARED_VALUES,
+    AUTH_PROVIDER_CMD,
+    AUTH_PROVIDER_EIDAS,
+)
 from udata.core.user.nic import hash_nic as _hash_nic
 from udata.core.user.nic import is_nic_hashed as _is_nic_hashed
 from udata.i18n import lazy_gettext as _
-from udata.mail import MailMessage, send_mail
+from udata.mail import MailCTA, MailMessage, send_mail
 from udata.models import datastore
+from udata.utils import mask_email as _mask_email
 
 from .faa_level import FAAALevel, LogoutUrl
 from .requested_atributes import RequestedAttribute, RequestedAttributes
@@ -404,6 +422,13 @@ _REPLAY_CACHE_KEY = "saml_consumed:{kind}:{response_id}"
 _OUTSTANDING_RELAY_KEY = "saml_outstanding_relay:{token}"
 _OUTSTANDING_RELAY_TTL = 600  # 10 minutes — enough for the user to complete CMD
 _OUTSTANDING_RELAY_TOKEN_BYTES = 32
+# Keyed by the same RelayState token as the outstanding bucket, and for the
+# same reason: the session cookie does not survive the IdP's cross-site POST,
+# so anything the callback needs to know about how the round-trip STARTED has
+# to travel in the SAML form payload. Holds the id of the account that asked
+# to link, and nothing else — see _store_link_intent for what that is and is
+# not allowed to decide.
+_LINK_INTENT_KEY = "saml_link_intent:{token}"
 
 # CMD (autenticacao.gov MDC) attribute URIs — used both in the AuthnRequest
 # RequestedAttributes and in the SSO postback extraction.
@@ -411,6 +436,122 @@ MDC_ATTR_EMAIL = "http://interop.gov.pt/MDC/Cidadao/CorreioElectronico"
 MDC_ATTR_NIC = "http://interop.gov.pt/MDC/Cidadao/NIC"
 MDC_ATTR_FIRST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeProprio"
 MDC_ATTR_LAST_NAME = "http://interop.gov.pt/MDC/Cidadao/NomeApelido"
+
+# The document a foreign citizen's CMD was created with. A foreigner has no
+# NIC, so these three together are the only identity the assertion carries.
+MDC_ATTR_DOC_TYPE = "http://interop.gov.pt/MDC/Cidadao/DocType"
+MDC_ATTR_DOC_NATIONALITY = "http://interop.gov.pt/MDC/Cidadao/DocNationality"
+MDC_ATTR_DOC_NUMBER = "http://interop.gov.pt/MDC/Cidadao/DocNumber"
+
+# The document types autenticacao.gov issues to a FOREIGN citizen: residence
+# permit, passport, residence card, residence authorisation certificate.
+#
+# The composition below is gated on this set on purpose. A national's assertion
+# normally carries a NIC and never reaches it -- but "normally" is not a
+# guarantee, and without the gate an assertion that merely lost its NIC would
+# be resolved to a brand-new composed identity instead of falling through to
+# the email/name branches. That is the fastest way to lock a national out of
+# their own account, which is the one thing this ticket must not do.
+MDC_FOREIGN_DOC_TYPES = frozenset({"TR", "PAS", "CR", "DR"})
+
+# autenticacao.gov sends the type with a trailing colon -- "TR:" and not "TR"
+# -- which is what kept every foreign citizen from being recognised: the gate
+# above compared the raw value against the set and never matched, the
+# composition returned None, and the login fell through to the email branches.
+# Measured against a real foreign CMD, and stored that way in extras.
+_DOC_TYPE_TRAILING_SEPARATORS = re.compile(r"[\s:;.,]+$")
+
+
+def _normalize_doc_type(doc_type):
+    """Clean a DocType attribute before it is compared or stored.
+
+    ⚠️ This runs BEFORE the gate, never inside the composition -- the
+    pre-image is frozen (see _compose_foreign_identifier). For any of the four
+    accepted types the result is the input, byte for byte, because none of them
+    carries a trailing separator: the change is additive, turning values that
+    used to compose nothing into values that compose, and never altering an
+    identifier that already resolves an account.
+
+    Only a TRAILING run of separators is removed, and deliberately nothing
+    else. A rule that stripped every non-letter would fold "T:R" into "TR" and
+    admit a type the gate is there to refuse; this one cannot, because it never
+    touches a letter, a digit or an interior character. The only strings whose
+    classification changes are "<candidate><trailing separators>". Leading
+    punctuation has never been observed and is left alone for the same reason.
+    """
+    if not doc_type:
+        return doc_type
+    return _DOC_TYPE_TRAILING_SEPARATORS.sub("", doc_type.strip().upper())
+
+
+def _compose_foreign_identifier(doc_type, doc_nationality, doc_number):
+    """Build the identity string for a foreign citizen, from their document.
+
+    🚨 THIS COMPOSITION IS FROZEN. It is the pre-image of a one-way HMAC, and
+    the digest is the key the login resolves accounts by. Change the order, the
+    separator, the casing or the leading segment and every foreign citizen
+    already registered stops matching their own account, with no way to
+    recompute the stored values. Treat it the way a database migration is
+    treated: additive only, never edited.
+
+    Why a composition at all, rather than the document number alone: the number
+    is not unique across types. A passport number and a residence permit number
+    can coincide, and ``DocNationality`` is forced to "PT" on residence permits
+    and residence cards, so what separates two holders is the type plus the
+    number. Hashing the number alone would hand two different people the same
+    identity, and therefore the same account -- worse than a duplicate, it is
+    somebody else's session.
+
+    Why the leading "MDC" segment, which is the part that looks superfluous:
+    "TR" and "CR" are valid ISO 3166-1 alpha-2 codes (Turkey, Costa Rica), and
+    an eIDAS PersonIdentifier has the shape "<alpha2>/<alpha2>/<id>" -- the
+    "ES/PT/..." named in _find_or_create_saml_user. With the nationality forced
+    to "PT", a residence-permit holder would compose "TR/PT/123456", which is
+    byte for byte what a Turkish citizen signing in through eIDAS presents.
+    The two would share an account. "MDC" is three characters and can never be
+    an alpha-2 code, so the three identifier classes stay disjoint: a NIC is
+    digits only, an eIDAS identifier starts with a country code, ours with MDC.
+
+    ⚠️ This is NOT the provider prefix that ``udata/core/user/nic.py`` forbids.
+    That prohibition is about the STORED value ("cmd-<hash>"), and its argument
+    is that hashes already written cannot be recomputed into a prefixed form.
+    This segment lives in the PRE-IMAGE: what is stored is still a bare 64-hex
+    digest, ``is_nic_hashed`` still holds, and no existing value is touched.
+    The sibling keys that note prescribes still apply -- the document type and
+    nationality are also recorded in ``extras``, in the clear, for counting.
+
+    ⚠️ Known and accepted: this identity is LESS STABLE than a NIC. A residence
+    permit is renewed and changes number; a passport expires and is replaced.
+    When that happens the digest changes and the person arrives as a brand-new
+    identity, leaving the old account -- with its datasets and its organization
+    memberships -- unreachable, often behind a placeholder email nobody reads.
+    A verified email is the only thing that survives a document swap, which is
+    why it matters more for foreign citizens than for nationals. Reuniting the
+    two accounts is support work, not something this function can do.
+
+    Returns None when any attribute is missing or the type is not a foreign
+    one, so the caller falls through to the existing email/name branches
+    instead of minting an identity from half an answer.
+
+    The type is normalised by ``_normalize_doc_type`` BEFORE the gate, which is
+    the only place a fix may touch: normalising the input can admit values that
+    used to compose nothing, but it can never change an identifier that already
+    resolves an account. Normalising anything INSIDE the f-string below would.
+    """
+    if not (doc_type and doc_nationality and doc_number):
+        return None
+    doc_type = _normalize_doc_type(doc_type)
+    if doc_type not in MDC_FOREIGN_DOC_TYPES:
+        return None
+    # Upper-cased, including the number. The eIDAS PersonIdentifier is passed
+    # through verbatim, but it is an opaque string minted by another state --
+    # this is a number printed on a Portuguese document, and this project's own
+    # audit has already seen one carrying letters ("4595P5L28"). The risks are
+    # not symmetric: normalising risks colliding two documents that differ only
+    # in case, which do not exist; not normalising risks failing to recognise a
+    # person whose IdP sent a different casing, which locks them out.
+    return f"MDC/{doc_type}/{doc_nationality.strip().upper()}/{doc_number.strip().upper()}"
+
 
 # eIDAS natural-person attribute URIs. Field mapping to the CMD equivalents:
 # PersonIdentifier → NIC slot (extras.auth_nic, HMAC-hashed),
@@ -428,6 +569,44 @@ EIDAS_ATTR_FAMILY_NAME = "http://eidas.europa.eu/attributes/naturalperson/Curren
 # The MDC/Cidadao URIs are in no map, which is why they stay as raw URIs
 # (allow_unknown_attributes) and the CMD lookups match while URI-based eIDAS
 # lookups do not. Extraction must therefore try both forms.
+# The shape the eIDAS profile recommends for a PersonIdentifier. Matched whole,
+# and deliberately without stripping, upper-casing or any other tidying: the
+# country has to describe the identifier EXACTLY as it is hashed, and anything
+# else would be guessing.
+_EIDAS_PERSON_IDENTIFIER_SHAPE = re.compile(r"([A-Z]{2})/[A-Z]{2}/.+")
+
+
+def _eidas_origin_country(identifier):
+    """The member state that asserted this identity, or None.
+
+    Read-only over the identifier: this NEVER modifies it, because the
+    identifier is the pre-image of the one-way digest every sign-in resolves
+    accounts by. The country is extracted beside it, never instead of it.
+
+    🚩 The shape is a RECOMMENDATION of the eIDAS profile, not a guarantee, and
+    we have exactly one real sample to go on. So the rule is deliberately
+    strict and everything that does not match returns None rather than a guess:
+
+      - a NIC (digits only), which the eIDAS route accepts
+      - "MDC/..." -- three letters, so a foreign citizen's CMD identifier
+        cannot be mistaken for a country code
+      - lower case, a missing id segment, surrounding whitespace
+
+    In every one of those the sign-in proceeds untouched; only the country is
+    absent. A member state that turns out to emit a different shape gets no
+    country until someone decides what that shape means -- admitting a form
+    later is trivial, and telling two forms apart afterwards is not.
+
+    It also leaves alone the invariant _find_or_create_saml_user documents:
+    nothing here adds a fourth identity format, and this pattern cannot match
+    either of the other two.
+    """
+    if not identifier:
+        return None
+    match = _EIDAS_PERSON_IDENTIFIER_SHAPE.fullmatch(identifier)
+    return match.group(1) if match else None
+
+
 EIDAS_FRIENDLY_PERSON_IDENTIFIER = "PersonIdentifier"
 EIDAS_FRIENDLY_GIVEN_NAME = "FirstName"
 EIDAS_FRIENDLY_FAMILY_NAME = "FamilyName"
@@ -513,6 +692,120 @@ def _store_outstanding_relay(relay_token, reqid, kind):
         )
 
 
+def _store_link_intent(relay_token, user_id):
+    """Remember that this SAML round-trip was started to LINK an account.
+
+    🚨 The session cannot carry this. The IdP returns the assertion in a
+    cross-site POST, and with ``SESSION_COOKIE_SAMESITE=Lax`` the browser does
+    not send the session cookie on it — so ``current_user`` at the ACS is
+    anonymous even for somebody who was signed in a moment ago. That is the
+    same fact that made ``_store_outstanding_relay`` necessary, and this rides
+    the same RelayState-keyed bucket for the same reason.
+
+    🔑 WHAT THIS IS ALLOWED TO DECIDE, and it is deliberately small: it says
+    "whoever comes back this way is linking, not signing up", and nothing
+    else. It does NOT authorise binding the identity to that account. Proof of
+    ownership stays where it already is — the wizard, by password or by a link
+    mailed to the account's own address — so a stolen intent buys an attacker
+    a screen asking for the victim's password.
+
+    Single use, and the same TTL as the outstanding bucket it travels beside:
+    ten minutes is a CMD sign-in, not a window somebody can sit on.
+    """
+    if not relay_token or not user_id:
+        return
+    from udata.app import cache
+
+    try:
+        cache.set(
+            _LINK_INTENT_KEY.format(token=relay_token),
+            str(user_id),
+            timeout=_OUTSTANDING_RELAY_TTL,
+        )
+    except Exception:
+        # Non-fatal, and the degraded behaviour is today's: with no intent the
+        # ACS treats the sign-in as any other, which may create an account the
+        # person then has to merge. Worse than linking, better than a 500 on a
+        # flow they cannot retry.
+        current_app.logger.warning(
+            "SAML: failed to persist link intent; the callback will be treated as a plain sign-in",
+            exc_info=True,
+        )
+
+
+def _resolve_link_intent(relay_token):
+    """The account that started this round-trip to link, if it still qualifies.
+
+    Consumes the ticket and re-checks the account against the database, which
+    is not belt-and-braces: up to ten minutes passed while the citizen was at
+    autenticacao.gov, and in that time the account can have been deleted,
+    deactivated, or linked from another tab. Every failure returns None, and
+    None means "treat this as an ordinary sign-in" -- today's behaviour, never
+    an error page on a flow the person cannot retry.
+    """
+    from mongoengine.errors import ValidationError
+
+    from udata.core.user.models import User
+
+    # 🚩 OFF HAS TO MEAN OFF, INCLUDING MID-FLIGHT. The ticket lives for ten
+    # minutes, which is a window in which a deploy can turn the invite off
+    # while somebody is at autenticacao.gov. Honouring it then would send them
+    # to a wizard whose every endpoint now answers 403 -- a dead end, and the
+    # one shape this whole ticket exists to avoid.
+    #
+    # Read BEFORE the ticket is consumed, deliberately: with the feature off
+    # there is nothing to consume for, and leaving the entry to expire on its
+    # own keeps this read free of side effects.
+    if not _invite_enabled():
+        return None
+
+    user_id = _consume_link_intent(relay_token)
+    if not user_id:
+        return None
+
+    try:
+        user = User.objects(id=user_id, deleted=None).first()
+    except (ValidationError, TypeError):
+        # The id comes out of a cache entry we wrote, so a malformed one means
+        # a corrupted or hand-edited value rather than caller input -- and it
+        # still must not 500 the callback.
+        return None
+
+    if not user or not user.is_active:
+        return None
+
+    # Linked in the meantime -- in another tab, or by a link clicked from an
+    # email. Binding a second identity here would be the duplicate this whole
+    # flow exists to prevent, wearing the costume of the fix.
+    if not _needs_identity_link(user):
+        return None
+
+    return user
+
+
+def _consume_link_intent(relay_token):
+    """Return and delete the link intent stored under ``relay_token``.
+
+    Returns None when the token is empty, unknown, already used, or the cache
+    is unavailable — in every one of those cases the caller must fall back to
+    the ordinary sign-in path rather than guess, which is why there is no
+    second source to consult.
+    """
+    if not isinstance(relay_token, str) or not relay_token:
+        return None
+    from udata.app import cache
+
+    key = _LINK_INTENT_KEY.format(token=relay_token)
+    try:
+        user_id = cache.get(key)
+        if user_id:
+            cache.delete(key)
+        return user_id or None
+    except Exception:
+        current_app.logger.warning("SAML: failed to read link intent", exc_info=True)
+        return None
+
+
 def _consume_outstanding_relay(relay_token):
     """Return and delete the outstanding bucket stored under ``relay_token``.
 
@@ -564,17 +857,54 @@ def _check_and_record_replay(response_id, kind, ttl=None):
     return True
 
 
-audit_logger = logging.getLogger("saml.audit")
+# Dedicated audit logger: one line per terminal SSO decision, so "what
+# happened to this sign-in?" can be answered from the backoffice log page
+# instead of reconstructed. It lives under `udata.*` on purpose — the records
+# propagate to the handlers of the `udata` logger (`app.logger`), whose stderr
+# uwsgi writes to the file that page reads. Its level is pinned in
+# `udata.auth.init_app` because `udata` is set to WARNING in production, which
+# a child with no level of its own would inherit, silently dropping every line.
+#
+# It was "saml.audit" until LEDG-2371, and that name was two bugs at once: no
+# level of its own, and a top-level logger outside the tree whose records
+# propagated to a root with no handler. Between May and September it emitted
+# nothing at all, which is why nothing can depend on the old name.
+audit_logger = logging.getLogger("udata.auth.saml.audit")
 
 
 def _audit_saml(outcome, kind, *, issuer=None, name_id=None, reason=None):
     """Emit a structured SAML SSO audit log line.
 
-    One line per terminal decision (success/reject/error) so the SAML
-    authentication funnel can be traced post-hoc without correlating
-    multiple debug logs. ``name_id`` is hashed (HMAC-SHA256) so the raw
-    Subject identifier is never written to disk; this matches how it is
-    stored in ``user.extras.auth_nic``.
+    **Exactly one line per SSO callback request**, at the point where the
+    outcome is actually decided. That invariant is what makes the lines
+    countable: two lines double a sign-in, none hides it, and a line written
+    before the decision counts something that did not happen.
+
+    ⚠️ "per SSO callback" and not "per sign-in": the migration link click
+    (`migration_confirm_link`) establishes a session and emits nothing at
+    all. That gap predates this and is not closed here, but anyone counting
+    these lines to answer "how many people signed in" will undercount by the
+    number of people who arrived through an emailed link.
+
+    ``outcome`` is one of five values, and this list is the vocabulary --
+    anything counting these lines depends on it, so a sixth value is a
+    contract change, not an implementation detail:
+
+    - ``success``          -- a session was established
+    - ``rejected``         -- the sign-in was refused, fail-closed
+    - ``migration_pending`` -- not refused: the citizen was sent on to finish
+      something (the migration wizard, or a pending email confirmation). They
+      have a way forward, which is what separates this from ``rejected``
+    - ``user_not_found``   -- the assertion carried no identity to resolve
+    - ``error``            -- the request was malformed before any decision
+
+    ``reason`` is free text and is what distinguishes cases sharing an
+    outcome: ``inactive_account`` and ``deleted_account`` are both
+    ``rejected``; ``migration_candidate``/``no_match`` (the wizard) and
+    ``pending_email_confirmation`` (the funnel) are both ``migration_pending``.
+
+    ``name_id`` is hashed (HMAC-SHA256) so the raw Subject identifier is never
+    written to disk; this matches how it is stored in ``user.extras.auth_nic``.
     """
     name_id_hash = "-"
     if name_id:
@@ -685,12 +1015,63 @@ def _idp_status_rejection(raw_saml_response, kind):
     return None
 
 
-def _create_saml_user(user_email, user_nic, first_name, last_name):
-    """Create a new account from SAML attributes (scenario 4)."""
-    # Generate a placeholder email when the IdP does not provide one, or
-    # when the CMD email is already taken by an existing account (the
-    # user explicitly chose to create a new one in the wizard).
-    if not user_email or datastore.find_user(email=user_email):
+def _create_saml_user(
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+    eidas_country=None,
+):
+    """Create a new account from SAML attributes (scenario 4).
+
+    ``provider`` is AUTH_PROVIDER_CMD or AUTH_PROVIDER_EIDAS, and comes from the
+    ACS route that received the assertion -- the same reason
+    _handle_migration_redirect takes it explicitly: nothing this far downstream
+    can infer which one started the flow. Recorded only when supplied, so a
+    caller without a route to speak for stores nothing rather than a guess.
+
+    ``citizen_declared`` is what the citizen said on the login screen, already
+    allowlisted by the route that received it. Same rule as the provider: only
+    written when there is one. It is SELF-DECLARED and gates nothing -- see
+    AUTH_CITIZEN_DECLARED for why that matters.
+    """
+    from udata.core.user.models import find_user_by_email_ci
+
+    # Generate a placeholder email, which is what sends the account to the
+    # registration completion screen: the funnel redirects there on
+    # `has_placeholder_email` and nothing else.
+    #
+    # Minted for an identity that carries an identifier EVEN WHEN the assertion
+    # supplied a free address, which is the whole point. autenticação.gov
+    # vouches for the IDENTITY; it says nothing about the mailbox. Adopting the
+    # asserted address made it the account's login identity and stamped
+    # confirmed_at on it, so nobody ever proved possession -- and the person was
+    # never asked which address they wanted the portal to hold. The address is
+    # still offered back, as a PREFILL on that screen (see saml_asserted_email),
+    # so the common case stays one click; what changes is that it is a
+    # suggestion rather than a decision taken on their behalf.
+    #
+    # 🚨 `user_nic` GUARDS THIS, and dropping it re-opens LEDG-2045. Without an
+    # identifier the account holds no auth_nic, and with a placeholder it holds
+    # no real address either -- so the next sign-in finds it by neither route
+    # and mints a second one, then a third, one per login. That population is
+    # measured at zero and LEDG-2503 closed the door it came through, but the
+    # guarantee lives in the IdP, not here, and LEDG-2436 is still parked. An
+    # identity with no identifier therefore keeps the old behaviour: one
+    # unproven address beats a new account every login. Refusing it outright is
+    # LEDG-2436's decision to take, not this one's.
+    #
+    # Case-insensitively, like the resolver that decided this identity has no
+    # account of its own. An exact check here saw "maria@x.pt" as free while
+    # "Maria@x.pt" already existed, and minted a second row holding the real
+    # address -- a duplicate with no placeholder prefix, invisible to every
+    # count filtered by it and to migrate-nics.
+    if user_nic or not user_email or find_user_by_email_ci(user_email):
         import uuid
 
         from udata.core.user.constants import (
@@ -702,21 +1083,254 @@ def _create_saml_user(user_email, user_nic, first_name, last_name):
             f"{SAML_PLACEHOLDER_EMAIL_PREFIX}{uuid.uuid4().hex[:8]}@{SAML_PLACEHOLDER_EMAIL_DOMAIN}"
         )
 
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
+        AUTH_PROVIDER,
+    )
+
     user_data = {
         "first_name": (first_name or "").title(),
         "last_name": (last_name or "").title(),
         "email": user_email,
     }
+    # Built separately from the identifier: the provider is known even when the
+    # assertion carried no NIC/PersonIdentifier, which is a real case (see the
+    # identity-without-identifier bug) and the one where knowing the provider
+    # matters most.
+    extras = {}
     if user_nic:
-        user_data["extras"] = {"auth_nic": _hash_nic(user_nic)}
+        extras["auth_nic"] = _hash_nic(user_nic)
+    if provider:
+        extras[AUTH_PROVIDER] = provider
+    if citizen_declared:
+        extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # The verified counterpart of the declared type. Recorded HERE and not only
+    # by the funnel, which already writes them a few lines later in this same
+    # request: the funnel's write is guarded bookkeeping that swallows its own
+    # failure on purpose, because it must not cost a sign-in. Written into the
+    # insert instead, they cannot be lost silently -- and the paths that do not
+    # reach the funnel at all (the wizard) now have somewhere to put them.
+    if doc_type:
+        extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    # A DIFFERENT thing from the nationality above, which is why it is a
+    # different key: that one is printed on a document and is forced to "PT" on
+    # residence permits, this one is the member state whose node asserted the
+    # identity. See the comment on the constant.
+    if eidas_country:
+        extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
+    if extras:
+        user_data["extras"] = extras
 
-    user = datastore.create_user(**user_data)
     # Auto-confirm users created via SAML — they were already verified
     # by autenticação.gov, so no email confirmation is needed.
-    user.confirmed_at = datetime.utcnow()
-    datastore.commit()
+    #
+    # Passed INTO create_user rather than assigned after it. `create_user`
+    # ends in `put(user)`, which under MongoEngine is `model.save()` -- the
+    # document is already written by the time it returns. Assigning the field
+    # afterwards and calling `datastore.commit()` left it in memory only:
+    # commit() is `pass` on the base Datastore and MongoEngineDatastore does
+    # not override it, because its put() already writes.
+    #
+    # The consequence was not "lost on a repeat login" but never stored at
+    # all: the returned object carries the value, so requires_confirmation()
+    # -- which is `confirmed_at is None` -- said False and the funnel's
+    # auto-confirm never ran, while the provider stamp saw its value already
+    # agreed and saved nothing. The next login reran the same loop.
+    user_data["confirmed_at"] = datetime.utcnow()
 
-    return user
+    return datastore.create_user(**user_data)
+
+
+# Marks an account whose email was typed by the user rather than vouched for
+# by the IdP. autenticação.gov proves the *identity*; it says nothing about an
+# address the user just declared, so that address must be confirmed by its
+# owner before the account gets a session. Every other SAML flow keeps today's
+# auto-confirm, which is exactly what this marker buys. It never needs
+# clearing: once confirmed_at is set the gate opens and the marker is inert.
+PENDING_EMAIL_CONFIRMATION = "pending_email_confirmation"
+
+# How many confirmation mails one pending account may ever trigger, and where
+# that tally lives. It is monotonic — correcting the address does not reset it —
+# so the ceiling is per CMD identity, not per address typed. It is kept on the account rather than in the session because the
+# recipient is an address the wizard user typed: a session-held counter is
+# reset by replaying an older copy of the signed cookie, which would leave the
+# resend endpoint able to mail an arbitrary victim without limit.
+CONFIRMATION_SEND_COUNT = "confirmation_send_count"
+MAX_CONFIRMATION_SENDS = 5
+
+# The pending validation link for a legacy-account link request, held on the
+# account it points at. It lives on the document rather than in the session
+# because the link must work with no session at all — its owner may well open
+# it in another browser — and because a mailed token is stateless: once sent,
+# only destroying this record can invalidate it. The nonce is the secret; the
+# URL carries nothing but its hash.
+MIGRATION_LINK_PENDING = "migration_link_pending"
+
+# First element of the token payload. The confirm serializer and its salt are
+# shared with flask-security's own confirmation token, whose payload is also a
+# two-element list of strings ([fs_uniquifier, hash_data(email)]) — anyone who
+# registers gets one in their inbox. Without a discriminator that token reaches
+# our route, and its uniquifier hits an ObjectIdField as a 500. Tagging the
+# payload keeps the two apart by shape as well as by content.
+MIGRATION_LINK_TOKEN_TAG = "migration-link"
+
+# How long a validation link stays usable. Deliberately far shorter than the
+# five days flask-security allows its own confirmation links, because this one
+# both opens a session and binds an identity permanently. The deadline is kept
+# on the record instead of in SECURITY_CONFIRM_EMAIL_WITHIN: that setting also
+# governs the account-creation link, which this flow does not own.
+MIGRATION_LINK_TTL = timedelta(minutes=30)
+
+# How many links one account may be sent, and over what window. Unlike
+# CONFIRMATION_SEND_COUNT this is NOT monotonic for life: there the recipient
+# is an address the wizard user typed, so the ceiling stops a stranger being
+# mailed at all; here the recipient is always the account's own address, so
+# the cap only has to stop a mail flood. A lifetime ceiling would let five
+# anonymous requests permanently deny an account's owner the email route,
+# leaving them only the password they came to the wizard without.
+MIGRATION_LINK_SEND_COUNT = "migration_link_send_count"
+MAX_MIGRATION_LINK_SENDS = 5
+MIGRATION_LINK_SEND_WINDOW = timedelta(hours=1)
+
+# How long a dismissal of the optional linking invite lasts before the invite
+# comes back. The acceptance criterion asks for a frequency rule that is
+# WRITTEN rather than implied, so here it is, with its reasoning:
+#
+# - on every sign-in is not a rule, it is nagging, and it trains people to
+#   dismiss the notice without reading a word of it. And it would BE every day:
+#   login_user() marks no permanent session, so the cookie dies with the
+#   browser and somebody who works in the portal each morning signs in each
+#   morning;
+# - once and never again loses, in silence, everyone who was merely busy that
+#   day -- and they find out when the portal starts requiring a single account
+#   per person (LEDG-1277), which is far too late to be told;
+# - eight days, the product owner's decision, is about weekly: often enough
+#   that nobody reaches the deadline having seen it once, rare enough that
+#   dismissing it never becomes a reflex.
+#
+# 🔑 EIGHT AND NOT SEVEN, which is the part worth writing down: a seven-day
+# window always falls on the same weekday, so somebody who only opens the
+# portal on Tuesdays would see it every single time or never. Eight rotates.
+#
+# It is a constant and not configuration on purpose: a per-deployment value
+# would be one more thing that can differ between environments while nothing
+# tells you it did.
+MIGRATION_INVITE_REMIND_AFTER = timedelta(days=8)
+
+# Which flow put a link record on an account. Absent means the wizard, which
+# is every record written before this existed, so the default must stay the
+# wizard's behaviour in every branch that reads it.
+#
+# The registration origin is the completion screen: someone who signed in with
+# a government identity, got a placeholder account, and submitted the address
+# of an account they already had. The click then moves the identity onto that
+# older account instead of finishing a new one, which is why the record has to
+# name the placeholder it came from -- the consuming route has no session to
+# read it out of, and it is the account that gets retired.
+# The one flash code this origin emits. Shared verbatim with the frontend --
+# CompleteRegistrationGate forwards it and CompleteRegistrationClient renders
+# it -- so it is a contract between two repositories and changing it is a
+# two-sided change.
+REGISTRATION_ASSOCIATION_REFUSED_FLASH = "registration_association_refused"
+
+MIGRATION_LINK_ORIGIN = "origin"
+MIGRATION_LINK_ORIGIN_REGISTRATION = "complete_registration"
+MIGRATION_LINK_PLACEHOLDER_ID = "placeholder_id"
+# The verified document, carried to a click that has no session to read it out
+# of. Named like the keys above rather than reusing the extras key names: this
+# is the record's own vocabulary, and the two are free to diverge.
+MIGRATION_LINK_DOC_TYPE = "doc_type"
+MIGRATION_LINK_DOC_NATIONALITY = "doc_nationality"
+MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY = "eidas_origin_country"
+
+
+def _declared_citizen():
+    """What the citizen said on the login screen, or None if they said nothing.
+
+    Read from the top level of the session, not from the wizard's pending
+    record, and that is the difference from the provider: the provider is only
+    known once the assertion comes back, while this is known at ``/saml/login``
+    — before the redirect to the IdP — so it is stored alongside
+    ``saml_next_url`` and survives the same round trip.
+
+    Already allowlisted by the route that stored it, so a value read back here
+    is one of the two accepted ones or absent. Deliberately not popped: the
+    wizard runs in later requests and needs it too.
+    """
+    return session.get("saml_citizen_declared")
+
+
+def _create_pending_saml_user(
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+    eidas_country=None,
+):
+    """Create an account from a user-declared email, left unconfirmed.
+
+    Unlike :func:`_create_saml_user` this never mints a placeholder address —
+    the caller has already validated that ``user_email`` is well-formed and
+    unused — and it deliberately does NOT set ``confirmed_at``: the account
+    stays unconfirmed, and without a session, until the owner follows the
+    emailed confirmation link.
+
+    ``provider`` reaches here from the wizard session, which recorded it from
+    the ACS route. Recorded only when present: a session opened before that
+    field existed carries none, and the account is then created without one
+    rather than with a guess.
+
+    ``citizen_declared`` reaches here the same way, from the session key the
+    login route set after allowlisting it. Same rule, same reason.
+    """
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
+        AUTH_PROVIDER,
+    )
+
+    extras = {"auth_nic": _hash_nic(user_nic), PENDING_EMAIL_CONFIRMATION: True}
+    if provider:
+        extras[AUTH_PROVIDER] = provider
+    if citizen_declared:
+        extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # This is the path the wizard creates through, and the one the funnel never
+    # sees: the route that calls it returns JSON, and the confirmation that
+    # follows is flask_security's. Without these two the account is born
+    # without its document and only gains it on a sign-in that may never come.
+    if doc_type:
+        extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    # The wizard is the path the funnel never sees: the route that calls
+    # this returns JSON. Without it the country is gone by the time an
+    # account exists, and there is nothing to recover it from.
+    if eidas_country:
+        extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
+
+    # No datastore.commit() here: create_user already wrote the document, and
+    # commit() is a no-op under MongoEngine anyway. Nothing is assigned after
+    # the call -- confirmed_at is deliberately left unset on this path, since
+    # the address is self-declared and still has to be proved -- so the call
+    # only ever suggested a flush that does not exist.
+    return datastore.create_user(
+        first_name=(first_name or "").title(),
+        last_name=(last_name or "").title(),
+        email=user_email,
+        extras=extras,
+    )
 
 
 def _has_linked_nic(user):
@@ -730,14 +1344,50 @@ def _has_linked_nic(user):
     return _is_nic_hashed((user.extras or {}).get("auth_nic"))
 
 
+def _accounts_claiming_nic(user_nic, limit=2):
+    """Every account holding this identity, in either stored form.
+
+    Answers "how many accounts claim this identity?", which is the question
+    the login lookup actually needs -- and it has to span BOTH forms to be
+    answerable. The hashed value and the plain one were previously queried in
+    sequence, the second only when the first found nothing, so an account
+    holding the hash and another holding the same NIC in plain form were
+    invisible to each other: the first lookup returned one and the fallback
+    never ran.
+
+    One query with ``$in`` rather than one per form: ``extras.auth_nic`` has
+    no index (creating it belongs with merging the duplicates, since a unique
+    index cannot be added while they exist), so every lookup here is a
+    collection scan. Asking both forms separately would double the cost of the
+    most common sign-in, where the hashed value matches on the first try.
+
+    Capped at ``limit`` documents because the caller only has to tell "one"
+    from "more than one" -- there is no reason to load a whole duplicate set
+    on every sign-in.
+    """
+    from udata.core.user.models import User
+
+    return list(User.objects(extras__auth_nic__in=[_hash_nic(user_nic), user_nic])[:limit])
+
+
 def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     """Resolve the CMD/SAML identity to an account.
 
-    ``user_nic`` carries the unique identifier of the authenticated identity:
-    the NIC for CMD logins, or the eIDAS PersonIdentifier (e.g. "ES/PT/...")
-    for eIDAS logins. Both are HMAC-hashed into ``extras.auth_nic`` — the
-    formats cannot collide, and every lookup/linking rule below applies to
-    either provider identically.
+    ``user_nic`` carries the unique identifier of the authenticated identity,
+    in one of THREE formats: the NIC for a national CMD login; the eIDAS
+    PersonIdentifier ("<alpha2>/<alpha2>/<id>", e.g. "ES/PT/...") for eIDAS;
+    and "MDC/<DocType>/<DocNationality>/<DocNumber>" for a foreign citizen
+    signing in with CMD, who has no NIC (see _compose_foreign_identifier).
+    All three are HMAC-hashed into ``extras.auth_nic`` — the formats cannot
+    collide, and every lookup/linking rule below applies to any of them
+    identically.
+
+    ⚠️ "Cannot collide" is an invariant that is maintained, not one that comes
+    for free: a NIC is digits only, an eIDAS identifier opens with a country
+    code, and the third opens with "MDC", which is three characters and so can
+    never be one. Two of the four document types ARE valid alpha-2 codes, so
+    without that leading segment the third format would overlap the second.
+    Anything added to this list has to keep the three disjoint.
 
     Decision order:
     1. NIC already linked (hashed, or stored in plain form by an old plugin
@@ -747,45 +1397,73 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
     2. Email match → suspected existing account; the user must confirm
        ownership through the migration wizard before linking
     3. Name-only match → same, suspected existing account
-    4. No match → create a new account
+    4. No match → no account; the caller decides what to do
 
     Accounts whose ``auth_nic`` holds a stale non-hashed value (plain NIC of
     a different identity, legacy ciphertext, junk) are NOT treated as linked:
     they remain wizard candidates in rules 2 and 3.
 
+    This is a pure resolver: it never creates an account. Creating one is the
+    caller's decision, because it depends on whether the migration wizard is
+    enabled — with the wizard on, an unmatched identity goes through it and
+    must supply a confirmed email before any account exists.
+
     Returns a tuple (user, status) where status is one of:
     - "existing_saml" — NIC already linked, normal login
     - "migration_candidate" — email or name match; user is the single
       candidate account, or None when several homonyms exist
-    - "new" — newly created user
+    - "ambiguous_identity" — more than one account claims this identifier;
+      user is always None. The caller must refuse the sign-in: there is no
+      way to tell which account is the right one, and picking is how someone
+      ends up in a stranger's account
+    - "no_match" — nothing matched; user is always None
     - "error" — neither email nor NIC available
     """
-    from udata.core.user.models import User
+    from udata.core.user.models import User, find_user_by_email_ci
 
     # 1. CMD identity already linked: direct login, nothing else to check.
     #    (Use MongoEngine nested dict syntax, not find_user, because
     #    find_user(extras={...}) matches the entire dict exactly.)
     if user_nic:
-        user = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
-        if user:
-            return user, "existing_saml"
+        claimants = _accounts_claiming_nic(user_nic)
 
-        # 1b. Same identity stored in plain form by an old plugin version:
-        #     the incoming NIC comes from a signed autenticacao.gov
-        #     assertion, so an exact match proves the link — upgrade the
-        #     stored value to the hashed format and log the user in.
-        user = User.objects(extras__auth_nic=user_nic).first()
-        if user:
-            user.extras["auth_nic"] = _hash_nic(user_nic)
-            user.save()
-            current_app.logger.info(f"SAML: upgraded plain stored NIC to hash for user {user.id}")
+        # More than one account holds this identity. Refuse rather than pick:
+        # `.first()` is not the coin toss it looks like -- User._meta orders by
+        # -created_at, so the newest account always won, silently and
+        # consistently. That is worse than a random pick, not better: a random
+        # one would eventually be noticed, while this hands the same wrong
+        # session, content and organisation memberships over every time and
+        # never contradicts the illusion that the account is yours.
+        #
+        # Making the choice "deterministic" was never the missing piece. It
+        # already was. What is missing is proof of possession, and there is no
+        # way to obtain it here -- so the only honest answer is to refuse and
+        # let a human disambiguate (LEDG-2469).
+        if len(claimants) > 1:
+            return None, "ambiguous_identity"
+
+        if claimants:
+            user = claimants[0]
+            # Upgrade a plain stored value to the hashed format. The incoming
+            # NIC comes from a signed autenticacao.gov assertion, so an exact
+            # match proves the link.
+            if (user.extras or {}).get("auth_nic") == user_nic:
+                user.extras["auth_nic"] = _hash_nic(user_nic)
+                user.save()
+                current_app.logger.info(
+                    f"SAML: upgraded plain stored NIC to hash for user {user.id}"
+                )
             return user, "existing_saml"
 
     # 2. Match by email: never auto-link — ownership must be proven
     #    (password or email code) via the migration wizard. Accounts
     #    already linked to another CMD identity are not candidates.
     if user_email:
-        user = datastore.find_user(email=user_email)
+        # Case-insensitive, as everywhere else the wizard resolves an
+        # address: an exact match here sends the owner of "maria@x.pt" whose
+        # CMD carries "Maria@x.pt" down the no_match branch, making them ask
+        # for an account they already have.
+        user = find_user_by_email_ci(user_email)
         if user and not _has_linked_nic(user):
             current_app.logger.info(
                 f"SAML: email match for an existing account "
@@ -820,18 +1498,150 @@ def _find_or_create_saml_user(user_email, user_nic, first_name, last_name):
         current_app.logger.error("SAML: Cannot create user without email or NIC")
         return None, "error"
 
-    return _create_saml_user(user_email, user_nic, first_name, last_name), "new"
+    return None, "no_match"
 
 
-def _handle_saml_user_login(user, new_account=False):
+def _record_login_activity(user):
+    """Write the trackable session fields flask_security would have written.
+
+    ``SECURITY_TRACKABLE`` is on (``udata/settings.py``), and the five fields
+    are declared on our own document (``udata/core/user/models.py``), so a
+    password login keeps ``last_login_at``, ``current_login_at``,
+    ``last_login_ip``, ``current_login_ip`` and ``login_count`` up to date.
+    A SAML login did not: this module imports ``login_user`` from
+    ``flask_login``, which only establishes the session, while the code that
+    maintains those fields lives in ``flask_security``'s ``login_user``
+    (``flask_security/utils.py``, the ``if _security.trackable:`` block).
+
+    Deliberately NOT fixed by importing flask_security's ``login_user``
+    instead, even though ``proconnect.py`` reaches it through ``udata.auth``
+    and that would persist the fields on its own (its ``_datastore.put()`` is
+    ``document.save()`` under MongoEngine, so no extra write is needed there).
+    The swap is wider than this defect, in three ways that all land on the
+    sign-in path: that ``put()`` is unguarded, so a legacy document failing
+    validation for an unrelated reason would turn a working sign-in into a
+    500 -- the regression the comment further down deliberately avoids, on
+    the accounts most likely to be affected; it sets ``fs_cc``/``fs_paa`` in
+    the session; and it fires ``identity_changed``/``user_authenticated``,
+    which never fired on this path. Three behaviour changes to persist five
+    fields. There is no smaller unit to import either -- the semantics are
+    inline in that block, not a public function -- so they are mirrored here,
+    and a test asserts the two agree rather than trusting that they do.
+
+    The semantics come from that block and are load-bearing, not incidental:
+    ``last_login_*`` carry the PREVIOUS login's values, which is why
+    ``last_login_ip`` is empty until the second sign-in.
+
+    Written as an atomic update of exactly these five fields, and NOT with
+    ``user.save()``. A save writes the whole dirty document, and
+    ``User.pre_save`` sanitizes ``about``, ``first_name`` and ``last_name`` on
+    every write path: on a document predating that sanitization the value
+    genuinely changes (``Silva & Sousa`` becomes ``Silva &amp; Sousa``),
+    MongoEngine therefore marks the field dirty, and it rides along in the
+    same ``$set``. Someone signing in with CMD would see their own name
+    mangled on screen, silently, because this write is deliberately swallowed.
+    The same coupling would let this write clobber a bio edited in another tab
+    between the moment this request loaded the document and this line.
+    Sanitizing legacy documents is a migration, not a side effect of a login.
+    The atomic write also makes the counter safe: ``inc__`` cannot lose a
+    count when two sign-ins land at once, which ``+ 1`` in Python can.
+
+    Guarded because bookkeeping must never deny anyone their account -- the
+    same reasoning, and the same shape, as the provider write below. A failure
+    loses the fields, is logged, and the sign-in stands. Only the write is
+    inside the guard: a mistake computing the values should surface, not be
+    logged as a warning.
+    """
+    from udata.core.user.models import User
+
+    security = current_app.extensions.get("security")
+    # Mirrors the upstream condition, so a deployment that turns tracking off
+    # stops writing here too instead of diverging from its password logins.
+    if security is not None and not security.trackable:
+        return
+
+    # Same clock as the password login writes into the same fields, rather
+    # than one that happens to agree today.
+    now = security.datetime_factory() if security is not None else datetime.utcnow()
+    try:
+        User.objects(id=user.id).update_one(
+            set__last_login_at=user.current_login_at or now,
+            set__current_login_at=now,
+            set__last_login_ip=user.current_login_ip,
+            set__current_login_ip=request.remote_addr or None,
+            inc__login_count=1,
+        )
+    except Exception as exc:
+        current_app.logger.warning(
+            f"SAML: could not record login activity for user {user.id}: {type(exc).__name__}: {exc}"
+        )
+
+
+def _handle_saml_user_login(
+    user,
+    new_account=False,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+    eidas_country=None,
+    asserted_email=None,
+    asserted_first_name=None,
+    asserted_last_name=None,
+    kind=None,
+    issuer=None,
+    name_id=None,
+    status=None,
+):
     """Handle login/redirect after SAML authentication.
 
     When ``new_account`` is True the redirect carries ``cmd_new_account=1``
     so the frontend can inform the user that a new account was created
     (scenario 4).
+
+    ``provider`` is AUTH_PROVIDER_CMD or AUTH_PROVIDER_EIDAS, from the ACS
+    route. This is the single funnel every path that ends in a session passes
+    through -- a freshly created account, an identity already linked, and an
+    identity whose stored NIC was upgraded from the old plain format -- so
+    recording it here is what backfills the accounts that predate the field.
+    That also makes a write inside _find_or_create_saml_user unnecessary: its
+    plain-NIC upgrade returns "existing_saml" and lands here.
+
+    ``asserted_email`` is the address the assertion carried, from the ACS
+    route. Only CMD ever supplies one -- the eIDAS Minimum Data Set has no
+    email attribute at all -- which is why the completion screen can tell the
+    two apart by the presence of the value alone, without being told the
+    provider.
+
+    ``kind``, ``issuer``, ``name_id`` and ``status`` exist so this function can
+    emit the audit line ITSELF, at each of its exits. The routes used to emit
+    ``success`` before calling here, which was a guess: two of the branches
+    below refuse or divert, and the line was already written. Only here is the
+    outcome actually known.
+
+    ``kind`` has no truthful default. An omitted one writes ``kind=None`` --
+    a missing value -- rather than silently claiming the sign-in was CMD,
+    which is the same class of mistake this placement fixes.
+
+    ``asserted_first_name`` and ``asserted_last_name`` are kept for the same
+    window and for a stricter reason. They name the requester in the mail the
+    completion screen can send, and that mail goes to an address the requester
+    typed. Reading those names off the account document instead would let
+    anyone signed in with a government identity put text of their own choosing
+    into a message the portal sends to an address of their choosing, since the
+    profile form lets an account rewrite its own name. The assertion is the
+    only source that is not the sender's to edit.
     """
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     next_path = session.pop("saml_next_url", "")
+    # Consumed here for the same reason as the next-URL above: this sign-in is
+    # over, the caller already read the value into `citizen_declared`, and a
+    # declaration left in the session would be applied to whatever sign-in came
+    # next on this browser. The wizard path never reaches this function -- it
+    # returns at _handle_migration_redirect -- so its own later requests still
+    # find the value, and the logout clears it for them.
+    session.pop("saml_citizen_declared", None)
 
     if user is None:
         current_app.logger.warning(
@@ -839,25 +1649,180 @@ def _handle_saml_user_login(user, new_account=False):
             f"(frontend_url={frontend_url!r})"
         )
         do_flash(*get_message("CONFIRMATION_REQUIRED"))
+        _audit_saml("user_not_found", kind, issuer=issuer, name_id=name_id, reason=status)
         # user is None only when the IdP response carried neither an email
         # nor a NIC/PersonIdentifier — expose it in the redirect for
         # browser-trace diagnosis (see _reject_saml_login).
         return redirect(f"{frontend_url}/login?saml_error=missing_attributes")
-
-    if requires_confirmation(user):
-        # Auto-confirm on SAML login — autenticação.gov already verified the user.
-        user.confirmed_at = datetime.utcnow()
-        datastore.commit()
 
     if user.deleted:
         current_app.logger.warning(
             f"[DEBUG] _handle_saml_user_login: user.deleted=True, email={user.email!r}"
         )
         do_flash(*get_message("DISABLED_ACCOUNT"))
+        # A refusal, and audited as one: nothing is written and no session is
+        # established. Same shape as inactive_account, which the routes refuse
+        # earlier -- the reason is what tells the two apart.
+        _audit_saml("rejected", kind, issuer=issuer, name_id=name_id, reason="deleted_account")
         return redirect(frontend_url or "/")
 
-    login_user(user)
+    # An account created by the wizard from a self-declared email must not be
+    # let in — nor auto-confirmed — until its owner follows the emailed link.
+    # This gate has to sit BEFORE the auto-confirm below: the account already
+    # carries the NIC, so a repeat CMD login resolves straight to it, and the
+    # auto-confirm would otherwise turn the whole confirmation requirement
+    # into a "just try again". The gate needs no cleanup: once confirmed_at is
+    # set by the stock confirm flow, it stops matching and the marker is inert.
+    if user.confirmed_at is None and (user.extras or {}).get(PENDING_EMAIL_CONFIRMATION):
+        current_app.logger.info(
+            f"SAML: login blocked, email confirmation still pending for user {user.id}"
+        )
+        # Identifies the user to the resend endpoint without authenticating
+        # them — the wizard shows the pending-confirmation screen from it.
+        # Any wizard state still lying around belongs to an earlier, abandoned
+        # assertion; left in place, migration_pending would answer with that
+        # stale wizard instead of this screen.
+        session.pop("saml_migration_pending", None)
+        session.pop("migration_password_attempts", None)
+        session["saml_confirmation_pending"] = {
+            "email": user.email,
+            "nic_hash": (user.extras or {}).get("auth_nic"),
+        }
+        # NOT a refusal. Nobody was turned away: the citizen is sent on to
+        # finish confirming their address, and the destination is the very
+        # /migrate-account the routes already audit as migration_pending. The
+        # reason is what separates this from the wizard's own two reasons.
+        _audit_saml(
+            "migration_pending",
+            kind,
+            issuer=issuer,
+            name_id=name_id,
+            reason="pending_email_confirmation",
+        )
+        return redirect(f"{frontend_url}/migrate-account")
+
+    if requires_confirmation(user):
+        # Auto-confirm on SAML login — autenticação.gov already verified the
+        # user. This vouches for the IDENTITY, which is why it does not apply
+        # to the self-declared addresses gated above.
+        #
+        # An atomic single-field write, not `user.save()`. The document save
+        # drags `about`, `first_name` and `last_name` through `User.pre_save`,
+        # which sanitises them on every write path -- on a legacy document the
+        # value genuinely changes, so the field is marked dirty and rides
+        # along in the same update. Signing in would silently rewrite the
+        # person's own name. Same reasoning, and same shape, as
+        # `_record_login_activity`.
+        #
+        # This replaces a `datastore.commit()` that did nothing: the value
+        # only ever reached the database when some later write in this
+        # function happened to save the document, and on a repeat login --
+        # where the provider stamp already agrees and saves nothing -- it was
+        # lost. The intent stated in the comment above never held.
+        from udata.core.user.models import User
+
+        confirmed_at = datetime.utcnow()
+        try:
+            User.objects(id=user.id).update_one(set__confirmed_at=confirmed_at)
+            user.confirmed_at = confirmed_at
+        except Exception as exc:
+            # Bookkeeping must never cost anyone their sign-in: the identity
+            # was already verified by the IdP, so a failure here is logged and
+            # the login proceeds. Same call as the provider stamp below.
+            current_app.logger.warning(
+                f"SAML: could not persist auto-confirm for user {user.id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # Record which provider this session came through, now that the guards
+    # above have established there is going to be one. Accounts that predate
+    # the field get it here, on their owner's next sign-in; nothing is written
+    # for a caller that supplied no provider, and nothing is written when the
+    # stored value already agrees, so a repeat login is not a repeat save.
+    #
+    # Deliberately last: an account blocked by the guards above did not
+    # authenticate through anything yet, and stamping it would say it did.
+    # This is bookkeeping, and bookkeeping must never deny anyone their
+    # account. The save is the only new way this function could raise, and it
+    # sits before login_user: unguarded, a legacy document that fails to
+    # validate for some unrelated reason would turn a working sign-in into a
+    # 500 -- a behaviour change, on the accounts most likely to be affected.
+    # So a failure here loses the field and is logged, and the login proceeds.
+    # (Not the same call as the mail sends that deliberately re-raise: there,
+    # swallowing made a failure the user cared about look successful. Here the
+    # outcome the user came for still happens.)
+    if provider or citizen_declared or doc_type or doc_nationality or eidas_country:
+        from udata.core.user.constants import (
+            AUTH_CITIZEN_DECLARED,
+            AUTH_DOC_NATIONALITY,
+            AUTH_DOC_TYPE,
+            AUTH_EIDAS_ORIGIN_COUNTRY,
+            AUTH_PROVIDER,
+        )
+
+        incoming = {}
+        if provider:
+            incoming[AUTH_PROVIDER] = provider
+        if citizen_declared:
+            incoming[AUTH_CITIZEN_DECLARED] = citizen_declared
+        # The verified counterpart of the declared type. The caller passes
+        # these only when the document -- not a NIC -- was what identified the
+        # person, so they describe the identity that is actually stored in
+        # auth_nic rather than an attribute that merely came along for the
+        # ride. Never the document number: that one lives only in the digest.
+        if doc_type:
+            incoming[AUTH_DOC_TYPE] = doc_type
+        if doc_nationality:
+            incoming[AUTH_DOC_NATIONALITY] = doc_nationality
+        # The one and only way an account that predates this key ever gains it.
+        # There is no backfill -- the identifier survives solely as the digest
+        # -- so an older account gets its country when its OWN owner signs in
+        # again, and never otherwise. Same semantics as the provider above.
+        if eidas_country:
+            incoming[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
+
+        # Only what actually differs, so a repeat login is not a repeat write,
+        # and one save for both keys rather than one each.
+        current = user.extras or {}
+        changed = {key: value for key, value in incoming.items() if current.get(key) != value}
+        if changed:
+            try:
+                if not user.extras:
+                    user.extras = {}
+                user.extras.update(changed)
+                user.save()
+            except Exception as exc:
+                current_app.logger.warning(
+                    f"SAML: could not record {sorted(changed)} for user "
+                    f"{user.id}: {type(exc).__name__}: {exc}"
+                )
+
+    # Only on a login that actually happened. login_user returns False without
+    # establishing a session when the account is not active, and flask_security
+    # leaves its own trackable block for the same reason -- stamping a refused
+    # sign-in would say someone entered when they were turned away, and would
+    # corrupt the very activity figures this exists to make trustworthy.
+    if login_user(user):
+        _record_login_activity(user)
     session["saml_login"] = True
+    # Whoever is logging in now owns this session. A confirmation handle left
+    # by someone else on a shared browser would otherwise disclose their masked
+    # address through migration_pending and let this user spend their send
+    # budget.
+    session.pop("saml_confirmation_pending", None)
+
+    # After the session exists, never before. Both remaining exits below are
+    # the same outcome -- one of them asks for an email first -- so the line
+    # belongs here rather than duplicated at each return.
+    #
+    # Emitted unconditionally although login_user can return False. That is
+    # safe only because BOTH ACS routes refuse an inactive account before
+    # entering here (LEDG-2465), and `active` is the only property that makes
+    # login_user refuse. The guarantee therefore lives in the routes, not on
+    # this line -- so if either guard ever moves, this becomes a success line
+    # for a session that was never established. Wrapping the emission in the
+    # `if` would be worse: the refusal would then produce no line at all.
+    _audit_saml("success", kind, issuer=issuer, name_id=name_id, reason=status)
 
     # Accounts still holding a minted saml-* placeholder email (new accounts
     # created without a usable CMD email, or older ones from before this
@@ -865,6 +1830,36 @@ def _handle_saml_user_login(user, new_account=False):
     # destination is dropped on purpose: completing registration is a hard
     # precondition, and the page explains the situation itself (no
     # cmd_new_account banner needed).
+    # Offer the asserted address back to the completion screen as a prefill:
+    # the common case becomes one click instead of retyping an address the IdP
+    # just asserted. The session, not extras: the IdP vouches for the identity,
+    # not for the mailbox, so this is an UNVERIFIED address whose only job is
+    # to fill a field for the few minutes that screen is up. Proving the
+    # mailbox is still the whole point of what happens after the submit.
+    #
+    # Written on every login that lands on the screen, not only on the one that
+    # created the account -- which is what gives the accounts minted before
+    # this existed a prefill too: they come back through this same funnel.
+    #
+    # The else-branch clears it deliberately. A value left behind by an earlier
+    # sign-in would be offered to whoever logs in next on a shared browser, and
+    # an address is exactly the kind of thing that must not survive a session
+    # it did not belong to.
+    if user.has_placeholder_email and asserted_email:
+        session["saml_asserted_email"] = asserted_email
+    else:
+        session.pop("saml_asserted_email", None)
+
+    # Kept and cleared on exactly the same terms, and never merged into the
+    # branch above: the names must survive an assertion that carried no email,
+    # which is every eIDAS sign-in and some CMD ones.
+    if user.has_placeholder_email:
+        session["saml_asserted_first_name"] = asserted_first_name
+        session["saml_asserted_last_name"] = asserted_last_name
+    else:
+        session.pop("saml_asserted_first_name", None)
+        session.pop("saml_asserted_last_name", None)
+
     if user.has_placeholder_email:
         return redirect(f"{frontend_url}/complete-registration")
 
@@ -879,21 +1874,73 @@ def _handle_saml_user_login(user, new_account=False):
     return redirect(destination)
 
 
-def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name):
+def _handle_migration_redirect(
+    user,
+    user_email,
+    user_nic,
+    first_name,
+    last_name,
+    no_match=False,
+    provider="cmd",
+    doc_type=None,
+    doc_nationality=None,
+    eidas_country=None,
+    invited=False,
+):
     """Store SAML data in session and redirect to migration page.
 
     ``user`` is the single candidate account matched by name, or None
     when several homonym accounts exist — in that case the wizard asks
-    the user to identify the account (login or search).
+    the user to identify the account by proving a password.
     ``saml_email`` is always the email coming from the CMD identity,
     never the candidate account's email.
+
+    ``no_match`` says the identity matched nothing at all, as opposed to
+    matching several homonyms. Both cases arrive with ``user`` unset, so the
+    wizard cannot tell them apart otherwise — and they need different first
+    steps: create an account, versus help me find mine.
+
+    ``provider`` is "cmd" or "eidas". The wizard names the provider on every
+    screen it renders, and nothing downstream of here can infer which one
+    started the flow — the two ACS routes converge on this function and the
+    assertion attributes look the same afterwards. Same reason as no_match:
+    give the wizard the distinction it cannot derive.
     """
     session["saml_migration_pending"] = {
         "legacy_user_id": str(user.id) if user else None,
+        "no_match": no_match,
+        # Whether this wizard session was started from the optional invite,
+        # which the wizard cannot infer: both modes converge on this redirect
+        # and look identical afterwards. It changes what the wizard OFFERS --
+        # the account-creation escape has no place in a flow the person
+        # entered from inside an account they proved with a password seconds
+        # ago -- and nothing about what it does. migration_skip refuses in
+        # invite mode regardless, so this is the visible half of a guarantee
+        # that does not depend on it.
+        "saml_invited": invited,
         "saml_email": user_email,
         "saml_nic": user_nic,
         "saml_first_name": first_name,
         "saml_last_name": last_name,
+        "saml_provider": provider,
+        # Carried for the same reason as the provider above: nothing downstream
+        # can infer them. The wizard does NOT come back through the login
+        # funnel in the request that creates the account -- migration_skip
+        # creates it and returns JSON, and the confirmation that follows is
+        # flask_security's -- so the funnel, which is the only place that
+        # writes these two keys today, only runs on the NEXT CMD sign-in.
+        #
+        # Not read out of saml_nic, even though a foreigner's identifier does
+        # contain both: parsing it would make a second reader of a pre-image
+        # _compose_foreign_identifier declares frozen and additive-only, and
+        # the whole point of that declaration is that nothing depends on its
+        # shape. Two explicit keys cost two short strings in a signed cookie.
+        "saml_doc_type": doc_type,
+        "saml_doc_nationality": doc_nationality,
+        # Carried for the same reason, and for the path that needs it most:
+        # the wizard creates its account outside any login funnel, so without
+        # this the country is simply gone by the time there is an account.
+        "saml_eidas_origin_country": eidas_country,
     }
     frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
     has_email = bool(user_email)
@@ -901,52 +1948,823 @@ def _handle_migration_redirect(user, user_email, user_nic, first_name, last_name
     return redirect(f"{frontend_url}/migrate-account{no_email_param}")
 
 
-def _mask_email(email):
-    """Mask an email address for display (e.g. j***@example.com)."""
-    if not email or "@" not in email:
-        return ""
-    local, domain = email.rsplit("@", 1)
-    if len(local) <= 1:
-        masked = local + "***"
-    else:
-        masked = local[0] + "***"
-    return f"{masked}@{domain}"
+def _point_migration_candidate(pending, user):
+    """Point the pending migration at ``user`` as the account to link.
+
+    The single place that mutates the candidate reference. Any validation
+    link already emailed was issued for a different target, so it has to die
+    with the re-point — copying that invariant to a second call site is how
+    target-confusion gets reintroduced. The link is stateless and outlives
+    any session, so destroying the record on the account it was issued
+    against is what kills it.
+    """
+    previous_id = pending.get("legacy_user_id")
+    if previous_id and previous_id != str(user.id):
+        _drop_migration_link(previous_id, pending)
+
+    # Store only the candidate reference — saml_email must keep holding
+    # the email coming from the CMD identity (or None), never the
+    # legacy account's email.
+    pending["legacy_user_id"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.modified = True
 
 
-def _send_migration_code(user, code):
-    """Send a verification code email for account migration."""
+def _drop_migration_link(user_id, pending):
+    """Destroy the validation link THIS session issued for ``user_id``.
+
+    Scoped to the issuing session, and that scope is the whole point. The
+    record lives on the User document, so it is global to the account and
+    outlives whoever wrote it — while pointing at an account takes no proof
+    at all on one path that remains: the SSO points a candidate by itself,
+    by email match or by a unique name match. Unscoped, this function let
+    such a session delete a link somebody else had legitimately asked for,
+    which is a denial of the whole flow for the account's owner.
+
+    The invariant being protected is narrower than the record, which is why
+    scoping costs nothing: a link still live in the old candidate's mailbox
+    would put this session's NIC on a second account, and only a link this
+    session issued can be in that position. A link issued by another session
+    is already bound to that session's own target.
+    """
+    if not user_id or str(user_id) != pending.get("link_issued_for"):
+        return
+
+    from udata.core.user.models import User
+
+    previous = User.objects(id=user_id).first()
+    if previous and (previous.extras or {}).pop(MIGRATION_LINK_PENDING, None):
+        previous.save()
+
+    pending.pop("link_issued_for", None)
+    session["saml_migration_pending"] = pending
+    session.modified = True
+
+
+def _parse_isoformat(value):
+    """Parse an ISO-8601 stamp we wrote ourselves, tolerating a bad one.
+
+    These stamps live in ``extras`` on the account, so a document written by
+    an older build — or edited by hand — must degrade to "no deadline known"
+    rather than 500 on a click the user cannot retry.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _migration_link_send_allowed(user):
+    """Whether ``user`` may be sent another validation link right now.
+
+    Returns the tally to store alongside the answer, so the caller writes back
+    a window that has already been rolled over rather than recomputing it.
+    """
+    tally = (user.extras or {}).get(MIGRATION_LINK_SEND_COUNT) or {}
+    started = _parse_isoformat(tally.get("window_start"))
+    count = tally.get("count", 0)
+
+    if started is None or datetime.utcnow() - started >= MIGRATION_LINK_SEND_WINDOW:
+        return True, {"count": 1, "window_start": datetime.utcnow().isoformat()}
+
+    if count >= MAX_MIGRATION_LINK_SENDS:
+        return False, tally
+
+    return True, {"count": count + 1, "window_start": tally["window_start"]}
+
+
+def _issue_migration_link(
+    user,
+    nic_hash,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+    eidas_country=None,
+    origin=None,
+    placeholder_id=None,
+):
+    """Record a pending link request on ``user`` and return its token.
+
+    The record carries everything the click needs — the hashed NIC, the names
+    from the assertion, which provider it came from, and what the citizen
+    declared — so the consuming route never has to read the session. A fresh
+    nonce is minted on every call, which is what makes a resend invalidate the
+    link that preceded it. Takes the NIC already hashed so a reissue can work
+    from a record, where the raw value is long gone.
+
+    ``provider`` and ``citizen_declared`` travel in the record for the same
+    reason as everything else in it: the click arrives with no session, so a
+    value left behind in one would not be there to read. A record written before
+    either field existed carries none, and the link then completes without
+    recording it.
+
+    ``origin`` and ``placeholder_id`` are written only when supplied, so a
+    wizard record keeps exactly the shape it had before they existed and every
+    branch reading them sees "absent" for the flow that never sets them.
+    """
+    nonce = secrets.token_urlsafe(32)
+
+    if not user.extras:
+        user.extras = {}
+    user.extras[MIGRATION_LINK_PENDING] = {
+        "nonce": nonce,
+        "nic_hash": nic_hash,
+        "first_name": first_name,
+        "last_name": last_name,
+        "provider": provider,
+        "citizen_declared": citizen_declared,
+        "expires": (datetime.utcnow() + MIGRATION_LINK_TTL).isoformat(),
+    }
+    # Written conditionally on purpose: a record that always carried the keys
+    # with None would be indistinguishable from one written by an older build,
+    # and the click has to tell those apart to know which flow it is in.
+    if origin:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_ORIGIN] = origin
+    if placeholder_id:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_PLACEHOLDER_ID] = str(placeholder_id)
+    # Same rule, and the same reason: the click arrives with no session at all,
+    # so the record is the only thing that knows. A record issued before these
+    # keys existed simply has none, and the consuming side reads them with a
+    # bare get so that absent stays absent rather than becoming a written null.
+    if doc_type:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_TYPE] = doc_type
+    if doc_nationality:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_DOC_NATIONALITY] = doc_nationality
+    if eidas_country:
+        user.extras[MIGRATION_LINK_PENDING][MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY] = eidas_country
+
+    # str(user.id), not fs_uniquifier: /logout rotates the uniquifier to kill
+    # outstanding sessions (LEDG-2134), and a password reset rotates it too,
+    # either of which would silently void a link the owner had not opened yet.
+    # The id is not the secret here — the nonce is.
+    serializer = current_app.extensions["security"].confirm_serializer
+    return serializer.dumps([MIGRATION_LINK_TOKEN_TAG, str(user.id), hash_data(nonce)])
+
+
+def _link_identity_and_login(
+    user,
+    nic_hash,
+    first_name,
+    last_name,
+    *,
+    provider=None,
+    citizen_declared=None,
+    doc_type=None,
+    doc_nationality=None,
+    eidas_country=None,
+):
+    """Bind the authenticated identity to ``user`` and start its session.
+
+    The single place that completes a link, shared by every branch that can:
+    the password proof and the emailed validation link. Keeping it in one
+    place is not tidiness — clearing the pending link record is one of its
+    responsibilities, and a branch that linked an account without clearing it
+    would leave a live link able to overwrite the identity it just bound. The
+    password is left untouched so the account stays reachable both ways.
+
+    ``provider`` and ``citizen_declared`` come from the link record, not the
+    session: the consuming route is a click that arrives with no session at all.
+    Recorded under the same rule as everywhere else — only when there is one to
+    record.
+    """
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
+        AUTH_PROVIDER,
+    )
+
+    if not user.extras:
+        user.extras = {}
+    if nic_hash:
+        user.extras["auth_nic"] = nic_hash
+    if provider:
+        user.extras[AUTH_PROVIDER] = provider
+    if citizen_declared:
+        user.extras[AUTH_CITIZEN_DECLARED] = citizen_declared
+    # Not guarded, unlike the funnel's write of the same two keys: the save
+    # below IS the link, and must fail the operation if it fails. Recording
+    # what identified the person is part of completing that link, not
+    # bookkeeping alongside it.
+    if doc_type:
+        user.extras[AUTH_DOC_TYPE] = doc_type
+    if doc_nationality:
+        user.extras[AUTH_DOC_NATIONALITY] = doc_nationality
+    if eidas_country:
+        user.extras[AUTH_EIDAS_ORIGIN_COUNTRY] = eidas_country
+    if first_name:
+        user.first_name = first_name.title()
+    if last_name:
+        user.last_name = last_name.title()
+    if not user.confirmed_at:
+        user.confirmed_at = datetime.utcnow()
+
+    # However the link was proved, any validation link still outstanding for
+    # this account was issued against the state that has just changed. The
+    # send tally goes with it: it exists to pace mails towards an unlinked
+    # account, and this account is now linked.
+    user.extras.pop(MIGRATION_LINK_PENDING, None)
+    user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
+    user.save()
+
+    # The save above is the link itself and must fail the operation if it
+    # fails. The trackable write is bookkeeping and goes after the login,
+    # guarded, on the same terms as the ACS funnel: this is the second of the
+    # two places that sign someone in, and it is reached only by the emailed
+    # link, which arrives with no session at all.
+    if login_user(user):
+        _record_login_activity(user)
+    session["saml_login"] = True
+
+    # Clean up migration session data
+    session.pop("saml_migration_pending", None)
+    session.pop("migration_password_attempts", None)
+
+    current_app.logger.info(f"Account migration completed for user {user.id}")
+
+
+def _migration_link_token_status_from_record(record):
+    """Whether a stored link record is still live, without a token to check.
+
+    Only the deadline can be read from the record alone -- the nonce is stored
+    hashed and the token is the other half -- which is all the caller needs:
+    an expired record protects nobody, so overwriting it destroys nothing.
+    """
+    expires = _parse_isoformat((record or {}).get("expires"))
+    if expires is None or expires <= datetime.utcnow():
+        return None, record, "expired"
+    return None, record, "live"
+
+
+def _association_exempt_ids(user, record):
+    """Which account ids may hold this record's NIC without invalidating it.
+
+    Always the account the link is for. For a registration association also
+    the placeholder named in the record, because the whole point of that click
+    is to take the identity off it.
+    """
+    exempt = [user.id]
+    if (record or {}).get(MIGRATION_LINK_ORIGIN) == MIGRATION_LINK_ORIGIN_REGISTRATION:
+        placeholder_id = record.get(MIGRATION_LINK_PLACEHOLDER_ID)
+        if placeholder_id and ObjectId.is_valid(placeholder_id):
+            exempt.append(ObjectId(placeholder_id))
+    return exempt
+
+
+def _migration_link_token_status(token):
+    """Resolve a validation-link token to ``(user, record, state)``.
+
+    ``state`` is one of "ok", "invalid" or "expired". Validity is settled
+    BEFORE expiry, unlike the change-email precedent this otherwise follows:
+    there a stale token merely triggers a fresh mail, but here a resend mints
+    a new nonce, so letting a superseded token reach the expiry branch would
+    have it reissue and thereby kill the newer link the user is holding.
+    """
+    from udata.core.user.models import User
+
+    # The signature carries the same deadline as the record, so the TTL is
+    # enforced cryptographically too. An expired signature still yields its
+    # payload (loads_unsafe), which is what lets the caller identify the
+    # account and mail a fresh link rather than dead-ending the user.
+    signature_expired, invalid, token_data = check_and_get_token_status(
+        token, "confirm", MIGRATION_LINK_TTL
+    )
+    if (
+        invalid
+        or not token_data
+        or len(token_data) != 3
+        or token_data[0] != MIGRATION_LINK_TOKEN_TAG
+    ):
+        return None, None, "invalid"
+
+    _tag, user_id, nonce_hash = token_data
+    # A well-signed token from elsewhere can still carry something that is not
+    # an ObjectId, and handing that to the field raises rather than not-found.
+    if not ObjectId.is_valid(user_id):
+        return None, None, "invalid"
+
+    user = User.objects(id=user_id).first()
+    # ``is_active`` joins ``deleted`` here rather than at the login below,
+    # because this helper is read-only by construction: refusing here means
+    # the token is never consumed, since the consumption is the write further
+    # down that this return value stops us reaching. A click that cannot
+    # produce a session must not burn a single-use link.
+    #
+    # "invalid" rather than a distinct code is deliberate, and the cost is
+    # real: the legitimate owner is told the link is invalid when the actual
+    # problem is that their account is disabled. That is the price of not
+    # handing an unauthenticated GET -- a mail scanner pre-opening the link,
+    # a forwarded URL -- an oracle for account state, and it is exactly the
+    # answer ``deleted`` already gives on this same line. The way out is the
+    # ACS guard: a fresh CMD attempt now says ``inactive_account`` before the
+    # wizard branch, so the account is no longer handed another doomed link.
+    if not user or user.deleted or not user.is_active:
+        return None, None, "invalid"
+
+    record = (user.extras or {}).get(MIGRATION_LINK_PENDING)
+    if not record or not record.get("nonce"):
+        # No record: the link was consumed, the wizard was re-pointed at
+        # another account, or another branch linked this one. Where the
+        # account did end up linked, saying so is more use than "invalid" —
+        # it is what a second click, or a mail scanner pre-opening the link,
+        # actually ran into, and the answer is to sign in with CMD.
+        if _has_linked_nic(user):
+            return user, None, "already_done"
+        return user, None, "invalid"
+
+    if not verify_hash(nonce_hash, record["nonce"]):
+        return user, None, "invalid"
+
+    # The account gained a linked identity since the link went out, and it is
+    # not this one: refuse rather than overwrite somebody else's link.
+    current_nic = (user.extras or {}).get("auth_nic")
+    if _has_linked_nic(user) and current_nic != record.get("nic_hash"):
+        return user, None, "invalid"
+
+    # The record cannot see what happened to OTHER accounts while it sat in a
+    # mailbox. The password branch links whichever account proved its password,
+    # which by design may not be this one, and migration_skip creates a fresh
+    # account carrying the NIC — neither touches this record. Linking anyway
+    # would leave one identity on two accounts, and the login lookup resolves
+    # by auth_nic ordered by -created_at, so the newer one silently wins.
+    # migration_skip already refuses a NIC that is taken; so must this.
+    # One id is always exempt: the account this link is for. A registration
+    # association link exempts a second -- the placeholder fixed into the
+    # record when the link was issued. That account is the one whose identity
+    # is being moved, so of course it still holds the NIC; without the
+    # exemption every click of this origin would resolve "invalid" and the
+    # flow could never complete once.
+    #
+    # This does not reopen what the guard is for. The exempt id is written
+    # server-side from a session that had already proved the identity, is
+    # never supplied by the click, and the same click retires that account. A
+    # THIRD account that acquired the NIC in the meantime -- the password
+    # branch, migration_skip -- is still found here and still refuses, which
+    # is the case the guard was written for.
+    claimed_elsewhere = User.objects(
+        extras__auth_nic=record.get("nic_hash"),
+        id__nin=_association_exempt_ids(user, record),
+    ).first()
+    if claimed_elsewhere:
+        return user, None, "invalid"
+
+    expires = _parse_isoformat(record.get("expires"))
+    # A record with no readable deadline is not a link whose age we can vouch
+    # for, so it is refused outright rather than treated as merely expired.
+    if expires is None:
+        return user, None, "invalid"
+
+    if signature_expired or datetime.utcnow() > expires:
+        return user, record, "expired"
+
+    return user, record, "ok"
+
+
+def _send_migration_link(user, first_name, last_name, token):
+    """Email the validation link that completes a legacy-account link.
+
+    The body is a security control, not decoration. The wizard reaches this
+    account without proving anything about it, so this mail is what stands
+    between a request nobody made and an identity bound to someone else's
+    account. Where a code was inert to a click — the owner had to transcribe
+    it for an attacker to get anywhere — a link is not: so it names the
+    identity that asked, and says plainly not to open it otherwise.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    link = f"{frontend_url}/saml/migration/confirm-link/{token}"
+
+    requester = " ".join(part.title() for part in (first_name, last_name) if part)
+
     msg = MailMessage(
-        subject=_("Account migration verification code"),
+        subject=_("Confirm linking a digital identity to your account"),
         paragraphs=[
             _(
-                "Someone is linking a CMD identity to your %(site)s account.",
+                "Someone signed in with the digital identity of %(name)s and asked "
+                "to link it to your %(site)s account.",
+                name=requester or _("an unnamed identity"),
                 site=current_app.config.get("SITE_TITLE", "dados.gov.pt"),
             ),
-            _("Your verification code is: %(code)s", code=code),
-            _("This code expires in 10 minutes."),
-            _("If you did not request this, ignore this email."),
+            _("Open the link below to complete the linking and sign in."),
+            MailCTA(label=_("Confirm linking"), link=link),
+            _("The link is valid for 30 minutes and can only be used once."),
+            _(
+                "If it was not you who started this, do NOT open the link and "
+                "ignore this email. Your account will not be changed."
+            ),
         ],
     )
     send_mail(user, msg)
 
 
-def _find_legacy_user(email=None, first_name=None, last_name=None):
-    """Find a legacy user (has password, no NIC, not deleted) by email or name."""
-    user = None
-    if email:
-        user = datastore.find_user(email=email)
-    elif first_name and last_name:
-        from udata.core.user.models import User
+def _migration_identity(state):
+    """The identity a migration request belongs to, as a rate-limit subject.
 
-        user = User.objects(
-            first_name__iexact=first_name,
-            last_name__iexact=last_name,
-            deleted=None,
-        ).first()
+    Read from the wizard session while it lasts and from the confirmation
+    handle afterwards, because the skip ends the wizard on every exit and the
+    resend runs after that. Falls back to the caller's address only for
+    requests that carry neither -- which are the ones that answer 400 anyway.
+    """
+    state = state or {}
+    nic = state.get("saml_nic")
+    if nic:
+        return f"saml-nic:{_hash_nic(nic)}"
+    if state.get("nic_hash"):
+        return f"saml-nic:{state['nic_hash']}"
+    # Only requests carrying neither handle land here, and they answer 400
+    # before sending anything. Behind the F5/WAF this key is one national
+    # bucket, so anything that legitimately sends mail must never reach it.
+    return f"ip:{get_remote_address()}"
 
-    if user and user.password and not _has_linked_nic(user):
-        if not user.deleted:
-            return user
+
+def _resolve_confirmation_handle(awaiting):
+    """Resolve a confirmation handle to ``(own_account, address)``.
+
+    The handle has ONE shape whichever branch of the skip wrote it -- the
+    address the caller submitted and the hash of the NIC they authenticated
+    with -- and both are things the caller already knows. That is not tidiness.
+    The Flask session cookie is signed but NOT encrypted, so its payload is a
+    base64 decode away from the client: a handle shaped one way for a taken
+    address and another way for a free one hands over the very bit the generic
+    answer exists to withhold, without the attacker making a second request.
+
+    Which branch ran is therefore recomputed here instead of being recorded.
+    An account answering to the address AND carrying this identity's NIC is
+    the account this wizard created; anything else means the address belongs
+    to somebody else, and the caller is told nothing either way.
+    """
+    address = (awaiting or {}).get("email")
+    if not address:
+        return None, None
+
+    nic_hash = (awaiting or {}).get("nic_hash")
+    account = datastore.find_user(case_insensitive=True, email=address)
+    if account and nic_hash and (account.extras or {}).get("auth_nic") == nic_hash:
+        return account, address
+    return None, address
+
+
+def _migration_identity_key():
+    """Rate-limit key for the migration routes: the identity, not the IP.
+
+    Reads the wizard session while it lasts and the confirmation handle
+    afterwards -- the skip ends the wizard on every exit, and the resend runs
+    after that, so a key that only knew the wizard would fall back to the IP
+    exactly where it is needed most. Behind the F5/WAF that fallback is a
+    single national bucket (see MIGRATION_SUBMIT_LIMIT), so it is left only
+    for requests carrying neither handle, which answer 400 anyway.
+    """
+    return _migration_identity(
+        session.get("saml_migration_pending") or session.get("saml_confirmation_pending")
+    )
+
+
+def _migration_rate_limit(view):
+    """Apply the migration ceiling to a view.
+
+    Its own scope, deliberately not the ``auth-ip`` one that auth_rate_limit
+    shares: the wizard must not spend the login's budget, nor the reverse.
+    """
+    from udata.app import limiter
+
+    return limiter.shared_limit(
+        MIGRATION_SUBMIT_LIMIT, scope="saml-migration", key_func=_migration_identity_key
+    )(view)
+
+
+def _migration_notice_send_allowed(state):
+    """Whether this identity may send one more migration mail right now.
+
+    The budget lives in the limiter's storage, keyed on the identity the SSO
+    proved -- not on the recipient's document, which is the whole point. A
+    tally written on the target would hand a stranger the power to spend the
+    owner's allowance, and that is half of what LEDG-2361 is about; a tally in
+    the session would be no tally at all, the cookie being the client's.
+
+    It is checked BEFORE anything looks at whether the submitted address
+    exists, so that running out says nothing about the address.
+    """
+    # udata.app, not current_app.extensions["limiter"]: flask-limiter 3.x
+    # stores a *set* under that key, and the strategy lives on the extension
+    # object itself.
+    from udata.app import limiter
+
+    if not limiter.enabled:
+        # init_app returns before building a strategy when RATELIMIT_ENABLED is
+        # false -- which settings.Debug sets, i.e. every development run -- and
+        # the property that exposes it asserts. Reaching for it unguarded turns
+        # "rate limiting is off" into a 500 on account creation.
+        return True
+
+    item = parse(
+        f"{MAX_CONFIRMATION_SENDS} per {int(MIGRATION_LINK_SEND_WINDOW.total_seconds())} seconds"
+    )
+    return limiter.limiter.hit(item, "saml-migration-mail", _migration_identity(state))
+
+
+def _send_migration_address_taken_notice(user):
+    """Tell the owner of an address that it already has an account.
+
+    The counterpart of the generic answer the skip now gives: the browser
+    learns nothing, and the only party told anything is whoever can read that
+    mailbox. Deliberately carries no token and no linking CTA -- issuing a
+    validation link here would overwrite the record on an account this session
+    has proved nothing about, which is exactly the destruction the flow is
+    being fixed to prevent. It also prescribes no particular next step: the
+    account may have been created through SAML and have no usable password, or
+    already be linked to another identity, and "use your password" would be
+    impossible advice for both.
+    """
+    site = current_app.config.get("SITE_TITLE", "dados.gov.pt")
+    msg = MailMessage(
+        kind="migration_address_taken",
+        subject=_("Your %(site)s account already exists", site=site),
+        paragraphs=[
+            _(
+                "Someone signing in with a digital identity tried to use this "
+                "address to create a new %(site)s account. It already belongs "
+                "to an account, so nothing was created and nothing changed.",
+                site=site,
+            ),
+            _(
+                "If it was you, sign in to that account the way you normally "
+                "do, or use the account recovery if you cannot."
+            ),
+            # The commonest recipient is the owner of a legacy account who
+            # just typed their own address into the wizard. The wizard session
+            # is over by the time this arrives, so without this line they are
+            # told what went wrong and not what they came to do.
+            _(
+                "To link that account to your digital identity, start the "
+                "sign-in again and follow the account association steps."
+            ),
+            _("If it was not you, no action is needed. Your account is untouched."),
+        ],
+    )
+    send_mail(user, msg)
+
+
+def _placeholder_owns_content(user):
+    """Whether retiring ``user`` would destroy something it cannot get back.
+
+    This is the question the association asks before it offers to retire a
+    placeholder, and the list is derived from one rule: what does
+    mark_as_deleted destroy irrecoverably? Everything the association carries
+    across itself is deliberately absent -- follows are moved rather than
+    deleted, so having followed something is not a reason to refuse.
+
+    Authored discussions ARE a reason, though the retirement is a soft delete
+    and the messages survive: their author is rewritten to a deleted account,
+    so a conversation the citizen took part in stops being attributable to
+    them. That cannot be undone from outside, which is the test this list
+    applies.
+
+    It reads only the requester's own account. Nothing here looks at the
+    address that was submitted, which is why the caller may run it before the
+    address is resolved at all -- a refusal then says nothing about whether
+    that address exists.
+
+    Deliberately conservative where the two costs are asymmetric: a false
+    "owns content" costs the citizen a support conversation, a false "owns
+    nothing" costs them an API token nobody can show them again.
+    """
+    from udata.models import (
+        CommunityResource,
+        ContactPoint,
+        Dataservice,
+        Dataset,
+        Discussion,
+        Page,
+        Reuse,
+        Topic,
+    )
+
+    if user.organizations:
+        # mark_as_deleted walks the memberships out of every organization.
+        return True
+
+    for model in (Dataset, Reuse, Dataservice, CommunityResource, Topic, Page):
+        # Every subclass of the Owned mixin, checked against it rather than
+        # recalled -- Topic and Page own exactly like the rest, and are the two
+        # an enumeration written from memory drops. ContactPoint and
+        # HarvestSource are Owned too and are handled separately below, for
+        # reasons particular to each. If a new Owned document appears, it
+        # belongs in one of these lists.
+        if model.objects(owner=user).first():
+            return True
+
+    from udata.harvest.models import HarvestSource
+
+    if HarvestSource.objects(owner=user).first():
+        return True
+
+    from udata.core.api_token.models import ApiToken
+
+    if ApiToken.objects(user=user, revoked_at=None).first():
+        # Revoked on retirement, and the secret is never shown twice.
+        return True
+
+    if ContactPoint.objects(owner=user).first():
+        # Deleted AND pulled out of every dataset and dataservice pointing at
+        # it, so this one reaches beyond the account itself.
+        return True
+
+    if Discussion.objects(discussion__posted_by=user).first():
+        return True
+
+    return False
+
+
+def _send_association_refused_notice(user):
+    """Tell the owner that the association was refused, and why.
+
+    Separate from address_taken_notice, whose only actionable line is "sign in
+    to that account the way you normally do" -- impossible advice for exactly
+    this person, who is held on the completion screen and cannot sign in
+    anywhere. Its docstring declines to prescribe a step because it cannot
+    know the case; here the case is known, so the mail says it.
+    """
+    from udata.auth import mails
+
+    mails.registration_association_refused_notice().send(user)
+
+
+def _mail_registration_association_link(requester, target):
+    """Mail ``target`` a link that moves ``requester``'s identity onto it.
+
+    The completion screen's second path. Someone signed in with a government
+    identity, was given a placeholder account, and typed the address of an
+    account they already had. Finishing registration for them means linking
+    the identity to that older account and retiring the placeholder -- and the
+    only acceptable proof that the address is theirs is opening the mail.
+
+    Returns True when a link went out, so the caller can fall back to the
+    silent notice. **It must not tell the caller anything else**: every return
+    path out of change_email is shared, and a branch that could be told apart
+    from out there would be the account oracle this whole flow exists without.
+
+    The guards are the wizard's, in the wizard's order (see
+    migration_send_link):
+
+    - the requester must still be pending and hold a linked identity. Without
+      the identity there is nothing to move, and the click would bind
+      ``nic_hash=None``;
+    - the target must be a real, finished, unlinked account. A deleted one is
+      nobody to mail; a placeholder is not the legacy account this path is
+      for; an already-linked one is somebody else's identity, and the click
+      would refuse anyway;
+    - issuing is destructive -- a fresh nonce lands on top of whatever record
+      the target already had -- so a live link belonging to another flow is
+      left alone. Without this, submitting addresses in a loop would void the
+      outstanding link of every owner it touched;
+    - and the per-target cap, because the address here is *typed*, which is
+      exactly the case MAX_MIGRATION_LINK_SENDS windows. change_email allows
+      five submissions a minute; without the cap that is three hundred mails
+      an hour at one address of the sender's choosing.
+    """
+    if not requester.has_placeholder_email or not _has_linked_nic(requester):
+        return False
+
+    if target.deleted or target.has_placeholder_email or _has_linked_nic(target):
+        return False
+
+    outstanding = (target.extras or {}).get(MIGRATION_LINK_PENDING)
+    if outstanding:
+        _, _, state = _migration_link_token_status_from_record(outstanding)
+        if state == "live":
+            return False
+
+    allowed, tally = _migration_link_send_allowed(target)
+    if not allowed:
+        return False
+
+    from udata.core.user.constants import (
+        AUTH_CITIZEN_DECLARED,
+        AUTH_DOC_NATIONALITY,
+        AUTH_DOC_TYPE,
+        AUTH_EIDAS_ORIGIN_COUNTRY,
+        AUTH_PROVIDER,
+    )
+
+    # From the session's assertion, NEVER from requester.first_name. The
+    # profile form lets any account rewrite its own name, and this name is
+    # interpolated into a mail sent to an address the requester typed -- so
+    # reading the document would hand a CMD-authenticated sender a few hundred
+    # characters of their own text inside a portal message, beside a genuine
+    # portal link. It is exactly the property _send_migration_link's docstring
+    # claims for itself ("it names the identity that asked"), and the wizard
+    # keeps it by reading the assertion out of its own session record.
+    #
+    # Absent means absent: a session predating this carries no names and the
+    # mail is sent without them, which is the same thing that happens when the
+    # assertion itself brought none.
+    first_name = session.get("saml_asserted_first_name")
+    last_name = session.get("saml_asserted_last_name")
+
+    extras = requester.extras or {}
+    token = _issue_migration_link(
+        target,
+        extras.get("auth_nic"),
+        first_name,
+        last_name,
+        # Bare gets, never a default: the record must describe the identity
+        # that actually signed in, and inventing a provider for an account
+        # that predates the field would be a worse answer than none.
+        provider=extras.get(AUTH_PROVIDER),
+        citizen_declared=extras.get(AUTH_CITIZEN_DECLARED),
+        # Read from the requester -- the placeholder -- and not the session,
+        # unlike the names above. These are not interpolated into any mail:
+        # they describe the identity, and the requester is where the sign-in
+        # that minted it wrote them. Bare gets for the same reason as the
+        # provider: a placeholder created before this field existed has none.
+        doc_type=extras.get(AUTH_DOC_TYPE),
+        doc_nationality=extras.get(AUTH_DOC_NATIONALITY),
+        eidas_country=extras.get(AUTH_EIDAS_ORIGIN_COUNTRY),
+        origin=MIGRATION_LINK_ORIGIN_REGISTRATION,
+        placeholder_id=requester.id,
+    )
+    target.extras[MIGRATION_LINK_SEND_COUNT] = tally
+    target.save()
+
+    _send_migration_link(target, first_name, last_name, token)
+    current_app.logger.info(
+        f"Registration association link sent to user {target.id} for pending user {requester.id}"
+    )
+    return True
+
+
+def _mail_validation_link(pending, user, *, enforce_cap=True):
+    """Issue and email the validation link that completes ``user``'s link.
+
+    Shared by the two branches that reach this point: the wizard asking for a
+    link outright, and the password branch proving which account to link.
+    Returns None once the mail is out, or the ``(payload, status)`` its caller
+    should return.
+
+    The NIC guard comes first, before the cap and before anything is written:
+    the assertion is the only source of the NIC, and without it the token would
+    be consumed with ``nic_hash=None`` -- a link that starts a session and
+    binds no identity at all.
+
+    ``enforce_cap`` is False for the password branch, which also clears the
+    tally. The cap exists to stop an address being mailed by a stranger, and a
+    proven password is the owner asking: counting it against an allowance
+    strangers can fill would let five anonymous sends deny the owner the whole
+    flow, which is the very thing MAX_MIGRATION_LINK_SENDS was made a window
+    rather than a lifetime ceiling to avoid -- and the password used to be the
+    way out of it. The recipient is still only ever that same proven address,
+    so lifting the cap mails nobody who did not ask for it.
+    """
+    if not pending.get("saml_nic"):
+        # The assertion carried no NIC, so there is nothing to bind. Neither a
+        # broken session nor a user error: this identity cannot use this flow
+        # at all, and saying "session expired" would send the user round to
+        # authenticate again into an identical dead end.
+        return {"error": "nic_required"}, 400
+
+    if enforce_cap:
+        allowed, tally = _migration_link_send_allowed(user)
+        if not allowed:
+            # The frontend maps this exact string onto its "too many sends" copy.
+            return {"error": "Maximum confirmation sends exceeded"}, 429
+    else:
+        user.extras.pop(MIGRATION_LINK_SEND_COUNT, None)
+        _, tally = _migration_link_send_allowed(user)
+
+    token = _issue_migration_link(
+        user,
+        _hash_nic(pending["saml_nic"]),
+        pending.get("saml_first_name"),
+        pending.get("saml_last_name"),
+        # Bare get, never `or AUTH_PROVIDER_CMD`: a session opened before the
+        # provider was recorded must produce a record without one, so the link
+        # completes without inventing a provider for it.
+        provider=pending.get("saml_provider"),
+        citizen_declared=_declared_citizen(),
+        # Bare gets, like the provider above: a session opened before these
+        # keys existed names no document, and none is invented for it.
+        doc_type=pending.get("saml_doc_type"),
+        doc_nationality=pending.get("saml_doc_nationality"),
+        eidas_country=pending.get("saml_eidas_origin_country"),
+    )
+    user.extras[MIGRATION_LINK_SEND_COUNT] = tally
+    user.save()
+
+    # Remember that it was THIS session that put the record there. Only a
+    # link this session issued may later be destroyed by it — see
+    # _drop_migration_link.
+    pending["link_issued_for"] = str(user.id)
+    session["saml_migration_pending"] = pending
+    session.modified = True
+
+    _send_migration_link(user, pending.get("saml_first_name"), pending.get("saml_last_name"), token)
+    current_app.logger.info(f"Migration validation link sent to user {user.id}")
     return None
 
 
@@ -1074,9 +2892,37 @@ def saml_client_for(metadata_file):
 @autenticacao_gov.route("/saml/login")
 @anonymous_user_required
 def sp_initiated():
+    """Start a CMD sign-in. Anonymous callers only -- this is a way IN."""
+    return _begin_cmd_authn_request()
+
+
+def _begin_cmd_authn_request(link_user_id=None):
+    """Build and return the CMD AuthnRequest form.
+
+    Shared by the sign-in route and the linking route so the request itself --
+    the requested attributes, the assurance level, the outstanding bucket --
+    has ONE definition. Two copies of this is how the two ACS handlers already
+    drifted apart once, and that divergence is what LEDG-2506 cost.
+
+    ``link_user_id`` is the only difference between the two callers: present,
+    it records that the callback belongs to an account asking to link.
+    """
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
+
+    # The citizen type the login screen collected, on its way to the account.
+    # Validated against an exact allowlist and only then put in the session, for
+    # the same reason `next` is checked above: this arrives in a query parameter
+    # the caller controls, so an unrecognised value is DROPPED -- never stored
+    # raw, never replaced by a default. A guess written into
+    # extras.auth_citizen_declared reads exactly like something the citizen
+    # said, which is the one thing that field must never do.
+    #
+    # It is self-declared and gates nothing; see the constant for why.
+    declared = request.args.get("citizen", "")
+    if declared in AUTH_CITIZEN_DECLARED_VALUES:
+        session["saml_citizen_declared"] = declared
 
     saml_client = saml_client_for(
         current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")[0]
@@ -1091,20 +2937,91 @@ def sp_initiated():
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
                 is_required="True",
             ),
+            # Required, and this flag has now changed three times in three
+            # weeks (False, True, False, True) -- so the reasoning is written
+            # down rather than left to be re-derived a fourth time.
+            #
+            # What isRequired actually governs is the CONSENT SCREEN. Marked
+            # optional, autenticacao.gov lists the attribute under "Dados
+            # Opcionais" with a checkbox the citizen can clear; marked
+            # required, the checkbox is gone. It was the checkboxes that
+            # produced the defect: with all four cleared the assertion carries
+            # no identifier at all, nothing links the person to an account,
+            # and a new one is minted on every sign-in. Measured on 2026-09-15
+            # and 16: one person, one CMD, three accounts.
+            #
+            # A previous comment here claimed isRequired makes the IdP refuse
+            # a citizen who lacks the attribute, and that requiring the NIC is
+            # what shuts foreigners out. That was never observed. What WAS
+            # observed: tst ran with the NIC required from late August until
+            # 2026-09-14 -- two and a half weeks, with CMD sign-ins working
+            # throughout. That window covers the NIC and covers nationals; it
+            # does not cover the three document attributes below, which did
+            # not exist then.
+            #
+            # That the required form has NO checkbox is read off the contrast
+            # with that window rather than observed directly, and it is the
+            # premise the whole change rests on -- so it carries the same
+            # qualifier as everything else here.
             RequestedAttribute(
                 name=MDC_ATTR_NIC,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_FIRST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
             ),
             RequestedAttribute(
                 name=MDC_ATTR_LAST_NAME,
                 name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
-                is_required="False",
+                is_required="True",
+            ),
+            # The foreign citizen's document, required for the same reason as
+            # the NIC: a checkbox on any of the three is a way to arrive with
+            # no identity.
+            #
+            # 🚨 The identifier composition needs ALL THREE or none -- it
+            # returns None unless type, nationality and number are all present
+            # -- so leaving any one of them optional leaves the hole open.
+            #
+            # ⚠️ And the risk here is NOT only to foreigners, which is the
+            # easy thing to assume. What is actually known:
+            #
+            # - the consent screen OFFERS these three to a national (observed
+            #   2026-09-16), so a national plausibly supplies them;
+            # - whether the assertion arrives with them filled in is NOT
+            #   known, for either population;
+            # - unlike the NIC, no window of tst ever ran with these required,
+            #   so the pessimistic reading of isRequired is untested for them.
+            #
+            # Careful not to argue from the wrong end: the composer returns
+            # None for a Cartao de Cidadao, but that is about what WE do with
+            # the answer, not about what the IdP supplies. A national sending
+            # DocType=CC has supplied the attribute; we simply decline to
+            # build an identifier from it. Reading the composer as proof that
+            # nationals lack the attribute would be exactly the kind of
+            # supposition-stated-as-fact this change exists to remove.
+            #
+            # ⇒ Which is why the validation against a real CMD has to cover a
+            # national AND a foreigner before this leaves tst. The blast
+            # radius under the pessimistic reading is unknown, not bounded to
+            # one group.
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_TYPE,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="True",
+            ),
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_NATIONALITY,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="True",
+            ),
+            RequestedAttribute(
+                name=MDC_ATTR_DOC_NUMBER,
+                name_format="urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+                is_required="True",
             ),
         ]
     )
@@ -1139,6 +3056,7 @@ def sp_initiated():
     # POST and emptying the bucket on the callback. RelayState rides
     # the form payload end-to-end so the bucket survives that path too.
     _store_outstanding_relay(relay_token, reqid, kind="cmd")
+    _store_link_intent(relay_token, link_user_id)
     # TEMP DIAG (remove after PPR is green): confirm bucket landed in Redis.
     try:
         from udata.app import cache as _diag_cache
@@ -1159,6 +3077,66 @@ def sp_initiated():
 
 
 #################################################################
+# Starts a CMD/eIDAS link from an account that is already signed in.
+##
+#################################################################
+
+
+def _refuse_link_start():
+    """The checks both linking routes share, or None when the caller may pass.
+
+    🚨 These routes exist BECAUSE ``sp_initiated`` cannot serve this: it is
+    decorated ``@anonymous_user_required``, which is correct for a way in and
+    exactly wrong for somebody who just signed in with a password and wants to
+    add an identity. Without a door of their own, the invite's button bounces
+    off the sign-in route and nothing happens.
+
+    Refusing here is the same question the invite asked, asked again at the
+    moment it matters: the invite may have been rendered minutes ago, the flag
+    may have been turned off since, and the account may have linked in another
+    tab. A door that opens on a stale notice is a door that links an account
+    twice.
+    """
+    from flask_login import current_user
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Authentication required"}), 401
+
+    if not _invite_enabled():
+        return jsonify({"error": "Linking invite is not enabled"}), 403
+
+    # Deliberately NOT _invite_offered_to: a dismissal means "not now", not
+    # "never let me". The permanent way back has to keep working for somebody
+    # who dismissed the notice last week and changed their mind today.
+    if not _needs_identity_link(current_user):
+        return jsonify({"error": "Account has nothing to link"}), 409
+
+    return None
+
+
+@autenticacao_gov.route("/saml/link/start")
+def link_initiated():
+    """Start a CMD sign-in whose callback links, rather than signs up."""
+    from flask_login import current_user
+
+    refusal = _refuse_link_start()
+    if refusal:
+        return refusal
+    return _begin_cmd_authn_request(link_user_id=str(current_user.id))
+
+
+@autenticacao_gov.route("/saml/eidas/link/start")
+def link_eidas_initiated():
+    """Start an eIDAS sign-in whose callback links, rather than signs up."""
+    from flask_login import current_user
+
+    refusal = _refuse_link_start()
+    if refusal:
+        return refusal
+    return _begin_eidas_authn_request(link_user_id=str(current_user.id))
+
+
+#################################################################
 # Receives SAML Response.
 ##
 #################################################################
@@ -1169,12 +3147,18 @@ def sp_initiated():
 def idp_initiated():
     user_email = None
     user_nic = None
+    doc_type = doc_nationality = doc_number = None
     first_name = None
     last_name = None
     authn_response = None
 
     raw_saml_response = request.form.get("SAMLResponse")
     if not raw_saml_response:
+        # A POST to the ACS with no assertion at all. Audited as `error`, not
+        # `rejected`: nothing was decided about anybody -- the request never
+        # carried an identity to decide on. Without this the funnel simply
+        # ends here with no trace, which is the gap LEDG-2371 closes.
+        _audit_saml("error", "cmd", reason="missing_saml_response")
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
@@ -1199,6 +3183,10 @@ def idp_initiated():
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
     _diag_redis_bucket = _consume_outstanding_relay(relay_token)
+    # Consumed HERE, beside the outstanding bucket, and not further down where
+    # it is used: the ticket is single-use and must die with the round-trip
+    # that carried it, whatever branch this request goes on to take.
+    link_intent_user = _resolve_link_intent(relay_token)
     outstanding.update(_diag_redis_bucket)
     # TEMP DIAG (remove after PPR is green): see what AMA actually echoed and
     # whether we matched it in Redis. `in_response_to` is parsed from raw XML
@@ -1338,9 +3326,22 @@ def idp_initiated():
             user_nic = _first_value(identity, MDC_ATTR_NIC)
             first_name = _first_value(identity, MDC_ATTR_FIRST_NAME)
             last_name = _first_value(identity, MDC_ATTR_LAST_NAME)
+            # Normalised HERE and not inside _first_value: that extractor is
+            # shared, and the eIDAS route reads the PersonIdentifier through
+            # it -- a value hashed by the same function and as frozen as the
+            # composition below. Trimming punctuation there would unmatch
+            # eIDAS accounts already registered. Normalising at this single
+            # assignment feeds both consumers the clean type: the identifier
+            # composed below, and extras.auth_doc_type written by the funnel,
+            # which the counting reads (and which stored "TR:" until now).
+            doc_type = _normalize_doc_type(_first_value(identity, MDC_ATTR_DOC_TYPE))
+            doc_nationality = _first_value(identity, MDC_ATTR_DOC_NATIONALITY)
+            doc_number = _first_value(identity, MDC_ATTR_DOC_NUMBER)
             current_app.logger.warning(
                 f"[DEBUG] SAML atributos extraídos: email={user_email!r}, "
                 f"nic_present={bool(user_nic)}, nome={first_name!r} {last_name!r}, "
+                f"doc_type={doc_type!r}, doc_nationality={doc_nationality!r}, "
+                f"doc_number_present={bool(doc_number)}, "
                 f"identity_keys={list(identity.keys()) if identity else None}"
             )
         else:
@@ -1355,9 +3356,9 @@ def idp_initiated():
     except Exception as e:
         current_app.logger.warning(f"Falha ao extrair identity do pysaml2: {e}")
 
-    if not user_email and not user_nic:
+    if not user_email and not user_nic and not doc_number:
         current_app.logger.error(
-            "SAML SSO: nenhum atributo extraído (email/NIC). "
+            "SAML SSO: nenhum atributo extraído (email/NIC/documento). "
             "Verificar se as assertions estão encriptadas e se o pysaml2 "
             "tem acesso à chave privada para desencriptar."
         )
@@ -1388,42 +3389,222 @@ def idp_initiated():
             reason="subject_nic_mismatch",
         )
 
-    user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
+    # A foreign citizen has no NIC, so their document is the identity. The NIC
+    # wins whenever there is one: a national's stored auth_nic must keep
+    # matching hash_nic(nic) byte for byte, and nothing here may change that.
+    #
+    # The NameID↔NIC binding above deliberately stays keyed on user_nic. That
+    # check is about the NIC attribute specifically -- the Subject would never
+    # carry the composed string -- so it is skipped for a foreigner exactly as
+    # it already is for any assertion that arrives without a NIC.
+    user_identifier = user_nic or _compose_foreign_identifier(doc_type, doc_nationality, doc_number)
+
+    user, status = _find_or_create_saml_user(user_email, user_identifier, first_name, last_name)
     current_app.logger.warning(
         f"[DEBUG cmd] post _find_or_create_saml_user: user_id={getattr(user, 'id', None)}, "
         f"user_email={getattr(user, 'email', None)!r}, status={status!r}, "
         f"MIGRATION_MODE_ENABLED={current_app.config.get('MIGRATION_MODE_ENABLED', False)}"
     )
 
-    if status == "migration_candidate":
-        if _migration_enabled():
+    # More than one account claims this identity. There is no way to tell which
+    # one belongs to the person in front of us, so the sign-in is refused
+    # rather than resolved -- letting someone into a stranger's account is a
+    # worse outcome than letting nobody in.
+    #
+    # Sits here, before the wizard branch, for the same reason as the guard
+    # below: nothing has been written yet, and the funnel -- which is what
+    # emits the terminal audit line -- is never entered, so this refusal is
+    # the only line the request produces.
+    if status == "ambiguous_identity":
+        return _reject_saml_login(
+            "[SAML cmd] refused login for an identity claimed by more than one account",
+            # The file's own wording for a SAML-specific refusal, rather than
+            # flask_security's GENERIC_AUTHN_FAILED -- that one says "identity
+            # or password invalid", which is actively misleading here: the
+            # identity is perfectly valid, it is claimed twice. And this is a
+            # case only support can resolve, so the message has to say so.
+            _(
+                "Autenticação rejeitada: esta identidade está associada a mais do que uma "
+                "conta. Contacte o suporte para as reunir."
+            ),
+            log_level="warning",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="ambiguous_identity",
+        )
+
+    # flask_login.login_user returns False without establishing a session when
+    # the account is not active, and everything downstream used to treat that
+    # refusal as a success. The guard belongs HERE, and not at that return
+    # value: by the time the login funnel reaches login_user it has already
+    # auto-confirmed the account and stamped auth_provider on it, so refusing
+    # later would leave an account confirmed and marked as having authenticated
+    # through CMD by a login that was declined — exactly what the comment above
+    # that stamp forbids.
+    #
+    # It also sits before the wizard branch below on purpose: an inactive
+    # legacy account that is not linked yet is, by construction, the one that
+    # receives validation links, and a guard placed any lower would send it
+    # back to the wizard on every attempt — mailing it another link that the
+    # link path then refuses — without ever telling it what is wrong.
+    #
+    # ``user`` may be None here: _find_or_create_saml_user returns (None, ...)
+    # for an assertion carrying neither an email nor a NIC.
+    if user and not user.is_active:
+        return _reject_saml_login(
+            f"[SAML cmd] refused login for inactive account user_id={user.id}",
+            get_message("DISABLED_ACCOUNT")[0],
+            log_level="warning",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="inactive_account",
+        )
+
+    if status in ("migration_candidate", "no_match"):
+        # 🚨 `no_match` is in this branch for the invited flow too, and that is
+        # the whole point. The case that creates the duplicate is the citizen
+        # whose CMD carries a DIFFERENT address from their portal account, one
+        # nobody else holds: the resolver recognises nothing, answers no_match,
+        # and today a brand-new account is minted. The portal has no way to
+        # know it is the same person -- except the ticket, which says so.
+        #
+        # With a ticket the candidate is KNOWN, so the wizard is pointed
+        # straight at that account instead of asking "help me find mine". It
+        # still has to be proven: the wizard mails the validation link to that
+        # account's OWN address, never one typed here.
+        if _migration_enabled() or link_intent_user:
             _audit_saml(
                 "migration_pending",
                 "cmd",
                 issuer=issuer,
                 name_id=name_id_value,
-                reason=status,
+                reason="invite_link" if link_intent_user else status,
             )
-            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
-        # Migration wizard disabled: never log into an unproven account —
-        # fall back to creating a new one (scenario 4).
-        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+            return _handle_migration_redirect(
+                link_intent_user or user,
+                user_email,
+                user_identifier,
+                first_name,
+                last_name,
+                no_match=(status == "no_match" and not link_intent_user),
+                invited=bool(link_intent_user),
+                provider="cmd",
+                # The same guard the funnel already receives below: only when
+                # the document WAS the identity. For a national the NIC won in
+                # the composition, so carrying the document here would describe
+                # something other than what the identity actually holds.
+                doc_type=None if user_nic else doc_type,
+                doc_nationality=None if user_nic else doc_nationality,
+            )
+        # Migration wizard disabled: never log into an unproven account, and
+        # nobody is around to ask for a confirmed email — fall back to
+        # creating the account outright, exactly as before (scenario 4).
+        user = _create_saml_user(
+            user_email,
+            user_identifier,
+            first_name,
+            last_name,
+            provider=AUTH_PROVIDER_CMD,
+            citizen_declared=_declared_citizen(),
+            # Same guard as everywhere else: only when the document WAS the
+            # identity. The funnel below writes these too, in this same
+            # request -- but its write is guarded and swallows failure, so
+            # recording them in the insert is what makes them durable.
+            doc_type=None if user_nic else doc_type,
+            doc_nationality=None if user_nic else doc_nationality,
+        )
         status = "new"
 
-    _audit_saml(
-        "success" if user else "user_not_found",
-        "cmd",
-        issuer=issuer,
-        name_id=name_id_value,
-        reason=status,
-    )
+    # No audit line here. It used to be emitted at this point, before the
+    # funnel had decided anything, so a login the funnel went on to refuse
+    # (deleted account) or divert (pending confirmation) was still counted as
+    # a success. The funnel emits it now, at whichever exit it actually
+    # reaches -- see _handle_saml_user_login.
+    #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    # 🚩 THE CITIZEN ASKED TO LINK, AND THIS IDENTITY IS ALREADY SOMEBODY'S.
+    #
+    # Signing them into that other account is what used to happen, and it is
+    # the right answer for anyone who pressed "sign in with CMD" -- the
+    # identity IS that account's. It is the wrong answer for somebody who
+    # pressed "link": they are put into an account they did not ask about,
+    # the one they clicked from stays unlinked, and nothing says so. They
+    # walk away believing it worked, and find out when the invite comes back.
+    #
+    # Same principle as the password screen refusing a different account:
+    # never switch accounts in silence. Refusing here costs one click to
+    # whoever did want that account -- the sign-in button is still there --
+    # and saves everyone else from a change they never asked for.
+    #
+    # No identity in the redirect: the code is generic on purpose, because the
+    # query string lands in browser history, Referer headers and proxy logs.
+    if link_intent_user and status == "existing_saml":
+        return _reject_saml_login(
+            f"[SAML cmd] refused an invited link: the identity already belongs to "
+            f"another account (asked by user_id={link_intent_user.id})",
+            _(
+                "Não foi possível associar: esta identidade já está associada a outra "
+                "conta do portal. A sua conta ficou como estava."
+            ),
+            log_level="info",
+            kind="cmd",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="invite_identity_already_linked",
+        )
+
     session["saml_name_id"] = name_id_value
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
     session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
-    return _handle_saml_user_login(user, new_account=(status == "new"))
+    return _handle_saml_user_login(
+        user,
+        new_account=(status == "new"),
+        provider=AUTH_PROVIDER_CMD,
+        citizen_declared=_declared_citizen(),
+        # What the funnel needs to audit its own outcome, and which only this
+        # route knows.
+        kind="cmd",
+        issuer=issuer,
+        name_id=name_id_value,
+        status=status,
+        # 🚩 The one outcome the invited flow has that nobody would think to
+        # look for. The person clicked "Associate" from inside their own
+        # account, and the CMD they authenticated with turns out to belong to
+        # a DIFFERENT account -- so the portal signs them into that other one
+        # instead. The identity IS that account's, so this is correct and it
+        # is also today's behaviour; what it is not is expected by somebody
+        # who started from somewhere else.
+        #
+        # (The condition needs no comparison: _resolve_link_intent refuses an
+        # account that already holds an identity, so an intent that survived
+        # alongside `existing_saml` necessarily points at a different one.)
+        #
+        # It is the population LEDG-2472 exists for -- two accounts, one
+        # person -- and without a reason of its own it is indistinguishable
+        # from an ordinary sign-in in the audit log.
+        # Only when the document was the identity. For a national the NIC won
+        # in the composition above, so recording the document here would
+        # describe something other than what auth_nic actually holds.
+        doc_type=None if user_nic else doc_type,
+        doc_nationality=None if user_nic else doc_nationality,
+        # The address the assertion carried, never the minted placeholder:
+        # _create_saml_user rebinds its own local when it has to mint one, so
+        # what is still bound here is what autenticacao.gov actually sent.
+        # Deliberately passed even when it is already taken by another account
+        # -- unlike migration_pending, which withholds a taken address because
+        # offering it there guarantees a rejection. Here the taken address is
+        # the point: it is how the user reaches their own older account.
+        asserted_email=user_email,
+        # From the assertion, never from the account document: these name the
+        # requester in a mail sent to an address the requester typed, and the
+        # profile form lets an account rewrite its own name.
+        asserted_first_name=first_name,
+        asserted_last_name=last_name,
+    )
 
 
 #################################################################
@@ -1482,6 +3663,14 @@ def _terminate_local_session():
     session.pop("saml_login", None)
     session.pop("saml_name_id", None)
     session.pop("saml_name_id_format", None)
+    # Ends with the session like the rest: it is a handle onto someone's
+    # pending account, and the next person on this browser must not inherit it.
+    session.pop("saml_confirmation_pending", None)
+    # Same rule, same reason: this is what *someone* said about themselves. Left
+    # behind, the next person to start a CMD sign-in on this browser without
+    # passing through the screen -- a bookmarked /saml/login, say -- would have
+    # that answer recorded on their own account as if they had given it.
+    session.pop("saml_citizen_declared", None)
     logout_user()
 
 
@@ -1541,6 +3730,12 @@ def eidas_client_for(metadata_file):
 @autenticacao_gov.route("/saml/eidas/login")
 @anonymous_user_required
 def sp_eidas_initiated():
+    """Start an eIDAS sign-in. Anonymous callers only -- this is a way IN."""
+    return _begin_eidas_authn_request()
+
+
+def _begin_eidas_authn_request(link_user_id=None):
+    """Build and return the eIDAS AuthnRequest form. See its CMD twin."""
     next_url = request.args.get("next", "")
     if next_url.startswith("/") and not next_url.startswith("//"):
         session["saml_next_url"] = next_url
@@ -1607,6 +3802,7 @@ def sp_eidas_initiated():
     reqid, info = saml_client.prepare_for_authenticate(**args)
     _remember_outstanding(reqid, kind="eidas")
     _store_outstanding_relay(relay_token, reqid, kind="eidas")
+    _store_link_intent(relay_token, link_user_id)
     return _extract_saml_form_data(info["data"])
 
 
@@ -1623,10 +3819,13 @@ def idp_eidas_initiated():
     user_nic = None
     first_name = None
     last_name = None
+    eidas_country = None
     authn_response = None
 
     raw_saml_response = request.form.get("SAMLResponse")
     if not raw_saml_response:
+        # Same as the CMD route: a malformed request, audited as `error`.
+        _audit_saml("error", "eidas", reason="missing_saml_response")
         return "Erro: SAMLResponse em falta", 400
 
     auth_servers = current_app.config.get("SECURITY_SAML_IDP_METADATA").split(",")
@@ -1649,6 +3848,8 @@ def idp_eidas_initiated():
     outstanding = dict(session.get(_OUTSTANDING_SESSION_KEY, {}))
     relay_token = request.form.get("RelayState", "")
     outstanding.update(_consume_outstanding_relay(relay_token))
+    # See its CMD twin: consumed with the round-trip, not with the branch.
+    link_intent_user = _resolve_link_intent(relay_token)
     last_validation_error = None
     for server in auth_servers:
         saml_client = eidas_client_for(server)
@@ -1773,9 +3974,16 @@ def idp_eidas_initiated():
                 id_source = "eidas-friendly"
             else:
                 id_source = None
+            # Read beside the identifier, never instead of it: what goes into
+            # the digest below is `user_nic` verbatim. Named in the log because
+            # a member state is not personal data -- the identifier itself
+            # stays masked -- and because a country that comes back None here
+            # is the only way a shape we did not anticipate becomes visible.
+            eidas_country = _eidas_origin_country(user_nic)
             current_app.logger.info(
                 f"eIDAS atributos via pysaml2: email={user_email}, "
                 f"id={'***' if user_nic else None} (source={id_source}), "
+                f"origin_country={eidas_country}, "
                 f"nome={first_name} {last_name}, "
                 f"identity_keys={list(identity.keys())}, "
                 f"name_id_format={name_id_format!r}"
@@ -1826,19 +4034,72 @@ def idp_eidas_initiated():
 
     user, status = _find_or_create_saml_user(user_email, user_nic, first_name, last_name)
 
-    if status == "migration_candidate":
-        if _migration_enabled():
+    # Same refusal, same reasoning as the CMD route above.
+    if status == "ambiguous_identity":
+        return _reject_saml_login(
+            "[SAML eidas] refused login for an identity claimed by more than one account",
+            _(
+                "Autenticação rejeitada: esta identidade está associada a mais do que uma "
+                "conta. Contacte o suporte para as reunir."
+            ),
+            log_level="warning",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="ambiguous_identity",
+        )
+
+    # Same guard, same reasoning as the CMD route above — see the comment there
+    # for why it sits here and not at the login_user return value. Duplicated
+    # per route because that is how every other rejection code in this file is
+    # placed, and the tests run the same scenario through both handlers so a
+    # future divergence between the two copies turns one of them red.
+    if user and not user.is_active:
+        return _reject_saml_login(
+            f"[SAML eidas] refused login for inactive account user_id={user.id}",
+            get_message("DISABLED_ACCOUNT")[0],
+            log_level="warning",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="inactive_account",
+        )
+
+    if status in ("migration_candidate", "no_match"):
+        # Same branch, same reasoning as the CMD route above -- and eIDAS needs
+        # it more, not less: the Minimum Data Set carries NO email at all, so
+        # an invited eIDAS link is always a no_match and would ALWAYS have
+        # minted a second account without the ticket.
+        if _migration_enabled() or link_intent_user:
             _audit_saml(
                 "migration_pending",
                 "eidas",
                 issuer=issuer,
                 name_id=name_id_value,
-                reason=status,
+                reason="invite_link" if link_intent_user else status,
             )
-            return _handle_migration_redirect(user, user_email, user_nic, first_name, last_name)
-        # Migration wizard disabled: never log into an unproven account —
-        # fall back to creating a new one (scenario 4).
-        user = _create_saml_user(user_email, user_nic, first_name, last_name)
+            return _handle_migration_redirect(
+                link_intent_user or user,
+                user_email,
+                user_nic,
+                first_name,
+                last_name,
+                no_match=(status == "no_match" and not link_intent_user),
+                invited=bool(link_intent_user),
+                provider="eidas",
+                eidas_country=eidas_country,
+            )
+        # Migration wizard disabled: never log into an unproven account, and
+        # nobody is around to ask for a confirmed email — fall back to
+        # creating the account outright, exactly as before (scenario 4).
+        user = _create_saml_user(
+            user_email,
+            user_nic,
+            first_name,
+            last_name,
+            provider=AUTH_PROVIDER_EIDAS,
+            eidas_country=eidas_country,
+        )
         status = "new"
 
     if user is None:
@@ -1856,20 +4117,62 @@ def idp_eidas_initiated():
             detail=identity_keys_csv,
         )
 
-    _audit_saml(
-        "success",
-        "eidas",
-        issuer=issuer,
-        name_id=name_id_value,
-        reason=status,
-    )
+    # No audit line here, for the same reason as the CMD route: the funnel is
+    # the only place that knows which exit it took.
+    #
     # Remember the authenticated Subject so SP-initiated logout can send the
     # IdP a LogoutRequest for the RIGHT session (see _saml_session_name_id).
+    # Same guard, same reasoning as the CMD route above -- see the comment
+    # there. Duplicated per route because that is how every other rejection in
+    # this file is placed, and the tests run the scenario through both
+    # handlers so a divergence between the copies turns one of them red.
+    if link_intent_user and status == "existing_saml":
+        return _reject_saml_login(
+            f"[SAML eidas] refused an invited link: the identity already belongs to "
+            f"another account (asked by user_id={link_intent_user.id})",
+            _(
+                "Não foi possível associar: esta identidade já está associada a outra "
+                "conta do portal. A sua conta ficou como estava."
+            ),
+            log_level="info",
+            kind="eidas",
+            issuer=issuer,
+            name_id=name_id_value,
+            reason="invite_identity_already_linked",
+        )
+
     session["saml_name_id"] = name_id_value
     # Only ever store plain strings in the session (the format may be a
     # non-string sentinel in edge cases; production values are str or None).
     session["saml_name_id_format"] = name_id_format if isinstance(name_id_format, str) else ""
-    return _handle_saml_user_login(user, new_account=(status == "new"))
+    return _handle_saml_user_login(
+        user,
+        new_account=(status == "new"),
+        provider=AUTH_PROVIDER_EIDAS,
+        eidas_country=eidas_country,
+        kind="eidas",
+        issuer=issuer,
+        name_id=name_id_value,
+        status=status,
+        # 🚩 The one outcome the invited flow has that nobody would think to
+        # look for. The person clicked "Associate" from inside their own
+        # account, and the CMD they authenticated with turns out to belong to
+        # a DIFFERENT account -- so the portal signs them into that other one
+        # instead. The identity IS that account's, so this is correct and it
+        # is also today's behaviour; what it is not is expected by somebody
+        # who started from somewhere else.
+        #
+        # (The condition needs no comparison: _resolve_link_intent refuses an
+        # account that already holds an identity, so an intent that survived
+        # alongside `existing_saml` necessarily points at a different one.)
+        #
+        # It is the population LEDG-2472 exists for -- two accounts, one
+        # person -- and without a reason of its own it is indistinguishable
+        # from an ordinary sign-in in the audit log.
+        # No asserted_email: the eIDAS Minimum Data Set has no such attribute.
+        asserted_first_name=first_name,
+        asserted_last_name=last_name,
+    )
 
 
 #################################################################
@@ -1943,10 +4246,174 @@ def _migration_enabled():
     return current_app.config.get("MIGRATION_MODE_ENABLED", False)
 
 
+def _invite_enabled():
+    """True when the OPTIONAL linking invite is on, and the mandatory mode is not.
+
+    Two flags, one question each: MIGRATION_MODE_ENABLED asks "is linking
+    mandatory?", MIGRATION_INVITE_ENABLED asks "do we invite?". Of the four
+    combinations only one needs arbitrating, and it is arbitrated here rather
+    than at each call site: with BOTH on, the mandatory mode wins. Inviting
+    somebody to do optionally what the portal is about to refuse them for not
+    having done is not a state worth having, and leaving the precedence to be
+    re-derived by each reader is how two of them end up disagreeing.
+
+    So every branch downstream reads exactly one of the two functions and gets
+    a decision, never a pair of flags to combine on the spot.
+    """
+    if _migration_enabled():
+        return False
+    return bool(current_app.config.get("MIGRATION_INVITE_ENABLED", False))
+
+
+def _needs_identity_link(user):
+    """True for a traditional account that holds no CMD/eIDAS identity yet.
+
+    "Signs in with a password, and nothing government-issued is bound to the
+    account." Both halves are load-bearing:
+
+    - no linked identity, so there IS something to link. `_has_linked_nic`
+      and not a bare presence check, because a plain or legacy-encrypted
+      ``auth_nic`` can never match a login lookup: the account behaves as
+      unlinked and must be treated as such;
+    - a password, so there IS a way in that does not go through the IdP. An
+      account created by SAML has no password, has nothing to invite, and
+      would be told to link an identity it already signed in with.
+
+    Extracted from ``migration_check``, where it was correct and unnamed, so
+    the invite can ask the same question without copying the expression. Two
+    readers of one predicate, not two predicates that agree today.
+    """
+    return bool(not _has_linked_nic(user) and user.password)
+
+
+def _wizard_open():
+    """True when the linking wizard is reachable at all, in either mode.
+
+    The wizard's endpoints were gated on the mandatory flag because that was
+    the only way anyone reached them. The invite is a second way in, so the
+    gate has to name both -- otherwise the ACS hands somebody a wizard whose
+    every endpoint answers 403, which is a dead end wearing the costume of a
+    flow.
+
+    🚫 ONE ENDPOINT IS DELIBERATELY NOT HERE: ``migration_skip``, which creates
+    a brand-new account. In the mandatory mode it is the emergency exit for
+    somebody who cannot prove the old account is theirs and would otherwise be
+    locked out of the portal entirely. In invite mode they signed in with a
+    password seconds ago and are locked out of nothing -- so there it is not a
+    safety net, it is a way to manufacture the second account the invite
+    exists to prevent. The button goes from the screen AND the endpoint keeps
+    refusing: one of those alone is a UI change, not a guarantee.
+    """
+    return _migration_enabled() or _invite_enabled()
+
+
+def _invite_dismissed(user):
+    """True while a dismissal of the linking invite is still in force.
+
+    Reads the stamp rather than a flag, so "dismissed" has an expiry instead
+    of being permanent (see MIGRATION_INVITE_REMIND_AFTER for the rule and
+    why it exists). An absent or unparseable stamp means never dismissed,
+    which is the safe direction: the person sees an optional notice they can
+    dismiss again, rather than silently never being told.
+    """
+    from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+
+    dismissed_at = _parse_isoformat((user.extras or {}).get(MIGRATION_INVITE_DISMISSED_AT))
+    if dismissed_at is None:
+        return False
+    return datetime.utcnow() - dismissed_at < MIGRATION_INVITE_REMIND_AFTER
+
+
+def _invite_offered_to(user):
+    """The whole invite predicate, in one place, for one account.
+
+    Four conditions, and each one is somebody's bug if it goes missing: the
+    invite is on (and the mandatory mode is not, which _invite_enabled already
+    settles), the account has something to link, and it has not just said
+    "not now".
+
+    Every reader asks this function -- the /me field and the route that starts
+    a link -- so the notice and the door it opens can never disagree about
+    whether this account is being invited.
+    """
+    if not _invite_enabled():
+        return False
+    if not user or not user.is_authenticated:
+        return False
+    return _needs_identity_link(user) and not _invite_dismissed(user)
+
+
+def _link_available_to(user):
+    """Whether this account may still reach the linking flow at all.
+
+    🔑 THE SAME PREDICATE AS ``_invite_offered_to`` MINUS THE DISMISSAL, and
+    that single difference is the whole reason it exists.
+
+    Dismissing means "not now", never "never let me". A permanent way in that
+    asked ``_invite_offered_to`` would vanish the moment somebody pressed
+    "Not now" — so the notice would have closed the door behind itself, and
+    changing your mind would mean waiting out the window.
+
+    It is the same asymmetry ``_refuse_link_start`` already applies at the door
+    itself, which checks that there is something to link and not that a notice
+    is on screen. Two readers of one rule, so the button and the route it opens
+    can never disagree.
+    """
+    if not _invite_enabled():
+        return False
+    if not user or not user.is_authenticated:
+        return False
+    return _needs_identity_link(user)
+
+
+@autenticacao_gov.route("/saml/migration/invite/dismiss", methods=["POST"])
+@csrf.exempt
+def migration_invite_dismiss():
+    """Record that this account is not linking right now.
+
+    Authenticated and self-scoped: the caller can only dismiss their OWN
+    invite, because the account is read from the session and never from the
+    request. The body is ignored entirely.
+
+    Answers 200 whether or not the invite was actually being offered. There is
+    nothing to protect here -- the caller already knows whether they were
+    shown a notice -- and a refusal would only turn a harmless double-click
+    into an error the frontend has to explain.
+    """
+    from flask_login import current_user
+
+    from udata.core.user.constants import MIGRATION_INVITE_DISMISSED_AT
+    from udata.core.user.models import User
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Authentication required"}), 401
+
+    # A targeted single-field write, and the honest reason is narrower than
+    # "a save would clobber the document": MongoEngine sends a delta, so for
+    # an account that already has `extras` a save lands on the same one key.
+    # The difference is the account that has NONE -- assigning a fresh dict
+    # makes the delta the WHOLE dict, and a concurrent write (auth_nic, say,
+    # which is a credential) is lost. This form has no such edge, needs no
+    # empty-dict dance, and is what the rest of this module already does for a
+    # single key on an account somebody else may be touching.
+    User.objects(id=current_user.id).update_one(
+        **{f"set__extras__{MIGRATION_INVITE_DISMISSED_AT}": datetime.utcnow().isoformat()}
+    )
+    return jsonify({"dismissed": True})
+
+
 @autenticacao_gov.route("/saml/migration/check", methods=["GET"])
 @csrf.exempt
 def migration_check():
-    """Check if the currently authenticated user is a legacy user that needs migration."""
+    """Check if the currently authenticated user is a legacy user that needs migration.
+
+    🚨 ``needs_migration`` means MANDATORY, and it is not a synonym for "could
+    link". The frontend's /auth/login route reads this field and LOGS THE USER
+    OUT when it is true, which is right for the mandatory mode and would be a
+    regression for an invite that is supposed to be dismissible. So this
+    endpoint keeps answering about the mandatory mode only, in both states of
+    the flag, and the invite travels on the caller's own /me instead.
+    """
     if not _migration_enabled():
         return jsonify({"needs_migration": False})
 
@@ -1955,24 +4422,60 @@ def migration_check():
     if not current_user.is_authenticated:
         return jsonify({"needs_migration": False})
 
-    has_nic = _has_linked_nic(current_user)
-    needs = bool(not has_nic and current_user.password)
-    return jsonify({"needs_migration": needs})
+    return jsonify({"needs_migration": _needs_identity_link(current_user)})
 
 
 @autenticacao_gov.route("/saml/migration/pending", methods=["GET"])
 @csrf.exempt
 def migration_pending():
     """Check if there is a pending migration in the session."""
-    if not _migration_enabled():
+    from udata.core.user.models import find_user_by_email_ci
+
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
     if not pending:
+        # The wizard is over but the account it created is still waiting for
+        # its owner to follow the confirmation link. Tell the frontend so it
+        # can explain the situation and offer a resend, instead of bouncing
+        # the user to /login with no explanation.
+        awaiting = session.get("saml_confirmation_pending")
+        if awaiting:
+            own, address = _resolve_confirmation_handle(awaiting)
+            # Answered from the address the caller submitted, whichever branch
+            # of the skip put it there -- masking their own input tells them
+            # nothing, and any other answer would undo the generic one the
+            # skip just gave. Only the owner acting on their own account
+            # (confirming it) ever changes this, which is a state the caller
+            # cannot reach for somebody else's address.
+            if address and (own is None or own.confirmed_at is None):
+                return jsonify(
+                    {
+                        "pending": False,
+                        "awaiting_confirmation": True,
+                        "email": _mask_email(address),
+                    }
+                )
         return jsonify({"pending": False})
 
     # Whether the CMD identity itself carries an email address.
     has_email = bool(pending.get("saml_email"))
+
+    # The email the CMD identity carried, but only when no account holds it:
+    # the wizard pre-fills the account-creation field with it, and offering an
+    # address that is already taken would only produce a guaranteed rejection.
+    saml_email = pending.get("saml_email")
+    suggested_email = saml_email if saml_email and not find_user_by_email_ci(saml_email) else None
+
+    # True only when the identity matched no account at all (as opposed to
+    # matching several homonyms) AND carries a NIC. Both cases reach the
+    # wizard with legacy_user_id unset, so `candidate` alone cannot tell them
+    # apart. The NIC is required because an identity without one cannot create
+    # an account through this flow (see migration_skip): without auth_nic the
+    # pending account would match itself as a wizard candidate on the next
+    # login and could be confirmed without ever following the emailed link.
+    no_match = bool(pending.get("no_match")) and bool(pending.get("saml_nic"))
 
     # Fetch candidate (legacy) account details for user confirmation.
     legacy_user_id = pending.get("legacy_user_id")
@@ -1993,70 +4496,59 @@ def migration_pending():
             "pending": True,
             "email": _mask_email(legacy_email) if legacy_email else None,
             "has_email": has_email,
+            "suggested_email": suggested_email,
             "candidate": bool(legacy_user_id),
+            "no_match": no_match,
+            # Started from the optional invite. The wizard cannot tell
+            # otherwise -- both modes reach it through the same redirect --
+            # and it decides which escape hatch the screen offers. Absent for
+            # sessions opened before this existed, which read as False: the
+            # mandatory mode is the older behaviour and the safe default here.
+            "invited": bool(pending.get("saml_invited")),
             "first_name": first_name,
             "last_name": last_name,
+            # Defaults to CMD so a session opened before this field existed
+            # still names a provider, rather than rendering "Associar conta a".
+            #
+            # PRESENTATION ONLY — never persist this expression. The default
+            # exists so a heading reads sensibly; written to extras.auth_provider
+            # it would become a supposition stored as a fact, and the question
+            # that field answers ("how many people use eIDAS?") would come back
+            # wrong with nobody able to tell. Every path that persists the
+            # provider uses a bare pending.get("saml_provider") and writes
+            # nothing when it is absent.
+            "provider": pending.get("saml_provider") or "cmd",
         }
     )
 
 
-@autenticacao_gov.route("/saml/migration/search", methods=["POST"])
+@autenticacao_gov.route("/saml/migration/send-link", methods=["POST"])
 @csrf.exempt
-def migration_search():
-    """Search for a legacy account when SAML did not return an email."""
-    if not _migration_enabled():
+@_migration_rate_limit
+def migration_send_link():
+    """Email a validation link to the candidate account's own address.
+
+    Proof of ownership of the legacy account is the click, so this endpoint
+    reads no body at all: the recipient is the address already on the account,
+    never one supplied with the request. It deliberately does not log anyone
+    in — the link is what grants the session, exactly as on the
+    account-creation branch (see migration_skip).
+    """
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
-
-    data = request.get_json(silent=True) or {}
-    email = data.get("email")
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
-
-    user = _find_legacy_user(email=email, first_name=first_name, last_name=last_name)
-    if not user:
-        return jsonify({"found": False})
-
-    # Store only the candidate reference — saml_email must keep holding
-    # the email coming from the CMD identity (or None), never the
-    # legacy account's email.
-    pending["legacy_user_id"] = str(user.id)
-    session["saml_migration_pending"] = pending
-    # Any code previously emailed was issued for a different target —
-    # invalidate it so it cannot be replayed against the new candidate.
-    session.pop("migration_code", None)
-    session.modified = True
-
-    return jsonify(
-        {
-            "found": True,
-            "email": _mask_email(user.email),
-        }
-    )
-
-
-@autenticacao_gov.route("/saml/migration/send-code", methods=["POST"])
-@csrf.exempt
-def migration_send_code():
-    """Generate and send a 6-digit verification code to the legacy user's email."""
-    if not _migration_enabled():
-        return jsonify({"error": "Migration mode is not enabled"}), 403
-
-    pending = session.get("saml_migration_pending")
-    if not pending:
-        return jsonify({"error": "No pending migration"}), 400
-
-    # Rate limit: max 3 sends per session
-    send_count = session.get("migration_send_count", 0)
-    if send_count >= 3:
-        return jsonify({"error": "Maximum code sends exceeded"}), 429
 
     legacy_user_id = pending.get("legacy_user_id")
     if not legacy_user_id:
         return jsonify({"error": "No legacy user found"}), 400
+
+    if not pending.get("saml_nic"):
+        # Nothing to link. The assertion is the only source of the NIC, so
+        # this is a broken wizard session rather than a user error.
+        return jsonify({"error": "No pending migration"}), 400
 
     from udata.core.user.models import User
 
@@ -2064,29 +4556,293 @@ def migration_send_code():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    code = str(random.randint(100000, 999999))
-    session["migration_code"] = {
-        "code": code,
-        # Bind the code to the account it was emailed to, so it cannot be
-        # replayed against a different candidate re-pointed via search.
-        "legacy_user_id": legacy_user_id,
-        "expires": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
-        "attempts": 0,
-    }
-    session["migration_send_count"] = send_count + 1
-    session.modified = True
+    if _has_linked_nic(user):
+        # Already linked to some identity. Refuse here as well as on the
+        # click, so the wizard never mails a link the consuming route would
+        # then reject. Same generic wording as the password branch.
+        return jsonify({"error": "Invalid credentials"}), 400
 
-    _send_migration_code(user, code)
-    current_app.logger.info(f"Migration code sent to user {legacy_user_id}")
+    # Issuing is destructive too, and destroying a link is reserved to the
+    # session that issued it. _issue_migration_link mints a fresh nonce over
+    # the account's record, so a reissue kills whatever link was there --
+    # which makes an unproved session's send-link the same denial as the drop
+    # that was already scoped. It is reachable unproved: the SSO points a
+    # candidate by itself, by email match or by a unique name match, so a
+    # homonym arrives here aimed at an account they have proved nothing about.
+    #
+    # A session may therefore issue only when the account holds no live link,
+    # or when the live one is its own. The wizard loses nothing: the frontend
+    # reaches this route only to resend after a password proof, which is
+    # always the second case.
+    outstanding = (user.extras or {}).get(MIGRATION_LINK_PENDING)
+    if outstanding and pending.get("link_issued_for") != str(user.id):
+        _, _, state = _migration_link_token_status_from_record(outstanding)
+        if state == "live":
+            # Same generic wording as above: whether a stranger's link is
+            # outstanding is not this caller's business either.
+            return jsonify({"error": "Invalid credentials"}), 400
+
+    error = _mail_validation_link(pending, user)
+    if error:
+        payload, status = error
+        return jsonify(payload), status
 
     return jsonify({"sent": True})
 
 
+def _complete_registration_association(target, record):
+    """Move a pending registration's identity onto the account that was clicked.
+
+    The order of the three writes is the whole design, and it is not the
+    obvious one.
+
+    The identity leaves the placeholder FIRST, before anything is bound to the
+    target. Do it the other way round and there is a window in which both
+    accounts hold the same NIC -- and the login lookup refuses that outright
+    (see _accounts_claiming_nic and "ambiguous_identity"), so a failure in the
+    window would lock the citizen out of BOTH accounts until a human
+    intervened. Failing between the unset and the link instead leaves the
+    identity on no account at all, which the next CMD sign-in resolves by
+    itself: the citizen is simply back where they started.
+
+    Then _link_identity_and_login, untouched. It is the single place that
+    binds an identity and clears the pending record, and this route is a
+    caller of it, never a second implementation of it.
+
+    The placeholder is retired last, and by mark_as_deleted rather than the
+    raw delete the administrative merge uses. That merge retires an account
+    minted moments earlier; this one has had a full session since before the
+    completion screen appeared -- the gate that holds it there is client-side
+    -- so it may own follows, API tokens and contact points, and the raw
+    delete would leave every one of them pointing at a document that is gone.
+    """
+    from udata.core.user.models import User
+
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+
+    placeholder_id = record.get(MIGRATION_LINK_PLACEHOLDER_ID)
+    placeholder = (
+        User.objects(id=placeholder_id).first()
+        if placeholder_id and ObjectId.is_valid(placeholder_id)
+        else None
+    )
+
+    # Is the placeholder still the account this link was issued for? Three
+    # ways it can stop being: it was retired by something else, it finished
+    # its registration by another route, or its identity moved on. Any of them
+    # means the link in hand is stale, and consuming it would mark_as_deleted a
+    # live, finished account -- irreversible, and the only case that can break
+    # the resolver exemption this origin relies on. Exempting the placeholder
+    # from the claimed-NIC guard is safe precisely because this holds.
+    if not placeholder or (
+        not placeholder.has_placeholder_email
+        or (placeholder.extras or {}).get("auth_nic") != record.get("nic_hash")
+    ):
+        _drop_link_record(target)
+        return redirect(
+            f"{frontend_url}/complete-registration?flash={REGISTRATION_ASSOCIATION_REFUSED_FLASH}"
+        )
+
+    if placeholder and _placeholder_owns_content(placeholder):
+        # Re-asked at the click, because the submit's answer is minutes or
+        # hours old and the citizen kept their session throughout: anything
+        # they did while the mail sat in an inbox happened after the audit
+        # that let the link out. Retiring the account now would destroy it.
+        #
+        # This is the one place the refusal reaches a browser rather than a
+        # mailbox, and it is not an oracle: whoever is here opened a link that
+        # only the holder of that mailbox received, so they have already
+        # proved what the submit refused to disclose.
+        #
+        # The record goes with the refusal. Leaving a live link on the target
+        # would let a second click retry the same doomed association, and the
+        # citizen is better served by resubmitting from a screen that can tell
+        # them what happened.
+        _drop_link_record(target)
+        return redirect(
+            f"{frontend_url}/complete-registration?flash={REGISTRATION_ASSOCIATION_REFUSED_FLASH}"
+        )
+
+    if placeholder:
+        # Atomic, and deliberately not a save() of the loaded document: the
+        # only field that must change here is this one, and writing the whole
+        # document back would carry along anything read before the click.
+        User.objects(id=placeholder.id).update_one(unset__extras__auth_nic=True)
+
+    _link_identity_and_login(
+        target,
+        record.get("nic_hash"),
+        record.get("first_name"),
+        record.get("last_name"),
+        provider=record.get("provider"),
+        citizen_declared=record.get("citizen_declared"),
+        doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
+        doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
+        eidas_country=record.get(MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY),
+    )
+
+    if placeholder:
+        # Guarded because the association is already done and must stand. A
+        # placeholder left behind is inert -- no identity, a synthetic address
+        # -- and the reconciliation command finds it; an exception raised here
+        # would answer a completed link with a 500 the citizen cannot retry.
+        try:
+            placeholder.reload()
+            _move_follows(placeholder, target)
+            placeholder.mark_as_deleted(notify=False)
+        except Exception as exc:
+            current_app.logger.error(
+                f"Registration association: identity moved to user {target.id} but "
+                f"placeholder {placeholder.id} was not retired: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    current_app.logger.info(
+        f"Registration association completed: user {target.id} "
+        f"linked from placeholder {placeholder_id}"
+    )
+    return redirect(frontend_url or "/")
+
+
+def _drop_link_record(user):
+    """Remove a pending link record without touching anything else.
+
+    Atomic for the same reason the identity unset is: the document in hand was
+    read before the click and writing it back whole would carry along whatever
+    it was read with.
+    """
+    from udata.core.user.models import User
+
+    User.objects(id=user.id).update_one(**{f"unset__extras__{MIGRATION_LINK_PENDING}": True})
+
+
+def _move_follows(placeholder, target):
+    """Re-point the placeholder's follows at the account that survives.
+
+    mark_as_deleted deletes follows outright, in both directions, and a
+    pending account is the likeliest of all to have some: it holds a full
+    session from the moment the assertion comes back, and the screen that
+    holds it is enforced in the browser, not in the API. Refusing the whole
+    association over a followed dataset would block the case this flow exists
+    for, at the cost of something nobody would miss losing the option to keep.
+
+    This is not the content transfer the design refused. Ownership, authorship
+    and attribution stay where they are and are what the refusal protects; a
+    follow is the person's own preference, and the person is the same.
+    """
+    from udata.core.followers.models import Follow
+
+    for follow in Follow.objects(follower=placeholder):
+        # Users are followable, so the placeholder may have followed the very
+        # account it is about to merge into -- re-pointing that one would
+        # leave the target following itself, which nothing else in the product
+        # can produce and no screen expects.
+        if (
+            follow.following == target
+            or Follow.objects(follower=target, following=follow.following, until=None).count()
+        ):
+            follow.delete()
+        else:
+            follow.follower = target
+            follow.save()
+
+    for follow in Follow.objects(following=placeholder):
+        if (
+            follow.follower == target
+            or Follow.objects(follower=follow.follower, following=target, until=None).count()
+        ):
+            follow.delete()
+        else:
+            follow.following = target
+            follow.save()
+
+
+@autenticacao_gov.route("/saml/migration/confirm-link/<token>", methods=["GET"])
+@csrf.exempt
+def migration_confirm_link(token):
+    """Complete a legacy-account link from the emailed validation link.
+
+    This is the click, so it must work with no session: everything it needs
+    was recorded on the account when the link was issued. It logs the user in
+    directly rather than deferring to flask-security's /confirm/<token>, whose
+    AUTO_LOGIN_AFTER_CONFIRM defaults to False.
+
+    Every outcome is a redirect carrying a ?flash= the wizard screen renders.
+    A 500 here is a dead end for the user — the link is single-use, so they
+    cannot retry it.
+    """
+    frontend_url = current_app.config.get("CDATA_BASE_URL") or ""
+    wizard_url = f"{frontend_url}/migrate-account"
+
+    # The token is resolved BEFORE the flag is read, so the route can tell
+    # which flow the click belongs to before deciding whether the flag applies
+    # to it. It does not apply to a registration association: that origin is
+    # not the migration wizard, it is the only way a citizen held on the
+    # completion screen reaches the account they already had, and it has to
+    # keep working wherever the wizard is closed. Wizard records answer exactly
+    # as before -- what moved is the order of the reads, not their verdict.
+    user, record, state = _migration_link_token_status(token)
+    origin = (record or {}).get(MIGRATION_LINK_ORIGIN)
+
+    if not _wizard_open() and origin != MIGRATION_LINK_ORIGIN_REGISTRATION:
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
+
+    if state == "already_done":
+        return redirect(f"{wizard_url}?flash=migration_link_already_done")
+
+    if state == "invalid":
+        return redirect(f"{wizard_url}?flash=migration_link_invalid")
+
+    if state == "expired":
+        # Deliberately no reissue here, unlike the change-email confirmation
+        # this route otherwise follows. Mail scanners open links in inboxes
+        # before their owners do: reissuing from an unauthenticated GET would
+        # let a scanner keep an old mail alive indefinitely, each pass minting
+        # a fresh link with a fresh deadline. The user re-authenticates
+        # instead — a few seconds of CMD, and something only they can trigger.
+        if origin == MIGRATION_LINK_ORIGIN_REGISTRATION:
+            # No flash: the completion screen is still there, still holding
+            # this citizen, and resubmitting the same address mails a fresh
+            # link. Telling them the link expired on a page that already asks
+            # for the address adds nothing they cannot see.
+            return redirect(f"{frontend_url}/complete-registration")
+        return redirect(f"{wizard_url}?flash=migration_link_expired")
+
+    if origin == MIGRATION_LINK_ORIGIN_REGISTRATION:
+        return _complete_registration_association(user, record)
+
+    _link_identity_and_login(
+        user,
+        record.get("nic_hash"),
+        record.get("first_name"),
+        record.get("last_name"),
+        # From the record, because this route has no session to read. A record
+        # issued before either field existed simply has none.
+        provider=record.get("provider"),
+        citizen_declared=record.get("citizen_declared"),
+        doc_type=record.get(MIGRATION_LINK_DOC_TYPE),
+        doc_nationality=record.get(MIGRATION_LINK_DOC_NATIONALITY),
+        eidas_country=record.get(MIGRATION_LINK_EIDAS_ORIGIN_COUNTRY),
+    )
+    current_app.logger.info(f"Migration completed by validation link for user {user.id}")
+
+    return redirect(frontend_url or "/")
+
+
 @autenticacao_gov.route("/saml/migration/confirm", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_confirm():
-    """Confirm migration via verification code or old password."""
-    if not _migration_enabled():
+    """Identify the legacy account by its password, then mail the link.
+
+    The password says *which* account to link, not that its email is
+    reachable, so it no longer completes anything on its own: this route
+    mails the validation link and migration_confirm_link — the single place
+    that binds the identity and starts a session — consumes the click.
+    """
+    from udata.core.user.models import User, find_user_by_email_ci
+
+    if not _wizard_open():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
     pending = session.get("saml_migration_pending")
@@ -2096,57 +4852,20 @@ def migration_confirm():
     data = request.get_json(silent=True) or {}
     method = data.get("method")
 
-    from udata.core.user.models import User
-
-    if method == "code":
-        # Code verification targets the candidate account found by
-        # name/search — a code was emailed to that account's address.
-        legacy_user_id = pending.get("legacy_user_id")
-        if not legacy_user_id:
-            return jsonify({"error": "No legacy user found"}), 400
-
-        user = User.objects(id=legacy_user_id).first()
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-
-        code_data = session.get("migration_code")
-        if not code_data:
-            return jsonify({"error": "No code sent"}), 400
-
-        # The code is only valid for the account it was emailed to. If the
-        # candidate was re-pointed (via search) after the code was issued,
-        # refuse it — otherwise a code sent to an attacker-controlled
-        # mailbox could link the NIC to a victim account.
-        if code_data.get("legacy_user_id") != legacy_user_id:
-            return jsonify({"error": "No code sent"}), 400
-
-        if code_data["attempts"] >= 5:
-            return jsonify({"error": "Maximum attempts exceeded"}), 429
-
-        code_data["attempts"] += 1
-        session["migration_code"] = code_data
-        session.modified = True
-
-        expires = datetime.fromisoformat(code_data["expires"])
-        if datetime.utcnow() > expires:
-            return jsonify({"error": "Code expired"}), 400
-
-        if data.get("code") != code_data["code"]:
-            return jsonify({"error": "Invalid code"}), 400
-
-    elif method == "password":
+    if method == "password":
         # Full default login (email + password): the linked account is
         # the one whose credentials are proven, which may differ from
         # the name-matched candidate (homonym case).
-        attempts = session.get("migration_password_attempts", 0)
-        if attempts >= 5:
+        if session.get("migration_password_attempts", 0) >= 5:
             return jsonify({"error": "Maximum attempts exceeded"}), 429
-        session["migration_password_attempts"] = attempts + 1
-        session.modified = True
 
         email = (data.get("email") or "").strip()
         password = data.get("password", "")
-        user = datastore.find_user(email=email) if email else None
+        # Case-insensitive, to match the login form this branch stands in
+        # for. Exact-matching here failed the ownership proof for a correct
+        # password, and the generic error below made that indistinguishable
+        # from a wrong one.
+        user = find_user_by_email_ci(email)
         # Generic error on any failure to avoid account enumeration.
         if (
             not user
@@ -2155,47 +4874,93 @@ def migration_confirm():
             or _has_linked_nic(user)
             or not verify_and_update_password(password, user)
         ):
+            # Only a WRONG guess is counted, and the cap is never reset. A
+            # correct password must not cost an attempt, because this branch
+            # can now end in a 429 from the send path and charging that to the
+            # brute-force tally would lock the owner out of the only branch
+            # that can identify their account. But resetting on success is not
+            # the way to arrange that: anyone holding one legacy account's
+            # password could then launder four guesses per reset against any
+            # other address, indefinitely -- this file has no Flask-Limiter
+            # backstop, and the WAF collapses every visitor onto one IP.
+            attempts = session.get("migration_password_attempts", 0)
+            session["migration_password_attempts"] = attempts + 1
+            session.modified = True
             return jsonify({"error": "Invalid credentials"}), 400
 
     else:
         return jsonify({"error": "Invalid method"}), 400
 
-    # Link: add NIC and update names. The password is kept so the
-    # account remains accessible through both login methods.
-    saml_nic = pending.get("saml_nic")
-    saml_first_name = pending.get("saml_first_name")
-    saml_last_name = pending.get("saml_last_name")
+    # 🚩 IN INVITE MODE THE CANDIDATE IS NOT UP FOR RE-POINTING, and this is
+    # the one place the two modes must differ.
+    #
+    # In the mandatory mode the citizen arrives DEAUTHENTICATED: the portal has
+    # no idea which account is theirs, so the proved password is the only
+    # evidence there is, and re-pointing to it is the only thing that can be
+    # done. In invite mode they clicked from INSIDE an account and the ticket
+    # says which — so re-pointing silently throws away evidence the portal
+    # already holds, and lands the identity on an account they never asked
+    # about while the one they clicked from stays unlinked. They would find out
+    # by signing in with CMD later and not recognising what they see.
+    #
+    # It is not a security hole -- reaching another account still costs that
+    # account's password, so nothing is taken from anybody. It is the notice
+    # promising "you keep the account you already have" and then not.
+    #
+    # Refused AFTER the password check on purpose: a correct password for the
+    # wrong account is not a guess, and must not spend an attempt from a cap
+    # that never resets.
+    invited_target = pending.get("legacy_user_id") if pending.get("saml_invited") else None
+    if invited_target and str(user.id) != invited_target:
+        expected = User.objects(id=invited_target).first()
+        return jsonify(
+            {
+                "error": "Different account",
+                "code": "invited_account_mismatch",
+                # Masked, like everywhere else an address is echoed: the caller
+                # owns this one, but the habit is what stops the next reader
+                # printing one they do not.
+                "expected_email": _mask_email(expected.email) if expected else None,
+            }
+        ), 409
 
-    if not user.extras:
-        user.extras = {}
-    if saml_nic:
-        user.extras["auth_nic"] = _hash_nic(saml_nic)
-    if saml_first_name:
-        user.first_name = saml_first_name.title()
-    if saml_last_name:
-        user.last_name = saml_last_name.title()
-    if not user.confirmed_at:
-        user.confirmed_at = datetime.utcnow()
-    user.save()
+    # The account whose password was proved is the one to link, and by design
+    # it may not be the candidate the assertion matched by name. Re-pointing
+    # is also what makes the resend endpoint — which reads no body, on
+    # purpose — mail that account rather than the homonym; and it kills any
+    # link already issued for the previous target.
+    _point_migration_candidate(pending, user)
 
-    login_user(user)
-    session["saml_login"] = True
+    # The session is deliberately left pending: the resend and a second
+    # attempt both need it, and the click is what clears it.
+    error = _mail_validation_link(pending, user, enforce_cap=False)
+    if error:
+        payload, status = error
+        return jsonify(payload), status
 
-    # Clean up migration session data
-    session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
-    session.pop("migration_password_attempts", None)
-
-    current_app.logger.info(f"Account migration completed for user {user.id}")
-
-    return jsonify({"success": True})
+    return jsonify({"sent": True})
 
 
 @autenticacao_gov.route("/saml/migration/skip", methods=["POST"])
 @csrf.exempt
+@_migration_rate_limit
 def migration_skip():
-    """Skip migration and create a new account from SAML data."""
+    """Create a new account from a user-declared, confirmation-pending email.
+
+    The CMD proves who the person is; it does not prove that the address they
+    typed is theirs. So this endpoint validates the submitted email, creates
+    the account UNCONFIRMED, mails the standard confirmation link, and
+    deliberately starts NO session: authenticated access waits for the click.
+
+    And it answers the same way whether or not the address already has an
+    account. It used to reply 409 email_taken, which made it an oracle over
+    every registered address for anyone holding one wizard session -- against
+    the portal's own SECURITY_RETURN_GENERIC_RESPONSES, and useful precisely
+    for picking targets. A taken address now gets a notice mailed to it and
+    the caller gets the creation branch's answer; every refusal this route can
+    still return is settled before the address is looked at, so none of them
+    leaks the same bit by the back door.
+    """
     if not _migration_enabled():
         return jsonify({"error": "Migration mode is not enabled"}), 403
 
@@ -2203,26 +4968,227 @@ def migration_skip():
     if not pending:
         return jsonify({"error": "No pending migration"}), 400
 
-    # Use the CMD email when available (no account holds it, otherwise
-    # the email lookup would have auto-linked); a placeholder is
-    # generated by _create_saml_user when the CMD brought no email.
-    user = _create_saml_user(
-        pending.get("saml_email"),
-        pending.get("saml_nic"),
-        pending.get("saml_first_name"),
-        pending.get("saml_last_name"),
-    )
+    # Without a NIC the new account gets no auth_nic, and an account with no
+    # auth_nic is not excluded by _has_linked_nic: on the next CMD login it
+    # would match itself as a wizard candidate, letting the user mail a code
+    # to the very address awaiting confirmation and log in through
+    # migration_confirm — confirming the email without ever following the
+    # link. These identities cannot use this branch at all.
+    user_nic = pending.get("saml_nic")
+    if not user_nic:
+        return jsonify({"error": "nic_required"}), 400
 
-    login_user(user)
-    session["saml_login"] = True
+    # Coerce to a string at the boundary. A JSON body can carry a dict, and a
+    # dict reaching .strip() is an AttributeError, i.e. a 500 where a 400
+    # belongs. migration_search did this and was the only route that did; the
+    # coercion outlives it because the reason does.
+    email = str((request.get_json(silent=True) or {}).get("email") or "").strip()
+    if not email:
+        return jsonify({"error": "email_required"}), 400
 
-    # Clean up migration session data
+    try:
+        # Shape only, never deliverability. email_validator defaults
+        # check_deliverability to True, and SECURITY_EMAIL_VALIDATOR_ARGS is
+        # defined only in settings.Testing — so relying on the config alone
+        # would run a live MX lookup, for an attacker-chosen domain, inside
+        # the request. That both hands out an outbound DNS primitive and lets
+        # a resolver blip tell a user their valid address is invalid.
+        validator_args = {
+            "check_deliverability": False,
+            **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS") or {}),
+        }
+        # Store the normalised form, as the registration path does — not the
+        # raw string, whose casing would otherwise decide which of two rows
+        # the unique index accepts.
+        email = validate_email(email, **validator_args).normalized
+    except EmailNotValidError:
+        return jsonify({"error": "invalid_email"}), 400
+
+    # case_insensitive matters and is not cosmetic. The unique index on
+    # User.email is case-SENSITIVE, while every login and recovery lookup goes
+    # through SECURITY_USER_IDENTITY_ATTRIBUTES, which is case-INSENSITIVE. An
+    # exact-match check here therefore accepts "MARIA@x.pt" alongside an
+    # existing "maria@x.pt", and the victim's own login then resolves to the
+    # newer, password-less shadow row (User._meta ordering is -created_at) —
+    # locking them out of both login and password recovery, permanently.
+    from udata.core.user.models import User
+
+    existing = datastore.find_user(case_insensitive=True, email=email)
+    linked = User.objects(extras__auth_nic=_hash_nic(user_nic)).first()
+
+    # Everything that can refuse this request is settled BEFORE anything looks
+    # at whether the submitted address exists. Evaluated the other way round --
+    # as they were, behind the taken-address branch -- these refusals answer
+    # "does this address have an account?" by their presence or absence, which
+    # is the one question this route must not answer.
+    if linked is not None:
+        # This identity already has an account. Normally unreachable -- rule 1
+        # of _find_or_create_saml_user resolves it long before the wizard --
+        # but the Flask session is a client-held signed cookie, so replaying a
+        # copy taken before the first skip re-enters here with the pending
+        # state intact; the session pops are no defence, they only rewrite a
+        # response cookie the caller may discard.
+        if linked.confirmed_at is not None:
+            return jsonify({"error": "identity_already_registered"}), 409
+        # The account's own monotonic tally, hoisted for the same reason. It
+        # cannot fire on the branch that creates an account, which starts at
+        # zero, so hoisting loses no coverage and removes an oracle.
+        if (linked.extras or {}).get(CONFIRMATION_SEND_COUNT, 0) >= MAX_CONFIRMATION_SENDS:
+            return jsonify({"error": "too_many_sends"}), 429
+
+    # One mailer budget for this identity, spent by whichever branch mails.
+    # Split budgets would diverge, and a divergence is an oracle.
+    if not _migration_notice_send_allowed(pending):
+        return jsonify({"error": "too_many_sends"}), 429
+
+    if existing and (not linked or existing.id != linked.id):
+        # The address is taken — but by whom? If it is a legacy account this
+        # identity could legitimately claim, refusing outright is the wrong
+        # answer: linking it is exactly what the wizard exists for. So this
+        # branch says where to go next, and stops there.
+        #
+        # It says nothing about the address, and it writes nothing anywhere.
+        # The person who can act on this is whoever reads that mailbox, so
+        # that is who gets told -- the browser is answered exactly as it would
+        # be for a free address. Mailing the validation link here instead
+        # would be the obvious move and is forbidden: _issue_migration_link
+        # mints a fresh nonce over the account's record, so it would destroy
+        # whatever link the owner was holding, on demand, from any session.
+        #
+        # The candidate is not pointed either. The address arrives in the
+        # request body and nothing about it has been proved, while pointing
+        # drops the link outstanding for the previous candidate. Nothing is
+        # lost: the credentials screen never needed a pointed candidate,
+        # because migration_confirm resolves the account from the password it
+        # proves and re-points from there.
+        # mark_as_deleted rewrites the address to <id>@deleted, so a row
+        # deleted through the product cannot be found by a submitted address
+        # at all; the guard is for rows deleted by any other means, and
+        # mailing one would be mailing nobody. The response does not change
+        # either way -- the caller must not learn which case it was.
+        if not existing.deleted:
+            _send_migration_address_taken_notice(existing)
+
+        # Same shape as the creation branch, down to the normalised address --
+        # which is the one the caller submitted, so echoing it discloses
+        # nothing. The wizard ends here too, or the next GET of
+        # /saml/migration/pending would tell the caller which branch ran.
+        session.pop("saml_migration_pending", None)
+        session.pop("migration_password_attempts", None)
+        session["saml_confirmation_pending"] = {
+            "email": email,
+            "nic_hash": _hash_nic(user_nic),
+        }
+        return jsonify({"success": True, "email": email})
+
+    if linked:
+        # Refusing a linked-but-unconfirmed identity outright is not right: it
+        # would brick the identity on a typo, and on an SMTP failure
+        # mid-request, with no way back — the account has no password, so
+        # neither login nor recovery is available, and the address can never be
+        # changed. So the pending account's address stays correctable until it
+        # is confirmed, while the send tally stays monotonic, which is what
+        # keeps the mailer bounded.
+        user = linked
+        user.email = email
+        user.save()
+    else:
+        user = _create_pending_saml_user(
+            email,
+            user_nic,
+            pending.get("saml_first_name"),
+            pending.get("saml_last_name"),
+            # Bare get, for the same reason as the validation link: an older
+            # session names no provider, and none is invented for it.
+            provider=pending.get("saml_provider"),
+            citizen_declared=_declared_citizen(),
+            # Bare gets for the same reason: a session opened before these
+            # keys existed names no document, and none is invented for it.
+            # This is the path the funnel never sees, so if they are not read
+            # here the account is created without them.
+            doc_type=pending.get("saml_doc_type"),
+            doc_nationality=pending.get("saml_doc_nationality"),
+            eidas_country=pending.get("saml_eidas_origin_country"),
+        )
+
+    send_confirmation_instructions(user)
+    user.extras[CONFIRMATION_SEND_COUNT] = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0) + 1
+    user.save()
+
+    # The wizard walked away from whatever candidate it had pointed at, and
+    # the new account now carries the NIC. A link still sitting in the old
+    # candidate's mailbox would put that same NIC on a second account.
+    candidate_id = pending.get("legacy_user_id")
+    if candidate_id and candidate_id != str(user.id):
+        _drop_migration_link(candidate_id, pending)
+
+    # No login_user: the account has no session until the email is confirmed.
+    # The wizard state is done, but a resend handle must survive it — this key
+    # identifies the user to the resend endpoint without authenticating them.
     session.pop("saml_migration_pending", None)
-    session.pop("migration_code", None)
-    session.pop("migration_send_count", None)
     session.pop("migration_password_attempts", None)
+    session["saml_confirmation_pending"] = {
+        "email": user.email,
+        "nic_hash": _hash_nic(user_nic),
+    }
 
-    # A placeholder email means registration is not complete yet: the
-    # frontend must send the user to /complete-registration instead of
-    # the homepage.
-    return jsonify({"success": True, "pending_registration": user.has_placeholder_email})
+    return jsonify({"success": True, "email": user.email})
+
+
+@autenticacao_gov.route("/saml/migration/resend-confirmation", methods=["POST"])
+@csrf.exempt
+@_migration_rate_limit
+def migration_resend_confirmation():
+    """Resend the confirmation link for the account awaiting confirmation.
+
+    At this point there is no session to authenticate: the account exists but
+    is deliberately not logged in. The pending-confirmation key left in the
+    session identifies the user without authenticating them, which is why this
+    endpoint takes no email argument — it would otherwise be an open relay,
+    and the stock ``security.send_confirmation`` view carries no rate limit of
+    its own to fall back on.
+    """
+    if not _wizard_open():
+        return jsonify({"error": "Migration mode is not enabled"}), 403
+
+    awaiting = session.get("saml_confirmation_pending")
+    if not awaiting:
+        return jsonify({"error": "No pending confirmation"}), 400
+
+    # The handle has one shape and the branch is recomputed, so nothing the
+    # caller can read says which one it is. The mailer budget is spent first
+    # and identically by both, because it is keyed on the identity carried in
+    # that same handle -- keying one branch on the identity and the other on
+    # the IP would make the 429 itself the answer.
+    if not _migration_notice_send_allowed(awaiting):
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    user, address = _resolve_confirmation_handle(awaiting)
+    if user is None:
+        # The address is somebody else's. Re-send them the same notice, write
+        # nothing on their account, and answer as the other branch does --
+        # including when nobody holds it any more.
+        recipient = datastore.find_user(case_insensitive=True, email=address) if address else None
+        if recipient and not recipient.deleted:
+            _send_migration_address_taken_notice(recipient)
+        return jsonify({"sent": True})
+
+    if user.confirmed_at is not None:
+        # Already done — nothing to resend, and saying so lets the frontend
+        # send the user to the login instead of waiting for another mail.
+        return jsonify({"sent": False, "confirmed": True})
+
+    # The cap is counted ON THE ACCOUNT, not in the session: here the recipient
+    # was chosen by whoever ran the wizard, so a session-only counter would be
+    # no cap at all — the Flask session is a client-held signed cookie, and
+    # replaying a copy taken before the first send resets it to zero on every
+    # request.
+    send_count = (user.extras or {}).get(CONFIRMATION_SEND_COUNT, 0)
+    if send_count >= MAX_CONFIRMATION_SENDS:
+        return jsonify({"error": "Maximum confirmation sends exceeded"}), 429
+
+    send_confirmation_instructions(user)
+    user.extras[CONFIRMATION_SEND_COUNT] = send_count + 1
+    user.save()
+
+    return jsonify({"sent": True})

@@ -44,28 +44,38 @@ class TasksMetricsTest(PytestOnlyTestCase):
         ]
 
     @pytest.mark.parametrize(
-        "endpoint,id_key,factory,func,api_key",
+        "endpoint,id_key,factory,func,api_key,mock_keys",
         [
-            ("dataservices", "dataservice_id", DataserviceFactory, update_dataservices, "visit"),
-            ("reuses", "reuse_id", ReuseFactory, update_reuses, "visit"),
+            (
+                "dataservices",
+                "dataservice_id",
+                DataserviceFactory,
+                update_dataservices,
+                "visit",
+                ["visit"],
+            ),
+            ("reuses", "reuse_id", ReuseFactory, update_reuses, "visit", ["visit"]),
             (
                 "organizations",
                 "organization_id",
                 OrganizationFactory,
                 update_organizations,
                 "visit_dataset",
+                # update_organizations pages over four metric keys; every one of
+                # them has to be mocked or the task fails on the first unmocked URL.
+                ["visit_dataset", "download_resource", "visit_reuse", "visit_dataservice"],
             ),
         ],
     )
     def test_update_simple_visit_to_views_metrics(
-        self, app, rmock, endpoint, id_key, factory, func, api_key
+        self, app, rmock, endpoint, id_key, factory, func, api_key, mock_keys
     ):
         models = [factory() for i in range(15)]
         mock_metrics_api(
             app,
             rmock,
             endpoint,
-            [api_key],
+            mock_keys,
             [
                 {id_key: str(models[1].id), api_key: 42},
                 {id_key: str(models[3].id), api_key: 1337},

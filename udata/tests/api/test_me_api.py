@@ -93,7 +93,11 @@ class MeAPITest(APITestCase):
         data["active"] = False
         response = self.put(url_for("api.me"), data)
         self.assert200(response)
-        self.assertEqual(User.objects.count(), 1)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        self.assertEqual(len(list(User.objects)), 1)
         self.user.reload()
         self.assertEqual(self.user.about, "new about")
         self.assertTrue(self.user.active)

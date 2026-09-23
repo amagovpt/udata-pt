@@ -72,6 +72,7 @@ UNWANTED_KEYS: dict[str, list[str]] = {
         "last_update",
         "last_modified",
         "license",
+        "license_title",
         "spatial",
         "quality",
         "permissions",

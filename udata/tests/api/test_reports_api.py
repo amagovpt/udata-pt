@@ -42,7 +42,11 @@ class ReportsAPITest(APITestCase):
             },
         )
         self.assert201(response)
-        self.assertEqual(Report.objects.count(), 1)
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        self.assertEqual(len(list(Report.objects)), 1)
 
         self.login(user)
 
@@ -58,7 +62,7 @@ class ReportsAPITest(APITestCase):
             },
         )
         self.assert201(response)
-        self.assertEqual(Report.objects.count(), 2)
+        self.assertEqual(len(list(Report.objects)), 2)
 
         reports: list[Report] = list(Report.objects())
         self.assertEqual(Dataset, reports[0].subject.document_type)

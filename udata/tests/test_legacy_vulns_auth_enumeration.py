@@ -289,3 +289,119 @@ class SendConfirmationRateLimitRegressionTest(PytestOnlyAPITestCase):
             "send_confirmation view at udata/auth/views.py:205-209 is "
             f"not wrapped in auth_rate_limit. observed statuses: {statuses}"
         )
+
+
+# ---------------------------------------------------------------------------
+# LEDG-2456 — Enumeration on /change-email/
+# ---------------------------------------------------------------------------
+class ChangeEmailEnumerationRegressionTest(PytestOnlyAPITestCase):
+    """``/change-email`` answered a taken address with a form error saying
+    "This email is already registered", rendered straight back to the caller.
+
+    Not from the KITS24 audit — found while refining the SAML authentication
+    review — but the same CWE-203 shape as the four above, and reached from the
+    complete-registration screen every CMD/eIDAS account with a placeholder
+    address lands on. The oracle is weaker than the others because the view is
+    ``@login_required``, so an attacker needs one account; one account is still
+    enough to test any address.
+
+    The mitigation is not Flask-Security's generic responses: this check was
+    ours, in ``ChangeEmailForm``. It moved to the view, which warns the owner
+    of the address by mail and answers the browser identically either way.
+    """
+
+    @pytest.mark.options(
+        CAPTCHETAT_BASE_URL=None,
+        SECURITY_RETURN_GENERIC_RESPONSES=True,
+        RATELIMIT_ENABLED=False,
+    )
+    def test_change_email_does_not_leak_email_existence(self):
+        # Deliberately the same length. The success redirect echoes the
+        # submitted address, so unequal lengths would move the body length on
+        # their own and _bodies_indistinguishable would be comparing the
+        # addresses rather than the branches.
+        taken, fresh = "taken@example.org", "fresh@example.org"
+        assert len(taken) == len(fresh)
+
+        self.login(UserFactory(email="mine@example.org", confirmed_at=datetime.now()))
+        UserFactory(email=taken, confirmed_at=datetime.now())
+
+        def submit(address):
+            return self.post(
+                url_for("security.change_email"),
+                {"new_email": address, "new_email_confirm": address, "submit": True},
+                json=False,
+            )
+
+        known = submit(taken)
+        unknown = submit(fresh)
+
+        assert _bodies_indistinguishable(known, unknown), _diff_message(
+            "LEDG-2456 change_email", known, unknown
+        )
+
+        # The strong assertion the length check cannot make: the redirect
+        # target must match once the caller's own address is normalised out.
+        assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")
+
+    @pytest.mark.options(
+        CAPTCHETAT_BASE_URL=None,
+        SECURITY_RETURN_GENERIC_RESPONSES=True,
+        RATELIMIT_ENABLED=False,
+    )
+    def test_change_email_stays_indistinguishable_for_placeholder_requesters(self):
+        """The registration association added branches to this exact view.
+
+        A requester still completing a CMD registration now takes a different
+        path for a taken address -- an association link, or a refusal notice
+        when their temporary account holds content -- where before every
+        taken address produced the same silent notice. Three branches instead
+        of one, each doing different work and sending different mail.
+
+        None of that may be visible to the caller. The test above pins the
+        ordinary requester; this pins the requester the new branches exist
+        for, in both of the states that pick between them.
+        """
+        from udata.auth.saml.saml_plugin.saml_govpt import _hash_nic
+        from udata.core.dataset.factories import DatasetFactory
+
+        taken, fresh = "taken@example.org", "fresh@example.org"
+        assert len(taken) == len(fresh)
+
+        def submit(address):
+            return self.post(
+                url_for("security.change_email"),
+                {"new_email": address, "new_email_confirm": address, "submit": True},
+                json=False,
+            )
+
+        # (a) The association fires: a pending requester with an identity to
+        # move, and a target that can receive it.
+        requester = self.login(
+            UserFactory(
+                email="saml-deadbeef@autenticacao.gov.pt",
+                password=None,
+                extras={"auth_nic": _hash_nic("12345678")},
+                confirmed_at=datetime.now(),
+            )
+        )
+        UserFactory(email=taken, confirmed_at=datetime.now())
+
+        known = submit(taken)
+        unknown = submit(fresh)
+        assert _bodies_indistinguishable(known, unknown), _diff_message(
+            "LEDG-2431 association branch", known, unknown
+        )
+        assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")
+
+        # (b) The refusal fires instead: same requester, now owning content,
+        # so the branch does different work and sends a different mail. Still
+        # nothing the caller can see.
+        DatasetFactory(owner=requester)
+
+        known = submit(taken)
+        unknown = submit(fresh)
+        assert _bodies_indistinguishable(known, unknown), _diff_message(
+            "LEDG-2431 refusal branch", known, unknown
+        )
+        assert known.location.replace(taken, "ADDR") == unknown.location.replace(fresh, "ADDR")

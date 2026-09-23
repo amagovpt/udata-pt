@@ -14,6 +14,14 @@ The replay checks both layers of the fix (LEDG-1729):
    same URL even if a caller bypasses the form (e.g. a programmatic source
    creation, a fixture, or a DNS-rebinding attempt).
 
+Every case here signs in as a SYSADMIN, and has to: the preview endpoint now
+requires one when the payload names no organization, and it tests that before
+validating the form, precisely so an unauthorized caller cannot reach the URL
+resolution these cases exercise. A bare account answers 403 and never reaches
+the filter, which would leave the assertions below testing nothing. The subject
+of this suite is the URL filter, not the authorization — see the harvest API
+tests for that.
+
 Run with:
 
     uv run pytest udata/tests/api/test_vuln_2084_harvest_ssrf_simulation.py -v
@@ -26,6 +34,7 @@ from unittest.mock import patch
 import pytest
 from flask import url_for
 
+from udata.core.user.factories import AdminFactory
 from udata.harvest.exceptions import HarvestException
 from udata.harvest.models import HarvestSource
 from udata.harvest.tests.factories import FactoryBackend, MockBackendsMixin
@@ -62,7 +71,7 @@ class VULN2084HarvestSSRFSimulationTest(MockBackendsMixin, APITestCase):
         Post-fix: the deny pattern ``*.s.inty.io`` matches the hostname
         BEFORE the DNS resolution; `resolve_hostname` must not be invoked.
         """
-        self.login()
+        self.login(AdminFactory())
         payload = {
             "name": "audit-replay",
             "url": "http://ama.http.interaction.s.inty.io",
@@ -85,7 +94,7 @@ class VULN2084HarvestSSRFSimulationTest(MockBackendsMixin, APITestCase):
 
     def test_known_pentest_canaries_are_blocked(self):
         """All canary domains shipped in the default denylist must yield 400."""
-        self.login()
+        self.login(AdminFactory())
         for u in PENTEST_CANARY_URLS:
             response = self.post(
                 url_for("api.preview_harvest_source_config"),
@@ -100,7 +109,7 @@ class VULN2084HarvestSSRFSimulationTest(MockBackendsMixin, APITestCase):
         must still go through validation and reach the backend's harvest
         call — i.e. the guard is targeted, not a blanket block.
         """
-        self.login()
+        self.login(AdminFactory())
         response = self.post(
             url_for("api.preview_harvest_source_config"),
             {"name": "ok", "url": "https://example.com/dcat", "backend": "factory"},
@@ -152,7 +161,7 @@ class VULN2084HarvestSSRFSimulationTest(MockBackendsMixin, APITestCase):
         allowlist are rejected — proves the opt-in tightening works for
         operators that want a stricter posture (e.g. prod limited to gov.pt).
         """
-        self.login()
+        self.login(AdminFactory())
         response = self.post(
             url_for("api.preview_harvest_source_config"),
             {"name": "x", "url": "https://example.com/dcat", "backend": "factory"},
@@ -162,7 +171,7 @@ class VULN2084HarvestSSRFSimulationTest(MockBackendsMixin, APITestCase):
     @pytest.mark.options(HARVEST_URL_HOST_ALLOWLIST=("*.gov.pt",))
     def test_allowlist_accepts_matching_hosts(self):
         """Allowlist must accept hosts matching one of its glob patterns."""
-        self.login()
+        self.login(AdminFactory())
         response = self.post(
             url_for("api.preview_harvest_source_config"),
             {

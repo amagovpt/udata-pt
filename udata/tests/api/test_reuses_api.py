@@ -331,7 +331,11 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         user = self.login()
         response = self.post(url_for("api.reuses"), data)
         assert201(response)
-        assert Reuse.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        assert len(list(Reuse.objects)) == 1
 
         reuse = Reuse.objects.first()
         assert reuse.owner == user
@@ -346,7 +350,7 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         data["organization"] = str(org.id)
         response = self.post(url_for("api.reuses"), data)
         assert201(response)
-        assert Reuse.objects.count() == 1
+        assert len(list(Reuse.objects)) == 1
 
         reuse = Reuse.objects.first()
         assert reuse.owner is None
@@ -363,7 +367,7 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         data["organization"] = str(org.id)
         response = self.post(url_for("api.reuses"), data)
         assert400(response)
-        assert Reuse.objects.count() == 0
+        assert len(list(Reuse.objects)) == 0
 
     def test_reuse_api_update(self):
         """It should update a reuse from the API"""
@@ -373,7 +377,7 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.reuse", reuse=reuse), data)
         assert200(response)
-        assert Reuse.objects.count() == 1
+        assert len(list(Reuse.objects)) == 1
         assert Reuse.objects.first().description == "new description"
 
     def test_reuse_api_remove_org(self):
@@ -383,7 +387,7 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         data["organization"] = None
         response = self.put(url_for("api.reuse", reuse=reuse), data)
         assert200(response)
-        assert Reuse.objects.count() == 1
+        assert len(list(Reuse.objects)) == 1
         assert Reuse.objects.first().organization is None
 
     def test_reuse_api_update_org_with_full_object(self):
@@ -400,7 +404,7 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         response = self.put(url_for("api.reuse", reuse=reuse), data)
         assert200(response)
 
-        assert Reuse.objects.count() == 1
+        assert len(list(Reuse.objects)) == 1
         assert Reuse.objects.first().owner is None
         assert Reuse.objects.first().organization.id == org.id
 
@@ -417,12 +421,12 @@ class ReuseAPITest(PytestOnlyAPITestCase):
         reuse = ReuseFactory(owner=user)
         response = self.delete(url_for("api.reuse", reuse=reuse))
         assert204(response)
-        assert Reuse.objects.count() == 1
+        assert len(list(Reuse.objects)) == 1
         assert Reuse.objects[0].deleted is not None
 
         response = self.put(url_for("api.reuse", reuse=reuse), {"deleted": None})
         assert200(response)
-        assert Reuse.objects.count() == 1
+        assert len(list(Reuse.objects)) == 1
         assert Reuse.objects[0].deleted is None
 
     def test_reuse_api_delete_deleted(self):

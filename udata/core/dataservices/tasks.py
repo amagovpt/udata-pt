@@ -5,13 +5,14 @@ from udata.core.activity.models import Activity
 from udata.core.badges import tasks as badge_tasks
 from udata.core.constants import HVD
 from udata.core.dataservices.models import Dataservice
+from udata.core.discussions.actions import delete_discussions_for_subject
 from udata.core.organization.assignment import Assignment
 from udata.core.organization.constants import CERTIFIED, PUBLIC_SERVICE
 from udata.core.organization.models import Organization
 from udata.core.pages.models import Page
 from udata.core.topic.models import TopicElement
 from udata.harvest.models import HarvestJob
-from udata.models import Discussion, Follow, Transfer
+from udata.models import Follow, Transfer
 from udata.tasks import job
 
 log = get_task_logger(__name__)
@@ -24,7 +25,7 @@ def purge_dataservices(self):
         # Remove followers
         Follow.objects(following=dataservice).delete()
         # Remove discussions
-        Discussion.objects(subject=dataservice).delete()
+        delete_discussions_for_subject(dataservice)
         # Remove HarvestItem references (using update_many with array_filters to update all matching items)
         HarvestJob._get_collection().update_many(
             {"items.dataservice": dataservice.id},

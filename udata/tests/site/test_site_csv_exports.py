@@ -14,6 +14,19 @@ from udata.core.reuse.factories import ReuseFactory
 from udata.harvest.models import HarvestSource
 from udata.tests.api import APITestCase
 
+# Known failures owned by out-of-scope root causes. Each reason names the ticket that
+# owns the production bug; strict=True means a fix turns the XPASS red and forces the
+# marker to be removed by the same change.
+
+R5 = (
+    "LEDG-2336 pending. udata/core/dataset/search.py declares badge as a scalar Filter "
+    "while udata/core/dataset/api.py:276-277 consumes it with badges__kind__in, so "
+    "mongoengine iterates the string character by character and the filter silently "
+    "matches nothing. format_family has the identical defect. This is a production bug "
+    "being recorded, not a stale test: when it is fixed this starts passing and "
+    "strict=True turns the XPASS red, forcing the marker out."
+)
+
 
 class SiteCsvExportsTest(APITestCase):
     def test_datasets_csv(self):
@@ -98,6 +111,7 @@ class SiteCsvExportsTest(APITestCase):
             self.assertNotIn(str(dataset.id), ids)
         self.assertNotIn(str(hidden_dataset.id), ids)
 
+    @pytest.mark.xfail(strict=True, reason=R5)
     def test_datasets_csv_with_badge_filter(self):
         self.app.config["EXPORT_CSV_MODELS"] = []
         dataset_with_badge = DatasetFactory(resources=[ResourceFactory()])
@@ -458,6 +472,29 @@ class SiteCsvExportsTest(APITestCase):
         for harvest in harvests:
             self.assertIn(str(harvest.id), ids)
         self.assertNotIn(str(hidden_harvest.id), ids)
+
+    def test_harvest_csv_redacts_url_credentials(self):
+        """The CSV export must not publish the credentials of every source.
+
+        This route needs no session, and with the export feature on the same
+        adapter produces a public downloadable resource -- so a raw url column
+        hands out every source password at once, with no id and no failed
+        harvest required (LEDG-2477).
+        """
+        self.app.config["EXPORT_CSV_MODELS"] = []
+        HarvestSource.objects.create(
+            backend="factory",
+            name="credentialed",
+            url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            organization=OrganizationFactory(),
+        )
+
+        response = self.get(url_for("api.site_harvests_csv"))
+        self.assert200(response)
+
+        body = response.data.decode("utf8")
+        assert "sup3rs3cr3t" not in body
+        assert "https://***@www.ine.pt/broken.xml" in body
 
     @pytest.mark.usefixtures("instance_path")
     def test_harvest_csv_w_export_csv_feature(self):

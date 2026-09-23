@@ -24,6 +24,8 @@ from udata.models import Dataset
 from udata.mongo.document import UDataDocument as Document
 from udata.mongo.slug_fields import SlugField
 
+from .url_filter import redact_url_credentials
+
 log = logging.getLogger(__name__)
 
 HARVEST_FREQUENCIES = OrderedDict(
@@ -70,10 +72,58 @@ class HarvestError(EmbeddedDocument):
     message = StringField()
     details = StringField()
 
+    def __init__(self, *args, **kwargs):
+        """Strip URL credentials as the error is built.
+
+        Both fields are built from an exception raised by `requests`, whose
+        text embeds the URL of the failed request. `URLS_ALLOW_CREDENTIALS`
+        lets a source URL carry `user:password@`, and the harvest jobs are
+        readable without a session, so the password would be served to
+        anonymous callers (LEDG-2477).
+
+        Redacting in the constructor rather than at each call site covers
+        every backend at once, including future ones. It has to be here and
+        not only in `clean()` because `clean()` runs on validation, and the
+        INE backend appends its items with
+        `HarvestJob.objects(...).update_one(push_all__items=...)`, a queryset
+        update that never validates -- so those errors would reach Mongo raw.
+        """
+        super().__init__(*args, **kwargs)
+        self.message = redact_url_credentials(self.message)
+        self.details = redact_url_credentials(self.details)
+
+    def clean(self):
+        """Redact again on validation, for a field assigned after __init__.
+
+        Mongoengine runs `clean()` on embedded documents nested in a
+        `ListField`, at both levels (`HarvestJob.errors` and
+        `HarvestItem.errors`). Nothing runs at all on the dryrun (preview)
+        path, which never saves -- hence the matching redaction on the API
+        serialization side.
+        """
+        self.message = redact_url_credentials(self.message)
+        self.details = redact_url_credentials(self.details)
+
 
 class HarvestLog(EmbeddedDocument):
     level = StringField()
     message = StringField()
+
+    def __init__(self, *args, **kwargs):
+        """Redact the same credentials the errors carry.
+
+        `BaseBackend.process_dataset` captures the application logger while it
+        works and stores what it caught here, and the very line it logs before
+        recording a failure interpolates the same exception text that goes
+        into `HarvestError`. These logs are served by the job endpoint to
+        callers without a session, so they leaked exactly what the errors did
+        (LEDG-2477).
+        """
+        super().__init__(*args, **kwargs)
+        self.message = redact_url_credentials(self.message)
+
+    def clean(self):
+        self.message = redact_url_credentials(self.message)
 
 
 class HarvestItem(EmbeddedDocument):
@@ -138,8 +188,19 @@ class HarvestSource(Owned, Document[HarvestSourceQuerySet]):
 
     @property
     def domain(self):
+        # `hostname`, never `netloc`: the netloc carries the userinfo prefix, and
+        # `URLS_ALLOW_CREDENTIALS` lets one through form validation. Splitting it
+        # on ":" therefore returns the *credentials*, not the host — so a source
+        # pointed at `https://www.ine.pt:1@attacker.example/c.xml` claims the
+        # domain `www.ine.pt` while downloading from somewhere else entirely,
+        # and the domain branch of the harvest scoping query matches every
+        # dataset that legitimate source ever harvested. `hostname` is what
+        # `url_filter._hostname` already uses for the SSRF guard; it also
+        # lowercases the host and unwraps IPv6 brackets, both of which the
+        # split could not do. It is `None` for a URL with no host, where the
+        # split returned "" — hence the fallback, which keeps the contract.
         parsed = urlparse(self.url)
-        return parsed.netloc.split(":")[0]
+        return parsed.hostname or ""
 
     @classmethod
     def get(cls, ident):
@@ -164,10 +225,18 @@ class HarvestSource(Owned, Document[HarvestSourceQuerySet]):
 
     meta = {
         "indexes": [
+            # `url` is deliberately out of the text index. While it was in,
+            # `?q=<password>` on the public sources route returned the source
+            # that carried that password -- a confirmation oracle for anyone
+            # who had guessed one (LEDG-2477, LEDG-2502). A source URL can no
+            # longer be stored with credentials, and what was stored before
+            # stays out of reach of the search. Changing these fields needs the
+            # migration that drops the old index: MongoDB allows one text index
+            # per collection, so the two cannot coexist.
             {
-                "fields": ["$name", "$url"],
+                "fields": ["$name"],
                 "default_language": "french",
-                "weights": {"name": 10, "url": 5},
+                "weights": {"name": 10},
             },
             "-created_at",
             "slug",

@@ -1,5 +1,6 @@
 import logging
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytest
 from flask import url_for
@@ -10,6 +11,7 @@ from udata.core.dataset.factories import DatasetFactory
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.user.factories import AdminFactory, UserFactory
 from udata.harvest.backends import get_enabled_backends
+from udata.i18n import gettext
 from udata.models import Member, PeriodicTask
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.tests.helpers import assert200, assert201, assert204, assert400, assert403, assert404
@@ -22,10 +24,16 @@ from ..models import (
     VALIDATION_REFUSED,
     HarvestError,
     HarvestItem,
+    HarvestLog,
     HarvestSource,
     HarvestSourceValidation,
 )
-from .factories import HarvestJobFactory, HarvestSourceFactory, MockBackendsMixin
+from .factories import (
+    HarvestJobFactory,
+    HarvestSourceFactory,
+    MockBackendsMixin,
+    mock_initialize,
+)
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +105,31 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
 
         assert len(response.json["data"]) == 1
         assert response.json["data"][0]["id"] == str(source.id)
+
+    def test_list_sources_search_does_not_match_url(self):
+        """Searching must not confirm a credential stored in a source URL.
+
+        The text index used to cover `$url`, so `?q=<password>` on this public
+        route returned the source carrying it: not a disclosure, but a way for
+        someone who had guessed a credential to confirm it (LEDG-2502).
+        """
+        source = HarvestSourceFactory(
+            name="Fonte legada",
+            url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+        )
+
+        response = self.get(url_for("api.harvest_sources", q="sup3rs3cr3t"))
+        assert200(response)
+        assert response.json["data"] == []
+
+        response = self.get(url_for("api.harvest_sources", q="ine.pt"))
+        assert200(response)
+        assert response.json["data"] == []
+
+        # Searching by name still works -- the index is kept, minus the URL.
+        response = self.get(url_for("api.harvest_sources", q="legada"))
+        assert200(response)
+        assert [s["id"] for s in response.json["data"]] == [str(source.id)]
 
     def test_list_sources_paginate(self):
         total = 25
@@ -386,6 +419,145 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         source = response.json
         assert source["config"] == {"custom": "value"}
 
+    def test_create_source_rejects_url_credentials(self):
+        """A source URL may no longer carry `user:password@` (LEDG-2502).
+
+        LEDG-2477 redacted the userinfo everywhere it reached a reader, but the
+        portal kept accepting it, so every new serialization path reopened the
+        problem. An inventory of production found no source using basic auth in
+        its URL, so the field rejects it instead.
+        """
+        self.login()
+        data = {
+            "name": faker.word(),
+            "url": "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            "backend": "factory",
+        }
+
+        response = self.post(url_for("api.harvest_sources"), data)
+
+        assert400(response)
+        # Asserted through `gettext` rather than against English: the suite
+        # runs in the default locale, and the message is deliberately the msgid
+        # `udata.uris` already uses, which is translated for pt and fr.
+        with self.app.test_request_context():
+            expected = str(gettext("Credentials in URL are not allowed"))
+        assert response.json["errors"]["url"] == [expected]
+        # The rejection must not repeat the secret back to the caller, which is
+        # why this is not `uris.validate(url, credentials=False)`: that one
+        # composes `Invalid URL "{url}": {reason}`.
+        assert "sup3rs3cr3t" not in str(response.json)
+        assert HarvestSource.objects(url__contains="sup3rs3cr3t").count() == 0
+
+    def test_update_source_rejects_url_credentials_until_removed(self):
+        """A source stored before the rejection cannot be saved as it is.
+
+        This is the migration path for legacy sources: the PUT revalidates the
+        URL, so editing one forces its credentials out. Harvesting it keeps
+        working until someone does — the fetch guard is deliberately unchanged,
+        because rejecting there would break a live harvest in silence.
+        """
+        user = self.login()
+        source = HarvestSourceFactory(
+            owner=user, url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+        )
+        api_url = url_for("api.harvest_source", source=source)
+
+        data = {
+            "name": source.name,
+            "description": source.description,
+            "url": "https://harvestuser:sup3rs3cr3t@www.ine.pt/feed.xml",
+            "backend": "factory",
+        }
+        response = self.put(api_url, data)
+        assert400(response)
+        assert "sup3rs3cr3t" not in str(response.json)
+
+        data["url"] = "https://www.ine.pt/feed.xml"
+        response = self.put(api_url, data)
+        assert200(response)
+        source.reload()
+        assert source.url == "https://www.ine.pt/feed.xml"
+
+    def test_create_source_rejects_credentials_split_by_a_fragment(self):
+        """A password holding `#`, `?` or `/` must be refused like any other.
+
+        `urlsplit` cuts the fragment, the query and the path off before the
+        netloc, so it sees no `@` in these at all -- but `udata.uris.URL_REGEX`
+        accepts them as credentials, so the source was stored. Every redaction
+        downstream shares `urlsplit`'s reading, so the password was then served
+        in full to anonymous callers instead of being masked.
+        """
+        self.login()
+        for url in (
+            "https://harvestuser:sup3r#s3cr3t@www.ine.pt/broken.xml",
+            "https://harvestuser:sup3r?s3cr3t@www.ine.pt/broken.xml",
+            "https://harvestuser:sup3r/s3cr3t@www.ine.pt/broken.xml",
+        ):
+            data = {"name": faker.word(), "url": url, "backend": "factory"}
+
+            response = self.post(url_for("api.harvest_sources"), data)
+
+            assert400(response)
+            assert "sup3r" not in str(response.json)
+        assert HarvestSource.objects(url__contains="s3cr3t").count() == 0
+
+    def test_update_source_rejects_credentials_it_was_not_asked_to_change(self):
+        """A payload that omits `url` is still refused for a legacy source.
+
+        This is what makes the rejection a migration path rather than a rule
+        for new sources only: `api.validate(HarvestSourceForm, source)` seeds
+        the field from the stored object, so the credentials are revalidated
+        even by an edit that never mentions them -- deactivating the source,
+        say. Without this the legacy row would quietly stay as it is.
+        """
+        user = self.login()
+        source = HarvestSourceFactory(
+            owner=user, url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+        )
+
+        response = self.put(
+            url_for("api.harvest_source", source=source),
+            {"name": source.name, "description": source.description, "backend": "factory"},
+        )
+
+        assert400(response)
+        assert "sup3rs3cr3t" not in str(response.json)
+
+    def test_create_source_accepts_a_url_with_no_userinfo(self):
+        """The guard must not refuse an ordinary source URL, port and all."""
+        self.login()
+        data = {
+            "name": faker.word(),
+            "url": "https://www.ine.pt:8443/feed.xml",
+            "backend": "factory",
+        }
+
+        response = self.post(url_for("api.harvest_sources"), data)
+
+        assert201(response)
+
+    def test_preview_source_rejects_url_credentials(self):
+        """The preview route validates the same form, so it rejects too.
+
+        It is the route the backoffice calls before saving, so a payload that
+        the create would refuse must not be previewable either.
+        """
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        data = {
+            "name": faker.word(),
+            "url": "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+            "backend": "factory",
+            "organization": str(org.id),
+        }
+
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
+
+        assert400(response)
+        assert "sup3rs3cr3t" not in str(response.json)
+
     def test_update_source(self):
         """It should update a source if owner or orga admin"""
         user = self.login()
@@ -554,10 +726,75 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         launch.assert_not_called()
 
     def test_source_from_config(self):
+        """It should preview a config for an organization the user may harvest for"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        data = {
+            "name": faker.word(),
+            "url": faker.url(),
+            "backend": "factory",
+            "organization": str(org.id),
+        }
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
+        assert200(response)
+
+    def test_source_from_config_without_org_requires_admin(self):
+        """It should refuse a config preview that names no organization
+
+        This is the route that makes the server run a harvest backend against a
+        URL the caller chose, and a payload with no organization leaves nothing
+        to weigh that against. Being logged in used to be the whole test.
+        """
         self.login()
         data = {"name": faker.word(), "url": faker.url(), "backend": "factory"}
         response = self.post(url_for("api.preview_harvest_source_config"), data)
+        assert403(response)
+
+    def test_source_from_config_without_org_as_admin(self):
+        """It should preview a config with no organization for a sysadmin"""
+        self.login(AdminFactory())
+        data = {"name": faker.word(), "url": faker.url(), "backend": "factory"}
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
         assert200(response)
+
+    def test_source_from_config_refuses_before_resolving_the_url(self):
+        """It should authorize before the form resolves the submitted hostname
+
+        Validating the form resolves the URL's hostname, so authorizing after it
+        still hands any authenticated account an out-of-band DNS probe against
+        any host outside the denylist — the VULN-2084 pattern. The refusal has to
+        come first.
+        """
+        self.login()
+        data = {"name": faker.word(), "url": "http://probe.example.org", "backend": "factory"}
+
+        with patch(
+            "udata.uris.resolve_hostname",
+            side_effect=AssertionError("DNS leak: the URL was resolved before authorization"),
+        ):
+            response = self.post(url_for("api.preview_harvest_source_config"), data)
+
+        assert403(response)
+
+    def test_source_from_config_with_org_not_member(self):
+        """It should refuse a config preview for an organization the user only edits
+
+        `Organization.permissions["harvest"]` is `EditOrganizationPermission`,
+        which admits org admins and not editors — the same line `POST
+        /harvest/sources/` already draws.
+        """
+        user = self.login()
+        member = Member(user=user, role="editor")
+        org = OrganizationFactory(members=[member])
+        data = {
+            "name": faker.word(),
+            "url": faker.url(),
+            "backend": "factory",
+            "organization": str(org.id),
+        }
+        response = self.post(url_for("api.preview_harvest_source_config"), data)
+        assert403(response)
 
     def test_delete_source(self):
         user = self.login()
@@ -726,6 +963,226 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
         assert error_item["remote_id"] == "4"
         assert error_item["errors"][0]["message"] == "boom"
         assert error_item["dataset"]["id"] == str(failed_ds.id)
+
+    def test_list_jobs_anonymous_hides_url_credentials(self):
+        """The jobs list builds its dicts by hand, so it needs its own redaction.
+
+        `JobsAPI.get` projects the documents in an aggregation instead of
+        marshalling them, so it never passes through `error_fields` -- and it
+        is the endpoint that serves what the INE backend writes with a
+        queryset update (LEDG-2477).
+        """
+        source = HarvestSourceFactory()
+        HarvestJobFactory(
+            source=source,
+            items=[
+                HarvestItem(
+                    remote_id="1",
+                    status="failed",
+                    errors=[
+                        HarvestError(
+                            message=(
+                                "500 Server Error: None for url: "
+                                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                            )
+                        )
+                    ],
+                )
+            ],
+        )
+
+        response = self.get(url_for("api.harvest_jobs", source=source))
+        assert200(response)
+
+        message = response.json["data"][0]["error_items"][0]["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
+
+    def test_get_job_anonymous_hides_url_credentials_in_logs(self):
+        """The captured log lines carry the same exception text as the errors."""
+        job = HarvestJobFactory(
+            items=[
+                HarvestItem(
+                    remote_id="1",
+                    status="failed",
+                    logs=[
+                        HarvestLog(
+                            level="ERROR",
+                            message=(
+                                "Error while processing 1 : 401 Client Error: "
+                                "Unauthorized for url: "
+                                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                            ),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        response = self.get(url_for("api.harvest_job", ident=str(job.id)))
+        assert200(response)
+
+        message = response.json["items"][0]["logs"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
+
+    def test_get_source_anonymous_redacts_url_credentials(self):
+        """Neither source route may hand the URL password to a reader.
+
+        Both are open to anonymous callers and `source_fields` serialized the
+        URL verbatim, so the credentials of a basic-auth source were public
+        without a failed harvest and without knowing any id (LEDG-2477).
+        """
+        source = HarvestSourceFactory(url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml")
+        redacted = "https://***@www.ine.pt/broken.xml"
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["url"] == redacted
+
+        response = self.get(url_for("api.harvest_sources"))
+        assert200(response)
+        listed = next(s for s in response.json["data"] if s["id"] == str(source.id))
+        assert listed["url"] == redacted
+
+    def test_get_source_owner_sees_full_url(self):
+        """Whoever may rewrite the URL still needs to read it whole."""
+        user = self.login()
+        url = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+        source = HarvestSourceFactory(url=url, owner=user)
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["url"] == url
+
+    def test_get_source_anonymous_hides_config(self):
+        """Neither source route may hand the source config to a reader.
+
+        `config` is free-form -- `HarvestConfigField.pre_validate` only checks
+        `filters`, `extra_configs` and `features` -- and the CKAN family reads
+        `config["apikey"]` into an `Authorization` header, so serializing it
+        raw published the API key of every authenticated source to anyone
+        (LEDG-2514).
+        """
+        source = HarvestSourceFactory(
+            backend="ckan", config={"apikey": "sup3rs3cr3t", "filters": []}
+        )
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["config"] == {}
+        assert b"sup3rs3cr3t" not in response.data
+
+        response = self.get(url_for("api.harvest_sources"))
+        assert200(response)
+        listed = next(s for s in response.json["data"] if s["id"] == str(source.id))
+        assert listed["config"] == {}
+        assert b"sup3rs3cr3t" not in response.data
+
+    def test_get_source_owner_sees_full_config(self):
+        """Whoever may rewrite the config still needs to read it whole.
+
+        The admin harvester screen merges the form values onto the stored
+        config precisely because it holds keys no screen models, so an owner
+        who got `{}` back would wipe them on the next save.
+        """
+        user = self.login()
+        config = {"apikey": "sup3rs3cr3t", "filters": []}
+        source = HarvestSourceFactory(backend="ckan", config=config, owner=user)
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["config"] == config
+
+    def test_get_source_org_editor_does_not_see_config(self):
+        """The gate is `edit`, and nothing else would be caught.
+
+        `preview` is one step below and admits organization editors, and the
+        two permissions are indistinguishable on a source with no organization
+        -- which is the shape the tests above use -- so a gate quietly widened
+        to `preview` would leave the whole module green while serving the key
+        to every editor of the organization.
+        """
+        user = self.login()
+        org = OrganizationFactory(members=[Member(user=user, role="editor")])
+        source = HarvestSourceFactory(
+            backend="ckan", organization=org, config={"apikey": "sup3rs3cr3t"}
+        )
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["permissions"]["edit"] is False
+        assert response.json["permissions"]["preview"] is True
+        assert response.json["config"] == {}
+        assert b"sup3rs3cr3t" not in response.data
+
+    def test_get_source_org_admin_sees_full_config(self):
+        """The other half of the same gate: an organization admin maintains
+        the source, so the key has to reach them."""
+        user = self.login()
+        org = OrganizationFactory(members=[Member(user=user, role="admin")])
+        config = {"apikey": "sup3rs3cr3t"}
+        source = HarvestSourceFactory(backend="ckan", organization=org, config=config)
+
+        response = self.get(url_for("api.harvest_source", source=source))
+        assert200(response)
+        assert response.json["config"] == config
+
+    def test_get_job_anonymous_hides_url_credentials(self):
+        """Reading a job without a session must not disclose the source password.
+
+        The job endpoint has no `@api.secure` and `details` is the only field
+        gated behind the admin permission, so `message` used to hand the
+        credentials of the source URL to any anonymous caller (LEDG-2477).
+        """
+        job = HarvestJobFactory(
+            errors=[
+                HarvestError(
+                    message=(
+                        "500 Server Error: None for url: "
+                        "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+                    )
+                )
+            ]
+        )
+
+        response = self.get(url_for("api.harvest_job", ident=str(job.id)))
+        assert200(response)
+
+        message = response.json["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "harvestuser" not in message
+        assert message == ("500 Server Error: None for url: https://***@www.ine.pt/broken.xml")
+
+    def test_preview_error_hides_url_credentials(self):
+        """The preview never saves, so only the serialization can redact it.
+
+        `save_job()`/`end_job()` are no-ops when `dryrun` is set, so
+        `HarvestError.clean()` never runs on this path -- yet the preview
+        models are clones of the job models and serialize the same errors, to
+        an audience that includes organization editors.
+        """
+        user = self.login()
+        source = HarvestSourceFactory(
+            backend="factory",
+            owner=user,
+            url="https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml",
+        )
+
+        def init(self):
+            raise ValueError(
+                "500 Server Error: None for url: "
+                "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
+            )
+
+        with mock_initialize.connected_to(init):
+            response = self.get(url_for("api.preview_harvest_source", source=source))
+
+        assert200(response)
+        assert response.json["status"] == "failed"
+        message = response.json["errors"][0]["message"]
+        assert "sup3rs3cr3t" not in message
+        assert "https://***@www.ine.pt/broken.xml" in message
 
     def test_get_source_permissions_as_anonymous(self):
         """It should return all permissions as False for anonymous users"""

@@ -282,7 +282,10 @@ class TransferRequestNotificationTest(DBTestCase):
         request_transfer(dataset, recipient, faker.sentence())
         request_transfer(dataset, recipient, faker.sentence())
 
-        assert Notification.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a duplicate would slip through.
+        assert len(list(Notification.objects)) == 1
 
     def test_multiple_transfers_create_separate_notifications(self):
         """Multiple transfer requests create separate notifications"""

@@ -33,7 +33,13 @@ from udata.tests.api import APITestCase
 
 
 def _build_mock_response(body=b"hello", content_type="text/plain"):
-    """Return a `requests.Response`-shaped mock yielding `body` once."""
+    """Return a `requests.Response`-shaped mock yielding `body` once.
+
+    Tests using this must read ``response.data``. The endpoint answers with a
+    streamed response, and Flask only pops the request context once the generator
+    is exhausted: a test that asserts on headers alone leaves the context on the
+    stack and the next teardown fails with "Popped wrong request context".
+    """
     m = MagicMock()
     m.headers = {"Content-Type": content_type}
     m.status_code = 200
@@ -235,6 +241,10 @@ class ProxyDownloadEndpointTest(APITestCase):
         _, kwargs = g.call_args
         assert kwargs.get("allow_redirects") is False
         assert kwargs.get("stream") is True
+        # Read the body: it is what the proxy is meant to relay, and consuming the
+        # stream is what lets Flask pop the request context (see the note on
+        # _build_mock_response).
+        assert response.data == b"hello"
 
     def test_filename_query_overrides_url_segment(self):
         mock_resp = _build_mock_response(body=b"a,b\n", content_type="text/csv")
@@ -247,6 +257,7 @@ class ProxyDownloadEndpointTest(APITestCase):
             )
         assert response.status_code == 200
         assert 'filename="export.csv"' in response.headers["Content-Disposition"]
+        assert response.data == b"a,b\n"
 
     def test_response_has_cache_control_no_store(self):
         mock_resp = _build_mock_response()
@@ -256,6 +267,7 @@ class ProxyDownloadEndpointTest(APITestCase):
         ):
             response = self.get(self._endpoint() + "?url=https://example.com/x")
         assert "no-store" in response.headers["Cache-Control"]
+        assert response.data == b"hello"
 
     def test_default_content_type_when_upstream_missing(self):
         mock_resp = MagicMock()
@@ -269,3 +281,4 @@ class ProxyDownloadEndpointTest(APITestCase):
         ):
             response = self.get(self._endpoint() + "?url=https://example.com/blob")
         assert response.headers["Content-Type"].startswith("application/octet-stream")
+        assert response.data == b"raw"

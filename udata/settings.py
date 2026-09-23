@@ -158,7 +158,8 @@ class Defaults(object):
     SECURITY_RESET_SALT = "Default uData secret reset salt"
     SECURITY_REMEMBER_SALT = "Default uData remember salt"
 
-    SECURITY_EMAIL_SENDER = MAIL_DEFAULT_SENDER
+    # SECURITY_EMAIL_SENDER intentionally unset: Flask-Security's own default
+    # resolves MAIL_DEFAULT_SENDER lazily. See SecurityMailSenderTest.
 
     SECURITY_EMAIL_SUBJECT_REGISTER = _("Welcome")
     SECURITY_EMAIL_SUBJECT_CONFIRM = _("Please confirm your email")
@@ -181,6 +182,30 @@ class Defaults(object):
     SECURITY_TWO_FACTOR_RESCUE_MAIL = (
         "no-reply@data.gouv.fr"  # Should be a contact email for account rescue
     )
+
+    # CMD/eIDAS account linking — TWO flags, one question each.
+    #
+    #   MIGRATION_MODE_ENABLED   -> "is linking mandatory?"
+    #   MIGRATION_INVITE_ENABLED -> "do we invite?"
+    #
+    # They are separate because a single flag cannot express the state the
+    # portal is actually in: inviting without forcing. Hanging a fourth
+    # question on MIGRATION_MODE_ENABLED would mean reading `not
+    # _migration_enabled()` as "we are in invite mode", which makes a negation
+    # stand for a feature. The practical payoff decides it: turning the invite
+    # off restores today's behaviour WITHOUT turning the mandatory mode on.
+    #
+    # DEFAULT False, and deliberately not True even though the portal turns it
+    # on. A True default would put every test that only switches the mandatory
+    # flag off into invite mode without saying so, and the ACS would divert
+    # where those tests expect an account to be created. Enabling it is a
+    # deployment decision, exactly as it already is for the mandatory flag.
+    #
+    # This is the ONLY default for this flag. MIGRATION_MODE_ENABLED has three
+    # divergent ones (udata.cfg True, class Testing True, the reader's own
+    # `.get(..., False)`), which is a recorded trap in LEDG-2430 — not a
+    # pattern to copy.
+    MIGRATION_INVITE_ENABLED = False
 
     # Inactive users settings
     YEARS_OF_INACTIVITY_BEFORE_DELETION = None
@@ -836,6 +861,29 @@ class Testing(object):
     DATASET_HIDDEN_BADGES = []
     ELASTICSEARCH_URL = None
     ELASTICSEARCH_INDEX_BASENAME = "udata-test"
+
+    # The SAML views read these straight from the config and none of them has a default
+    # in Defaults - they only ever existed in udata.cfg, fed from a developer's .env. That
+    # made every /saml/* test depend on the machine running it: with no udata.cfg the
+    # views raise (saml_govpt.py does `config.get("SECURITY_SAML_IDP_METADATA").split(",")`
+    # on None) and answer 500 instead of the redirect under test. Declared here so the
+    # tests carry their own configuration and behave the same on a laptop and in CI.
+    # Values are inert: every test that exercises a real pysaml2 client sets its own paths
+    # in a fixture and is gated behind requires_saml_credentials.
+    SECURITY_SAML_ENTITY_ID = "udata.test"
+    SECURITY_SAML_ENTITY_NAME = "udata test"
+    SECURITY_SAML_KEY_FILE = "udata/auth/saml/credentials/private.pem"
+    SECURITY_SAML_CERT_FILE = "udata/auth/saml/credentials/AMA.pem"
+    SECURITY_SAML_IDP_METADATA = "udata/auth/saml/credentials/metadata.xml"
+    SECURITY_SAML_FA_URL = "https://preprod.autenticacao.gov.pt/fa/"
+    SECURITY_SAML_FAAALEVEL = 3
+    MIGRATION_MODE_ENABLED = True
+    # _trusted_saml_issuers() builds its allowlist from the entityID of each metadata
+    # file, and the metadata is part of the git-ignored credentials, so on a fresh
+    # checkout there is nothing to trust and every mocked SSO response is rejected with
+    # issuer_untrusted. The function takes this config as a second source for exactly
+    # this reason; the value is the issuer the test fixtures sign their responses with.
+    TRUSTED_SAML_ISSUERS = ["https://autenticacao.cartaodecidadao.pt"]
 
 
 class Debug(Defaults):

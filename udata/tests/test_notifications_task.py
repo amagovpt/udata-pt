@@ -30,7 +30,11 @@ class UserTasksTest(APITestCase):
         request = MembershipRequest(user=applicant, comment="test")
         org.add_membership_request(request)
 
-        assert Notification.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so an expired notification left behind
+        # would go unnoticed.
+        assert len(list(Notification.objects)) == 1
 
         request.status = "accepted"
         request.handled_by = self.user
@@ -40,4 +44,4 @@ class UserTasksTest(APITestCase):
 
         tasks.delete_expired_notifications()
 
-        assert Notification.objects.count() == 0
+        assert len(list(Notification.objects)) == 0

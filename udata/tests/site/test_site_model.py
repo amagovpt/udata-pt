@@ -13,25 +13,29 @@ class SiteModelTest(DBTestCase):
         current_app.config["SITE_ID"] = "old-id"
         current_app.config["SITE_TITLE"] = "Test"
 
-        assert Site.objects.count() == 0
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # that should have been removed is still there.
+        assert len(list(Site.objects)) == 0
 
         g.site = None
         site_1 = get_current_site()
-        assert Site.objects.count() == 1
+        assert len(list(Site.objects)) == 1
         assert site_1.id == "old-id"
         assert site_1.title == "Test"
 
         g.site = None
         current_app.config["SITE_TITLE"] = "New name"
         site_2 = get_current_site()
-        assert Site.objects.count() == 1
+        assert len(list(Site.objects)) == 1
         assert site_2.id == "old-id"
         assert site_2.title == "New name"
 
         g.site = None
         current_app.config["SITE_ID"] = "new-id"
         site_3 = get_current_site()
-        assert Site.objects.count() == 2
+        assert len(list(Site.objects)) == 2
         assert site_3.id == "new-id"
         assert site_3.title == "New name"
 

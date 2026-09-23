@@ -27,7 +27,6 @@ import sys
 
 import pymongo
 
-
 OLD_INDEX_NAME = "slug_text"
 COLLECTION = "user"
 

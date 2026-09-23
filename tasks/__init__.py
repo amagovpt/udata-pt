@@ -146,8 +146,8 @@ def work(ctx, loglevel="info"):
 @task
 def dev(ctx, host="localhost", port="7000", loglevel="info"):
     """Run development server and Celery worker together"""
-    import subprocess
     import signal
+    import subprocess
     import sys
 
     with ctx.cd(ROOT):

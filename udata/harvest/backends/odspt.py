@@ -9,6 +9,7 @@ from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
 from udata.harvest.models import HarvestItem
+from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.i18n import gettext as _
 from udata.models import License, Organization, Resource
 from udata.utils import get_by
@@ -86,18 +87,45 @@ class OdsBackendPT(BaseBackend):
 
     @property
     def source_url(self):
+        """The source URL as configured, credentials included.
+
+        `URLS_ALLOW_CREDENTIALS` is true, so this may be
+        `https://user:password@host/path`. Only `api_url` may be built on it:
+        that is the single request this backend makes, and it is the only place
+        that needs the credentials back. Everything else this backend derives
+        from the source URL is published, and must go through
+        `public_source_url` instead. See LEDG-2500.
+        """
         return self.source.url.rstrip("/")
+
+    @property
+    def public_source_url(self):
+        """`source_url` with any userinfo replaced by `***`.
+
+        The URLs built on this one end up in `Dataset.resources[].url` and in
+        `extras["ods:url"]`, both served to callers without a session. A
+        credentialed source would otherwise hand its password to every reader
+        of the dataset -- and `/r/<id>` would fetch the file with it on their
+        behalf.
+
+        A redacted URL no longer downloads, which is the point: an anonymous
+        reader is not supposed to hold the credentials. `udata.uris.validate`
+        still accepts it, because `***@` matches the userinfo group of
+        `URL_REGEX`; were `URLS_ALLOW_CREDENTIALS` ever turned off, these
+        resources would stop validating and this is where to look.
+        """
+        return redact_url_credentials_in_url(self.source_url)
 
     @property
     def api_url(self):
         return "{0}/api/datasets/1.0/search/".format(self.source_url)
 
     def explore_url(self, dataset_id):
-        return "{0}/explore/dataset/{1}/".format(self.source_url, dataset_id)
+        return "{0}/explore/dataset/{1}/".format(self.public_source_url, dataset_id)
 
     def extra_file_url(self, dataset_id, file_id, plural_type):
         return "{0}/api/datasets/1.0/{1}/{2}/{3}".format(
-            self.source_url, dataset_id, plural_type, file_id
+            self.public_source_url, dataset_id, plural_type, file_id
         )
 
     def download_url(self, dataset_id, format):

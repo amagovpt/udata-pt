@@ -150,11 +150,12 @@ class SiteContactAPITest(APITestCase):
         self.assertStatus(response, 204)
         assert len(mails) == 1
         html = mails[0].html
-        # Each structured field is separated from the next by a <br>, and the
-        # blank line between header and body becomes a double break.
+        # Lines inside a paragraph are separated by <br>; the blank line between
+        # the header block and the body closes the paragraph and opens a new one.
         assert "Categoria: Conteúdo incorreto ou indisponível<br>" in html
         assert "Página/URL: https://ppr-dadosgov.arte.gov.pt/pages/support<br>" in html
-        assert "Data/hora aproximada: 05/06/2026 16:30<br><br>" in html
+        assert "Data/hora aproximada: 05/06/2026 16:30</p>" in html
+        assert "TESTE este email é recebido em que situação?" in html
         # The bug was the whole message rendered as a single run with no breaks.
         assert "<br>" in html
         # The plain-text part keeps the original newlines verbatim.

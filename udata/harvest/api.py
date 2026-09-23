@@ -3,6 +3,8 @@ from flask_login import current_user
 from werkzeug.exceptions import BadRequest
 
 from udata.api import API, api, fields
+from udata.api.limits import HARVEST_PREVIEW_LIMIT, user_or_ip
+from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api_fields import dataset_fields, dataset_ref_fields
@@ -21,19 +23,31 @@ from .models import (
     HarvestJob,
     HarvestSource,
 )
+from .url_filter import redact_url_credentials, redact_url_credentials_in_url
 
 ns = api.namespace("harvest", "Harvest related operations")
 
 
+# Both fields are redacted on the way out as well as on the way in
+# (`HarvestError.clean`). The preview runs the backend with `dryrun=True`, so
+# it never saves and `clean()` never runs, yet `preview_job_fields` and
+# `preview_item_fields` are clones of these models and serialize the very same
+# errors. Gating `details` behind the admin permission is authorization, not
+# secrecy: it decides who may read the traceback, not whether the traceback
+# still carries a password (LEDG-2477).
 error_fields = api.model(
     "HarvestError",
     {
         "created_at": fields.ISODateTime(
             description="The error creation date", required=True, readonly=True
         ),
-        "message": fields.String(description="The error short message", required=True),
+        "message": fields.String(
+            attribute=lambda o: redact_url_credentials(o.message),
+            description="The error short message",
+            required=True,
+        ),
         "details": fields.Raw(
-            attribute=lambda o: o.details if admin_permission else None,
+            attribute=lambda o: redact_url_credentials(o.details) if admin_permission else None,
             description="Optional details (only for super-admins)",
             readonly=True,
         ),
@@ -45,7 +59,12 @@ log_fields = api.model(
     "HarvestError",
     {
         "level": fields.String(required=True),
-        "message": fields.String(required=True),
+        # Captured from the application logger while an item is processed, and
+        # the line logged just before a failure carries the same exception text
+        # as the error itself (LEDG-2477).
+        "message": fields.String(
+            attribute=lambda o: redact_url_credentials(o.message), required=True
+        ),
     },
 )
 
@@ -107,6 +126,10 @@ item_counts_fields = api.model(
     | {"total": fields.Integer(description="Total number of items")},
 )
 
+# The jobs list does not marshal documents: it projects them in an aggregation
+# and `_serialize_light_job` builds the dicts by hand, so the redaction that
+# `error_fields` applies has to be repeated there -- this model only describes
+# the shape for the API documentation (LEDG-2477).
 error_light_fields = api.model(
     "HarvestErrorLight",
     {
@@ -174,7 +197,15 @@ validation_fields = api.model(
         "state": fields.String(
             description="Is it validated or not", enum=list(VALIDATION_STATES), required=True
         ),
-        "by": fields.Nested(
+        # Tolerant, because nothing keeps this reference honest: mongoengine
+        # refuses `reverse_delete_rule` on an EmbeddedDocument field, the
+        # official deletion path (`User.mark_as_deleted`) keeps the document
+        # rather than removing it, and there is no user purge — so a validator
+        # only ever disappears through a direct write to the database, where no
+        # hook of ours runs. Before this, one such source answered 500 with an
+        # empty body for the *whole* listing, which nginx reported as a 502
+        # (LEDG-2535).
+        "by": fields.TolerantNested(
             user_ref_fields,
             allow_null=True,
             readonly=True,
@@ -207,13 +238,37 @@ source_fields = api.model(
         "id": fields.String(description="The source unique identifier", readonly=True),
         "name": fields.String(description="The source display name", required=True),
         "description": fields.Markdown(description="The source description"),
-        "url": fields.String(description="The source base URL", required=True),
+        # A URL stored before credentials were rejected may still carry
+        # user:password@, and both GET routes that serve this model are open
+        # to anonymous callers. The
+        # gate is the one that guards PUT, so whoever may rewrite the URL still
+        # reads it whole and nobody else does -- and no client can round-trip
+        # the mask back into the record (LEDG-2477).
+        "url": fields.String(
+            attribute=lambda s: s.url
+            if s.permissions["edit"].can()
+            else redact_url_credentials_in_url(s.url),
+            description="The source base URL",
+            required=True,
+        ),
         "backend": fields.String(
             description="The source backend",
             enum=lambda: list(get_enabled_backends().keys()),
             required=True,
         ),
-        "config": fields.Raw(description="The configuration as key-value pairs"),
+        # `config` is free-form: `HarvestConfigField.pre_validate` only checks
+        # `filters`, `extra_configs` and `features`, so any other key is stored
+        # and served verbatim -- and the CKAN family reads `config["apikey"]`
+        # into an `Authorization` header, so this field does carry a
+        # credential. Same gate as `url`, for the same reason: whoever may
+        # rewrite the config reads it whole and nobody else reads any of it.
+        # An empty dict rather than a masked one, because a mask can only hide
+        # the keys we already know about and the next credential key will have
+        # a name nobody listed (LEDG-2514).
+        "config": fields.Raw(
+            attribute=lambda s: s.config if s.permissions["edit"].can() else {},
+            description="The configuration as key-value pairs, served only to readers who may edit the source",  # noqa
+        ),
         "created_at": fields.ISODateTime(
             description="The source creation date", required=True, readonly=True
         ),
@@ -402,7 +457,38 @@ class SourceAPI(API):
     @api.doc("get_harvest_source")
     @api.marshal_with(source_fields)
     def get(self, source: HarvestSource):
-        """Get a single source given an ID or a slug"""
+        """Get a single source given an ID or a slug.
+
+        Deliberately readable without a session, like the rest of the harvest
+        reads -- which sources feed an open data portal is public information,
+        it is the contract the frontend and upstream udata are built on, and
+        `test_get_source_permissions_as_anonymous` draws that anonymous 200
+        explicitly.
+
+        What makes it safe is that no secret reaches the payload, not that
+        nobody is looking: `url` is redacted here and in `harvests.csv` for
+        anyone without `edit`, `config` is served only to those same readers
+        because it carries the CKAN `apikey`, `HarvestError` and `HarvestLog`
+        are redacted as they are built and again as they are serialized, and
+        the source URL copied onto harvested dataservices is redacted at the
+        copy.
+        `@api.secure` would not have replaced any of that -- it only demands an
+        account, and anyone can create one, so a registered reader would have
+        seen exactly what an anonymous one did.
+
+        The confirmation oracle that used to be accepted here is gone: the
+        text index no longer covers `url`, so `?q=<password>` matches nothing,
+        and a source URL can no longer be stored with credentials at all
+        (LEDG-2502).
+
+        `odspt` and `maaf` used to build public dataset resource URLs and
+        remote ids out of the source URL, which is the same defect in a place
+        where redacting breaks a working download link. That was settled by
+        redacting anyway: a link that only works because it carries somebody
+        else's password is the defect, not a feature.
+
+        See LEDG-2477, LEDG-2500, LEDG-2502 and LEDG-2514.
+        """
         return source
 
     @api.secure
@@ -488,14 +574,60 @@ class ScheduleSourceAPI(API):
         return actions.unschedule(source), 204
 
 
+def _names_an_organization() -> bool:
+    """Whether the raw request body carries a non-empty `organization`.
+
+    Read before the form is validated, so it cannot rely on the resolved field.
+    A body that is not JSON at all answers False and falls through to the
+    permission test, then to `api.validate`, which is what turns it into the 400
+    it has always been — the alternative, letting `request.get_json` raise here,
+    would answer 400 to an unauthorized caller and leak that the payload parsed.
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("organization"))
+
+
 @ns.route("/source/preview/", endpoint="preview_harvest_source_config")
 class PreviewSourceConfigAPI(API):
+    # Every request here walks a remote catalogue on the caller's behalf, so the
+    # cost is outbound rather than stored. Declared at class level, not on the
+    # verb: `decorators` run outside `@api.secure`, which is what keeps the limit
+    # counting a flood of unauthorized attempts instead of only the ones that get
+    # past authentication.
+    decorators = [
+        limiter.limit(
+            HARVEST_PREVIEW_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.expect(source_fields)
     @api.doc("preview_harvest_source_config")
     @api.marshal_with(preview_job_fields)
     def post(self):
         """Preview an harvesting from a source created with the given payload"""
+        # Authorized BEFORE `api.validate`, which is the order every other route
+        # in this file uses. Validating the form resolves the submitted hostname
+        # (`HarvestURLField` -> `URLField.pre_validate` -> `uris.resolve_hostname`,
+        # with URLS_RESOLVE_HOSTNAME on), so authorizing afterwards still let any
+        # authenticated account fire an out-of-band DNS lookup at any hostname
+        # outside HARVEST_URL_HOST_DENYLIST — which is the probe VULN-2084 was
+        # about. This closes it for a payload that names no organization; a caller
+        # naming an organization they administer still validates first, because
+        # resolving the organization needs the form, and that is a smaller and
+        # accountable population.
+        if not _names_an_organization():
+            # No organization to weigh the request against, and this is the one
+            # route that makes the server run a harvest backend against a URL the
+            # caller chose. Creating a source is inert by comparison: it lands
+            # VALIDATION_PENDING, validating is admin_permission, and
+            # RunSourceAPI refuses anything not accepted.
+            admin_permission.test()
+
         form = api.validate(HarvestSourceForm)
         if form.organization.data:
             form.organization.data.permissions["harvest"].test()
@@ -504,6 +636,22 @@ class PreviewSourceConfigAPI(API):
 
 @ns.route("/source/<harvest_source:source>/preview/", endpoint="preview_harvest_source")
 class PreviewSourceAPI(API):
+    # Same cost as the config route — `actions.preview` walks the same remote
+    # catalogue under the same HARVEST_PREVIEW_MAX_ITEMS — so the same ceiling,
+    # and the same `user_or_ip` key. Without this it fell under
+    # RATELIMIT_DEFAULT, which is keyed on the remote address: behind the F5
+    # every visitor arrives from one origin IP, so that ceiling is shared
+    # site-wide and one caller previewing in a loop answers 429 to everybody
+    # else. That matters more now that the backoffice sends every read-only
+    # preview here.
+    decorators = [
+        limiter.limit(
+            HARVEST_PREVIEW_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.secure
     @api.doc("preview_harvest_source")
     @api.marshal_with(preview_job_fields)
@@ -532,7 +680,10 @@ def _serialize_light_job(doc, dataset_map, source_id, show_details):
 
     def _errors(raw):
         return [
-            {"message": e.get("message"), "details": e.get("details") if show_details else None}
+            {
+                "message": redact_url_credentials(e.get("message")),
+                "details": redact_url_credentials(e.get("details")) if show_details else None,
+            }
             for e in (raw or [])
         ]
 
@@ -656,7 +807,18 @@ class JobAPI(API):
     @api.expect(parser)
     @api.marshal_with(job_fields)
     def get(self, ident):
-        """Get a single job given an ID"""
+        """Get a single job given an ID.
+
+        Readable without a session by the same decision as the source reads --
+        see `SourceAPI.get`, which records it in full. The errors and captured
+        logs served here are redacted twice over: in their constructors on the
+        way into the database, and in `error_fields`/`log_fields` on the way
+        out, which is what covers the preview, where nothing is ever saved.
+        The jobs list is the one route that marshals neither, so
+        `_serialize_light_job` repeats the redaction by hand.
+
+        See LEDG-2477.
+        """
         return actions.get_job(ident)
 
 

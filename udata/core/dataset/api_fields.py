@@ -522,4 +522,3 @@ catalog_schema_fields = api.model(
         ),
     },
 )
- 

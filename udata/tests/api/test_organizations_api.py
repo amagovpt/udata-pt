@@ -29,7 +29,6 @@ from udata.tests.helpers import (
     assert_emit,
     assert_not_emit,
     assert_starts_with,
-    assert_status,
 )
 from udata.utils import faker
 
@@ -115,7 +114,11 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         user = self.login()
         response = self.post(url_for("api.organizations"), data)
         assert201(response)
-        assert Organization.objects.count() == 1
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction -- including reporting zero while a document
+        # the request should not have persisted is still there.
+        assert len(list(Organization.objects)) == 1
 
         org = Organization.objects.first()
         member = org.member(user)
@@ -132,7 +135,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         data["description"] = "new description"
         response = self.put(url_for("api.organization", org=org), data)
         assert200(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects.first().description == "new description"
 
     def test_organization_api_update_badges(self):
@@ -157,6 +160,33 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         response = self.put(url_for("api.organization", org=org), data)
         assert403(response)
 
+    def test_organization_api_update_keeps_existing_badges(self):
+        """An organization admin can PUT back the badges the organization already has"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        org.add_badge(org_constants.PUBLIC_SERVICE)
+        data = org.to_dict()
+        data["description"] = "new description"
+        response = self.put(url_for("api.organization", org=org), data)
+        assert200(response)
+        org.reload()
+        assert org.description == "new description"
+        assert {b.kind for b in org.badges} == {org_constants.PUBLIC_SERVICE}
+
+    def test_organization_api_update_cannot_drop_badges(self):
+        """Only site admins can drop badges via the organization PUT payload"""
+        user = self.login()
+        member = Member(user=user, role="admin")
+        org = OrganizationFactory(members=[member])
+        org.add_badge(org_constants.PUBLIC_SERVICE)
+        data = org.to_dict()
+        data["badges"] = []
+        response = self.put(url_for("api.organization", org=org), data)
+        assert403(response)
+        org.reload()
+        assert {b.kind for b in org.badges} == {org_constants.PUBLIC_SERVICE}
+
     def test_organization_api_update_business_number_id(self):
         """It should update an organization from the API by adding a business number id"""
         user = self.login()
@@ -166,7 +196,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         data["business_number_id"] = "13002526500013"
         response = self.put(url_for("api.organization", org=org), data)
         assert200(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects.first().business_number_id == "13002526500013"
 
     def test_organization_api_update_business_number_id_failing(self):
@@ -212,7 +242,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         self.login()
         response = self.put(url_for("api.organization", org=org), data)
         assert403(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects.first().description == org.description
 
     def test_organization_api_delete(self):
@@ -222,7 +252,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         org = OrganizationFactory(members=[member])
         response = self.delete(url_for("api.organization", org=org))
         assert204(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects[0].deleted is not None
 
     def test_organization_api_delete_deleted(self):
@@ -240,7 +270,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         org = OrganizationFactory(members=[member])
         response = self.delete(url_for("api.organization", org=org))
         assert403(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects[0].deleted is None
 
     def test_organization_api_delete_as_non_member_forbidden(self):
@@ -249,7 +279,7 @@ class OrganizationAPITest(PytestOnlyAPITestCase):
         org = OrganizationFactory()
         response = self.delete(url_for("api.organization", org=org))
         assert403(response)
-        assert Organization.objects.count() == 1
+        assert len(list(Organization.objects)) == 1
         assert Organization.objects[0].deleted is None
 
 
@@ -462,10 +492,112 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert request.handled_on is not None
         assert request.refusal_comment is None
 
-        # test accepting twice will raise 409
+        # Accepting twice is deliberately idempotent: the endpoint returns the
+        # existing member with 200 instead of 409, and leaves the audit trail
+        # of the first acceptance alone. That preservation is asserted in
+        # test_accept_membership_twice_preserves_audit_trail.
         api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
         response = self.post(api_url)
-        assert_status(response, 409)
+        assert200(response)
+
+    def test_accept_membership_twice_preserves_audit_trail(self):
+        """A repeated accept must not rewrite who handled the request, nor when."""
+        user = self.login()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(user=applicant, comment="test")
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[membership_request]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        assert200(self.post(api_url))
+
+        organization.reload()
+        handled_by = organization.requests[0].handled_by
+        handled_on = organization.requests[0].handled_on
+        assert handled_by == user
+
+        # Second accept, same admin: the real-world shape of the bug.
+        with assert_not_emit(MembershipRequest.after_handle):
+            response = self.post(api_url)
+        assert200(response)
+
+        # The early return must marshal the existing member, not None: a null
+        # member marshals to a 200 full of nulls rather than raising, so only
+        # reading the body catches it.
+        assert response.json["user"]["id"] == str(applicant.id)
+        assert response.json["role"] == "editor"
+
+        organization.reload()
+        assert organization.requests[0].handled_by == handled_by
+        assert organization.requests[0].handled_on == handled_on
+        assert organization.requests[0].status == "accepted"
+        assert len(organization.members) == 2
+
+    def test_accept_membership_twice_preserves_another_admins_stamp(self):
+        """A second admin accepting an already accepted request keeps the first one's stamp."""
+        user = self.login()
+        other_admin = UserFactory()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(
+            user=applicant,
+            comment="test",
+            status="accepted",
+            handled_by=other_admin,
+            handled_on=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=applicant, role="editor")],
+            requests=[membership_request],
+        )
+        # Read the stamp back as stored: Mongo returns it naive.
+        organization.reload()
+        handled_on = organization.requests[0].handled_on
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        with assert_not_emit(MembershipRequest.after_handle):
+            response = self.post(api_url)
+        assert200(response)
+
+        assert response.json["user"]["id"] == str(applicant.id)
+        assert response.json["role"] == "editor"
+
+        organization.reload()
+        request = organization.requests[0]
+        assert request.handled_by == other_admin
+        assert request.handled_on == handled_on
+        assert request.status == "accepted"
+        assert len(organization.members) == 2
+
+    def test_accept_membership_restores_a_removed_member(self):
+        """An accepted request whose member was removed takes the normal path again."""
+        user = self.login()
+        other_admin = UserFactory()
+        applicant = UserFactory()
+        membership_request = MembershipRequest(
+            user=applicant,
+            comment="test",
+            status="accepted",
+            handled_by=other_admin,
+            handled_on=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        # Accepted request, but the member was since removed: MemberAPI.delete
+        # pulls the member and leaves the request alone. The short-circuit must
+        # not swallow this — it would answer 200 with a null member.
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[membership_request]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=membership_request.id)
+        with assert_emit(MembershipRequest.after_handle):
+            response = self.post(api_url)
+        assert200(response)
+
+        assert response.json["user"]["id"] == str(applicant.id)
+
+        organization.reload()
+        assert organization.is_member(applicant)
+        assert organization.requests[0].handled_by == user
 
     def test_only_admin_can_accept_membership(self):
         user = self.login()
@@ -557,6 +689,29 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
         organization.reload()
         assert organization.requests[0].status == "pending"
+        assert len(organization.members) == 1
+
+    def test_accept_membership_rejects_email_invitation(self):
+        """An invitation to an address with no account is refused too."""
+        user = self.login()
+        # The shape MemberInviteAPI actually stores for an unregistered
+        # address: no user, only an email. Accepting it used to append a
+        # Member with a null user.
+        invitation = MembershipRequest(
+            kind="invitation", user=None, email=faker.email(), created_by=user, role="editor"
+        )
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin")], requests=[invitation]
+        )
+
+        api_url = url_for("api.accept_membership", org=organization, id=invitation.id)
+        response = self.post(api_url)
+
+        assert400(response)
+
+        organization.reload()
+        assert organization.requests[0].status == "pending"
+        assert len(organization.members) == 1
 
     def test_refuse_membership_rejects_invitation(self):
         """Test that refuse_membership rejects invitations."""
@@ -908,6 +1063,101 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         organization.reload()
         assert organization.is_member(deleted_user)
 
+    def test_cannot_delete_the_last_administrator(self):
+        """An organisation without an administrator is stuck: nobody can
+        manage members, accept transfers or edit it, and it cannot promote
+        anyone from the inside -- recovering needs a sysadmin."""
+        user = self.login()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=UserFactory(), role="editor")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=user)
+        response = self.delete(api_url)
+        assert400(response)
+
+        organization.reload()
+        assert organization.is_admin(user), "the admin must still be there"
+
+    def test_cannot_demote_the_last_administrator(self):
+        """The other way to empty an organisation of administrators."""
+        user = self.login()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=UserFactory(), role="editor")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=user)
+        response = self.put(api_url, {"role": "editor"})
+        assert400(response)
+
+        organization.reload()
+        assert organization.is_admin(user), "the role must not have changed"
+
+    def test_can_update_the_last_administrator_without_changing_the_role(self):
+        """The guard fires on a role CHANGE, not on any update of the last
+        admin's record. Without this, dropping the new-role condition would
+        refuse a PUT that keeps them admin -- and nothing else here would
+        notice."""
+        user = self.login()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=UserFactory(), role="editor")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=user)
+        response = self.put(api_url, {"role": "admin"})
+        assert200(response)
+
+        organization.reload()
+        assert organization.is_admin(user)
+
+    def test_can_delete_an_administrator_when_another_one_remains(self):
+        """The control. A guard that refused every admin removal would satisfy
+        the two assertions above and make organisations unmanageable."""
+        user = self.login()
+        other_admin = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=other_admin, role="admin")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=other_admin)
+        response = self.delete(api_url)
+        assert204(response)
+
+        organization.reload()
+        assert not organization.is_member(other_admin)
+        assert organization.is_admin(user)
+
+    def test_can_demote_an_administrator_when_another_one_remains(self):
+        user = self.login()
+        other_admin = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=other_admin, role="admin")]
+        )
+
+        api_url = url_for("api.member", org=organization, user=other_admin)
+        response = self.put(api_url, {"role": "editor"})
+        assert200(response)
+
+        organization.reload()
+        assert not organization.is_admin(other_admin)
+        assert organization.is_admin(user)
+
+    def test_an_organisation_already_without_an_admin_is_not_frozen(self):
+        """Deliberately NOT refused. The guard stops an organisation from
+        losing its last administrator; it must not freeze one that has none
+        already, over an operation that cannot make it worse."""
+        user = self.login()
+        removed = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="editor"), Member(user=removed, role="editor")]
+        )
+        # Written past the API: the endpoint requires the members permission,
+        # which an editor does not have. What is under test is the guard, not
+        # the authorisation that already sits in front of it.
+        assert not any(m.role == "admin" for m in organization.members)
+
+        assert organization.is_last_admin(removed) is False
+
     def test_follow_org(self):
         """It should follow an organization on POST"""
         user = self.login()
@@ -948,11 +1198,21 @@ class MembershipAPITest(PytestOnlyAPITestCase):
 
     def test_suggest_organizations_api(self):
         """It should suggest organizations"""
+        # Both the names and the descriptions are fixed rather than faker-generated.
+        # The endpoint matches the query against name, acronym *and* description, so a
+        # faker-generated description containing "tes" makes an organization whose name
+        # does not match come back anyway - which broke the name assertion below
+        # depending on how many tests had consumed faker before this one.
+        NO_MATCH = "fixture description without the query"
         for i in range(3):
             OrganizationFactory(
-                name="test-{0}".format(i) if i % 2 else faker.word(), metrics={"followers": i}
+                name="test-{0}".format(i) if i % 2 else "unrelated-{0}".format(i),
+                description=NO_MATCH,
+                metrics={"followers": i},
             )
-        max_follower_organization = OrganizationFactory(name="test-4", metrics={"followers": 10})
+        max_follower_organization = OrganizationFactory(
+            name="test-4", description=NO_MATCH, metrics={"followers": 10}
+        )
         response = self.get(url_for("api.suggest_organizations", q="tes", size=5))
         assert200(response)
 
@@ -966,7 +1226,10 @@ class MembershipAPITest(PytestOnlyAPITestCase):
             assert "image_url" in suggestion
             assert "acronym" in suggestion
             assert "tes" in suggestion["name"]
-            assert response.json[0]["id"] == str(max_follower_organization.id)
+
+        # Ranked by followers: the organization with 10 comes first. Asserted once,
+        # outside the loop it used to sit in.
+        assert response.json[0]["id"] == str(max_follower_organization.id)
 
     def test_suggest_organizations_with_special_chars(self):
         """It should suggest organizations with special caracters"""

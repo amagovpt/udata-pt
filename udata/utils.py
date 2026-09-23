@@ -235,7 +235,12 @@ def safe_harvest_datetime(value: Any, field: str, refuse_future: bool = False) -
         return None
     try:
         parsed = to_naive_datetime(value)
-    except ParserError:
+    except (ParserError, OverflowError, TypeError):
+        # `dateutil` raises OverflowError, not ParserError, for a run of digits
+        # too long to be a year -- an epoch-milliseconds timestamp in a date
+        # field is exactly that -- and TypeError for a value that is not text
+        # at all. Neither should reach the caller: the point of this helper is
+        # that an unreadable date degrades the dataset instead of failing it.
         log.warning(f"Unparseable {field} value: '{value}'")
         return None
     if refuse_future and parsed:
@@ -332,6 +337,18 @@ def clean_string(value: str):
 def not_none_dict(d: dict) -> dict:
     """Filter out None values from a dict"""
     return {k: v for k, v in d.items() if v is not None}
+
+
+def mask_email(email):
+    """Mask an email address for display (e.g. j***@example.com)."""
+    if not email or "@" not in email:
+        return ""
+    local, domain = email.rsplit("@", 1)
+    if len(local) <= 1:
+        masked = local + "***"
+    else:
+        masked = local[0] + "***"
+    return f"{masked}@{domain}"
 
 
 def hash_url(url: str) -> str | None:

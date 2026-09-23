@@ -87,6 +87,33 @@ FEED_LIMIT = "120 per minute; 2400 per hour"
 PUBLIC_READ_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
+# Harvest preview, both routes (`POST /harvest/source/preview/` for a config that
+# is not stored yet, `GET /harvest/source/<id>/preview/` for a saved source).
+# Unlike the limits above, what this one rations is not writes: these are the
+# routes that make the server run a whole harvest backend against a remote
+# catalogue, so each request means outbound traffic in the portal's name. That is
+# expensive regardless of who asks, which is why they carry a limit even though
+# both also require authorization. The two share the constant deliberately —
+# they cost the same and the backoffice picks between them by who is asking, so
+# a tighter ceiling on one would just be a ceiling on some users.
+#
+# A separate constant from CONTENT_CREATE_LIMIT even where the numbers coincide
+# (COMMENT_CREATE_LIMIT is the same shape for the same reason): the two ceilings
+# answer to different things — content creation to abuse of public content, this
+# one to outbound cost — and would have to move apart the first time either is
+# calibrated. Which happened immediately: 5/min was the first choice and it
+# 429'd a test that walks the seven canary URLs of the VULN-2084 replay, so it
+# would equally 429 a sysadmin tuning filters and re-previewing after each
+# change, which is the actual workflow. 20/min is out of reach for someone
+# clicking a button and still an order of magnitude under the 200/h IP-keyed
+# default these routes would otherwise fall under. Note the limiter is live in
+# the test suite: `RATELIMIT_ENABLED = False` sits in `settings.Debug`, not in
+# `settings.Testing`.
+#
+# Keyed by `user_or_ip`, and since both routes are `@api.secure` the key is
+# always `user:{id}` — a per-publisher bucket, so the daily cap never becomes the
+# site-wide daily block that the anonymous endpoints above have to avoid.
+HARVEST_PREVIEW_LIMIT = "20 per minute; 120 per hour; 400 per day"
 COMMENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 # File upload on existing/new dataset resources. Keyed by `user_or_ip` and the
 # endpoint is authenticated (`@api.secure`), so the key is always `user:{id}` —
@@ -130,6 +157,26 @@ CRAWLER_WRITE_LIMIT = "1200 per minute; 60000 per hour"
 # deliberately NO per-day cap (a daily cap would become a site-wide daily block,
 # the exact failure mode to avoid on an anonymous endpoint).
 CONTACT_SUBMIT_LIMIT = "20 per minute; 200 per hour"
+
+
+# Ceiling on the SAML migration wizard's address-taking and mail-sending
+# routes. Keyed on the government identity the SSO proved (see
+# _migration_identity_key in the SAML plugin), NOT on the IP: behind the
+# F5/WAF anonymous traffic collapses onto one origin address
+# (docs/infra-adc-waf-impact-ppr-prd.md), so an IP key here would be a single
+# national bucket that separates nobody from anybody. The identity key makes
+# each budget cost a real Autenticacao.gov login, which is what bounds the
+# enumeration these routes would otherwise allow one probe at a time.
+#
+# Sized well above a person finishing the wizard -- a full run is a handful of
+# requests, and the mail caps (MAX_CONFIRMATION_SENDS, MAX_MIGRATION_LINK_SENDS)
+# are the tighter limit on anything that sends. It must also stay above what a
+# single test does in one go: udata/tests/frontend/test_saml.py drives six
+# requests at these routes inside one test to prove those caps, and the
+# limiter is live under pytest (RATELIMIT_ENABLED is switched off in
+# settings.Debug, not in settings.Testing). No per-day cap, for the same
+# reason CONTACT_SUBMIT_LIMIT has none.
+MIGRATION_SUBMIT_LIMIT = "30 per minute; 200 per hour"
 
 
 def user_or_ip() -> str:

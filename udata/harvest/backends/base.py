@@ -26,7 +26,7 @@ from ..models import (
     archive_harvested_dataset,
 )
 from ..signals import after_harvest_job, before_harvest_job
-from ..url_filter import HarvestURLForbidden, check_harvest_url
+from ..url_filter import HarvestURLForbidden, check_harvest_url, redact_url_credentials
 
 log = logging.getLogger(__name__)
 
@@ -256,7 +256,12 @@ class BaseBackend(object):
         raise NotImplementedError
 
     def harvest(self):
-        log.debug(f"Starting harvesting {self.source.name} ({self.source.url})…")
+        # The source URL may legitimately carry `user:password@`, and this line
+        # prints it on every run, with no exception involved (LEDG-2501).
+        log.debug(
+            f"Starting harvesting {self.source.name} "
+            f"({redact_url_credentials(str(self.source.url))})…"
+        )
         factory = HarvestJob if self.dryrun else HarvestJob.objects.create
         self.job = factory(status="initialized", started=datetime.now(UTC), source=self.source)
         self.remote_ids = set()
@@ -296,7 +301,8 @@ class BaseBackend(object):
             self.job.errors.append(error)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             log.warning(
-                f'Harvesting connection error for "{safe_unicode(self.source.name)}" ({self.source.backend}): {e}'
+                f'Harvesting connection error for "{safe_unicode(self.source.name)}" '
+                f"({self.source.backend}): {redact_url_credentials(safe_unicode(e))}"
             )
 
             self.job.status = "failed"
@@ -366,7 +372,10 @@ class BaseBackend(object):
             item.errors.append(HarvestError(message=safe_unicode(e)))
         except Exception as e:
             item.status = "failed"
-            log.exception(f"Error while processing {item.remote_id} : {safe_unicode(e)}")
+            log.exception(
+                f"Error while processing {item.remote_id} : "
+                f"{redact_url_credentials(safe_unicode(e))}"
+            )
 
             error = HarvestError(message=safe_unicode(e), details=traceback.format_exc())
             item.errors.append(error)
@@ -426,7 +435,10 @@ class BaseBackend(object):
             item.errors.append(HarvestError(message=safe_unicode(e)))
         except Exception as e:
             item.status = "failed"
-            log.exception(f"Error while processing {item.remote_id} : {safe_unicode(e)}")
+            log.exception(
+                f"Error while processing {item.remote_id} : "
+                f"{redact_url_credentials(safe_unicode(e))}"
+            )
 
             error = HarvestError(message=safe_unicode(e), details=traceback.format_exc())
             item.errors.append(error)
@@ -466,7 +478,12 @@ class BaseBackend(object):
         harvest.domain = self.source.domain
 
         harvest.source_id = str(self.source.id)
-        harvest.source_url = str(self.source.url)
+        # This is denormalized onto the dataservice, and Dataservice.harvest is
+        # readable without a session, so every dataservice listing would hand
+        # out the source URL. URLS_ALLOW_CREDENTIALS lets that URL carry
+        # user:password@, and nothing here ever needs the credentials back --
+        # the HTTP calls use self.source.url (LEDG-2477).
+        harvest.source_url = redact_url_credentials(str(self.source.url))
 
         harvest.remote_id = remote_id
         harvest.last_update = datetime.now(UTC)
@@ -553,6 +570,7 @@ class BaseBackend(object):
             ).first()
 
         if dataset:
+            self.ensure_unique_ownership(dataset)
             return dataset
 
         if self.source.organization:
@@ -577,6 +595,7 @@ class BaseBackend(object):
         ).first()
 
         if dataservice:
+            self.ensure_unique_ownership(dataservice)
             return dataservice
 
         if self.source.organization:
@@ -585,6 +604,40 @@ class BaseBackend(object):
             return Dataservice(owner=self.source.owner)
 
         return Dataservice()
+
+    def ensure_unique_ownership(self, item):
+        """Raise if item already belongs to some other owner.
+
+        Ressources (datasets, services, ...) must have universally unique
+        identifiers, but some catalogs fail to enforce it. Cases seen
+        in the wild:
+        - Copy-pasting record metadata without changing the identifier.
+        - Using the table name of the originating data as identifier, and
+          generating several datasets out of the same table.
+        - "TODO", "A REMPLIR", etc. in the identifier field.
+
+        Diverges from upstream: a record this very source already harvested is
+        never a conflict, whoever owns it. Upstream can compare owners directly
+        because none of its backends writes `dataset.organization`, but `ckanpt`
+        and `odspt` deliberately re-own each dataset to the remote publisher's
+        organization, which routinely differs from the source's. Without this
+        check those sources would reject their own records from the second
+        harvest onwards. The takeover this guards against is by definition
+        another source claiming the record.
+        """
+        if item.harvest and item.harvest.source_id == str(self.source.id):
+            return
+
+        other_owner = None
+        if item.organization and item.organization != self.source.organization:
+            other_owner = item.organization
+        elif item.owner and item.owner != self.source.owner:
+            other_owner = item.owner
+        else:
+            return
+        raise HarvestValidationError(
+            f"Item has another owner: {other_owner.page() or other_owner.id}"
+        )
 
     def validate(self, data, schema):
         """Perform a data validation against a given schema.

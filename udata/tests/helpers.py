@@ -17,6 +17,23 @@ requires_search_service = pytest.mark.skipif(
     reason="Set UDATA_TEST_SEARCH_INTEGRATION=1 to run search integration tests",
 )
 
+# The SAML service-provider credentials are deliberately kept out of git (see
+# .gitignore), so the handful of tests that build a real pysaml2 client - rather than
+# patching saml_client_for - cannot run on a fresh checkout or in CI. They also need the
+# xmlsec1 binary, which is not preinstalled on GitHub's runners.
+SAML_CREDENTIALS = [
+    "udata/auth/saml/credentials/private.pem",
+    "udata/auth/saml/credentials/AMA.pem",
+    "udata/auth/saml/credentials/metadata.xml",
+]
+
+requires_saml_credentials = pytest.mark.skipif(
+    not all(os.path.exists(path) for path in SAML_CREDENTIALS),
+    reason=(
+        "SAML SP credentials are absent (they are git-ignored): " + ", ".join(SAML_CREDENTIALS)
+    ),
+)
+
 
 def assert_equal_dates(datetime1, datetime2, limit=1):  # Seconds.
     """Lax date comparison, avoid comparing milliseconds and seconds."""

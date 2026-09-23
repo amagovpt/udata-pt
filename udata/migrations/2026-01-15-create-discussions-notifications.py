@@ -41,7 +41,7 @@ def migrate(db):
                                 user=user,
                                 details=DiscussionNotificationDetails(
                                     status=DiscussionStatus.NEW_COMMENT,
-                                    message_id=str(last_comment.id),
+                                    message_id=last_comment.id,
                                     discussion=discussion,
                                 ),
                             )
@@ -62,6 +62,6 @@ def migrate(db):
                             notification.save()
                             created_count += 1
             except Exception as e:
-                log.error(f"Error creating notification for discussion {discussion.id}: {e}")
+                log.exception(f"Error creating notification for discussion {discussion.id}: {e}")
 
     log.info(f"Created {created_count} DiscussionNotifications")

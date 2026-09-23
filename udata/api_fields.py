@@ -591,9 +591,7 @@ def generate_fields(**kwargs) -> Callable:
                         if constraint == "objectid":
                             values = filter if isinstance(filter, list) else [filter]
                             if not all(ObjectId.is_valid(v) for v in values):
-                                api.abort(
-                                    400, f"`{filterable['key']}` must be an identifier"
-                                )
+                                api.abort(400, f"`{filterable['key']}` must be an identifier")
 
                     query = filterable.get("query", None)
                     if query:

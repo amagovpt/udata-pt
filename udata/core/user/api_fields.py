@@ -12,6 +12,45 @@ def _get_saml_login():
     return session.get("saml_login", False)
 
 
+def _get_asserted_email():
+    """Return the address the SAML assertion carried, if this session has one.
+
+    Only set while the caller still holds a placeholder email, and only by CMD
+    -- the eIDAS Minimum Data Set has no email attribute, so an eIDAS session
+    reaches the completion screen with nothing to offer.
+    """
+    return session.get("saml_asserted_email")
+
+
+def _get_migration_invite(user) -> bool:
+    """Whether this account is being offered the optional CMD/eIDAS link.
+
+    The whole decision lives in the SAML plugin, next to the flags and the
+    predicate it shares with the wizard, and is merely surfaced here. A second
+    copy of the condition in the serializer is how the notice and the flow it
+    starts end up disagreeing about who is invited.
+
+    Imported inside the function because udata.auth.saml imports back into the
+    user package, and this module is imported at API registration time.
+    """
+    from udata.auth.saml.saml_plugin.saml_govpt import _invite_offered_to
+
+    return _invite_offered_to(user)
+
+
+def _get_migration_link_available(user) -> bool:
+    """Whether this account may still reach the linking flow at all.
+
+    The sibling of _get_migration_invite, and the difference is one condition:
+    this one ignores a dismissal. "Not now" must never mean "never let me", so
+    the permanent way in stays while the notice is hidden -- otherwise the
+    notice would have closed the door behind itself.
+    """
+    from udata.auth.saml.saml_plugin.saml_govpt import _link_available_to
+
+    return _link_available_to(user)
+
+
 def _is_current_user(user) -> bool:
     """True when the serialized user is the authenticated caller.
 
@@ -105,6 +144,57 @@ user_fields = api.model(
             description="True while the account still has a minted saml-* placeholder "
             "email; the user must provide a real email to complete registration "
             "(only present for global admins and on /me)",
+            readonly=True,
+        ),
+        # Guarded by _is_current_user and NOT by current_user_is_admin_or_self,
+        # which the sibling pending_registration above uses. The difference
+        # matters because this value comes from the *session*, not from the
+        # document: under the admin guard, an admin listing users would see
+        # their own session's address stamped onto every row they may see.
+        # Nulled once the placeholder is gone, so it cannot outlive the screen
+        # it exists for -- an association leaves the session key behind, and
+        # this is what stops it being served afterwards.
+        "pending_registration_email": fields.Raw(
+            attribute=lambda o: (
+                _get_asserted_email() if _is_current_user(o) and o.has_placeholder_email else None
+            ),
+            description="The email address the CMD assertion carried, offered as a "
+            "prefill on the registration completion screen. Null for eIDAS (the "
+            "Minimum Data Set has no email attribute), for a CMD assertion that "
+            "carried none, and on any user other than the caller",
+            readonly=True,
+        ),
+        # The optional CMD/eIDAS linking invite, decided here and never in the
+        # browser. That is not a style preference: the frontend reading a
+        # migration flag is what removed the sign-in form from production
+        # (LEDG-2432), and nothing observable in a rendered page distinguishes
+        # "the backend said so" from "we guessed from configuration".
+        #
+        # It rides /me rather than /saml/migration/check because that
+        # endpoint's `needs_migration` means MANDATORY, and the frontend logs
+        # the user out when it is true -- which would sign people out of a
+        # notice they are allowed to dismiss.
+        #
+        # Guarded by _is_current_user like saml_login, not by the admin guard:
+        # whether somebody has linked an identity is not a listing column.
+        "migration_invite": fields.Raw(
+            attribute=lambda o: _get_migration_invite(o) if _is_current_user(o) else None,
+            description="True when this account is being invited (optionally) to link a "
+            "CMD/eIDAS identity: the invite is enabled, linking is not mandatory, the "
+            "account signs in with a password and holds no identity yet, and the invite "
+            "has not been dismissed recently. Only present on the caller's own user",
+            readonly=True,
+        ),
+        # The permanent way in, as opposed to the notice above. Same guard,
+        # same reason; the difference is that this one survives a dismissal,
+        # because dismissing is "not now" and never "never let me".
+        "migration_link_available": fields.Raw(
+            attribute=lambda o: _get_migration_link_available(o) if _is_current_user(o) else None,
+            description="True when this account can still link a CMD/eIDAS identity: the "
+            "invite is enabled, linking is not mandatory, and the account signs in with a "
+            "password and holds no identity yet. Unlike migration_invite this stays true "
+            "after the notice has been dismissed, so the entry point in the profile does "
+            "not disappear with it. Only present on the caller's own user",
             readonly=True,
         ),
         "avatar": fields.ImageField(original=True, description="The user avatar URL"),

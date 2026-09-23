@@ -725,7 +725,11 @@ class ExecutionTestMixin(MockBackendsMixin, PytestOnlyDBTestCase):
 
         # We have an activity for each dataset created by the source action
         activities = UserCreatedDataset.objects(actor=user)
-        assert activities.count() == Dataset.objects().count()
+        # `len(list(...))` rather than `.count()`: mongoengine routes an *unfiltered*
+        # count to `estimated_document_count()`, which reads collection metadata and
+        # can be wrong in either direction, so a harvest that created too many or too
+        # few documents could go unnoticed.
+        assert activities.count() == len(list(Dataset.objects()))
 
         # On a second run, we don't expect any signal sent (no creation, update or deletion)
         with assert_not_emit(Dataset.on_create, Dataset.on_update, new_activity):

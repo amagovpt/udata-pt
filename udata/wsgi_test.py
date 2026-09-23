@@ -10,9 +10,7 @@ import os
 from pathlib import Path
 
 if "UDATA_SETTINGS" not in os.environ:
-    os.environ["UDATA_SETTINGS"] = str(
-        Path(__file__).resolve().parent.parent / "udata.test.cfg"
-    )
+    os.environ["UDATA_SETTINGS"] = str(Path(__file__).resolve().parent.parent / "udata.test.cfg")
 
 from udata.app import create_app, standalone  # noqa: E402
 

@@ -1,21 +1,55 @@
 from __future__ import annotations
 
+import html
+import os
 import random
 import re
+import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from urllib.parse import urlparse
+from uuid import uuid4
 
+import defusedxml.ElementTree as DET
 import requests
 from flask import current_app
 from slugify import slugify
 
+from udata.core.dataset.constants import UpdateFrequency
+from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
-from udata.harvest.models import HarvestItem, HarvestJob
+from udata.harvest.exceptions import HarvestValidationError
+from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
+from udata.utils import safe_harvest_datetime, safe_unicode
 
-from .tools.harvester_utils import normalize_url_slashes, sync_resources
+from ..url_filter import redact_url_credentials
+from .tools.harvester_utils import (
+    map_ine_periodicity,
+    normalize_url_slashes,
+    parse_ine_date,
+    reset_ine_periodicity_warnings,
+    sync_resources,
+)
+
+# The HVD subset of the catalogue, published as a separate feed. A fact of the source
+# rather than an operator choice, so a module constant and not a per-source extra config.
+INE_HVD_FEED_URL = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
+
+# Metadata the INE catalogue publishes per indicator and that we store as extras. Kept as
+# a tuple so `_has_changed` and `_apply_metadata_to_dataset` iterate the same set: a key
+# written by one and ignored by the other is how enrichment silently fails to reach the
+# ~13k datasets already in the database.
+INE_SOURCE_EXTRAS = (
+    "geo_lastlevel",
+    "source_description",
+    "last_period_available",
+    "last_update_remote",
+    "update_type",
+    "metainfo_url",
+)
 
 
 class INEDownloadIncomplete(Exception):
@@ -72,6 +106,23 @@ class INEBackend(BaseBackend):
         super().__init__(*args, **kwargs)
 
         self._cc_by_license = None
+        self._catalog_truncated = False
+
+        if self.dryrun and not self.IS_TEST_MODE:
+            # Previews must not share the download path with the real harvest.
+            # `LOCAL_FILE_PATH` is a class attribute, so every INE run in the
+            # process reads and writes the same file: a preview could overwrite
+            # the catalog a running harvest was reading, and its cleanup deletes
+            # the cached file that harvest falls back on. The real harvest keeps
+            # the shared path deliberately — that cache is what saves it when the
+            # slow INE endpoint drops the connection on every attempt. The cost
+            # of the split is disk: the body is downloaded before any `max_items`
+            # cut, so N concurrent previews now hold N bodies instead of one.
+            # `IS_TEST_MODE` is excluded because there the file is placed at the
+            # class path by hand, and overriding it would make every run fail.
+            self.LOCAL_FILE_PATH = os.path.join(
+                tempfile.gettempdir(), f"ine-preview-{uuid4().hex}.xml"
+            )
 
         try:
             self._log = current_app.logger
@@ -216,6 +267,20 @@ class INEBackend(BaseBackend):
     # --------------------------
     # Normalização de tags
     # --------------------------
+    def _text(self, node: ET.Element, tag: str) -> str:
+        """Text of a child element, stripped.
+
+        Values arrive wrapped in CDATA and 13152 of the 13154 published periodicities
+        carry surrounding whitespace, so stripping is not defensive tidying here.
+        """
+        child = node.find(tag)
+        if child is None or not child.text:
+            return ""
+        return child.text.strip()
+
+    def _source_hostname(self) -> str:
+        return urlparse(self.source.url or "").hostname or ""
+
     def _normalize_tag(self, tag: str) -> str:
         if not tag:
             return ""
@@ -231,12 +296,12 @@ class INEBackend(BaseBackend):
     # HVD IDs
     # --------------------------
     def _fetch_hvd_ids(self) -> set[str]:
-        url = "https://www.ine.pt/ine/xml_indic_hvd.jsp?opc=3&lang=PT"
+        url = INE_HVD_FEED_URL
         try:
             # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
             resp = self.get(url, timeout=30)
             resp.raise_for_status()
-            root = ET.fromstring(resp.content)
+            root = DET.fromstring(resp.content)
             ids = {ind.attrib["id"] for ind in root.findall(".//indicator") if "id" in ind.attrib}
             self._log.info("[INE] HVD IDs carregados: %s", len(ids))
             return ids
@@ -248,11 +313,23 @@ class INEBackend(BaseBackend):
     # Extrai metadados do indicator (já normalizados)
     # --------------------------
     def _extract_metadata(self, elem: ET.Element) -> dict:
+        """Read one `<indicator>` into a metadata dict, sanitized.
+
+        Title and description are sanitized *here*, at extraction, and not in
+        `_apply_metadata_to_dataset`. This backend writes `dataset.to_mongo()`
+        straight to pymongo, so the `Dataset.pre_save` signal that sanitizes
+        every other write in the portal never fires for it; the sanitization has
+        to be reproduced by hand. It cannot happen in the apply step, though,
+        because `_has_changed` compares the *stored* values against this dict
+        and runs before it: sanitizing later would compare a sanitized title
+        against a raw one, so any indicator carrying markup would report as
+        changed on every nightly harvest and be rewritten forever.
+        """
         md = {}
 
         node = elem.find("title")
         if node is not None and node.text:
-            md["title"] = node.text
+            md["title"] = sanitize_strict(node.text)
 
         desc = ""
         remote_url = None
@@ -260,16 +337,22 @@ class INEBackend(BaseBackend):
         if node is not None and node.text:
             desc = node.text
 
+        metainfo_url = None
         html_node = elem.find("html")
         if html_node is not None:
             bdd_url = html_node.find("bdd_url")
             if bdd_url is not None and bdd_url.text:
                 remote_url = bdd_url.text.strip()
                 desc = (desc + "\n" + bdd_url.text) if desc else bdd_url.text
+            metainfo_node = html_node.find("metainfo_url")
+            if metainfo_node is not None and metainfo_node.text:
+                metainfo_url = metainfo_node.text.strip()
 
         if desc:
-            md["description"] = desc
+            md["description"] = sanitize_markdown_html(desc)
         if remote_url:
+            # Not sanitized on purpose: this is a URL, not markup, and it is
+            # stored in `harvest.remote_url` rather than rendered as content.
             md["remote_url"] = remote_url
 
         resources = []
@@ -279,7 +362,7 @@ class INEBackend(BaseBackend):
             if jds is not None and jds.text:
                 resources.append(
                     {
-                        "title": "Dataset json url",
+                        "title": "Dados (JSON)",
                         "description": "Dataset em formato json",
                         "url": normalize_url_slashes(jds.text),
                         "filetype": "remote",
@@ -290,7 +373,7 @@ class INEBackend(BaseBackend):
             if jmi is not None and jmi.text:
                 resources.append(
                     {
-                        "title": "Json metainfo url",
+                        "title": "Metainfo (JSON)",
                         "description": "Metainfo em formato json",
                         "url": normalize_url_slashes(jmi.text),
                         "filetype": "remote",
@@ -322,8 +405,49 @@ class INEBackend(BaseBackend):
 
         tags_norm = {self._normalize_tag(t) for t in keywords if t}
         tags_norm.discard("")
-        tags_norm.add("ine-pt")
+        # Which source a dataset came from, as a tag. Derived from the source URL rather
+        # than hardcoded, like `ckanpt` and `odspt` do. Normalized on the way in because
+        # `TagListField` slugifies on write while `_has_changed` compares the stored tags
+        # against this dict: storing "www.ine.pt" here and "www-ine-pt" in Mongo would
+        # report every dataset in the catalogue as changed on every nightly harvest.
+        tags_norm.add(self._normalize_tag(self._source_hostname()))
+        tags_norm.discard("")
         md["tags_norm"] = sorted(tags_norm)
+
+        md["frequency"] = map_ine_periodicity(self._text(elem, "periodicity"))
+
+        extras = {}
+        # Free text rendered by the portal, so sanitized here for the same reason the
+        # docstring gives for the title and description.
+        geo_lastlevel = self._text(elem, "geo_lastlevel")
+        if geo_lastlevel:
+            extras["geo_lastlevel"] = sanitize_strict(geo_lastlevel)
+        source_description = self._text(elem, "source")
+        if source_description:
+            extras["source_description"] = sanitize_strict(source_description)
+
+        dates_node = elem.find("dates")
+        if dates_node is not None:
+            last_period = self._text(dates_node, "last_period_available")
+            if last_period:
+                extras["last_period_available"] = last_period
+            last_update = self._text(dates_node, "last_update")
+            if last_update:
+                extras["last_update_remote"] = last_update
+                md["modified_at"] = safe_harvest_datetime(
+                    parse_ine_date(last_update), "INE <last_update>", refuse_future=True
+                )
+
+        # Published for ~5% of indicators only, and an opaque code ("A", "N"): stored
+        # verbatim, never mapped onto a meaning we would be inventing.
+        update_type = self._text(elem, "update_type")
+        if update_type:
+            extras["update_type"] = update_type
+
+        if metainfo_url:
+            extras["metainfo_url"] = metainfo_url
+
+        md["extras"] = extras
 
         return md
 
@@ -409,6 +533,23 @@ class INEBackend(BaseBackend):
         if current_sig != (new_md.get("resource_sig") or set()):
             return True
 
+        # Everything below is metadata the backend only started writing once it stopped
+        # hardcoding it. Without these comparisons the enrichment would never reach the
+        # datasets already in the database: they match on title, description, tags and
+        # resources, so they would be reported unchanged and skipped forever.
+        current_frequency = dataset.frequency or UpdateFrequency.UNKNOWN
+        if current_frequency != new_md.get("frequency", UpdateFrequency.UNKNOWN):
+            return True
+
+        new_extras = new_md.get("extras") or {}
+        for key in INE_SOURCE_EXTRAS:
+            if (dataset.extras.get(key) or None) != (new_extras.get(key) or None):
+                return True
+
+        current_uri = (dataset.harvest.uri if dataset.harvest else None) or None
+        if current_uri != (new_md.get("remote_url") or None):
+            return True
+
         return False
 
     # --------------------------
@@ -418,17 +559,29 @@ class INEBackend(BaseBackend):
         if self._cc_by_license is None:
             self._cc_by_license = License.guess("cc-by")
 
+        # cc-by is our editorial choice, not something the feed states: the INE catalogue
+        # publishes no licence element at all.
         dataset.license = self._cc_by_license
-        dataset.frequency = "unknown"
+        dataset.frequency = md.get("frequency", UpdateFrequency.UNKNOWN)
 
         tags = list(md.get("tags_norm") or [])
         if remote_id in self.HVD_INDICATOR_IDS:
             for t in ("estatisticas", "hvd"):
                 if t not in tags:
                     tags.append(t)
-        if "ine-pt" not in tags:
-            tags.append("ine-pt")
+        source_tag = self._normalize_tag(self._source_hostname())
+        if source_tag and source_tag not in tags:
+            tags.append(source_tag)
         dataset.tags = tags
+
+        for key in INE_SOURCE_EXTRAS:
+            value = (md.get("extras") or {}).get(key)
+            if value:
+                dataset.extras[key] = value
+            else:
+                # An indicator that stopped publishing a field must not keep the stale
+                # value glued to it.
+                dataset.extras.pop(key, None)
 
         if "title" in md:
             dataset.title = md["title"]
@@ -449,31 +602,44 @@ class INEBackend(BaseBackend):
         dataset.harvest.last_update = datetime.now(timezone.utc)
         dataset.harvest.domain = getattr(self.source, "domain", "") or ""
 
-        # Identificador do backend
-        dataset.harvest.backend = "ine"
+        # The display name, as `BaseBackend.update_dataset_harvest_info` stamps for every
+        # other backend. This one never reaches that method — it bypasses `process_dataset`
+        # for the bulk write path — so the field has to be set by hand here; dropping the
+        # line would leave it empty rather than let the base class fill it in.
+        dataset.harvest.backend = self.display_name
 
-        # URL remota do dataset no portal de origem
-        if md.get("remote_url"):
-            dataset.harvest.remote_url = md["remote_url"]
+        # The landing page the source publishes, for both fields that hold it. Written
+        # unconditionally, `None` included: keeping a URL the source no longer publishes
+        # would leave `remote_url` and `uri` disagreeing for good, and would go on feeding
+        # `dcat:landingPage` a link the feed has dropped.
+        dataset.harvest.remote_url = md.get("remote_url") or None
 
         # Identificador DCT (Dublin Core Terms)
         dataset.harvest.dct_identifier = f"ine:{remote_id}"
 
-        # URI única para o dataset
-        dataset.harvest.uri = f"https://www.ine.pt/indicador/{remote_id}"
+        # Not the `/indicador/<id>` we used to compose. Same unconditional write as
+        # `remote_url` above: a stale URI the dict no longer carries would make
+        # `_has_changed` fire on every harvest and rewrite the dataset nightly, forever.
+        dataset.harvest.uri = md.get("remote_url") or None
 
         # Data de criação (apenas se for novo)
         if not dataset.harvest.created_at:
             dataset.harvest.created_at = datetime.now(timezone.utc)
 
-        # Data de modificação (sempre atualizada)
-        dataset.harvest.modified_at = datetime.now(timezone.utc)
+        # When the source last updated the indicator — not when we last looked at it.
+        # `harvest.last_update` above is the timestamp of this run; conflating the two is
+        # what made every INE dataset look freshly modified after every nightly harvest.
+        dataset.harvest.modified_at = md.get("modified_at") or datetime.now(timezone.utc)
 
         # Gera slug a partir do título para novos datasets
         # Adiciona remote_id ao final para garantir unicidade
         if not getattr(dataset, "id", None):
             if not getattr(dataset, "slug", None) and dataset.title:
-                base_slug = slugify(dataset.title, to_lower=True)
+                # Unescaped first: the title is sanitized, and bleach escapes
+                # what it does not strip, so slugifying it directly turns
+                # "Investigação e Desenvolvimento (I&D)" into a permalink
+                # carrying a spurious "-amp-" segment.
+                base_slug = slugify(html.unescape(dataset.title), to_lower=True)
                 dataset.slug = f"{base_slug}-{remote_id}" if base_slug else f"ine-{remote_id}"
 
         return dataset
@@ -491,6 +657,21 @@ class INEBackend(BaseBackend):
 
         if not ops:
             return 0, 0, 0  # matched, modified, upserted
+
+        if self.dryrun:
+            # A preview must never touch the database. This backend does not go
+            # through `BaseBackend.process_dataset`, so the dryrun guard around
+            # `dataset.save()` in `base.py` never applies here: `inner_harvest`
+            # writes the datasets itself, and every one of those writes — the
+            # `ReplaceOne` of a changed dataset and the upserting `UpdateOne` of a
+            # new one — funnels through this method. Guarding here therefore
+            # closes both call sites (the per-chunk flush and the final one) at
+            # once. Logged at WARNING because suppressed writes are an
+            # operationally meaningful event; note that, unlike the LEDG-2320
+            # backends, nothing on this path installs a `LogCatcher`, so this
+            # does not reach the preview response.
+            self._log.warning("[INE] Dryrun: discarding %s pending write(s)", len(ops))
+            return 0, 0, 0
 
         t0 = time.time()
         try:
@@ -550,7 +731,60 @@ class INEBackend(BaseBackend):
     # inner_harvest (2 fases)
     # --------------------------
     def inner_harvest(self):
-        self._log.info("[INE] Iniciando harvester de %s", self.source.url)
+        reset_ine_periodicity_warnings()
+        try:
+            self._inner_harvest()
+        finally:
+            if self.dryrun and not self.IS_TEST_MODE:
+                # The success-path cleanup at the end of `_inner_harvest` does not
+                # run when phase 2 raises, and the phase 1 handler keeps the file
+                # on purpose, for debugging. Both are fine for the real harvest,
+                # which reuses one shared path; a preview owns a unique file per
+                # instance and would leave it behind for good.
+                self._cleanup_local_file()
+
+    def autoarchive(self):
+        """Skip archiving when the catalog was only partly read.
+
+        `BaseBackend.autoarchive` treats every remote_id missing from
+        `job.items` as gone from the remote platform. That is sound for a run
+        that read the whole catalog and false for one that stopped at
+        `max_items` — which is every preview, since `actions.preview` always
+        passes `HARVEST_PREVIEW_MAX_ITEMS`. Without this, a preview of a source
+        whose real harvest has been failing for longer than the grace period
+        would report the entire rest of the catalog as archived.
+        """
+        if self._catalog_truncated:
+            self._log.warning(
+                "[INE] Autoarchive ignorado: o catálogo foi truncado em max_items=%s",
+                self.max_items,
+            )
+            return
+        super().autoarchive()
+
+    def _cleanup_local_file(self):
+        if not self.USE_LOCAL_FILE:
+            return
+        try:
+            if os.path.exists(self.LOCAL_FILE_PATH):
+                os.remove(self.LOCAL_FILE_PATH)
+                self._log.info(
+                    "[INE] Ficheiro descarregado removido após processamento: %s",
+                    self.LOCAL_FILE_PATH,
+                )
+        except Exception as e:
+            self._log.warning(
+                "[INE] Falha ao remover ficheiro %s: %s",
+                self.LOCAL_FILE_PATH,
+                e,
+            )
+
+    def _inner_harvest(self):
+        # Redacted here too: this line runs on every harvest, and an INFO
+        # record also becomes a Sentry breadcrumb (LEDG-2501).
+        self._log.info(
+            "[INE] Iniciando harvester de %s", redact_url_credentials(str(self.source.url))
+        )
         self._log.info(
             "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s, TestMode=%s",
             self.BULK_SIZE,
@@ -604,15 +838,36 @@ class INEBackend(BaseBackend):
 
             # Fase 1: Criação do iterador sobre o XML
             # source_context pode ser file path ou file-like object (BytesIO)
-            context = ET.iterparse(source_context, events=("start", "end"))
+            # Hardened parser: the catalog body is remote and, through the
+            # preview endpoint, caller-supplied. defusedxml refuses DTD entity
+            # definitions and external references by default, which is what
+            # turns a billion-laughs body from a worker-memory DoS into a clean
+            # harvest failure. The elements it yields are ordinary stdlib ones,
+            # so `elem.clear()` and the `ET.Element` type hints still hold — the
+            # stdlib import stays because defusedxml does not re-export Element.
+            context = DET.iterparse(source_context, events=("start", "end"))
             context = iter(context)
             event, root = next(context)  # Pega o elemento raiz
 
             metadata_map = {}  # {remote_id: metadata_dict}
             total_parsed = 0
+            # `max_items` has to be honoured here, not in phase 2. The convention
+            # elsewhere is to call `has_reached_max_items()` per item, but that
+            # reads `len(self.job.items)` and this backend only pushes into that
+            # list every `BULK_SIZE * 2` items (or at the very end), so for a
+            # 20-item preview it would never be true. Cutting the parse in
+            # document order is what the dcat backend does too.
+            truncated = False
 
             for event, elem in context:
                 if event == "end" and elem.tag == "indicator":
+                    # Checked before processing, not after: deciding on the way in
+                    # means a catalog holding exactly `max_items` indicators ends
+                    # the loop naturally and is not reported as truncated.
+                    if self.max_items and len(metadata_map) >= self.max_items:
+                        truncated = True
+                        break
+
                     total_parsed += 1
                     md = self._extract_metadata(elem)
                     remote_id = elem.get("id")
@@ -630,6 +885,24 @@ class INEBackend(BaseBackend):
                 "[INE] Parsing XML concluído. Total items: %s. Iniciando processamento...",
                 total_parsed,
             )
+
+            self._catalog_truncated = truncated
+
+            if truncated and not self.dryrun:
+                # Expected in a preview, worth an error on a real harvest: with
+                # `source.autoarchive` on, everything below the cut would be
+                # archived as if it had disappeared from the remote catalog.
+                self._log.warning(
+                    "[INE] max_items=%s atingido: nem todos os indicadores foram retirados",
+                    self.max_items,
+                )
+                self.job.errors.append(
+                    HarvestError(
+                        message=(
+                            f"{self.max_items} max items reached, not all datasets were retrieved"
+                        )
+                    )
+                )
 
         except Exception as e:
             self._log.error("[INE] Erro no download/parsing do XML: %s", e)
@@ -719,6 +992,32 @@ class INEBackend(BaseBackend):
                         and getattr(dataset, "id", None) is not None
                     )
 
+                    if is_existing:
+                        # Every other backend reaches an existing record through
+                        # `BaseBackend.get_dataset`, which asks this right after
+                        # the lookup. This one used to as well; the FAST 2-phase
+                        # rewrite (4dc13d6eb) took it off that shared path in
+                        # favour of a bulk lookup and a bulk write, so when the
+                        # guard was later added to `get_dataset` this backend
+                        # silently missed it — nothing here ever asked whether
+                        # the record it was about to overwrite belongs to
+                        # somebody else. Note the guard is blind to records with
+                        # no owner at all: an orphan is still adopted, upstream
+                        # behaviour shared with `get_dataset`.
+                        # It is asked here rather than in the
+                        # prefetch because the prefetch has no per-item error
+                        # handling — raising there would lose the whole chunk,
+                        # whereas the `except` below fails this one item and
+                        # carries on, which is what `process_dataset` does.
+                        # Asked before `_has_changed` too, for the same reason
+                        # the precedent asks before knowing whether anything
+                        # changed: an unchanged record owned by someone else
+                        # must not be quietly reported as "skipped" against
+                        # this source either. The CREATE branch needs no guard,
+                        # since it can only be reached with a `_new_dataset()`
+                        # already owned by this source.
+                        self.ensure_unique_ownership(dataset)
+
                     # ========================================
                     # CASO 1: Dataset já existe na base de dados
                     # ========================================
@@ -775,13 +1074,42 @@ class INEBackend(BaseBackend):
                         created_remote_ids.append(remote_id)
                         self._log.debug("[INE] CREATE: remote_id=%s (novo dataset)", remote_id)
 
-                except Exception:
+                except Exception as e:
                     failed += 1
                     item_status = "failed"
-                    self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
-                    # HarvestItem para falhas
+                    if isinstance(e, HarvestValidationError):
+                        # A refusal, not a crash: `process_dataset` logs these at
+                        # info too. A rejected catalogue can fail every one of
+                        # 13k items, and a full traceback each would bury the
+                        # log without adding anything the message does not say.
+                        self._log.info(
+                            "[INE] Recusado na fase 2 para remote_id=%s: %s", remote_id, e
+                        )
+                    else:
+                        self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
+                    # The message is carried onto the item, as `process_dataset`
+                    # does: a job over 13k items reporting `failed` with an empty
+                    # `errors` list tells the operator nothing about which of
+                    # them is an ownership conflict, or who the other owner is.
+                    # Truncated because the items are pushed into one job
+                    # document: 13k unbounded messages (a mongoengine or pymongo
+                    # error runs to a kilobyte) would carry the job past the
+                    # 16 MB BSON limit and lose the whole record of a harvest
+                    # whose writes already landed.
                     if self.job:
-                        h_item = HarvestItem(remote_id=remote_id, status=item_status)
+                        h_item = HarvestItem(
+                            remote_id=remote_id,
+                            status=item_status,
+                            # Redact before truncating: a cut landing inside the
+                            # userinfo would leave a prefix of the password that
+                            # the constructor can no longer recognise as one.
+                            errors=[
+                                HarvestError(message=redact_url_credentials(safe_unicode(e))[:500])
+                            ],
+                        )
+                        # Kept so the job links to the dataset in conflict; the
+                        # message names the other owner, not the record.
+                        h_item.dataset = getattr(dataset, "id", None)
                         batch_harvest_items.append(h_item)
 
             # --- Fim do loop do chunk ---
@@ -863,19 +1191,5 @@ class INEBackend(BaseBackend):
 
         # Remover ficheiro descarregado após processamento bem-sucedido
         # (não remover em modo teste)
-        if not self.IS_TEST_MODE and self.USE_LOCAL_FILE:
-            try:
-                import os
-
-                if os.path.exists(self.LOCAL_FILE_PATH):
-                    os.remove(self.LOCAL_FILE_PATH)
-                    self._log.info(
-                        "[INE] Ficheiro descarregado removido após processamento: %s",
-                        self.LOCAL_FILE_PATH,
-                    )
-            except Exception as e:
-                self._log.warning(
-                    "[INE] Falha ao remover ficheiro %s: %s",
-                    self.LOCAL_FILE_PATH,
-                    e,
-                )
+        if not self.IS_TEST_MODE:
+            self._cleanup_local_file()
