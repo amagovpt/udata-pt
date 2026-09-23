@@ -273,6 +273,21 @@ class OdsBackendPTFrequencyTest(OdsBackendPTSnsTestCase):
         assert OdsBackendPT._frequency("Ocasional | Anual") == UpdateFrequency.ANNUAL
         assert OdsBackendPT._frequency("Ocasional") == UpdateFrequency.IRREGULAR
 
+    @pytest.mark.parametrize(
+        "published, expected",
+        [
+            # The deltas tie on each of these pairs; the order of the parts must not
+            # decide.
+            ("Anual | Semestral", UpdateFrequency.SEMIANNUAL),
+            ("Semestral | Anual", UpdateFrequency.SEMIANNUAL),
+            ("Anual | Quadrimestral", UpdateFrequency.THREE_TIMES_A_YEAR),
+            ("Quadrimestral | Anual", UpdateFrequency.THREE_TIMES_A_YEAR),
+            ("Semanal | Mensal", UpdateFrequency.WEEKLY),
+        ],
+    )
+    def test_a_combination_does_not_depend_on_the_order_of_its_parts(self, published, expected):
+        assert OdsBackendPT._frequency(published) == expected
+
     @pytest.mark.parametrize("published", [None, "", "Quando calha", "|", 42])
     def test_no_usable_value_is_unknown(self, published):
         assert OdsBackendPT._frequency(published) == UpdateFrequency.UNKNOWN
@@ -330,6 +345,12 @@ class OdsBackendPTDatesTest(OdsBackendPTSnsTestCase):
 
     @pytest.mark.parametrize("published", ["não é uma data", "1623715200000"])
     def test_an_unreadable_date_does_not_fail_the_item(self, rmock, published):
+        dataset = self.harvest(rmock, _sns_payload(dcat={"issued": published}))
+        assert dataset.harvest.issued_at is None
+        assert dataset.created_at_internal == datetime(2016, 1, 24)
+
+    @pytest.mark.parametrize("published", [20181231, ["2018-12-31"], {"date": "2018"}])
+    def test_a_date_that_is_not_text_does_not_fail_the_item(self, rmock, published):
         dataset = self.harvest(rmock, _sns_payload(dcat={"issued": published}))
         assert dataset.harvest.issued_at is None
         assert dataset.created_at_internal == datetime(2016, 1, 24)

@@ -140,6 +140,11 @@ class OdsBackendPT(BaseBackend):
         combination resolves to the most frequent of its parts: the data is updated at
         least that often. Parts with no period of their own (`OTHER`, `IRREGULAR`) only
         count when nothing else does.
+
+        "Most frequent" is the order `UpdateFrequency` declares its members in, from
+        `CONTINUOUS` down to `DECENNIAL`, not their `delta`: the deltas tie (ANNUAL,
+        SEMIANNUAL and THREE_TIMES_A_YEAR are all 365 days), which would let the order the
+        source lists the parts in decide.
         """
         if not isinstance(text, str):
             return UpdateFrequency.UNKNOWN
@@ -149,9 +154,10 @@ class OdsBackendPT(BaseBackend):
             for part in text.split("|")
         ]
         known = [part for part in parts if part != UpdateFrequency.UNKNOWN]
-        periodic = [part for part in known if part.delta]
+        periodic = [part for part in known if part.delta or part == UpdateFrequency.CONTINUOUS]
         if periodic:
-            return min(periodic, key=lambda part: part.delta)
+            ranking = list(UpdateFrequency)
+            return min(periodic, key=ranking.index)
         return known[0] if known else UpdateFrequency.UNKNOWN
 
     @staticmethod
@@ -245,8 +251,14 @@ class OdsBackendPT(BaseBackend):
         # `created` on 141 and `issued` on 120 of the 144 SNS datasets (2026-09-23).
         # Written only when they parse, so a re-harvest of a record that stops
         # publishing one keeps the last date read, as in `dgt`.
-        created = safe_harvest_datetime(dcat.get("created"), "ODS dcat.created", refuse_future=True)
-        issued = safe_harvest_datetime(dcat.get("issued"), "ODS dcat.issued", refuse_future=True)
+        # Text only: `safe_harvest_datetime` hands a number or a list back untouched,
+        # and its future-date comparison would then raise and fail the item.
+        created, issued = (
+            safe_harvest_datetime(value, f"ODS dcat.{field}", refuse_future=True)
+            if isinstance(value, str)
+            else None
+            for field, value in (("created", dcat.get("created")), ("issued", dcat.get("issued")))
+        )
         if created or issued:
             if not dataset.harvest:
                 dataset.harvest = HarvestDatasetMetadata()
