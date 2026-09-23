@@ -13,6 +13,7 @@ from udata.mongo.datetime_fields import DateRange
 
 from .tools.harvester_utils import (
     attach_publisher_contact,
+    bbox_to_spatial_coverage,
     guess_format_from_mime,
     guess_url_format,
     sync_resources,
@@ -130,6 +131,7 @@ class OGCBackend(BaseBackend):
                 "license": each.get("license") or data.get("license"),
                 "temporal_coverage": each.get("temporalCoverage"),
                 "url": each.get("url"),
+                "spatial_boxes": self._spatial_boxes(each.get("spatial")),
                 "provider": each.get("provider") or data.get("provider"),
             }
 
@@ -263,6 +265,13 @@ class OGCBackend(BaseBackend):
             else:
                 dataset.harvest.remote_url = url.strip()
 
+        # Replaces the whole coverage when the source publishes one, and leaves
+        # it alone otherwise: `SpatialCoverage.clean` refuses `zones` and
+        # `geom` together, so the two cannot be merged.
+        spatial = bbox_to_spatial_coverage(item_data.get("spatial_boxes") or [])
+        if spatial:
+            dataset.spatial = spatial
+
         # Only set when it parses, so a coverage entered by hand is not
         # replaced with nothing by a source that publishes none.
         coverage = self._temporal_coverage(item_data.get("temporal_coverage"))
@@ -283,6 +292,43 @@ class OGCBackend(BaseBackend):
             attach_publisher_contact(self, dataset, provider.get("name"), email)
 
         return dataset
+
+    @staticmethod
+    def _spatial_boxes(spatial) -> list[tuple[float, float, float, float]]:
+        """The collection's bounding boxes, as `(minx, miny, maxx, maxy)` tuples.
+
+        schema.org puts them in `spatial[].geo.box`, a `GeoShape` written as two
+        space-separated corners. The standard orders each corner `lat,lon`; the
+        TML source writes `lon,lat` -- its `-9.4972,38.4194 -8.4575,39.0792`
+        only lands on Lisbon in that order -- and it is the one OGC source
+        configured, so that is the order read. A source following the standard
+        for Portugal would still pass the range check, only transposed.
+
+        Anything else is skipped rather than guessed at; the shared helper then
+        drops what is not geographic.
+        """
+        if isinstance(spatial, dict):
+            spatial = [spatial]
+        elif not isinstance(spatial, list):
+            return []
+
+        boxes = []
+        for place in spatial:
+            geo = place.get("geo") if isinstance(place, dict) else None
+            box = geo.get("box") if isinstance(geo, dict) else None
+            if not isinstance(box, str):
+                continue
+            corners = box.split()
+            if len(corners) != 2:
+                continue
+            try:
+                (minx, miny), (maxx, maxy) = (
+                    tuple(float(value) for value in corner.split(",")) for corner in corners
+                )
+            except ValueError:
+                continue
+            boxes.append((minx, miny, maxx, maxy))
+        return boxes
 
     @staticmethod
     def _temporal_coverage(text) -> DateRange | None:

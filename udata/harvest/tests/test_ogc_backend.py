@@ -658,3 +658,49 @@ class OGCTemporalCoverageTest(PytestOnlyDBTestCase):
         dataset.save()
         dataset = self._harvest(rmock, "None/None")
         assert "temporal_coverage" not in dataset.extras
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCSpatialTest(PytestOnlyDBTestCase):
+    """`spatial[].geo.box` becomes the dataset's spatial coverage."""
+
+    def _harvest(self, rmock, **overrides):
+        item = _tml_item()
+        for key, value in overrides.items():
+            if value is None:
+                item.pop(key, None)
+            else:
+                item[key] = value
+        rmock.get(OGC_URL, text=_ogc_payload([item]))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_the_tml_box_becomes_a_multipolygon(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.spatial.geom["type"] == "MultiPolygon"
+        (ring,) = dataset.spatial.geom["coordinates"][0]
+        assert ring[0] == [-9.4972, 38.4194]
+        assert ring[2] == [-8.4575, 39.0792]
+
+    def test_no_spatial_yields_no_coverage(self, rmock):
+        dataset = self._harvest(rmock, spatial=None)
+        assert dataset.spatial is None
+
+    @pytest.mark.parametrize(
+        "spatial",
+        [
+            "Lisboa",
+            [{"geo": {"box": "lixo"}}],
+            [{"geo": {"box": "-9.4,38.4 -8.4"}}],
+            [{"geo": {"box": "a,b c,d"}}],
+            [{"geo": {"box": "-120000,-300000 165000,280000"}}],
+            [{"geo": "box"}, 42],
+        ],
+    )
+    def test_an_unusable_spatial_does_not_fail_the_item(self, rmock, spatial):
+        dataset = self._harvest(rmock, spatial=spatial)
+        assert dataset.spatial is None
