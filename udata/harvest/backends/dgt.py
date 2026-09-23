@@ -1,3 +1,4 @@
+import logging
 import re
 
 from udata.core.dataset.models import HarvestDatasetMetadata
@@ -18,6 +19,8 @@ from .tools.harvester_utils import (
     settle_harvested_license,
     sync_resources,
 )
+
+log = logging.getLogger(__name__)
 
 # The SNIG index publishes the licence as free text inside `legalConstraints`.
 # It is never fed to `License.guess`: that falls back to a Damerau-Levenshtein
@@ -261,12 +264,6 @@ class DGTBackend(BaseBackend):
     # (snig.dgterritorio.gov.pt) present a valid certificate (checked 2026-07).
     display_name = "Harvester DGT"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        import logging
-
-        self.logger = logging.getLogger(__name__)
-
     @staticmethod
     def _legal_constraints(record: dict) -> list[str]:
         """Normalize the record's `legalConstraints` into a list of strings.
@@ -465,12 +462,12 @@ class DGTBackend(BaseBackend):
         elif isinstance(metadata, str) and data.get("@to") == "1":
             # Se for string e @to == "1", não é possível processar como dict, então ignora ou loga erro
             msg = ("Error: metadata é uma string, não um dict: %r", metadata)
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         elif isinstance(metadata, str) and data.get("@to") == "0":
             msg = "Erro: Metadados vazios. Nenhum dataset disponível."
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         elif not isinstance(metadata, list):
@@ -478,7 +475,7 @@ class DGTBackend(BaseBackend):
 
         if not metadata:
             msg = "Erro: Metadados vazios. Nenhum dataset disponível."
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         # Loop through the metadata and process each item
@@ -508,7 +505,7 @@ class DGTBackend(BaseBackend):
             for link in resources:
                 parsed = self._parse_link(link)
                 if parsed is None:
-                    self.logger.warning(
+                    log.warning(
                         "DGT: skipping a link of %s that names no resource: %r",
                         item["remote_id"],
                         link,
@@ -523,12 +520,6 @@ class DGTBackend(BaseBackend):
     def inner_process_dataset(self, item: HarvestItem, **kwargs):
         """Process harvested data into a dataset"""
         dataset = self.get_dataset(item.remote_id)
-        # Here you comes your implementation. You should :
-        # - fetch the remote dataset (if necessary)
-        # - validate the fetched payload
-        # - map its content to the dataset fields
-        # - store extra significant data in the `extra` attribute
-        # - map resources data
         data = kwargs.get("items")
 
         # Set basic dataset fields
@@ -638,7 +629,7 @@ class DGTBackend(BaseBackend):
             # The portal does not carry this licence yet. Visible on purpose:
             # silently landing on a near neighbour is how a record ends up
             # granting more than its source does.
-            self.logger.warning(
+            log.warning(
                 "DGT record %r declares licence %r, which the portal does not have",
                 item.remote_id,
                 license_id,

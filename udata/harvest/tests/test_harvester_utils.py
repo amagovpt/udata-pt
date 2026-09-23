@@ -8,8 +8,10 @@ functions, when the CSW backends were merged.
 import pytest
 
 from ..backends.tools.harvester_utils import (
+    MIME_FORMATS,
     build_resource_url,
     collapse_duplicated_path,
+    guess_format_from_mime,
     guess_url_format,
 )
 
@@ -123,3 +125,92 @@ class BuildResourceUrlPreservesQueryTest:
     def test_the_path_is_still_collapsed_with_a_query_present(self):
         url = "https://host/a//b?url=https://other//y"
         assert build_resource_url(url) == "https://host/a/b?url=https://other//y"
+
+
+class GuessFormatFromMimeTest:
+    """The single MIME-to-format guess, shared by `odspt` and `ogc` (LEDG-2493)."""
+
+    @pytest.mark.parametrize(
+        "mime,expected",
+        [
+            ("application/json", "json"),
+            ("application/ld+json", "jsonld"),
+            ("application/xml", "xml"),
+            ("text/xml", "xml"),
+            ("application/csv", "csv"),
+            ("text/csv", "csv"),
+            ("application/xls", "xls"),
+            ("application/xlsx", "xlsx"),
+            ("application/geo+json", "geojson"),
+            ("application/gml+xml", "gml"),
+        ],
+    )
+    def test_the_curated_table(self, mime, expected):
+        assert guess_format_from_mime(mime) == expected
+
+    def test_the_table_covers_every_mime_the_sources_publish(self):
+        # Pinned so a table entry cannot be dropped by accident: these are the
+        # types the OGC and ODS feeds send.
+        assert set(MIME_FORMATS) == {
+            "application/json",
+            "application/ld+json",
+            "application/xml",
+            "text/xml",
+            "application/csv",
+            "text/csv",
+            "application/xls",
+            "application/xlsx",
+            "application/geo+json",
+            "application/gml+xml",
+        }
+
+    def test_the_table_wins_over_mimetypes(self):
+        # `mimetypes.guess_extension("application/xml")` answers `.xsl`, which is
+        # an artefact of the standard library's table rather than the format of
+        # the resource. The order of the two steps is the fix, so it is pinned.
+        assert guess_format_from_mime("application/xml") == "xml"
+
+    def test_a_mime_outside_the_table_falls_to_mimetypes(self):
+        assert guess_format_from_mime("application/pdf") == "pdf"
+
+    def test_the_spellings_mimetypes_does_not_know(self):
+        # These three resolved to nothing before the table was shared: `odspt`
+        # only had `mimetypes`, which answers `None` for all of them.
+        assert guess_format_from_mime("application/csv") == "csv"
+        assert guess_format_from_mime("application/xls") == "xls"
+        assert guess_format_from_mime("application/xlsx") == "xlsx"
+
+    def test_case_and_padding_do_not_matter(self):
+        assert guess_format_from_mime("  Application/GEO+JSON ") == "geojson"
+        # Outside the table too: `mimetypes` is asked the normalized type, not
+        # the raw one, which it would answer `None` to.
+        assert guess_format_from_mime(" Application/PDF ") == "pdf"
+
+    def test_an_unknown_mime_falls_back_to_the_url(self):
+        url = "https://host/exports/dataset.csv?download=1"
+        assert guess_format_from_mime("application/x-made-up", url) == "csv"
+
+    def test_the_url_is_read_through_the_single_url_guess(self):
+        # `guess_url_format` reads the last path segment only; the previous
+        # `os.path.splitext` over the whole URL is what LEDG-2250 fixed.
+        url = "https://host.with.dots/exports/dataset"
+        assert guess_format_from_mime("application/x-made-up", url) is None
+
+    def test_no_mime_reads_the_url(self):
+        assert guess_format_from_mime(None, "https://host/file.json") == "json"
+
+    def test_a_long_extension_is_not_a_format(self):
+        # `guess_url_format` drops anything over five characters as upstream
+        # noise (LEDG-2250), so `.geojson` only ever comes from the MIME type.
+        assert guess_format_from_mime(None, "https://host/file.geojson") is None
+        assert guess_format_from_mime("application/geo+json", "https://host/x") == "geojson"
+
+    @pytest.mark.parametrize("mime", [None, ""])
+    def test_a_missing_mime_no_longer_raises(self, mime):
+        # `mimetypes.guess_extension(None)` raises `AttributeError`, which used
+        # to fail the whole harvested item for an attachment without a type.
+        assert guess_format_from_mime(mime) is None
+
+    def test_the_fallback_is_the_last_resort(self):
+        assert guess_format_from_mime(None, None, fallback="unknown") == "unknown"
+        assert guess_format_from_mime("application/x-made-up", fallback="remote") == "remote"

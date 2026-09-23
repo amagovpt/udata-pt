@@ -1,6 +1,5 @@
 import logging
 import mimetypes
-import os
 from urllib.parse import urlparse
 
 from dateutil.parser import parse as parse_date
@@ -11,24 +10,16 @@ from udata.harvest.exceptions import HarvestSkipException
 from udata.harvest.models import HarvestItem
 from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.i18n import gettext as _
-from udata.models import License, Organization, Resource
+from udata.models import License, Resource
 from udata.utils import get_by
 
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import (
+    guess_format_from_mime,
+    normalize_url_slashes,
+    resolve_publisher_organization,
+)
 
 log = logging.getLogger(__name__)
-
-
-def guess_format(mimetype, url=None):
-    """
-    Guess a file format given a MIME type and/or an url
-    """
-    # TODO: factorize in udata
-    ext = mimetypes.guess_extension(mimetype)
-    if not ext and url:
-        parts = os.path.splitext(url)
-        ext = parts[1] if parts[1] else None
-    return ext[1:] if ext and ext.startswith(".") else ext
 
 
 def guess_mimetype(mimetype, url=None):
@@ -196,40 +187,11 @@ class OdsBackendPT(BaseBackend):
         except KeyError:
             pass
         else:
-            orgObj = Organization.objects(acronym=organization_acronym).first()
-            if orgObj:
-                dataset.organization = orgObj
-            elif not self.dryrun:
-                orgObj = Organization()
-                orgObj.acronym = organization_acronym
-                orgObj.name = organization_acronym
-                orgObj.description = organization_acronym
-                orgObj.save()
-
-                dataset.organization = orgObj
-            else:
-                # A preview creates nothing, so an unknown publisher cannot be shown
-                # on the item: `organization` is a `ReferenceField` and mongoengine
-                # refuses to reference an unsaved document, which would fail the item
-                # on the `validate()` a dryrun runs instead of `save()`.
-                #
-                # The field is left untouched rather than set to `None`, so it keeps
-                # whatever `get_dataset` seeded from the source - which on a source
-                # that has an organization means the item shows one a real run would
-                # not use. `process_dataset` collects this onto `item.logs`, which
-                # the preview API returns, so the difference is not silent.
-                #
-                # `warning`, not `info`: `init_logging` puts the app logger at
-                # WARNING outside debug, and the collector hangs off that logger.
-                # This branch only runs on a preview, so it cannot become noise on
-                # a scheduled harvest.
-                log.warning(
-                    "Organization %s does not exist yet; a real harvest would create "
-                    "it, the preview does not",
-                    # `repr` and bounded: the value is remote and these records
-                    # are returned in the preview response.
-                    repr(organization_acronym)[:200],
-                )
+            # The ODS feed carries no publisher title or description, so the
+            # helper falls back to the acronym for both, as this backend did.
+            organization = resolve_publisher_organization(self, organization_acronym)
+            if organization:
+                dataset.organization = organization
 
         tags = set()
         if "keyword" in ods_metadata:
@@ -286,7 +248,7 @@ class OdsBackendPT(BaseBackend):
             created, resource = self.get_resource(dataset, url)
             resource.title = export.get("title", "No title")
             resource.description = export.get("description")
-            resource.format = guess_format(export.get("mimetype"), export["url"])
+            resource.format = guess_format_from_mime(export.get("mimetype"), export["url"])
             resource.mime = guess_mimetype(export.get("mimetype"), export["url"])
             resource.modified = modified_at
             resource.extras["ods:type"] = data_type

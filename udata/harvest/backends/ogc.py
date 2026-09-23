@@ -6,13 +6,20 @@ from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
 from udata.models import License
 
-from .tools.harvester_utils import sync_resources
+from .tools.harvester_utils import guess_format_from_mime, guess_url_format, sync_resources
+
+log = logging.getLogger(__name__)
 
 # The TML source publishes thirteen distributions per collection and the portal
 # only catalogues three of them: the two item downloads and the collection
 # schema. The labels below are the source's own, matched verbatim (LEDG-2512).
 ITEMS_AS_PREFIX = "Items as "
 SCHEMA_DISTRIBUTION_LABEL = "Schema of collection in JSON"
+
+# This source publishes its formats in upper case, and two of them are not the
+# upper-cased format name: `GeoJSON` and `JSON-LD`. The guess itself is shared
+# (`guess_format_from_mime`), so only the spelling is kept here.
+FORMAT_LABELS = {"geojson": "GeoJSON", "jsonld": "JSON-LD"}
 
 
 class OGCBackend(BaseBackend):
@@ -24,10 +31,6 @@ class OGCBackend(BaseBackend):
     name = "ogc"
     display_name = "Harvester OGC"
     filters = (HarvestFilter(_("Tag"), "tags", str, _("A keyword/tag name")),)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.logger = logging.getLogger(__name__)
 
     def _item_keywords(self, keywords):
         """Normalize an item's keywords into a lower-cased set of strings."""
@@ -74,7 +77,7 @@ class OGCBackend(BaseBackend):
             data = res.json()
         except Exception as e:
             msg = f"Error fetching OGC data: {e}"
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         # OGC/Schema.org JSON-LD structure: look for 'dataset' array
@@ -82,7 +85,7 @@ class OGCBackend(BaseBackend):
 
         if not metadata:
             msg = f'Could not find "dataset" in OGC response. Keys found: {list(data.keys())}'
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         # Ensure metadata is always a list
@@ -94,7 +97,7 @@ class OGCBackend(BaseBackend):
             remote_id = each.get("@id")
 
             if not remote_id:
-                self.logger.warning(f"Skipping OGC dataset without @id: {each.get('name')}")
+                log.warning(f"Skipping OGC dataset without @id: {each.get('name')}")
                 continue
 
             keywords = each.get("keywords") or []
@@ -162,14 +165,15 @@ class OGCBackend(BaseBackend):
                     if not self._is_target_distribution(label):
                         continue
 
-                    # Extract format from MIME type or use the type directly
+                    # The MIME type is authoritative when the source sends one;
+                    # only without it is the URL read, which is why the guess is
+                    # called without a URL here.
                     if link_type:
-                        format_value = self._extract_format_from_mime(link_type)
+                        subtype = link_type.rsplit("/", 1)[-1] if "/" in link_type else link_type
+                        fmt = guess_format_from_mime(link_type, fallback=subtype)
+                        format_value = FORMAT_LABELS.get(fmt, fmt.upper())
                     else:
-                        # Try to extract from URL
-                        format_value = (
-                            url.split(".")[-1] if "." in url.split("/")[-1] else "unknown"
-                        )
+                        format_value = guess_url_format(url, fallback="unknown")
 
                     resource_title = self._resource_title(label, item_data["title"])
 
@@ -188,7 +192,7 @@ class OGCBackend(BaseBackend):
             # job still reports success -- the one way this change can go wrong
             # without anyone noticing. Say so per item, so the cause is in the
             # log before the missing downloads are reported by a user.
-            self.logger.warning(
+            log.warning(
                 "OGC: no distribution of %s matched the catalogued labels; "
                 "%d were offered and all were dropped. Labels seen: %s",
                 item.remote_id,
@@ -307,23 +311,3 @@ class OGCBackend(BaseBackend):
     def _is_target_distribution(self, label: str) -> bool:
         """Whether a distribution is one of the three the portal catalogues."""
         return label.startswith(ITEMS_AS_PREFIX) or label == SCHEMA_DISTRIBUTION_LABEL
-
-    def _extract_format_from_mime(self, mime_type: str) -> str:
-        """
-        Extract a simple format string from a MIME type.
-        """
-        mime_to_format = {
-            "application/json": "JSON",
-            "application/ld+json": "JSON-LD",
-            "application/xml": "XML",
-            "application/xls": "XLS",
-            "application/xlsx": "XLSX",
-            "application/csv": "CSV",
-            "text/csv": "CSV",
-            "text/xml": "XML",
-            "application/geo+json": "GeoJSON",
-            "application/gml+xml": "GML",
-        }
-        return mime_to_format.get(
-            mime_type, mime_type.split("/")[-1].upper() if "/" in mime_type else mime_type
-        )
