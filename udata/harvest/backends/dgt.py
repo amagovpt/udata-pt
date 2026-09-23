@@ -524,7 +524,11 @@ class DGTBackend(BaseBackend):
         # Set basic dataset fields
         dataset.title = data["title"]
         dataset.license = self._license_for(dataset, item, data)
-        dataset.tags = ["snig.dgterritorio.gov.pt"]
+        # The source's own host, as `cswudata` and `ckanpt` tag theirs. The
+        # constant that stood here was right only for the one SNIG instance it
+        # was written against; a DGT source on any other host carried it too.
+        # An empty hostname would fail `TagListField` on its minimum length.
+        dataset.tags = [self.source.domain] if self.source.domain else []
         dataset.description = data["description"]
 
         # `Dataset.created_at` is a read-only property -- it reads

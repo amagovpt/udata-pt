@@ -1062,3 +1062,19 @@ class DGTSpatialHarvestTest(PytestOnlyDBTestCase):
             ],
         )
         assert len(dataset.spatial.geom["coordinates"]) == 2
+
+
+class DGTSourceTagTest(PytestOnlyDBTestCase):
+    """The tag names the host the record was harvested from."""
+
+    def test_the_tag_is_the_hostname_of_the_source(self, rmock):
+        url = "https://snig.example.pt/rndg/srv/por/q?_content_type=json"
+        rmock.get(url, text=_index_payload([_index_record(REMOTE_ID, None)]))
+        source = HarvestSourceFactory(backend="dgt", url=url)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+
+        # `TagListField` slugifies, as it did with the constant.
+        dataset = harvested_dataset(REMOTE_ID)
+        assert "snig-example-pt" in dataset.tags
+        assert "snig-dgterritorio-gov-pt" not in dataset.tags
