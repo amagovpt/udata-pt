@@ -345,3 +345,55 @@ class OdsBackendPTDatesTest(OdsBackendPTSnsTestCase):
         dataset = self.harvest(rmock, source=source)
         assert dataset.harvest.issued_at == datetime(2018, 12, 31)
         assert dataset.created_at_internal == datetime(2018, 12, 31)
+
+
+class OdsBackendPTDcatExtrasTest(OdsBackendPTSnsTestCase):
+    """Authorship and coverage text into the extras, `metas.bbox` into the coverage."""
+
+    def test_creator_contributor_and_spatial_text_reach_the_extras(self, rmock):
+        # As recorded: creator ACSS, contributor SPMS, "Portugal Continental".
+        dataset = self.harvest(rmock)
+        assert dataset.extras["ods:creator"] == "ACSS"
+        assert dataset.extras["ods:contributor"] == "SPMS"
+        assert dataset.extras["ods:spatial"] == "Portugal Continental"
+        # Prose, deliberately not parsed nor kept.
+        assert "ods:temporal" not in dataset.extras
+        assert dataset.temporal_coverage is None
+
+    def test_markup_is_stripped_from_the_extras(self, rmock):
+        payload = _sns_payload(dcat={"creator": "<script>alert(1)</script><b>ACSS</b>"})
+        dataset = self.harvest(rmock, payload)
+        # `sanitize_strict` drops the tags and keeps their text.
+        assert "<" not in dataset.extras["ods:creator"]
+        assert dataset.extras["ods:creator"].endswith("ACSS")
+
+    def test_an_extra_the_source_stops_publishing_is_removed(self, rmock):
+        source = HarvestSourceFactory(backend="odspt", url=ODS_URL, organization=None, owner=None)
+        self.harvest(rmock, source=source)
+        dataset = self.harvest(rmock, _sns_payload(dcat={"contributor": None}), source=source)
+        assert "ods:contributor" not in dataset.extras
+
+    def test_the_bbox_becomes_the_spatial_coverage(self, rmock):
+        dataset = self.harvest(rmock)
+        assert dataset.spatial.geom["type"] == "MultiPolygon"
+        (ring,) = dataset.spatial.geom["coordinates"][0]
+        # The envelope of the recorded polygon, `[minx, miny]` first.
+        assert ring[0] == [-9.418267076835036, 37.02389728277922]
+        assert ring[2] == [-6.768198050558567, 41.80565318092704]
+
+    def test_no_bbox_yields_no_coverage(self, rmock):
+        dataset = self.harvest(rmock, _sns_payload(bbox=None))
+        assert dataset.spatial is None
+
+    @pytest.mark.parametrize(
+        "bbox",
+        [
+            "lixo",
+            {"type": "Point", "coordinates": [-9.1, 38.7]},
+            {"type": "Polygon", "coordinates": [[["a", "b"]]]},
+            {"type": "Polygon", "coordinates": [[[-120000, -300000], [165000, 280000]]]},
+        ],
+    )
+    def test_an_unusable_bbox_does_not_fail_the_item(self, rmock, bbox):
+        dataset = self.harvest(rmock, _sns_payload(bbox=bbox))
+        assert dataset.spatial is None

@@ -7,6 +7,7 @@ from dateutil.parser import parse as parse_date
 
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.models import HarvestDatasetMetadata
+from udata.core.utils.sanitization import sanitize_strict
 from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
@@ -17,6 +18,7 @@ from udata.models import License, Resource
 from udata.utils import get_by, safe_harvest_datetime
 
 from .tools.harvester_utils import (
+    bbox_to_spatial_coverage,
     guess_format_from_mime,
     map_ine_periodicity,
     normalize_url_slashes,
@@ -152,6 +154,36 @@ class OdsBackendPT(BaseBackend):
             return min(periodic, key=lambda part: part.delta)
         return known[0] if known else UpdateFrequency.UNKNOWN
 
+    @staticmethod
+    def _bbox_boxes(bbox) -> list[tuple[float, float, float, float]]:
+        """`metas.bbox` as `(minx, miny, maxx, maxy)` tuples, one per polygon.
+
+        ODS computes it from the records and publishes it as a GeoJSON `Polygon` --
+        on 49 of the 144 SNS datasets on 2026-09-23 -- so its envelope is the box.
+        A `MultiPolygon` is tolerated; any other shape is skipped rather than
+        guessed at, and the shared helper drops what is not geographic.
+        """
+        if not isinstance(bbox, dict):
+            return []
+        coordinates = bbox.get("coordinates")
+        if bbox.get("type") == "Polygon":
+            polygons = [coordinates]
+        elif bbox.get("type") == "MultiPolygon" and isinstance(coordinates, list):
+            polygons = coordinates
+        else:
+            return []
+
+        boxes = []
+        for polygon in polygons:
+            try:
+                points = [(float(x), float(y)) for ring in polygon for x, y in ring]
+            except (TypeError, ValueError):
+                continue
+            if points:
+                xs, ys = zip(*points)
+                boxes.append((min(xs), min(ys), max(xs), max(ys)))
+        return boxes
+
     def inner_harvest(self):
         # An unmapped periodicity is warned about once per harvest, not once per
         # dataset, and reported again on the next run.
@@ -285,6 +317,24 @@ class OdsBackendPT(BaseBackend):
         if "references" in ods_metadata:
             dataset.extras["ods:references"] = ods_metadata["references"]
         dataset.extras["ods:has_records"] = ods_dataset["has_records"]
+
+        # Free text, kept as published. Sanitized because extras are marshalled raw by
+        # the API, as in `dgt` and `inehvd`; removed when the source stops publishing
+        # them, so an extra never outlives its source. `dcat.temporal` is left out on
+        # purpose: it is prose ("janeiro 2020 a agosto 2026"), not a date range.
+        for field in ("creator", "contributor", "spatial"):
+            value = dcat.get(field)
+            value = sanitize_strict(value).strip() if isinstance(value, str) else ""
+            if value:
+                dataset.extras[f"ods:{field}"] = value
+            else:
+                dataset.extras.pop(f"ods:{field}", None)
+
+        # Replaces the whole coverage when the source publishes a box, and leaves it
+        # alone otherwise: `SpatialCoverage.clean` refuses `zones` and `geom` together.
+        coverage = bbox_to_spatial_coverage(self._bbox_boxes(ods_metadata.get("bbox")))
+        if coverage:
+            dataset.spatial = coverage
         dataset.extras["ods:geo"] = "geo" in ods_dataset["features"]
 
         return dataset
