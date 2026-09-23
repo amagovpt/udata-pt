@@ -1,16 +1,19 @@
 import logging
 import re
 
+from udata.core.contact_point.models import check_is_email, check_no_urls
 from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
+from udata.mongo.errors import FieldValidationError
 from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
     DERIVED_LICENSE_EXTRA,  # noqa: F401  -- re-exported: the tests import it from here
     OGC_SERVICE_FORMATS,
+    attach_publisher_contact,
     bbox_to_spatial_coverage,
     guess_url_format,
     map_iso_maintenance_frequency,
@@ -442,6 +445,61 @@ class DGTBackend(BaseBackend):
         return groups
 
     @staticmethod
+    def _publisher_contact(record: dict) -> dict | None:
+        """The publisher contact the record names, as `{"name", "email"}`.
+
+        `responsibleParty` is a list of
+        `role|scope|organisation||email|...|address|phone||order` strings --
+        checked against the IPMA record recorded on 2026-09-23 -- with one
+        entry for whoever is responsible for the `resource` and another for the
+        `metadata`, and they need not share an email. The resource's entry is
+        preferred, since that is who publishes the data. Without either,
+        `orgNameSNIG` still names the organisation, with no email.
+
+        Address and phone are not kept: `ContactPoint` has nowhere to put them.
+        A name or email the model would refuse at save time -- a URL in the
+        name, an address that is not one -- is dropped here instead, because
+        the refusal would fail the whole item over a contact.
+        """
+        parties = record.get("responsibleParty")
+        if isinstance(parties, str):
+            parties = [parties]
+        elif not isinstance(parties, list):
+            parties = []
+
+        by_scope = {}
+        for entry in parties:
+            if not isinstance(entry, str):
+                continue
+            parts = entry.split("|")
+            if len(parts) < 5:
+                continue
+            name = sanitize_strict(parts[2]).strip()
+            if name:
+                by_scope.setdefault(parts[1].strip(), (name, parts[4].strip()))
+
+        name, email = by_scope.get("resource") or by_scope.get("metadata") or (None, None)
+        if not name:
+            fallback = record.get("orgNameSNIG")
+            if isinstance(fallback, list):
+                fallback = next((value for value in fallback if isinstance(value, str)), None)
+            name = sanitize_strict(fallback).strip() if isinstance(fallback, str) else None
+            email = None
+        if not name:
+            return None
+
+        try:
+            check_no_urls(name, "name")
+        except FieldValidationError:
+            return None
+        try:
+            check_is_email(email, "email")
+        except FieldValidationError:
+            email = None
+        # `ContactPoint.name` and `email` are both bounded at 255.
+        return {"name": name[:255], "email": email[:255] if email else None}
+
+    @staticmethod
     def _change_dates(record: dict) -> list[str]:
         """The record's `changeDate` values, the last time the source says it changed.
 
@@ -503,6 +561,7 @@ class DGTBackend(BaseBackend):
             }
             item["created_at"] = self._publication_dates(each)
             item["modified_at"] = self._change_dates(each)
+            item["publisher"] = self._publisher_contact(each)
             item["update_frequency"] = self._update_frequency(each)
             item["geo_boxes"] = self._geo_boxes(each)
 
@@ -648,6 +707,10 @@ class DGTBackend(BaseBackend):
             )
 
         sync_resources(dataset, resources)
+
+        publisher = data.get("publisher")
+        if publisher:
+            attach_publisher_contact(self, dataset, publisher["name"], publisher["email"])
 
         # Add extra metadata
         dataset.extras["harvest:name"] = self.source.name

@@ -9,7 +9,8 @@ import pytest
 
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import LicenseFactory
-from udata.models import License
+from udata.core.organization.factories import OrganizationFactory
+from udata.models import ContactPoint, License
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.dgt import (
@@ -1151,3 +1152,76 @@ class DGTChangeDateTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, referenceDate=None, changeDate=None)
         assert dataset.harvest.created_at is None
         assert dataset.harvest.modified_at is None
+
+
+IPMA = "Instituto Português do Mar e da Atmosfera, I.P. (IPMA, I.P.)"
+
+
+class DGTContactPointTest(PytestOnlyDBTestCase):
+    """`responsibleParty` becomes the dataset's `publisher` contact point.
+
+    The contact point belongs to the dataset's organization, so the source
+    carries one, as in `OGCBackendContactPointTest`.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(backend="dgt", url=DGT_URL, organization=OrganizationFactory())
+
+    def _harvest(self, rmock, dryrun=False, **overrides):
+        rmock.get(DGT_URL, text=_index_payload([_recorded_record(**overrides)]))
+        job = DGTBackend(self._source(), dryrun=dryrun).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return job
+
+    def test_the_responsible_party_becomes_the_publisher_contact(self, rmock):
+        self._harvest(rmock)
+        dataset = harvested_dataset(SNIG_REMOTE_ID)
+        (contact,) = dataset.contact_points
+        assert contact.role == "publisher"
+        assert contact.name == IPMA
+        # The `resource` entry, not the `metadata` one (`info@ipma.pt`).
+        assert contact.email == "maps.services@ipma.pt"
+
+    def test_the_metadata_entry_stands_in_for_the_resource_one(self, rmock):
+        self._harvest(rmock, responsibleParty=[SNIG_RECORD["responsibleParty"][0]])
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.email == "info@ipma.pt"
+
+    def test_the_organisation_name_stands_in_without_a_responsible_party(self, rmock):
+        self._harvest(rmock, responsibleParty=None)
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.name == IPMA
+        assert contact.email is None
+
+    def test_no_contact_without_either(self, rmock):
+        self._harvest(rmock, responsibleParty=None, orgNameSNIG=None)
+        assert harvested_dataset(SNIG_REMOTE_ID).contact_points == []
+
+    @pytest.mark.parametrize(
+        "published",
+        ["lixo", "Contacto|resource", ["Contacto|resource||||", 42]],
+    )
+    def test_a_malformed_responsible_party_does_not_fail_the_item(self, rmock, published):
+        self._harvest(rmock, responsibleParty=published)
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.name == IPMA
+
+    def test_an_invalid_email_is_dropped_not_the_item(self, rmock):
+        self._harvest(rmock, responsibleParty=[f"Contacto|resource|{IPMA}||não-é-email||||"])
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.email is None
+
+    def test_a_preview_creates_no_contact_point(self, rmock):
+        job = self._harvest(rmock, dryrun=True)
+        assert len(list(ContactPoint.objects)) == 0
+        assert job.items[0].dataset.contact_points == []
+
+    def test_a_re_harvest_reuses_the_contact_point(self, rmock):
+        source = self._source()
+        rmock.get(DGT_URL, text=_index_payload([_recorded_record()]))
+        DGTBackend(source).harvest()
+        DGTBackend(source).harvest()
+        assert len(list(ContactPoint.objects)) == 1
+        assert len(harvested_dataset(SNIG_REMOTE_ID).contact_points) == 1

@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import requests
 
+from udata.core.contact_point.models import ContactPoint
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.spatial.models import SpatialCoverage
 from udata.models import License, Organization, Resource
@@ -259,6 +260,58 @@ def resolve_publisher_organization(
     )
     organization.save()
     return organization
+
+
+def attach_publisher_contact(backend, dataset, name: str | None, email: str | None) -> None:
+    """Attach the `publisher` contact point `name`/`email` to `dataset`.
+
+    Extracted from `ogc.py`, where it was written first, so DGT does not carry a
+    second copy of the `dryrun` handling. The contact point belongs to the
+    dataset's organization, or to its owner; with neither there is nothing to
+    attach it to and the call does nothing.
+
+    A preview creates nothing: it only reuses an existing contact point, never
+    mints one. Mongoengine cannot reference an unsaved document, so there is
+    nothing to put on the item when none matches -- the same guard upstream
+    applies in `contact_points_from_rdf` for the DCAT path.
+
+    `get()`, not `first()`: `get_or_create` ends on a `get`, so duplicates
+    matching this query fail a real run. Predicting that failure is the
+    preview's job -- `first()` would quietly pick one of them and report the
+    item as fine.
+
+    Contact points are only ever added: one the source no longer publishes stays
+    on the dataset.
+    """
+    if email:
+        email = email.replace("mailto:", "").strip()
+    if not (name or email):
+        return
+
+    if dataset.organization:
+        org_or_owner = {"organization": dataset.organization}
+    elif dataset.owner:
+        org_or_owner = {"owner": dataset.owner}
+    else:
+        return
+
+    if backend.dryrun:
+        try:
+            contact = ContactPoint.objects.get(
+                name=name, email=email, role="publisher", **org_or_owner
+            )
+        except ContactPoint.DoesNotExist:
+            contact = None
+    else:
+        contact, _ = ContactPoint.objects.get_or_create(
+            name=name, email=email, role="publisher", **org_or_owner
+        )
+
+    if contact:
+        if not dataset.contact_points:
+            dataset.contact_points = []
+        if contact not in dataset.contact_points:
+            dataset.contact_points.append(contact)
 
 
 def build_resource_url(raw_url: str) -> str:

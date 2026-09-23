@@ -1,12 +1,16 @@
 import logging
 
-from udata.core.contact_point.models import ContactPoint
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
 from udata.models import License
 
-from .tools.harvester_utils import guess_format_from_mime, guess_url_format, sync_resources
+from .tools.harvester_utils import (
+    attach_publisher_contact,
+    guess_format_from_mime,
+    guess_url_format,
+    sync_resources,
+)
 
 log = logging.getLogger(__name__)
 
@@ -230,48 +234,8 @@ class OGCBackend(BaseBackend):
             dataset.extras["publisher_name"] = provider.get("name")
             dataset.extras["publisher_email"] = provider.get("contactPoint", {}).get("email")
 
-            # Create contact point
-            name = provider.get("name")
             email = provider.get("contactPoint", {}).get("email") or provider.get("email")
-            if email:
-                email = email.replace("mailto:", "").strip()
-
-            if name or email:
-                org_or_owner = {}
-                if dataset.organization:
-                    org_or_owner = {"organization": dataset.organization}
-                elif dataset.owner:
-                    org_or_owner = {"owner": dataset.owner}
-
-                if org_or_owner:
-                    if self.dryrun:
-                        # A preview creates nothing: only reuse an existing contact
-                        # point, never mint one. Mongoengine cannot reference an
-                        # unsaved document, so there is nothing to put on the item
-                        # when none matches - the same guard upstream applies in
-                        # `contact_points_from_rdf` for the DCAT path.
-                        #
-                        # `get()`, not `first()`: `get_or_create` ends on a `get`, so
-                        # duplicates matching this query fail a real run. Predicting
-                        # that failure is the preview's job - `first()` would quietly
-                        # pick one of them and report the item as fine.
-                        try:
-                            contact = ContactPoint.objects.get(
-                                name=name, email=email, role="publisher", **org_or_owner
-                            )
-                        except ContactPoint.DoesNotExist:
-                            contact = None
-                    else:
-                        contact, _ = ContactPoint.objects.get_or_create(
-                            name=name, email=email, role="publisher", **org_or_owner
-                        )
-
-                    if contact:
-                        if not dataset.contact_points:
-                            dataset.contact_points = []
-
-                        if contact not in dataset.contact_points:
-                            dataset.contact_points.append(contact)
+            attach_publisher_contact(self, dataset, provider.get("name"), email)
 
         return dataset
 
