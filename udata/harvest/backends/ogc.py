@@ -8,6 +8,8 @@ from udata.models import License
 
 from .tools.harvester_utils import sync_resources
 
+log = logging.getLogger(__name__)
+
 # The TML source publishes thirteen distributions per collection and the portal
 # only catalogues three of them: the two item downloads and the collection
 # schema. The labels below are the source's own, matched verbatim (LEDG-2512).
@@ -24,10 +26,6 @@ class OGCBackend(BaseBackend):
     name = "ogc"
     display_name = "Harvester OGC"
     filters = (HarvestFilter(_("Tag"), "tags", str, _("A keyword/tag name")),)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.logger = logging.getLogger(__name__)
 
     def _item_keywords(self, keywords):
         """Normalize an item's keywords into a lower-cased set of strings."""
@@ -74,7 +72,7 @@ class OGCBackend(BaseBackend):
             data = res.json()
         except Exception as e:
             msg = f"Error fetching OGC data: {e}"
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         # OGC/Schema.org JSON-LD structure: look for 'dataset' array
@@ -82,7 +80,7 @@ class OGCBackend(BaseBackend):
 
         if not metadata:
             msg = f'Could not find "dataset" in OGC response. Keys found: {list(data.keys())}'
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         # Ensure metadata is always a list
@@ -94,7 +92,7 @@ class OGCBackend(BaseBackend):
             remote_id = each.get("@id")
 
             if not remote_id:
-                self.logger.warning(f"Skipping OGC dataset without @id: {each.get('name')}")
+                log.warning(f"Skipping OGC dataset without @id: {each.get('name')}")
                 continue
 
             keywords = each.get("keywords") or []
@@ -188,7 +186,7 @@ class OGCBackend(BaseBackend):
             # job still reports success -- the one way this change can go wrong
             # without anyone noticing. Say so per item, so the cause is in the
             # log before the missing downloads are reported by a user.
-            self.logger.warning(
+            log.warning(
                 "OGC: no distribution of %s matched the catalogued labels; "
                 "%d were offered and all were dropped. Labels seen: %s",
                 item.remote_id,

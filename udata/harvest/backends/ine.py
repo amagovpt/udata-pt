@@ -147,7 +147,6 @@ class INEBackend(BaseBackend):
         A truncated download (connection dropped mid-stream) will not contain the
         closing </catalog> tag, so we can detect it without parsing the whole file.
         """
-        import os
 
         try:
             size = os.path.getsize(path)
@@ -163,8 +162,6 @@ class INEBackend(BaseBackend):
 
     @staticmethod
     def _safe_remove(path: str) -> None:
-        import os
-
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -188,7 +185,6 @@ class INEBackend(BaseBackend):
         budget is INE-specific (`DOWNLOAD_MAX_RETRIES`) because each retry
         re-transfers the whole catalog.
         """
-        import os
 
         tmp_path = f"{dest_path}.part"
         delay = self.http_retry_initial_delay
@@ -797,7 +793,6 @@ class INEBackend(BaseBackend):
         self.HVD_INDICATOR_IDS = self._fetch_hvd_ids()
 
         try:
-            import os
             from io import BytesIO
 
             # Determina a fonte do XML baseado no modo de operação
@@ -909,8 +904,6 @@ class INEBackend(BaseBackend):
             # Remover ficheiro descarregado em caso de erro (não remover em modo teste)
             if not self.IS_TEST_MODE and self.USE_LOCAL_FILE:
                 try:
-                    import os
-
                     if os.path.exists(self.LOCAL_FILE_PATH):
                         # os.remove(self.LOCAL_FILE_PATH)
                         self._log.info(
