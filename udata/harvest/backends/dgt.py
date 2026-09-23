@@ -441,6 +441,20 @@ class DGTBackend(BaseBackend):
                 groups.append(dates)
         return groups
 
+    @staticmethod
+    def _change_dates(record: dict) -> list[str]:
+        """The record's `changeDate` values, the last time the source says it changed.
+
+        A bare string on the records sampled, tolerated as a list for the same
+        reason the publication dates are.
+        """
+        value = record.get("changeDate")
+        if isinstance(value, str):
+            value = [value]
+        elif not isinstance(value, list):
+            return []
+        return [entry for entry in value if isinstance(entry, str) and entry.strip()]
+
     def inner_harvest(self):
         # An unmapped frequency is warned about once per harvest, not once per
         # dataset; without the reset it would be silenced for the lifetime of
@@ -488,6 +502,7 @@ class DGTBackend(BaseBackend):
                 "legal_constraints": self._legal_constraints(each),
             }
             item["created_at"] = self._publication_dates(each)
+            item["modified_at"] = self._change_dates(each)
             item["update_frequency"] = self._update_frequency(each)
             item["geo_boxes"] = self._geo_boxes(each)
 
@@ -555,7 +570,30 @@ class DGTBackend(BaseBackend):
             # published on the first of the three, not on whichever the index
             # happened to list first.
             dataset.harvest.created_at = min(published)
+            # The public listing sorts on `created_at_internal`
+            # (`DEFAULT_SORTING`), not on the property, so without this every
+            # harvested record would sort as if it had been published on the
+            # day it was first harvested. Same fix as `ckanpt`.
+            dataset.created_at_internal = dataset.harvest.created_at
             break
+
+        changed = [
+            parsed
+            for parsed in (
+                safe_harvest_datetime(value, "DGT change date", refuse_future=True)
+                for value in data.get("modified_at") or []
+            )
+            if parsed
+        ]
+        if changed:
+            if not dataset.harvest:
+                dataset.harvest = HarvestDatasetMetadata()
+            # The latest of them: the record last changed on the last date it
+            # lists. `harvest.modified_at` is what `Dataset.last_modified`
+            # reads; `last_modified_internal` is its fallback and what the
+            # search sorts on as `last_update`.
+            dataset.harvest.modified_at = max(changed)
+            dataset.last_modified_internal = dataset.harvest.modified_at
 
         # `unknown` when the source says nothing. The field itself has no
         # default and was `None` on these datasets until now; both read as
