@@ -601,6 +601,17 @@ class OGCLicenseTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, item, catalogue_license=CC_BY_URL)
         assert dataset.license.id == "odc-odbl"
 
+    def test_a_catalogue_license_object_is_read_by_its_url(self, rmock):
+        item = _item("a", "Rede", [])
+        catalogue_license = {"@type": "CreativeWork", "url": CC_BY_URL}
+        dataset = self._harvest(rmock, item, catalogue_license=catalogue_license)
+        assert dataset.license.id == "cc-by"
+
+    def test_an_unreadable_license_object_is_notspecified_not_a_failure(self, rmock):
+        item = {**_item("a", "Rede", []), "license": {"name": "sem url"}}
+        dataset = self._harvest(rmock, item, catalogue_license=["not", "text"])
+        assert dataset.license.id == "notspecified"
+
     def test_no_license_anywhere_is_notspecified(self, rmock):
         dataset = self._harvest(rmock, _item("a", "Rede", []))
         assert dataset.license.id == "notspecified"
@@ -641,6 +652,19 @@ class OGCTemporalCoverageTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, temporal)
         assert dataset.temporal_coverage.start == date(2020, 1, 1)
         assert dataset.temporal_coverage.end is None
+
+    @pytest.mark.parametrize(
+        "temporal, start, end",
+        [
+            ("2019/2021", date(2019, 1, 1), date(2021, 12, 31)),
+            ("2019-03/2019-05", date(2019, 3, 1), date(2019, 5, 31)),
+            ("2019/..", date(2019, 1, 1), None),
+        ],
+    )
+    def test_a_partial_bound_covers_its_whole_period(self, rmock, temporal, start, end):
+        """`dateutil` would fill the missing parts from today, moving on every harvest."""
+        dataset = self._harvest(rmock, temporal)
+        assert (dataset.temporal_coverage.start, dataset.temporal_coverage.end) == (start, end)
 
     def test_a_single_year_covers_the_year(self, rmock):
         dataset = self._harvest(rmock, "2020")

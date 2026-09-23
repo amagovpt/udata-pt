@@ -128,7 +128,8 @@ class OGCBackend(BaseBackend):
                 "distributions": each.get("distribution") or [],
                 # The catalogue publishes a licence of its own for the
                 # collections that carry none, the same way it does `provider`.
-                "license": each.get("license") or data.get("license"),
+                "license": self._license_text(each.get("license"))
+                or self._license_text(data.get("license")),
                 "temporal_coverage": each.get("temporalCoverage"),
                 "url": each.get("url"),
                 "spatial_boxes": self._spatial_boxes(each.get("spatial")),
@@ -331,6 +332,31 @@ class OGCBackend(BaseBackend):
         return boxes
 
     @staticmethod
+    def _license_text(value) -> str | None:
+        """A licence as text, from a URL or from a schema.org `CreativeWork` object.
+
+        `License.guess` only reads strings; an object reaching it raises, and at the
+        catalogue level that would fail every collection without a licence of its own.
+        """
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("@id")
+        return value if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def _interval_bound(text: str, end: bool):
+        """One bound of an interval, as a date.
+
+        A bound given as a year or a year-month covers the whole period, so a start
+        takes its first day and an end its last -- `dateutil` would fill the missing
+        parts from today instead, and the stored coverage would move on every harvest.
+        """
+        if text.count("-") <= 1:
+            period = temporal_from_literal(text)
+            if period:
+                return period.end if end else period.start
+        return parse_dt(text).date()
+
+    @staticmethod
     def _temporal_coverage(text) -> DateRange | None:
         """The collection's `temporalCoverage`, or `None` when it names no dates.
 
@@ -354,8 +380,8 @@ class OGCBackend(BaseBackend):
                 if not (start or end):
                     return None
                 return DateRange(
-                    start=parse_dt(start).date() if start else None,
-                    end=parse_dt(end).date() if end else None,
+                    start=OGCBackend._interval_bound(start, end=False) if start else None,
+                    end=OGCBackend._interval_bound(end, end=True) if end else None,
                 )
             return temporal_from_literal(text)
         except (ValueError, OverflowError):
