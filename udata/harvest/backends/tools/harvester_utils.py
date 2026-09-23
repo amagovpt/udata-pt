@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+import mimetypes
 import random
 import re
 import time
@@ -327,6 +328,49 @@ def guess_url_format(url: str, fallback: str = "remote") -> str:
 # 13152 of the 13154 values carry surrounding whitespace (`<![CDATA[ Mensal]]>`), and the
 # same value appears in different capitalisations (`Decenal`/`decenal`,
 # `Não periódica`/`Não Periódica`).
+
+# The MIME types the harvested sources publish, mapped to the portal's format
+# names. Curated on purpose, and consulted before `mimetypes`: the standard
+# library answers `application/xml` with `.xsl`, which is an artefact of its
+# table rather than the format of the resource, and it knows none of the
+# `application/csv|xls|xlsx` spellings the sources use.
+MIME_FORMATS = {
+    "application/json": "json",
+    "application/ld+json": "jsonld",
+    "application/xml": "xml",
+    "text/xml": "xml",
+    "application/csv": "csv",
+    "text/csv": "csv",
+    "application/xls": "xls",
+    "application/xlsx": "xlsx",
+    "application/geo+json": "geojson",
+    "application/gml+xml": "gml",
+}
+
+
+def guess_format_from_mime(
+    mime: str | None, url: str | None = None, fallback: str | None = None
+) -> str | None:
+    """Derive a resource format from a MIME type, falling back to `url`.
+
+    The single MIME-to-format guess for every harvest backend: the curated
+    table first, then `mimetypes`, then the URL through `guess_url_format` -
+    the single URL guess - and `fallback` when nothing resolves. The result is
+    always lower case; a backend that publishes formats differently maps the
+    result itself rather than guessing again.
+    """
+    if mime:
+        mapped = MIME_FORMATS.get(mime.strip().lower())
+        if mapped:
+            return mapped
+        extension = mimetypes.guess_extension(mime)
+        if extension:
+            return extension.lstrip(".").lower()
+    if url:
+        return guess_url_format(url, fallback=fallback)
+    return fallback
+
+
 INE_PERIODICITY: dict[str, UpdateFrequency] = {
     "anual": UpdateFrequency.ANNUAL,
     "mensal": UpdateFrequency.MONTHLY,
