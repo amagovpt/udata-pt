@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -302,3 +303,45 @@ class OdsBackendPTLicenseTest(OdsBackendPTSnsTestCase):
         dataset = self.harvest(rmock, _sns_payload(license="cc-by"))
 
         assert dataset.license.id == "cc-by"
+
+
+class OdsBackendPTDatesTest(OdsBackendPTSnsTestCase):
+    """`dcat.created` and `dcat.issued` become the dataset's dates."""
+
+    def test_the_dcat_dates_land_on_the_harvest_metadata_and_the_listing_date(self, rmock):
+        # As recorded: created 2016-01-24, issued 2018-12-31.
+        dataset = self.harvest(rmock)
+        assert dataset.harvest.created_at == datetime(2016, 1, 24)
+        assert dataset.harvest.issued_at == datetime(2018, 12, 31)
+        assert dataset.created_at == datetime(2018, 12, 31)
+        # What `DEFAULT_SORTING` sorts the public listing on.
+        assert dataset.created_at_internal == dataset.created_at
+
+    def test_created_stands_in_without_issued(self, rmock):
+        dataset = self.harvest(rmock, _sns_payload(dcat={"issued": None}))
+        assert dataset.harvest.issued_at is None
+        assert dataset.created_at_internal == datetime(2016, 1, 24)
+
+    def test_no_dates_leave_the_listing_date_alone(self, rmock):
+        before = datetime.now(UTC) - timedelta(minutes=1)
+        dataset = self.harvest(rmock, _sns_payload(dcat={"created": None, "issued": None}))
+        assert dataset.harvest.created_at is None
+        assert dataset.created_at_internal > before
+
+    @pytest.mark.parametrize("published", ["não é uma data", "1623715200000"])
+    def test_an_unreadable_date_does_not_fail_the_item(self, rmock, published):
+        dataset = self.harvest(rmock, _sns_payload(dcat={"issued": published}))
+        assert dataset.harvest.issued_at is None
+        assert dataset.created_at_internal == datetime(2016, 1, 24)
+
+    def test_a_future_date_is_refused(self, rmock):
+        ahead = (datetime.now(UTC) + timedelta(days=365)).isoformat()
+        dataset = self.harvest(rmock, _sns_payload(dcat={"issued": ahead}))
+        assert dataset.harvest.issued_at is None
+
+    def test_the_dates_survive_a_re_harvest(self, rmock):
+        source = HarvestSourceFactory(backend="odspt", url=ODS_URL, organization=None, owner=None)
+        self.harvest(rmock, source=source)
+        dataset = self.harvest(rmock, source=source)
+        assert dataset.harvest.issued_at == datetime(2018, 12, 31)
+        assert dataset.created_at_internal == datetime(2018, 12, 31)

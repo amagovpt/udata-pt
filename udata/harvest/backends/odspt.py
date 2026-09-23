@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from dateutil.parser import parse as parse_date
 
 from udata.core.dataset.constants import UpdateFrequency
+from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
@@ -13,7 +14,7 @@ from udata.harvest.models import HarvestItem
 from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.i18n import gettext as _
 from udata.models import License, Resource
-from udata.utils import get_by
+from udata.utils import get_by, safe_harvest_datetime
 
 from .tools.harvester_utils import (
     guess_format_from_mime,
@@ -208,6 +209,24 @@ class OdsBackendPT(BaseBackend):
         if not isinstance(dcat, dict):
             dcat = {}
         dataset.frequency = self._frequency(dcat.get("accrualperiodicity"))
+
+        # `created` on 141 and `issued` on 120 of the 144 SNS datasets (2026-09-23).
+        # Written only when they parse, so a re-harvest of a record that stops
+        # publishing one keeps the last date read, as in `dgt`.
+        created = safe_harvest_datetime(dcat.get("created"), "ODS dcat.created", refuse_future=True)
+        issued = safe_harvest_datetime(dcat.get("issued"), "ODS dcat.issued", refuse_future=True)
+        if created or issued:
+            if not dataset.harvest:
+                dataset.harvest = HarvestDatasetMetadata()
+            if created:
+                dataset.harvest.created_at = created
+            if issued:
+                dataset.harvest.issued_at = issued
+            # The public listing sorts on `created_at_internal` (`DEFAULT_SORTING`),
+            # while the dataset shows `Dataset.created_at`, which reads
+            # `harvest.issued_at or harvest.created_at`. Same precedence here, so the
+            # order of the listing agrees with the date on each card.
+            dataset.created_at_internal = dataset.harvest.issued_at or dataset.harvest.created_at
         description = ods_metadata.get("description", "").strip()
         dataset.description = parse_html(description)
         dataset.private = False
