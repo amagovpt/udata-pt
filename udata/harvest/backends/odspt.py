@@ -1,9 +1,13 @@
 import logging
 import mimetypes
+import re
 from urllib.parse import urlparse
 
 from dateutil.parser import parse as parse_date
 
+from udata.core.dataset.constants import UpdateFrequency
+from udata.core.dataset.models import HarvestDatasetMetadata
+from udata.core.utils.sanitization import sanitize_strict
 from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
@@ -11,15 +15,29 @@ from udata.harvest.models import HarvestItem
 from udata.harvest.url_filter import redact_url_credentials_in_url
 from udata.i18n import gettext as _
 from udata.models import License, Resource
-from udata.utils import get_by
+from udata.utils import get_by, safe_harvest_datetime
 
 from .tools.harvester_utils import (
+    bbox_to_spatial_coverage,
     guess_format_from_mime,
+    map_ine_periodicity,
     normalize_url_slashes,
+    reset_ine_periodicity_warnings,
     resolve_publisher_organization,
 )
 
 log = logging.getLogger(__name__)
+
+# A qualifier the SNS source appends to a periodicity, as in
+# "Diário (novembro a março)" or "Diária (dias úteis)".
+#
+# `[^()]*` rather than `.*?`: the text is remote, and a lazy dot in front of a closing
+# parenthesis that never comes rescans the rest of the line from every `(`, which is
+# quadratic -- reachable from the harvest preview, which runs on an HTTP worker.
+PERIODICITY_QUALIFIER_RE = re.compile(r"\s*\([^()]*\)\s*")
+
+# Longer than any periodicity the source publishes (the longest seen is 25 characters).
+MAX_PERIODICITY_LENGTH = 256
 
 
 def guess_mimetype(mimetype, url=None):
@@ -60,14 +78,6 @@ class OdsBackendPT(BaseBackend):
     # above this records count limit, shapefile export will be disabled
     # since it would be a partial export
     SHAPEFILE_RECORDS_LIMIT = 50000
-
-    LICENSES = {
-        "Open Database License (ODbL)": "odc-odbl",
-        "Licence Ouverte (Etalab)": "fr-lo",
-        "Licence ouverte / Open Licence": "fr-lo",
-        "CC BY-SA": "cc-by-sa",
-        "Public Domain": "other-pd",
-    }
 
     FORMATS = {
         "csv": ("CSV", "csv", "text/csv"),
@@ -127,7 +137,71 @@ class OdsBackendPT(BaseBackend):
     def export_url(self, dataset_id):
         return "{0}?tab=export".format(self.explore_url(dataset_id))
 
+    @staticmethod
+    def _frequency(text) -> UpdateFrequency:
+        """The dataset's frequency, from `interop_metas.dcat.accrualperiodicity`.
+
+        The SNS source writes a single periodicity for most datasets, but 11 of the 144
+        enumerated on 2026-09-23 combine several (`Anual | Mensal`) and a few qualify
+        theirs in parentheses. Each part is mapped by the shared periodicity map, and a
+        combination resolves to the most frequent of its parts: the data is updated at
+        least that often. Parts with no period of their own (`OTHER`, `IRREGULAR`) only
+        count when nothing else does.
+
+        "Most frequent" is the order `UpdateFrequency` declares its members in, from
+        `CONTINUOUS` down to `DECENNIAL`, not their `delta`: the deltas tie (ANNUAL,
+        SEMIANNUAL and THREE_TIMES_A_YEAR are all 365 days), which would let the order the
+        source lists the parts in decide.
+        """
+        if not isinstance(text, str):
+            return UpdateFrequency.UNKNOWN
+
+        parts = [
+            map_ine_periodicity(PERIODICITY_QUALIFIER_RE.sub(" ", part).strip())
+            for part in text[:MAX_PERIODICITY_LENGTH].split("|")
+        ]
+        known = [part for part in parts if part != UpdateFrequency.UNKNOWN]
+        periodic = [part for part in known if part.delta or part == UpdateFrequency.CONTINUOUS]
+        if periodic:
+            ranking = list(UpdateFrequency)
+            return min(periodic, key=ranking.index)
+        return known[0] if known else UpdateFrequency.UNKNOWN
+
+    @staticmethod
+    def _bbox_boxes(bbox) -> list[tuple[float, float, float, float]]:
+        """`metas.bbox` as `(minx, miny, maxx, maxy)` tuples, one per polygon.
+
+        ODS computes it from the records and publishes it as a GeoJSON `Polygon` --
+        on 49 of the 144 SNS datasets on 2026-09-23 -- so its envelope is the box.
+        A `MultiPolygon` is tolerated; any other shape is skipped rather than
+        guessed at, and the shared helper drops what is not geographic.
+        """
+        if not isinstance(bbox, dict):
+            return []
+        coordinates = bbox.get("coordinates")
+        if bbox.get("type") == "Polygon":
+            polygons = [coordinates]
+        elif bbox.get("type") == "MultiPolygon" and isinstance(coordinates, list):
+            polygons = coordinates
+        else:
+            return []
+
+        boxes = []
+        for polygon in polygons:
+            try:
+                points = [(float(x), float(y)) for ring in polygon for x, y in ring]
+            except (TypeError, ValueError):
+                continue
+            if points:
+                xs, ys = zip(*points)
+                boxes.append((min(xs), min(ys), max(xs), max(ys)))
+        return boxes
+
     def inner_harvest(self):
+        # An unmapped periodicity is warned about once per harvest, not once per
+        # dataset, and reported again on the next run.
+        reset_ine_periodicity_warnings()
+
         count = 0
         nhits = None
 
@@ -176,7 +250,34 @@ class OdsBackendPT(BaseBackend):
         dataset = self.get_dataset(item.remote_id)
 
         dataset.title = ods_metadata["title"]
-        dataset.frequency = "unknown"
+        dcat = ods_interopmetas.get("dcat")
+        if not isinstance(dcat, dict):
+            dcat = {}
+        dataset.frequency = self._frequency(dcat.get("accrualperiodicity"))
+
+        # `created` on 141 and `issued` on 120 of the 144 SNS datasets (2026-09-23).
+        # Written only when they parse, so a re-harvest of a record that stops
+        # publishing one keeps the last date read, as in `dgt`.
+        # Text only: `safe_harvest_datetime` hands a number or a list back untouched,
+        # and its future-date comparison would then raise and fail the item.
+        created, issued = (
+            safe_harvest_datetime(value, f"ODS dcat.{field}", refuse_future=True)
+            if isinstance(value, str)
+            else None
+            for field, value in (("created", dcat.get("created")), ("issued", dcat.get("issued")))
+        )
+        if created or issued:
+            if not dataset.harvest:
+                dataset.harvest = HarvestDatasetMetadata()
+            if created:
+                dataset.harvest.created_at = created
+            if issued:
+                dataset.harvest.issued_at = issued
+            # The public listing sorts on `created_at_internal` (`DEFAULT_SORTING`),
+            # while the dataset shows `Dataset.created_at`, which reads
+            # `harvest.issued_at or harvest.created_at`. Same precedence here, so the
+            # order of the listing agrees with the date on each card.
+            dataset.created_at_internal = dataset.harvest.issued_at or dataset.harvest.created_at
         description = ods_metadata.get("description", "").strip()
         dataset.description = parse_html(description)
         dataset.private = False
@@ -211,12 +312,12 @@ class OdsBackendPT(BaseBackend):
         dataset.tags = list(tags)
         dataset.tags.append(urlparse(self.source.url).hostname)
 
-        # Detect license
+        # Detect license. The map of labels this used to go through came from the
+        # French upstream (Licence Ouverte, Etalab) and the SNS source never uses it:
+        # `metas.license` is empty on all 144 of its datasets (2026-09-23), so the
+        # licence already set, or the portal default, is what stands.
         default_license = dataset.license or License.default()
-        license_id = ods_metadata.get("license")
-        dataset.license = License.guess(
-            license_id, self.LICENSES.get(license_id), default=default_license
-        )
+        dataset.license = License.guess(ods_metadata.get("license"), default=default_license)
 
         self.process_resources(dataset, ods_dataset, ("csv", "json"))
 
@@ -235,6 +336,24 @@ class OdsBackendPT(BaseBackend):
         if "references" in ods_metadata:
             dataset.extras["ods:references"] = ods_metadata["references"]
         dataset.extras["ods:has_records"] = ods_dataset["has_records"]
+
+        # Free text, kept as published. Sanitized because extras are marshalled raw by
+        # the API, as in `dgt` and `inehvd`; removed when the source stops publishing
+        # them, so an extra never outlives its source. `dcat.temporal` is left out on
+        # purpose: it is prose ("janeiro 2020 a agosto 2026"), not a date range.
+        for field in ("creator", "contributor", "spatial"):
+            value = dcat.get(field)
+            value = sanitize_strict(value).strip() if isinstance(value, str) else ""
+            if value:
+                dataset.extras[f"ods:{field}"] = value
+            else:
+                dataset.extras.pop(f"ods:{field}", None)
+
+        # Replaces the whole coverage when the source publishes a box, and leaves it
+        # alone otherwise: `SpatialCoverage.clean` refuses `zones` and `geom` together.
+        coverage = bbox_to_spatial_coverage(self._bbox_boxes(ods_metadata.get("bbox")))
+        if coverage:
+            dataset.spatial = coverage
         dataset.extras["ods:geo"] = "geo" in ods_dataset["features"]
 
         return dataset

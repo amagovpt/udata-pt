@@ -1,15 +1,18 @@
 import json
 import logging
 import os
+from datetime import date
 
 import pytest
 
+from udata.core.dataset.factories import LicenseFactory
 from udata.core.dataset.models import Resource
 from udata.core.organization.factories import OrganizationFactory
 from udata.models import ContactPoint, Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.ogc import OGCBackend
+from ..models import HarvestJob
 from .factories import HarvestSourceFactory
 
 OGC_URL = "https://geoportal.example.pt/ogc-api/collections?f=jsonld"
@@ -510,6 +513,58 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
         ]
         assert {r.url: r.id for r in dataset.resources} == kept_ids
 
+    def test_the_source_hostname_is_the_tag_not_dgterritorio(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+
+        # `TagListField` slugifies, as it did with the constant.
+        assert "geoportal-example-pt" in dataset.tags
+        assert "ogcapi-dgterritorio-gov-pt" not in dataset.tags
+
+    def test_a_re_harvest_drops_the_old_dgterritorio_tag(self, rmock):
+        """The datasets in production already carry it; no migration removes it."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+        dataset.tags.append("ogcapi.dgterritorio.gov.pt")
+        dataset.save()
+
+        dataset = self._harvest(rmock, source)
+
+        assert "ogcapi-dgterritorio-gov-pt" not in dataset.tags
+
+    def test_the_collection_url_becomes_the_remote_url(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+
+        assert dataset.harvest.remote_url == (
+            "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento"
+        )
+        # The harvest item carries it too, which is what the preview shows.
+        (item,) = HarvestJob.objects.order_by("-created").first().items
+        assert item.remote_url == dataset.harvest.remote_url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            None,
+            "",
+            "not a url",
+            "/ogc-api/collections/relative",
+            # Past the length bound it is not validated at all: `uris.validate`
+            # backtracks quadratically on a long hostname with no TLD.
+            "http://" + "a" * 200_000,
+        ],
+    )
+    def test_a_missing_or_unusable_url_does_not_fail_the_item(self, rmock, url):
+        item = _tml_item()
+        item["url"] = url
+        rmock.get(OGC_URL, text=_ogc_payload([item]))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+        assert dataset.harvest.remote_url is None
+
     def test_a_manual_upload_survives_the_transition(self, rmock):
         """Resources uploaded on the portal never belonged to the harvester."""
         source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
@@ -524,3 +579,163 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
         assert [r.title for r in dataset.resources if r.filetype == "file"] == [
             "Ficheiro carregado à mão"
         ]
+
+
+CC_BY_URL = "https://creativecommons.org/licenses/by/4.0/"
+ODBL_URL = "https://opendatacommons.org/licenses/odbl/1-0/"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCLicenseTest(PytestOnlyDBTestCase):
+    """The collection's licence, then the catalogue's, then `notspecified`."""
+
+    def _harvest(self, rmock, item, catalogue_license=None):
+        LicenseFactory(id="cc-by", title="Creative Commons Attribution", url=CC_BY_URL)
+        LicenseFactory(id="odc-odbl", title="Open Database License", url=ODBL_URL)
+        LicenseFactory(id="notspecified", title="License Not Specified", url=None)
+        payload = {"dataset": [item]}
+        if catalogue_license:
+            payload["license"] = catalogue_license
+        rmock.get(OGC_URL, text=json.dumps(payload))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_the_catalogue_license_stands_in_for_a_silent_item(self, rmock):
+        item = _item("a", "Rede", [])
+        dataset = self._harvest(rmock, item, catalogue_license=CC_BY_URL)
+        assert dataset.license.id == "cc-by"
+
+    def test_the_item_license_wins_over_the_catalogue(self, rmock):
+        item = {**_item("a", "Rede", []), "license": ODBL_URL}
+        dataset = self._harvest(rmock, item, catalogue_license=CC_BY_URL)
+        assert dataset.license.id == "odc-odbl"
+
+    def test_a_catalogue_license_object_is_read_by_its_url(self, rmock):
+        item = _item("a", "Rede", [])
+        catalogue_license = {"@type": "CreativeWork", "url": CC_BY_URL}
+        dataset = self._harvest(rmock, item, catalogue_license=catalogue_license)
+        assert dataset.license.id == "cc-by"
+
+    def test_an_unreadable_license_object_is_notspecified_not_a_failure(self, rmock):
+        item = {**_item("a", "Rede", []), "license": {"name": "sem url"}}
+        dataset = self._harvest(rmock, item, catalogue_license=["not", "text"])
+        assert dataset.license.id == "notspecified"
+
+    def test_no_license_anywhere_is_notspecified(self, rmock):
+        dataset = self._harvest(rmock, _item("a", "Rede", []))
+        assert dataset.license.id == "notspecified"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCTemporalCoverageTest(PytestOnlyDBTestCase):
+    """`temporalCoverage` becomes the dataset's `DateRange` when it names dates."""
+
+    def _harvest(self, rmock, temporal):
+        item = _tml_item()
+        if temporal is None:
+            item.pop("temporalCoverage")
+        else:
+            item["temporalCoverage"] = temporal
+        rmock.get(OGC_URL, text=_ogc_payload([item]))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_none_slash_none_yields_no_coverage(self, rmock):
+        # What every recorded TML collection publishes.
+        assert _tml_item()["temporalCoverage"] == "None/None"
+        dataset = self._harvest(rmock, "None/None")
+        assert dataset.temporal_coverage is None
+        assert "temporal_coverage" not in dataset.extras
+
+    def test_an_iso_interval_becomes_a_date_range(self, rmock):
+        dataset = self._harvest(rmock, "2020-01-01/2021-12-31")
+        assert dataset.temporal_coverage.start == date(2020, 1, 1)
+        assert dataset.temporal_coverage.end == date(2021, 12, 31)
+
+    @pytest.mark.parametrize("temporal", ["2020-01-01/..", "2020-01-01/None"])
+    def test_an_open_end_keeps_the_start(self, rmock, temporal):
+        dataset = self._harvest(rmock, temporal)
+        assert dataset.temporal_coverage.start == date(2020, 1, 1)
+        assert dataset.temporal_coverage.end is None
+
+    @pytest.mark.parametrize(
+        "temporal, start, end",
+        [
+            ("2019/2021", date(2019, 1, 1), date(2021, 12, 31)),
+            ("2019-03/2019-05", date(2019, 3, 1), date(2019, 5, 31)),
+            ("2019/..", date(2019, 1, 1), None),
+        ],
+    )
+    def test_a_partial_bound_covers_its_whole_period(self, rmock, temporal, start, end):
+        """`dateutil` would fill the missing parts from today, moving on every harvest."""
+        dataset = self._harvest(rmock, temporal)
+        assert (dataset.temporal_coverage.start, dataset.temporal_coverage.end) == (start, end)
+
+    def test_a_single_year_covers_the_year(self, rmock):
+        dataset = self._harvest(rmock, "2020")
+        assert dataset.temporal_coverage.start == date(2020, 1, 1)
+        assert dataset.temporal_coverage.end == date(2020, 12, 31)
+
+    @pytest.mark.parametrize("temporal", ["janeiro a março", "2020-13-45/2021-01-01", None])
+    def test_unreadable_text_does_not_fail_the_item(self, rmock, temporal):
+        dataset = self._harvest(rmock, temporal)
+        assert dataset.temporal_coverage is None
+
+    def test_the_raw_extra_left_by_earlier_harvests_is_removed(self, rmock):
+        dataset = self._harvest(rmock, "None/None")
+        dataset.extras["temporal_coverage"] = "None/None"
+        dataset.save()
+        dataset = self._harvest(rmock, "None/None")
+        assert "temporal_coverage" not in dataset.extras
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCSpatialTest(PytestOnlyDBTestCase):
+    """`spatial[].geo.box` becomes the dataset's spatial coverage."""
+
+    def _harvest(self, rmock, **overrides):
+        item = _tml_item()
+        for key, value in overrides.items():
+            if value is None:
+                item.pop(key, None)
+            else:
+                item[key] = value
+        rmock.get(OGC_URL, text=_ogc_payload([item]))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_the_tml_box_becomes_a_multipolygon(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.spatial.geom["type"] == "MultiPolygon"
+        (ring,) = dataset.spatial.geom["coordinates"][0]
+        assert ring[0] == [-9.4972, 38.4194]
+        assert ring[2] == [-8.4575, 39.0792]
+
+    def test_no_spatial_yields_no_coverage(self, rmock):
+        dataset = self._harvest(rmock, spatial=None)
+        assert dataset.spatial is None
+
+    @pytest.mark.parametrize(
+        "spatial",
+        [
+            "Lisboa",
+            [{"geo": {"box": "lixo"}}],
+            [{"geo": {"box": "-9.4,38.4 -8.4"}}],
+            [{"geo": {"box": "a,b c,d"}}],
+            [{"geo": {"box": "-120000,-300000 165000,280000"}}],
+            [{"geo": "box"}, 42],
+        ],
+    )
+    def test_an_unusable_spatial_does_not_fail_the_item(self, rmock, spatial):
+        dataset = self._harvest(rmock, spatial=spatial)
+        assert dataset.spatial is None

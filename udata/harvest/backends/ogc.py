@@ -1,12 +1,23 @@
 import logging
 
-from udata.core.contact_point.models import ContactPoint
+from dateutil.parser import parse as parse_dt
+
+from udata import uris
+from udata.core.dataset.models import HarvestDatasetMetadata
+from udata.core.dataset.rdf import temporal_from_literal
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.models import HarvestItem
 from udata.i18n import gettext as _
 from udata.models import License
+from udata.mongo.datetime_fields import DateRange
 
-from .tools.harvester_utils import guess_format_from_mime, guess_url_format, sync_resources
+from .tools.harvester_utils import (
+    attach_publisher_contact,
+    bbox_to_spatial_coverage,
+    guess_format_from_mime,
+    guess_url_format,
+    sync_resources,
+)
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +31,15 @@ SCHEMA_DISTRIBUTION_LABEL = "Schema of collection in JSON"
 # upper-cased format name: `GeoJSON` and `JSON-LD`. The guess itself is shared
 # (`guess_format_from_mime`), so only the spelling is kept here.
 FORMAT_LABELS = {"geojson": "GeoJSON", "jsonld": "JSON-LD"}
+
+# How an interval says it has no start or no end. `..` is what OGC API -
+# Common writes for an open bound; `None` is what the TML source writes, as the
+# Python repr of a missing value.
+OPEN_INTERVAL_BOUNDS = frozenset({"", "..", "none", "null"})
+
+# `uris.validate` backtracks quadratically on a long hostname with no valid TLD, and the
+# url is remote: past this it is not a page link, and it is not validated at all.
+MAX_REMOTE_URL_LENGTH = 2048
 
 
 class OGCBackend(BaseBackend):
@@ -110,8 +130,13 @@ class OGCBackend(BaseBackend):
                 "description": each.get("description") or "",
                 "keywords": keywords,
                 "distributions": each.get("distribution") or [],
-                "license": each.get("license"),
+                # The catalogue publishes a licence of its own for the
+                # collections that carry none, the same way it does `provider`.
+                "license": self._license_text(each.get("license"))
+                or self._license_text(data.get("license")),
                 "temporal_coverage": each.get("temporalCoverage"),
+                "url": each.get("url"),
+                "spatial_boxes": self._spatial_boxes(each.get("spatial")),
                 "provider": each.get("provider") or data.get("provider"),
             }
 
@@ -127,7 +152,13 @@ class OGCBackend(BaseBackend):
         # Set basic dataset fields
         dataset.title = item_data["title"]
         dataset.description = item_data["description"]
-        dataset.tags = ["ogcapi.dgterritorio.gov.pt"]
+        # The source's own host. The constant that stood here named the DGT OGC
+        # API, so every dataset harvested from any other OGC source -- the TML
+        # collections, the one source configured -- carried the DGT's tag. The
+        # tag list is rebuilt on every run, so the old tag goes on the first
+        # harvest. An empty hostname would fail `TagListField` on its minimum
+        # length.
+        dataset.tags = [self.source.domain] if self.source.domain else []
 
         # Add keywords as tags
         keywords = item_data.get("keywords", [])
@@ -219,10 +250,44 @@ class OGCBackend(BaseBackend):
             # Fallback if guess failed or no license provided
             dataset.license = License.guess("notspecified")
 
-        # Temporal Coverage
-        temporal = item_data.get("temporal_coverage")
-        if temporal:
-            dataset.extras["temporal_coverage"] = temporal
+        # The collection's own page. Reset first, so a collection that stops
+        # announcing one does not keep yesterday's. `remote_url` is a validated
+        # `URLField`: an unusable link would raise at `save()` and cost the
+        # whole item, so it costs the link instead -- as in `cswudata`.
+        if not dataset.harvest:
+            dataset.harvest = HarvestDatasetMetadata()
+        dataset.harvest.remote_url = None
+        url = item_data.get("url")
+        if isinstance(url, str) and len(url) > MAX_REMOTE_URL_LENGTH:
+            log.warning("OGC collection %r announces a url too long to keep", item.remote_id)
+        elif isinstance(url, str) and url.strip():
+            try:
+                uris.validate(url)
+            except uris.ValidationError:
+                log.warning(
+                    "OGC collection %r announces an unusable url %r",
+                    item.remote_id,
+                    url[:200],
+                )
+            else:
+                dataset.harvest.remote_url = url.strip()
+
+        # Replaces the whole coverage when the source publishes one, and leaves
+        # it alone otherwise: `SpatialCoverage.clean` refuses `zones` and
+        # `geom` together, so the two cannot be merged.
+        spatial = bbox_to_spatial_coverage(item_data.get("spatial_boxes") or [])
+        if spatial:
+            dataset.spatial = spatial
+
+        # Only set when it parses, so a coverage entered by hand is not
+        # replaced with nothing by a source that publishes none.
+        coverage = self._temporal_coverage(item_data.get("temporal_coverage"))
+        if coverage:
+            dataset.temporal_coverage = coverage
+        # The raw text used to be kept here instead. `get_dataset` reuses the
+        # stored extras, so without the `pop` every TML dataset already
+        # harvested would keep its `"None/None"`; nothing reads the key.
+        dataset.extras.pop("temporal_coverage", None)
 
         # Provider/Publisher
         provider = item_data.get("provider")
@@ -230,50 +295,104 @@ class OGCBackend(BaseBackend):
             dataset.extras["publisher_name"] = provider.get("name")
             dataset.extras["publisher_email"] = provider.get("contactPoint", {}).get("email")
 
-            # Create contact point
-            name = provider.get("name")
             email = provider.get("contactPoint", {}).get("email") or provider.get("email")
-            if email:
-                email = email.replace("mailto:", "").strip()
-
-            if name or email:
-                org_or_owner = {}
-                if dataset.organization:
-                    org_or_owner = {"organization": dataset.organization}
-                elif dataset.owner:
-                    org_or_owner = {"owner": dataset.owner}
-
-                if org_or_owner:
-                    if self.dryrun:
-                        # A preview creates nothing: only reuse an existing contact
-                        # point, never mint one. Mongoengine cannot reference an
-                        # unsaved document, so there is nothing to put on the item
-                        # when none matches - the same guard upstream applies in
-                        # `contact_points_from_rdf` for the DCAT path.
-                        #
-                        # `get()`, not `first()`: `get_or_create` ends on a `get`, so
-                        # duplicates matching this query fail a real run. Predicting
-                        # that failure is the preview's job - `first()` would quietly
-                        # pick one of them and report the item as fine.
-                        try:
-                            contact = ContactPoint.objects.get(
-                                name=name, email=email, role="publisher", **org_or_owner
-                            )
-                        except ContactPoint.DoesNotExist:
-                            contact = None
-                    else:
-                        contact, _ = ContactPoint.objects.get_or_create(
-                            name=name, email=email, role="publisher", **org_or_owner
-                        )
-
-                    if contact:
-                        if not dataset.contact_points:
-                            dataset.contact_points = []
-
-                        if contact not in dataset.contact_points:
-                            dataset.contact_points.append(contact)
+            attach_publisher_contact(self, dataset, provider.get("name"), email)
 
         return dataset
+
+    @staticmethod
+    def _spatial_boxes(spatial) -> list[tuple[float, float, float, float]]:
+        """The collection's bounding boxes, as `(minx, miny, maxx, maxy)` tuples.
+
+        schema.org puts them in `spatial[].geo.box`, a `GeoShape` written as two
+        space-separated corners. The standard orders each corner `lat,lon`; the
+        TML source writes `lon,lat` -- its `-9.4972,38.4194 -8.4575,39.0792`
+        only lands on Lisbon in that order -- and it is the one OGC source
+        configured, so that is the order read. A source following the standard
+        for Portugal would still pass the range check, only transposed.
+
+        Anything else is skipped rather than guessed at; the shared helper then
+        drops what is not geographic.
+        """
+        if isinstance(spatial, dict):
+            spatial = [spatial]
+        elif not isinstance(spatial, list):
+            return []
+
+        boxes = []
+        for place in spatial:
+            geo = place.get("geo") if isinstance(place, dict) else None
+            box = geo.get("box") if isinstance(geo, dict) else None
+            if not isinstance(box, str):
+                continue
+            corners = box.split()
+            if len(corners) != 2:
+                continue
+            try:
+                (minx, miny), (maxx, maxy) = (
+                    tuple(float(value) for value in corner.split(",")) for corner in corners
+                )
+            except ValueError:
+                continue
+            boxes.append((minx, miny, maxx, maxy))
+        return boxes
+
+    @staticmethod
+    def _license_text(value) -> str | None:
+        """A licence as text, from a URL or from a schema.org `CreativeWork` object.
+
+        `License.guess` only reads strings; an object reaching it raises, and at the
+        catalogue level that would fail every collection without a licence of its own.
+        """
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("@id")
+        return value if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def _interval_bound(text: str, end: bool):
+        """One bound of an interval, as a date.
+
+        A bound given as a year or a year-month covers the whole period, so a start
+        takes its first day and an end its last -- `dateutil` would fill the missing
+        parts from today instead, and the stored coverage would move on every harvest.
+        """
+        if text.count("-") <= 1:
+            period = temporal_from_literal(text)
+            if period:
+                return period.end if end else period.start
+        return parse_dt(text).date()
+
+    @staticmethod
+    def _temporal_coverage(text) -> DateRange | None:
+        """The collection's `temporalCoverage`, or `None` when it names no dates.
+
+        schema.org writes it as an ISO 8601 interval, `start/end`. Either bound
+        may be open, and the TML source writes both open as `None/None` on
+        every collection, which is no coverage at all. Anything else --
+        a single year or month -- goes through `temporal_from_literal`, the
+        parser the DCAT path uses.
+
+        Never raises: a coverage that does not parse must not fail the item.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+        text = text.strip()
+        try:
+            if text.count("/") == 1:
+                start, end = (
+                    None if bound.strip().casefold() in OPEN_INTERVAL_BOUNDS else bound.strip()
+                    for bound in text.split("/")
+                )
+                if not (start or end):
+                    return None
+                return DateRange(
+                    start=OGCBackend._interval_bound(start, end=False) if start else None,
+                    end=OGCBackend._interval_bound(end, end=True) if end else None,
+                )
+            return temporal_from_literal(text)
+        except (ValueError, OverflowError):
+            log.warning("OGC: unreadable temporalCoverage %r", text[:200])
+            return None
 
     def _distribution_label(self, dist: dict) -> str:
         """The human label a distribution carries, as the resource title reads it.

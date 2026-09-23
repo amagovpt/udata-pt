@@ -9,8 +9,11 @@ from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import requests
+from mongoengine.errors import ValidationError
 
+from udata.core.contact_point.models import ContactPoint
 from udata.core.dataset.constants import UpdateFrequency
+from udata.core.spatial.models import SpatialCoverage
 from udata.models import License, Organization, Resource
 
 log = logging.getLogger(__name__)
@@ -260,6 +263,70 @@ def resolve_publisher_organization(
     return organization
 
 
+def attach_publisher_contact(backend, dataset, name: str | None, email: str | None) -> None:
+    """Attach the `publisher` contact point `name`/`email` to `dataset`.
+
+    Extracted from `ogc.py`, where it was written first, so DGT does not carry a
+    second copy of the `dryrun` handling. The contact point belongs to the
+    dataset's organization, or to its owner; with neither there is nothing to
+    attach it to and the call does nothing.
+
+    A preview creates nothing: it only reuses an existing contact point, never
+    mints one. Mongoengine cannot reference an unsaved document, so there is
+    nothing to put on the item when none matches -- the same guard upstream
+    applies in `contact_points_from_rdf` for the DCAT path.
+
+    `get()`, not `first()`: `get_or_create` ends on a `get`, so duplicates
+    matching this query fail a real run. Predicting that failure is the
+    preview's job -- `first()` would quietly pick one of them and report the
+    item as fine.
+
+    Contact points are only ever added: one the source no longer publishes stays
+    on the dataset.
+    """
+    if email:
+        email = email.replace("mailto:", "").strip()
+    if not (name or email):
+        return
+
+    if dataset.organization:
+        org_or_owner = {"organization": dataset.organization}
+    elif dataset.owner:
+        org_or_owner = {"owner": dataset.owner}
+    else:
+        return
+
+    if backend.dryrun:
+        try:
+            contact = ContactPoint.objects.get(
+                name=name, email=email, role="publisher", **org_or_owner
+            )
+        except ContactPoint.DoesNotExist:
+            contact = None
+    else:
+        try:
+            contact, _ = ContactPoint.objects.get_or_create(
+                name=name, email=email, role="publisher", **org_or_owner
+            )
+        except ValidationError as error:
+            # The model validates on creation -- a missing name, a name over 255
+            # characters, a value that is not a string. A contact it refuses costs
+            # the contact, not the item.
+            log.warning(
+                "Publisher contact point %r <%r> refused: %s",
+                repr(name)[:200],
+                repr(email)[:200],
+                error,
+            )
+            return
+
+    if contact:
+        if not dataset.contact_points:
+            dataset.contact_points = []
+        if contact not in dataset.contact_points:
+            dataset.contact_points.append(contact)
+
+
 def build_resource_url(raw_url: str) -> str:
     """Turn a raw `dct:references` link into the URL published on the resource.
 
@@ -398,6 +465,17 @@ INE_PERIODICITY: dict[str, UpdateFrequency] = {
     "diario": UpdateFrequency.DAILY,
     "bimestral": UpdateFrequency.BIMONTHLY,
     "ocasional": UpdateFrequency.IRREGULAR,
+    # Added for the ODS SNS source (`dcat.accrualperiodicity`), enumerated over its 144
+    # datasets on 2026-09-23. None of these changes a value INE already maps.
+    "diária": UpdateFrequency.DAILY,
+    "diaria": UpdateFrequency.DAILY,
+    # Every fifteen days: the same member ISO 19115's `fortnightly` maps to below.
+    "quinzenal": UpdateFrequency.BIWEEKLY,
+    # Every four months.
+    "quadrimestral": UpdateFrequency.THREE_TIMES_A_YEAR,
+    # 7 of the 144 SNS datasets spell it in English.
+    "annual": UpdateFrequency.ANNUAL,
+    "monthly": UpdateFrequency.MONTHLY,
 }
 
 # Warn once per unseen value: a single INE harvest walks ~13k indicators, and an unmapped
@@ -413,7 +491,11 @@ def reset_ine_periodicity_warnings() -> None:
 
 
 def map_ine_periodicity(text: str | None) -> UpdateFrequency:
-    """Map INE's `<periodicity>` text onto `UpdateFrequency`.
+    """Map a Portuguese periodicity text onto `UpdateFrequency`.
+
+    Written for INE's `<periodicity>`, and the one periodicity map shared with the ODS
+    backend. The shape of a source's own values -- ODS combines several with `|` -- is
+    settled by that backend before calling this; the match here stays exact.
 
     Returns `UpdateFrequency.UNKNOWN` for empty, missing or unrecognised values and never
     raises: a periodicity we cannot name must not fail the item being harvested.
@@ -434,9 +516,10 @@ def map_ine_periodicity(text: str | None) -> UpdateFrequency:
 
     frequency = INE_PERIODICITY.get(key)
     if frequency is None:
-        if key not in _warned_periodicities:
-            _warned_periodicities.add(key)
-            log.warning("Unmapped INE <periodicity> value: %r", text.strip())
+        if key[:200] not in _warned_periodicities:
+            # Bounded: the text is remote, and this set lives as long as the worker.
+            _warned_periodicities.add(key[:200])
+            log.warning("Unmapped periodicity value: %r", text.strip()[:200])
         return UpdateFrequency.UNKNOWN
 
     return frequency
@@ -483,6 +566,40 @@ def bbox_to_multipolygon(boxes: list[tuple[float, float, float, float]]) -> dict
             ]
         )
     return {"type": "MultiPolygon", "coordinates": polygons}
+
+
+def _is_geographic_box(box) -> bool:
+    """Whether `box` is four coordinates on Earth, in degrees.
+
+    Also what rejects `nan` and `inf`, which `float` parses happily: every
+    comparison against NaN is false, and the infinities fall outside the bounds.
+    A non-finite or projected corner would otherwise reach `SpatialCoverage.geom`
+    intact and fail the item at save time, or put the dataset several thousand
+    degrees off the map -- `spatial.geom` carries no 2dsphere index to refuse it.
+    """
+    try:
+        minx, miny, maxx, maxy = (float(value) for value in box)
+    except (TypeError, ValueError):
+        return False
+    return -180 <= minx <= 180 and -180 <= maxx <= 180 and -90 <= miny <= 90 and -90 <= maxy <= 90
+
+
+def bbox_to_spatial_coverage(
+    boxes: list[tuple[float, float, float, float]],
+) -> SpatialCoverage | None:
+    """The `SpatialCoverage` for one or more `(minx, miny, maxx, maxy)` boxes.
+
+    The one step every backend reading a bounding box ends with -- DGT's
+    `geoBox`, the OGC `GeoShape.box`, the ODS `metas.bbox` -- so each of them
+    only has to parse its own source's shape. Boxes that are not geographic are
+    dropped, and `None` is returned when none is left: the caller then keeps
+    whatever coverage the dataset already had rather than replacing it with
+    nothing.
+    """
+    valid = [box for box in boxes if _is_geographic_box(box)]
+    if not valid:
+        return None
+    return SpatialCoverage(geom=bbox_to_multipolygon(valid))
 
 
 # ISO 19115 publishes the update frequency as the `MD_MaintenanceFrequencyCode`

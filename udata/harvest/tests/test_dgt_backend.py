@@ -1,13 +1,17 @@
 """DGT harvester: resource identity (LEDG-2251) and licence derivation (LEDG-2518)."""
 
+import copy
 import json
+import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from mongoengine.errors import ValidationError
 
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import LicenseFactory
-from udata.models import License
+from udata.core.organization.factories import OrganizationFactory
+from udata.models import ContactPoint, License
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.dgt import (
@@ -1062,3 +1066,177 @@ class DGTSpatialHarvestTest(PytestOnlyDBTestCase):
             ],
         )
         assert len(dataset.spatial.geom["coordinates"]) == 2
+
+
+class DGTSourceTagTest(PytestOnlyDBTestCase):
+    """The tag names the host the record was harvested from."""
+
+    def test_the_tag_is_the_hostname_of_the_source(self, rmock):
+        url = "https://snig.example.pt/rndg/srv/por/q?_content_type=json"
+        rmock.get(url, text=_index_payload([_index_record(REMOTE_ID, None)]))
+        source = HarvestSourceFactory(backend="dgt", url=url)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+
+        # `TagListField` slugifies, as it did with the constant.
+        dataset = harvested_dataset(REMOTE_ID)
+        assert "snig-example-pt" in dataset.tags
+        assert "snig-dgterritorio-gov-pt" not in dataset.tags
+
+
+# One record copied verbatim out of the SNIG index on 2026-09-23, via
+# `?_content_type=json&fast=index&resultType=details&from=1&to=1`, with the
+# editor's `userinfo` removed. It carries no `publicationDate` -- only a
+# `referenceDate` and a `changeDate` -- and two `responsibleParty` entries.
+SNIG_RECORD_PATH = os.path.join(os.path.dirname(__file__), "dgt", "snig_record.json")
+with open(SNIG_RECORD_PATH, encoding="utf-8") as fh:
+    SNIG_RECORD = json.load(fh)["metadata"][0]
+SNIG_REMOTE_ID = SNIG_RECORD["geonet:info"]["uuid"]
+
+
+def _recorded_record(**overrides):
+    """The recorded SNIG record, with `overrides` set and `None` values removed."""
+    record = copy.deepcopy(SNIG_RECORD)
+    for key, value in overrides.items():
+        if value is None:
+            record.pop(key, None)
+        else:
+            record[key] = value
+    return record
+
+
+class DGTChangeDateTest(PytestOnlyDBTestCase):
+    """The dates the listing and `Dataset.last_modified` read, from the source."""
+
+    def _harvest(self, rmock, **overrides):
+        rmock.get(DGT_URL, text=_index_payload([_recorded_record(**overrides)]))
+        source = HarvestSourceFactory(backend="dgt", url=DGT_URL)
+        job = DGTBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return harvested_dataset(SNIG_REMOTE_ID)
+
+    def test_the_publication_date_also_drives_the_listing_order(self, rmock):
+        dataset = self._harvest(rmock, publicationDate="2016-07-01")
+        assert dataset.harvest.created_at == datetime(2016, 7, 1)
+        # What `DEFAULT_SORTING` sorts the public listing on.
+        assert dataset.created_at_internal == datetime(2016, 7, 1)
+
+    def test_the_recorded_reference_date_stands_in_for_the_listing_too(self, rmock):
+        # The record as published: `publicationDate` is absent.
+        dataset = self._harvest(rmock)
+        assert dataset.harvest.created_at == datetime(2016, 6, 17)
+        assert dataset.created_at_internal == datetime(2016, 6, 17)
+
+    def test_the_change_date_is_the_last_modification(self, rmock):
+        dataset = self._harvest(rmock)
+        assert dataset.harvest.modified_at == datetime(2018, 4, 7)
+        assert dataset.last_modified_internal == datetime(2018, 4, 7)
+        assert dataset.last_modified == datetime(2018, 4, 7)
+
+    def test_several_change_dates_resolve_to_the_latest(self, rmock):
+        dataset = self._harvest(rmock, changeDate=["2018-04-07", "2021-03-02", "2019-01-01"])
+        assert dataset.harvest.modified_at == datetime(2021, 3, 2)
+
+    @pytest.mark.parametrize("published", ["não é uma data", "1623715200000"])
+    def test_an_unreadable_change_date_does_not_fail_the_item(self, rmock, published):
+        dataset = self._harvest(rmock, changeDate=published)
+        assert dataset.harvest.modified_at is None
+
+    def test_a_future_change_date_is_refused(self, rmock):
+        ahead = (datetime.now(UTC) + timedelta(days=365)).strftime("%Y-%m-%d")
+        dataset = self._harvest(rmock, changeDate=ahead)
+        assert dataset.harvest.modified_at is None
+
+    def test_a_record_without_dates_keeps_the_harvest_dates(self, rmock):
+        dataset = self._harvest(rmock, referenceDate=None, changeDate=None)
+        assert dataset.harvest.created_at is None
+        assert dataset.harvest.modified_at is None
+
+
+IPMA = "Instituto Português do Mar e da Atmosfera, I.P. (IPMA, I.P.)"
+
+
+class DGTContactPointTest(PytestOnlyDBTestCase):
+    """`responsibleParty` becomes the dataset's `publisher` contact point.
+
+    The contact point belongs to the dataset's organization, so the source
+    carries one, as in `OGCBackendContactPointTest`.
+    """
+
+    def _source(self):
+        return HarvestSourceFactory(backend="dgt", url=DGT_URL, organization=OrganizationFactory())
+
+    def _harvest(self, rmock, dryrun=False, **overrides):
+        rmock.get(DGT_URL, text=_index_payload([_recorded_record(**overrides)]))
+        job = DGTBackend(self._source(), dryrun=dryrun).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return job
+
+    def test_the_responsible_party_becomes_the_publisher_contact(self, rmock):
+        self._harvest(rmock)
+        dataset = harvested_dataset(SNIG_REMOTE_ID)
+        (contact,) = dataset.contact_points
+        assert contact.role == "publisher"
+        assert contact.name == IPMA
+        # The `resource` entry, not the `metadata` one (`info@ipma.pt`).
+        assert contact.email == "maps.services@ipma.pt"
+
+    def test_the_metadata_entry_stands_in_for_the_resource_one(self, rmock):
+        self._harvest(rmock, responsibleParty=[SNIG_RECORD["responsibleParty"][0]])
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.email == "info@ipma.pt"
+
+    def test_the_organisation_name_stands_in_without_a_responsible_party(self, rmock):
+        self._harvest(rmock, responsibleParty=None)
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.name == IPMA
+        assert contact.email is None
+
+    def test_no_contact_without_either(self, rmock):
+        self._harvest(rmock, responsibleParty=None, orgNameSNIG=None)
+        assert harvested_dataset(SNIG_REMOTE_ID).contact_points == []
+
+    @pytest.mark.parametrize(
+        "published",
+        ["lixo", "Contacto|resource", ["Contacto|resource||||", 42]],
+    )
+    def test_a_malformed_responsible_party_does_not_fail_the_item(self, rmock, published):
+        self._harvest(rmock, responsibleParty=published)
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.name == IPMA
+
+    def test_an_invalid_email_is_dropped_not_the_item(self, rmock):
+        self._harvest(rmock, responsibleParty=[f"Contacto|resource|{IPMA}||não-é-email||||"])
+        (contact,) = harvested_dataset(SNIG_REMOTE_ID).contact_points
+        assert contact.email is None
+
+    @pytest.mark.options(SECURITY_EMAIL_VALIDATOR_ARGS=None)
+    def test_the_email_is_checked_for_shape_only(self, rmock, mocker):
+        """No MX lookup per record: `SECURITY_EMAIL_VALIDATOR_ARGS` is unset outside Testing."""
+        spy = mocker.patch("udata.harvest.backends.dgt.validate_email")
+        self._harvest(rmock)
+        assert spy.call_args.kwargs["check_deliverability"] is False
+
+    def test_a_contact_point_the_model_refuses_does_not_fail_the_item(self, rmock, mocker):
+        mocker.patch.object(
+            ContactPoint.objects.__class__, "get_or_create", side_effect=ValidationError("nope")
+        )
+        self._harvest(rmock)
+        assert harvested_dataset(SNIG_REMOTE_ID).contact_points == []
+
+    def test_a_preview_creates_no_contact_point(self, rmock):
+        job = self._harvest(rmock, dryrun=True)
+        assert len(list(ContactPoint.objects)) == 0
+        assert job.items[0].dataset.contact_points == []
+
+    def test_a_re_harvest_reuses_the_contact_point(self, rmock):
+        source = self._source()
+        rmock.get(DGT_URL, text=_index_payload([_recorded_record()]))
+        DGTBackend(source).harvest()
+        DGTBackend(source).harvest()
+        assert len(list(ContactPoint.objects)) == 1
+        assert len(harvested_dataset(SNIG_REMOTE_ID).contact_points) == 1
