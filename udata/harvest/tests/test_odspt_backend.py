@@ -1,11 +1,12 @@
-"""Tests for the OpenDataSoft PT backend.
+"""Tests for the OpenDataSoft PT backend."""
 
-Only the organization mapping is covered here: it is the one place this backend
-writes to the database on its own, outside what `BaseBackend` already guards.
-"""
+import copy
+import json
+import os
 
 import pytest
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.core.organization.factories import OrganizationFactory
 from udata.models import Organization
 from udata.tests.api import PytestOnlyDBTestCase
@@ -171,3 +172,109 @@ class OdsBackendPTCredentialedSourceTest(PytestOnlyDBTestCase):
         after = [(resource.id, resource.url) for resource in second.items[0].dataset.resources]
 
         assert after == before
+
+
+# One dataset recorded verbatim from `transparencia.sns.gov.pt` on 2026-09-23, via
+# `/api/datasets/1.0/search/?rows=1&interopmetas=true&refine.datasetid=...`. Chosen
+# among the 44 of 144 that carry `bbox`, `dcat.created`, `dcat.issued`,
+# `dcat.accrualperiodicity`, `dcat.creator`, `dcat.contributor` and `dcat.spatial`
+# together, so one record exercises every field the backend reads from the source.
+SNS_DATASET_PATH = os.path.join(os.path.dirname(__file__), "odspt", "sns_dataset.json")
+with open(SNS_DATASET_PATH, encoding="utf-8") as fh:
+    SNS_PAYLOAD = json.load(fh)
+SNS_DATASET = SNS_PAYLOAD["datasets"][0]
+SNS_DATASET_ID = SNS_DATASET["datasetid"]
+
+
+def _sns_payload(dcat=None, **metas):
+    """The recorded payload, with `dcat` and `metas` fields overridden.
+
+    A value of `None` removes the field instead.
+    """
+    payload = copy.deepcopy(SNS_PAYLOAD)
+    dataset = payload["datasets"][0]
+    for block, overrides in (
+        (dataset["interop_metas"]["dcat"], dcat or {}),
+        (dataset["metas"], metas),
+    ):
+        for key, value in overrides.items():
+            if value is None:
+                block.pop(key, None)
+            else:
+                block[key] = value
+    return payload
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["odspt"])
+class OdsBackendPTSnsTestCase(PytestOnlyDBTestCase):
+    """Harvests the recorded SNS dataset through the real search endpoint."""
+
+    def harvest(self, rmock, payload=None, source=None):
+        rmock.get(SEARCH_URL, json=payload or _sns_payload())
+        source = source or HarvestSourceFactory(
+            backend="odspt", url=ODS_URL, organization=None, owner=None
+        )
+        job = OdsBackendPT(source).harvest()
+        assert [item.status for item in job.items] == ["done"], [
+            error.message for item in job.items for error in item.errors
+        ]
+        return job.items[0].dataset
+
+
+# Every distinct `dcat.accrualperiodicity` among the 144 SNS datasets on 2026-09-23,
+# spelled exactly as published -- trailing spaces and doubled spaces included.
+OBSERVED_ODS_PERIODICITIES = {
+    "Mensal": UpdateFrequency.MONTHLY,
+    "Mensal ": UpdateFrequency.MONTHLY,
+    "monthly": UpdateFrequency.MONTHLY,
+    "Diária": UpdateFrequency.DAILY,
+    "Diaria": UpdateFrequency.DAILY,
+    "Diário": UpdateFrequency.DAILY,
+    "Diário (novembro a março)": UpdateFrequency.DAILY,
+    "Diária (dias úteis)": UpdateFrequency.DAILY,
+    "Anual": UpdateFrequency.ANNUAL,
+    "annual": UpdateFrequency.ANNUAL,
+    "Trimestral": UpdateFrequency.QUARTERLY,
+    "Semestral": UpdateFrequency.SEMIANNUAL,
+    "Quinzenal": UpdateFrequency.BIWEEKLY,
+    # Combinations resolve to the most frequent of their parts.
+    "Anual | Mensal": UpdateFrequency.MONTHLY,
+    "Anual | Mensal ": UpdateFrequency.MONTHLY,
+    "Anual | Trimestral": UpdateFrequency.QUARTERLY,
+    "Trimestral | Mensal": UpdateFrequency.MONTHLY,
+    "Quadrimestral  | Mensal": UpdateFrequency.MONTHLY,
+    "Mensal | Semestral": UpdateFrequency.MONTHLY,
+    "Semestral | Mensal": UpdateFrequency.MONTHLY,
+}
+
+
+class OdsBackendPTFrequencyTest(OdsBackendPTSnsTestCase):
+    """`dcat.accrualperiodicity` becomes the dataset's frequency."""
+
+    def test_mensal_maps_to_monthly(self, rmock):
+        # What the recorded dataset publishes.
+        assert SNS_DATASET["interop_metas"]["dcat"]["accrualperiodicity"] == "Mensal"
+        assert self.harvest(rmock).frequency == UpdateFrequency.MONTHLY
+
+    def test_every_observed_value_maps_off_unknown(self):
+        """The whole of what the source publishes, and none of it lands on UNKNOWN."""
+        assert len(OBSERVED_ODS_PERIODICITIES) == 20  # + one dataset without a value
+        for published, expected in OBSERVED_ODS_PERIODICITIES.items():
+            frequency = OdsBackendPT._frequency(published)
+            assert frequency == expected, published
+            assert frequency != UpdateFrequency.UNKNOWN, published
+
+    def test_quadrimestral_alone_is_three_times_a_year(self):
+        assert OdsBackendPT._frequency("Quadrimestral") == UpdateFrequency.THREE_TIMES_A_YEAR
+
+    def test_a_part_with_no_period_only_counts_alone(self):
+        assert OdsBackendPT._frequency("Ocasional | Anual") == UpdateFrequency.ANNUAL
+        assert OdsBackendPT._frequency("Ocasional") == UpdateFrequency.IRREGULAR
+
+    @pytest.mark.parametrize("published", [None, "", "Quando calha", "|", 42])
+    def test_no_usable_value_is_unknown(self, published):
+        assert OdsBackendPT._frequency(published) == UpdateFrequency.UNKNOWN
+
+    def test_a_dataset_without_the_field_is_unknown(self, rmock):
+        dataset = self.harvest(rmock, _sns_payload(dcat={"accrualperiodicity": None}))
+        assert dataset.frequency == UpdateFrequency.UNKNOWN

@@ -452,6 +452,17 @@ INE_PERIODICITY: dict[str, UpdateFrequency] = {
     "diario": UpdateFrequency.DAILY,
     "bimestral": UpdateFrequency.BIMONTHLY,
     "ocasional": UpdateFrequency.IRREGULAR,
+    # Added for the ODS SNS source (`dcat.accrualperiodicity`), enumerated over its 144
+    # datasets on 2026-09-23. None of these changes a value INE already maps.
+    "diária": UpdateFrequency.DAILY,
+    "diaria": UpdateFrequency.DAILY,
+    # Every fifteen days: the same member ISO 19115's `fortnightly` maps to below.
+    "quinzenal": UpdateFrequency.BIWEEKLY,
+    # Every four months.
+    "quadrimestral": UpdateFrequency.THREE_TIMES_A_YEAR,
+    # 7 of the 144 SNS datasets spell it in English.
+    "annual": UpdateFrequency.ANNUAL,
+    "monthly": UpdateFrequency.MONTHLY,
 }
 
 # Warn once per unseen value: a single INE harvest walks ~13k indicators, and an unmapped
@@ -467,7 +478,11 @@ def reset_ine_periodicity_warnings() -> None:
 
 
 def map_ine_periodicity(text: str | None) -> UpdateFrequency:
-    """Map INE's `<periodicity>` text onto `UpdateFrequency`.
+    """Map a Portuguese periodicity text onto `UpdateFrequency`.
+
+    Written for INE's `<periodicity>`, and the one periodicity map shared with the ODS
+    backend. The shape of a source's own values -- ODS combines several with `|` -- is
+    settled by that backend before calling this; the match here stays exact.
 
     Returns `UpdateFrequency.UNKNOWN` for empty, missing or unrecognised values and never
     raises: a periodicity we cannot name must not fail the item being harvested.
@@ -490,7 +505,7 @@ def map_ine_periodicity(text: str | None) -> UpdateFrequency:
     if frequency is None:
         if key not in _warned_periodicities:
             _warned_periodicities.add(key)
-            log.warning("Unmapped INE <periodicity> value: %r", text.strip())
+            log.warning("Unmapped periodicity value: %r", text.strip())
         return UpdateFrequency.UNKNOWN
 
     return frequency

@@ -1,9 +1,11 @@
 import logging
 import mimetypes
+import re
 from urllib.parse import urlparse
 
 from dateutil.parser import parse as parse_date
 
+from udata.core.dataset.constants import UpdateFrequency
 from udata.frontend.markdown import parse_html
 from udata.harvest.backends.base import BaseBackend, HarvestFeature, HarvestFilter
 from udata.harvest.exceptions import HarvestSkipException
@@ -15,11 +17,17 @@ from udata.utils import get_by
 
 from .tools.harvester_utils import (
     guess_format_from_mime,
+    map_ine_periodicity,
     normalize_url_slashes,
+    reset_ine_periodicity_warnings,
     resolve_publisher_organization,
 )
 
 log = logging.getLogger(__name__)
+
+# A qualifier the SNS source appends to a periodicity, as in
+# "Diário (novembro a março)" or "Diária (dias úteis)".
+PERIODICITY_QUALIFIER_RE = re.compile(r"\s*\(.*?\)\s*")
 
 
 def guess_mimetype(mimetype, url=None):
@@ -127,7 +135,35 @@ class OdsBackendPT(BaseBackend):
     def export_url(self, dataset_id):
         return "{0}?tab=export".format(self.explore_url(dataset_id))
 
+    @staticmethod
+    def _frequency(text) -> UpdateFrequency:
+        """The dataset's frequency, from `interop_metas.dcat.accrualperiodicity`.
+
+        The SNS source writes a single periodicity for most datasets, but 11 of the 144
+        enumerated on 2026-09-23 combine several (`Anual | Mensal`) and a few qualify
+        theirs in parentheses. Each part is mapped by the shared periodicity map, and a
+        combination resolves to the most frequent of its parts: the data is updated at
+        least that often. Parts with no period of their own (`OTHER`, `IRREGULAR`) only
+        count when nothing else does.
+        """
+        if not isinstance(text, str):
+            return UpdateFrequency.UNKNOWN
+
+        parts = [
+            map_ine_periodicity(PERIODICITY_QUALIFIER_RE.sub(" ", part).strip())
+            for part in text.split("|")
+        ]
+        known = [part for part in parts if part != UpdateFrequency.UNKNOWN]
+        periodic = [part for part in known if part.delta]
+        if periodic:
+            return min(periodic, key=lambda part: part.delta)
+        return known[0] if known else UpdateFrequency.UNKNOWN
+
     def inner_harvest(self):
+        # An unmapped periodicity is warned about once per harvest, not once per
+        # dataset, and reported again on the next run.
+        reset_ine_periodicity_warnings()
+
         count = 0
         nhits = None
 
@@ -176,7 +212,10 @@ class OdsBackendPT(BaseBackend):
         dataset = self.get_dataset(item.remote_id)
 
         dataset.title = ods_metadata["title"]
-        dataset.frequency = "unknown"
+        dcat = ods_interopmetas.get("dcat")
+        if not isinstance(dcat, dict):
+            dcat = {}
+        dataset.frequency = self._frequency(dcat.get("accrualperiodicity"))
         description = ods_metadata.get("description", "").strip()
         dataset.description = parse_html(description)
         dataset.private = False
