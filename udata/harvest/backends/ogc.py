@@ -2,6 +2,8 @@ import logging
 
 from dateutil.parser import parse as parse_dt
 
+from udata import uris
+from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.core.dataset.rdf import temporal_from_literal
 from udata.harvest.backends.base import BaseBackend, HarvestFilter
 from udata.harvest.models import HarvestItem
@@ -127,6 +129,7 @@ class OGCBackend(BaseBackend):
                 # collections that carry none, the same way it does `provider`.
                 "license": each.get("license") or data.get("license"),
                 "temporal_coverage": each.get("temporalCoverage"),
+                "url": each.get("url"),
                 "provider": each.get("provider") or data.get("provider"),
             }
 
@@ -239,6 +242,26 @@ class OGCBackend(BaseBackend):
         if not dataset.license:
             # Fallback if guess failed or no license provided
             dataset.license = License.guess("notspecified")
+
+        # The collection's own page. Reset first, so a collection that stops
+        # announcing one does not keep yesterday's. `remote_url` is a validated
+        # `URLField`: an unusable link would raise at `save()` and cost the
+        # whole item, so it costs the link instead -- as in `cswudata`.
+        if not dataset.harvest:
+            dataset.harvest = HarvestDatasetMetadata()
+        dataset.harvest.remote_url = None
+        url = item_data.get("url")
+        if isinstance(url, str) and url.strip():
+            try:
+                uris.validate(url)
+            except uris.ValidationError:
+                log.warning(
+                    "OGC collection %r announces an unusable url %r",
+                    item.remote_id,
+                    url[:200],
+                )
+            else:
+                dataset.harvest.remote_url = url.strip()
 
         # Only set when it parses, so a coverage entered by hand is not
         # replaced with nothing by a source that publishes none.

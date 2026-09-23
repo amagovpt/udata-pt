@@ -12,6 +12,7 @@ from udata.models import ContactPoint, Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.ogc import OGCBackend
+from ..models import HarvestJob
 from .factories import HarvestSourceFactory
 
 OGC_URL = "https://geoportal.example.pt/ogc-api/collections?f=jsonld"
@@ -530,6 +531,28 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, source)
 
         assert "ogcapi-dgterritorio-gov-pt" not in dataset.tags
+
+    def test_the_collection_url_becomes_the_remote_url(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+
+        assert dataset.harvest.remote_url == (
+            "https://geoportal.tmlmobilidade.pt/ogc-api/collections/cml_ciclovia_estacionamento"
+        )
+        # The harvest item carries it too, which is what the preview shows.
+        (item,) = HarvestJob.objects.order_by("-created").first().items
+        assert item.remote_url == dataset.harvest.remote_url
+
+    @pytest.mark.parametrize("url", [None, "", "not a url", "/ogc-api/collections/relative"])
+    def test_a_missing_or_unusable_url_does_not_fail_the_item(self, rmock, url):
+        item = _tml_item()
+        item["url"] = url
+        rmock.get(OGC_URL, text=_ogc_payload([item]))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        dataset = Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+        assert dataset.harvest.remote_url is None
 
     def test_a_manual_upload_survives_the_transition(self, rmock):
         """Resources uploaded on the portal never belonged to the harvester."""
