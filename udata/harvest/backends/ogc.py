@@ -37,6 +37,10 @@ FORMAT_LABELS = {"geojson": "GeoJSON", "jsonld": "JSON-LD"}
 # Python repr of a missing value.
 OPEN_INTERVAL_BOUNDS = frozenset({"", "..", "none", "null"})
 
+# `uris.validate` backtracks quadratically on a long hostname with no valid TLD, and the
+# url is remote: past this it is not a page link, and it is not validated at all.
+MAX_REMOTE_URL_LENGTH = 2048
+
 
 class OGCBackend(BaseBackend):
     """
@@ -254,7 +258,9 @@ class OGCBackend(BaseBackend):
             dataset.harvest = HarvestDatasetMetadata()
         dataset.harvest.remote_url = None
         url = item_data.get("url")
-        if isinstance(url, str) and url.strip():
+        if isinstance(url, str) and len(url) > MAX_REMOTE_URL_LENGTH:
+            log.warning("OGC collection %r announces a url too long to keep", item.remote_id)
+        elif isinstance(url, str) and url.strip():
             try:
                 uris.validate(url)
             except uris.ValidationError:

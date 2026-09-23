@@ -309,9 +309,9 @@ def attach_publisher_contact(backend, dataset, name: str | None, email: str | No
                 name=name, email=email, role="publisher", **org_or_owner
             )
         except ValidationError as error:
-            # The model validates on creation -- a URL in the name, a name over 255
-            # characters, and outside `settings.Testing` a live deliverability check
-            # of the email. A contact it refuses costs the contact, not the item.
+            # The model validates on creation -- a missing name, a name over 255
+            # characters, a value that is not a string. A contact it refuses costs
+            # the contact, not the item.
             log.warning(
                 "Publisher contact point %r <%r> refused: %s",
                 repr(name)[:200],
@@ -516,9 +516,10 @@ def map_ine_periodicity(text: str | None) -> UpdateFrequency:
 
     frequency = INE_PERIODICITY.get(key)
     if frequency is None:
-        if key not in _warned_periodicities:
-            _warned_periodicities.add(key)
-            log.warning("Unmapped periodicity value: %r", text.strip())
+        if key[:200] not in _warned_periodicities:
+            # Bounded: the text is remote, and this set lives as long as the worker.
+            _warned_periodicities.add(key[:200])
+            log.warning("Unmapped periodicity value: %r", text.strip()[:200])
         return UpdateFrequency.UNKNOWN
 
     return frequency

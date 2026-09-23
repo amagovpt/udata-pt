@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -287,6 +288,12 @@ class OdsBackendPTFrequencyTest(OdsBackendPTSnsTestCase):
     )
     def test_a_combination_does_not_depend_on_the_order_of_its_parts(self, published, expected):
         assert OdsBackendPT._frequency(published) == expected
+
+    def test_an_unclosed_parenthesis_is_linear_not_quadratic(self):
+        """A lazy `.*?` rescanned the rest of the line from every `(`."""
+        started = time.monotonic()
+        assert OdsBackendPT._frequency("(" * 200_000) == UpdateFrequency.UNKNOWN
+        assert time.monotonic() - started < 1
 
     @pytest.mark.parametrize("published", [None, "", "Quando calha", "|", 42])
     def test_no_usable_value_is_unknown(self, published):

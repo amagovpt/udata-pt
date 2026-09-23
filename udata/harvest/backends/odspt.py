@@ -30,7 +30,14 @@ log = logging.getLogger(__name__)
 
 # A qualifier the SNS source appends to a periodicity, as in
 # "Diário (novembro a março)" or "Diária (dias úteis)".
-PERIODICITY_QUALIFIER_RE = re.compile(r"\s*\(.*?\)\s*")
+#
+# `[^()]*` rather than `.*?`: the text is remote, and a lazy dot in front of a closing
+# parenthesis that never comes rescans the rest of the line from every `(`, which is
+# quadratic -- reachable from the harvest preview, which runs on an HTTP worker.
+PERIODICITY_QUALIFIER_RE = re.compile(r"\s*\([^()]*\)\s*")
+
+# Longer than any periodicity the source publishes (the longest seen is 25 characters).
+MAX_PERIODICITY_LENGTH = 256
 
 
 def guess_mimetype(mimetype, url=None):
@@ -151,7 +158,7 @@ class OdsBackendPT(BaseBackend):
 
         parts = [
             map_ine_periodicity(PERIODICITY_QUALIFIER_RE.sub(" ", part).strip())
-            for part in text.split("|")
+            for part in text[:MAX_PERIODICITY_LENGTH].split("|")
         ]
         known = [part for part in parts if part != UpdateFrequency.UNKNOWN]
         periodic = [part for part in known if part.delta or part == UpdateFrequency.CONTINUOUS]

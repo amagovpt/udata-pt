@@ -543,7 +543,18 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
         (item,) = HarvestJob.objects.order_by("-created").first().items
         assert item.remote_url == dataset.harvest.remote_url
 
-    @pytest.mark.parametrize("url", [None, "", "not a url", "/ogc-api/collections/relative"])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            None,
+            "",
+            "not a url",
+            "/ogc-api/collections/relative",
+            # Past the length bound it is not validated at all: `uris.validate`
+            # backtracks quadratically on a long hostname with no TLD.
+            "http://" + "a" * 200_000,
+        ],
+    )
     def test_a_missing_or_unusable_url_does_not_fail_the_item(self, rmock, url):
         item = _tml_item()
         item["url"] = url

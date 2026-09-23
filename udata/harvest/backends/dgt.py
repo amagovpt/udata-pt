@@ -496,11 +496,13 @@ class DGTBackend(BaseBackend):
         except FieldValidationError:
             return None
         if email:
-            # Shape only, never deliverability, as `saml_govpt` does:
-            # email_validator defaults `check_deliverability` to True and
+            # The model's `check_is_email` only runs on API patches, never on
+            # `save()`, so this is the one check a harvested email gets. Shape
+            # only, never deliverability, as `saml_govpt` does: email_validator
+            # defaults `check_deliverability` to True and
             # `SECURITY_EMAIL_VALIDATOR_ARGS` is only set in `settings.Testing`,
-            # so the model's own check would run a live MX lookup per record --
-            # and a resolver blip would drop the email on one run and bring it
+            # so without the override this would run a live MX lookup per record
+            # -- and a resolver blip would drop the email on one run and bring it
             # back on the next, minting a second contact point.
             validator_args = {
                 "check_deliverability": False,
