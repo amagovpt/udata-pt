@@ -7,8 +7,9 @@ import os
 import pytest
 
 from udata.core.dataset.constants import UpdateFrequency
+from udata.core.dataset.factories import LicenseFactory
 from udata.core.organization.factories import OrganizationFactory
-from udata.models import Organization
+from udata.models import License, Organization
 from udata.tests.api import PytestOnlyDBTestCase
 
 from ..backends.odspt import OdsBackendPT
@@ -278,3 +279,26 @@ class OdsBackendPTFrequencyTest(OdsBackendPTSnsTestCase):
     def test_a_dataset_without_the_field_is_unknown(self, rmock):
         dataset = self.harvest(rmock, _sns_payload(dcat={"accrualperiodicity": None}))
         assert dataset.frequency == UpdateFrequency.UNKNOWN
+
+
+class OdsBackendPTLicenseTest(OdsBackendPTSnsTestCase):
+    """The source publishes no licence, so the default stands."""
+
+    def test_a_null_license_keeps_the_default(self, rmock):
+        LicenseFactory(id="notspecified", title="License Not Specified", url=None)
+        LicenseFactory(id="cc-by", title="Creative Commons Attribution", url=None)
+        assert "license" not in SNS_DATASET["metas"]
+
+        dataset = self.harvest(rmock)
+
+        assert dataset.license is not None
+        assert dataset.license == License.default()
+        assert not hasattr(OdsBackendPT, "LICENSES")
+
+    def test_a_published_license_is_still_guessed(self, rmock):
+        LicenseFactory(id="notspecified", title="License Not Specified", url=None)
+        LicenseFactory(id="cc-by", title="Creative Commons Attribution", url=None)
+
+        dataset = self.harvest(rmock, _sns_payload(license="cc-by"))
+
+        assert dataset.license.id == "cc-by"

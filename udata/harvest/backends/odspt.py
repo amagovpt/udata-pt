@@ -69,14 +69,6 @@ class OdsBackendPT(BaseBackend):
     # since it would be a partial export
     SHAPEFILE_RECORDS_LIMIT = 50000
 
-    LICENSES = {
-        "Open Database License (ODbL)": "odc-odbl",
-        "Licence Ouverte (Etalab)": "fr-lo",
-        "Licence ouverte / Open Licence": "fr-lo",
-        "CC BY-SA": "cc-by-sa",
-        "Public Domain": "other-pd",
-    }
-
     FORMATS = {
         "csv": ("CSV", "csv", "text/csv"),
         "geojson": ("GeoJSON", "json", "application/vnd.geo+json"),
@@ -250,12 +242,12 @@ class OdsBackendPT(BaseBackend):
         dataset.tags = list(tags)
         dataset.tags.append(urlparse(self.source.url).hostname)
 
-        # Detect license
+        # Detect license. The map of labels this used to go through came from the
+        # French upstream (Licence Ouverte, Etalab) and the SNS source never uses it:
+        # `metas.license` is empty on all 144 of its datasets (2026-09-23), so the
+        # licence already set, or the portal default, is what stands.
         default_license = dataset.license or License.default()
-        license_id = ods_metadata.get("license")
-        dataset.license = License.guess(
-            license_id, self.LICENSES.get(license_id), default=default_license
-        )
+        dataset.license = License.guess(ods_metadata.get("license"), default=default_license)
 
         self.process_resources(dataset, ods_dataset, ("csv", "json"))
 
