@@ -360,10 +360,13 @@ def guess_format_from_mime(
     result itself rather than guessing again.
     """
     if mime:
-        mapped = MIME_FORMATS.get(mime.strip().lower())
+        # Normalized once, for both lookups: `mimetypes` answers `None` to
+        # anything with surrounding whitespace or an upper-cased type.
+        normalized = mime.strip().lower()
+        mapped = MIME_FORMATS.get(normalized)
         if mapped:
             return mapped
-        extension = mimetypes.guess_extension(mime)
+        extension = mimetypes.guess_extension(normalized)
         if extension:
             return extension.lstrip(".").lower()
     if url:

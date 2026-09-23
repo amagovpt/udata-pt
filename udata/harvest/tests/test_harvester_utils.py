@@ -182,6 +182,9 @@ class GuessFormatFromMimeTest:
 
     def test_case_and_padding_do_not_matter(self):
         assert guess_format_from_mime("  Application/GEO+JSON ") == "geojson"
+        # Outside the table too: `mimetypes` is asked the normalized type, not
+        # the raw one, which it would answer `None` to.
+        assert guess_format_from_mime(" Application/PDF ") == "pdf"
 
     def test_an_unknown_mime_falls_back_to_the_url(self):
         url = "https://host/exports/dataset.csv?download=1"

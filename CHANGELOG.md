@@ -26,7 +26,9 @@
     twice. It is now `resolve_publisher_organization` in `harvester_utils`. The callers keep
     what actually differs: `ckanpt` passes the CKAN title and description, `odspt` has neither
     in its feed. The fallback to the acronym is on `is not None`, not on truthiness, so a
-    source that publishes an empty description still stores an empty one.
+    source that publishes an empty description still stores an empty one. A source that
+    publishes an explicit `null` title does change: the organization is now created under the
+    acronym, where before `Organization.name` being required failed the whole item.
   - **One format guess per MIME type instead of two**, `guess_format_from_mime`, beside the
     single URL guess that was already there: a curated table, then `mimetypes`, then the URL,
     then the fallback. The table is consulted first because the standard library answers
@@ -41,7 +43,9 @@
     path segment through `guess_url_format` instead of splitting the whole URL, which is the
     guard added for the APAmbiente catalogue. Two more only reach `ogc` through MIME types its
     source does not publish: `application/vnd.ms-excel` now reads `XLS` rather than
-    `VND.MS-EXCEL`, and `application/octet-stream` reads `BIN` rather than `OCTET-STREAM`.
+    `VND.MS-EXCEL`, and `application/octet-stream` reads `BIN` rather than `OCTET-STREAM`. A
+    type padded with whitespace also stops carrying that padding into the format, where
+    `text/csv ` used to be published as `CSV `.
   - **Housekeeping with no behaviour attached**: `dgt` and `ogc` log through a module-level
     `log` like every other backend, instead of building an instance logger in an `__init__`
     that did nothing else; `ine` stops re-importing `os` inside five methods that the module
