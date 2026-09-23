@@ -2,7 +2,6 @@ import logging
 import re
 
 from udata.core.dataset.models import HarvestDatasetMetadata
-from udata.core.spatial.models import SpatialCoverage
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
@@ -12,7 +11,7 @@ from udata.utils import safe_harvest_datetime
 from .tools.harvester_utils import (
     DERIVED_LICENSE_EXTRA,  # noqa: F401  -- re-exported: the tests import it from here
     OGC_SERVICE_FORMATS,
-    bbox_to_multipolygon,
+    bbox_to_spatial_coverage,
     guess_url_format,
     map_iso_maintenance_frequency,
     reset_maintenance_frequency_warnings,
@@ -566,16 +565,17 @@ class DGTBackend(BaseBackend):
         # `DERIVED_LICENSE_EXTRA` style of guard the licence has.
         dataset.frequency = map_iso_maintenance_frequency(data.get("update_frequency"))
 
-        boxes = data.get("geo_boxes")
-        if boxes:
+        coverage = bbox_to_spatial_coverage(data.get("geo_boxes") or [])
+        if coverage:
             # Replaces the whole coverage: `SpatialCoverage.clean` refuses
             # `zones` and `geom` together, so the two cannot be merged.
             #
-            # Not wrapped in a try: `_geo_boxes` has already rejected anything
-            # that is not four finite coordinates in range, and what the model
-            # would raise for a bad geometry is a mongoengine `ValidationError`
-            # at `save()` -- outside any handler that could sit here.
-            dataset.spatial = SpatialCoverage(geom=bbox_to_multipolygon(boxes))
+            # Not wrapped in a try: `_geo_boxes` and the helper have already
+            # rejected anything that is not four finite coordinates in range,
+            # and what the model would raise for a bad geometry is a
+            # mongoengine `ValidationError` at `save()` -- outside any handler
+            # that could sit here.
+            dataset.spatial = coverage
 
         # Add keywords as tags
         if data.get("keywords"):

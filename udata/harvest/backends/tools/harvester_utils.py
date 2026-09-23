@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 import requests
 
 from udata.core.dataset.constants import UpdateFrequency
+from udata.core.spatial.models import SpatialCoverage
 from udata.models import License, Organization, Resource
 
 log = logging.getLogger(__name__)
@@ -483,6 +484,40 @@ def bbox_to_multipolygon(boxes: list[tuple[float, float, float, float]]) -> dict
             ]
         )
     return {"type": "MultiPolygon", "coordinates": polygons}
+
+
+def _is_geographic_box(box) -> bool:
+    """Whether `box` is four coordinates on Earth, in degrees.
+
+    Also what rejects `nan` and `inf`, which `float` parses happily: every
+    comparison against NaN is false, and the infinities fall outside the bounds.
+    A non-finite or projected corner would otherwise reach `SpatialCoverage.geom`
+    intact and fail the item at save time, or put the dataset several thousand
+    degrees off the map -- `spatial.geom` carries no 2dsphere index to refuse it.
+    """
+    try:
+        minx, miny, maxx, maxy = (float(value) for value in box)
+    except (TypeError, ValueError):
+        return False
+    return -180 <= minx <= 180 and -180 <= maxx <= 180 and -90 <= miny <= 90 and -90 <= maxy <= 90
+
+
+def bbox_to_spatial_coverage(
+    boxes: list[tuple[float, float, float, float]],
+) -> SpatialCoverage | None:
+    """The `SpatialCoverage` for one or more `(minx, miny, maxx, maxy)` boxes.
+
+    The one step every backend reading a bounding box ends with -- DGT's
+    `geoBox`, the OGC `GeoShape.box`, the ODS `metas.bbox` -- so each of them
+    only has to parse its own source's shape. Boxes that are not geographic are
+    dropped, and `None` is returned when none is left: the caller then keeps
+    whatever coverage the dataset already had rather than replacing it with
+    nothing.
+    """
+    valid = [box for box in boxes if _is_geographic_box(box)]
+    if not valid:
+        return None
+    return SpatialCoverage(geom=bbox_to_multipolygon(valid))
 
 
 # ISO 19115 publishes the update frequency as the `MD_MaintenanceFrequencyCode`
