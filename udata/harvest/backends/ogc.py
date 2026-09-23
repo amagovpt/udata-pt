@@ -114,7 +114,9 @@ class OGCBackend(BaseBackend):
                 "description": each.get("description") or "",
                 "keywords": keywords,
                 "distributions": each.get("distribution") or [],
-                "license": each.get("license"),
+                # The catalogue publishes a licence of its own for the
+                # collections that carry none, the same way it does `provider`.
+                "license": each.get("license") or data.get("license"),
                 "temporal_coverage": each.get("temporalCoverage"),
                 "provider": each.get("provider") or data.get("provider"),
             }

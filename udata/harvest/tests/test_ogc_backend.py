@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from udata.core.dataset.factories import LicenseFactory
 from udata.core.dataset.models import Resource
 from udata.core.organization.factories import OrganizationFactory
 from udata.models import ContactPoint, Dataset
@@ -543,3 +544,39 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
         assert [r.title for r in dataset.resources if r.filetype == "file"] == [
             "Ficheiro carregado à mão"
         ]
+
+
+CC_BY_URL = "https://creativecommons.org/licenses/by/4.0/"
+ODBL_URL = "https://opendatacommons.org/licenses/odbl/1-0/"
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCLicenseTest(PytestOnlyDBTestCase):
+    """The collection's licence, then the catalogue's, then `notspecified`."""
+
+    def _harvest(self, rmock, item, catalogue_license=None):
+        LicenseFactory(id="cc-by", title="Creative Commons Attribution", url=CC_BY_URL)
+        LicenseFactory(id="odc-odbl", title="Open Database License", url=ODBL_URL)
+        LicenseFactory(id="notspecified", title="License Not Specified", url=None)
+        payload = {"dataset": [item]}
+        if catalogue_license:
+            payload["license"] = catalogue_license
+        rmock.get(OGC_URL, text=json.dumps(payload))
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_the_catalogue_license_stands_in_for_a_silent_item(self, rmock):
+        item = _item("a", "Rede", [])
+        dataset = self._harvest(rmock, item, catalogue_license=CC_BY_URL)
+        assert dataset.license.id == "cc-by"
+
+    def test_the_item_license_wins_over_the_catalogue(self, rmock):
+        item = {**_item("a", "Rede", []), "license": ODBL_URL}
+        dataset = self._harvest(rmock, item, catalogue_license=CC_BY_URL)
+        assert dataset.license.id == "odc-odbl"
+
+    def test_no_license_anywhere_is_notspecified(self, rmock):
+        dataset = self._harvest(rmock, _item("a", "Rede", []))
+        assert dataset.license.id == "notspecified"
