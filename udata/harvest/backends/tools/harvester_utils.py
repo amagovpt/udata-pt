@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 import requests
 
 from udata.core.dataset.constants import UpdateFrequency
-from udata.models import License, Resource
+from udata.models import License, Organization, Resource
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +203,60 @@ def settle_harvested_license(dataset, resolved):
     if default is not None:
         dataset.extras[DERIVED_LICENSE_EXTRA] = default.id
     return default
+
+
+def resolve_publisher_organization(
+    backend, acronym: str, name: str | None = None, description: str | None = None
+) -> Organization | None:
+    """Return the local organization for a remote publisher `acronym`.
+
+    Existing organizations are matched by acronym. A new one is created only
+    outside a dryrun, with `name` and `description` when the source carries
+    them and the acronym itself when it does not -- the ODS feed has no
+    publisher title or description, only the acronym. `None` means the caller
+    must leave `dataset.organization` alone.
+
+    A preview creates nothing, so an organization that does not exist yet cannot
+    be shown on the item: `organization` is a `ReferenceField` and mongoengine
+    refuses to reference an unsaved document, which would fail the whole item on
+    the `validate()` a dryrun runs instead of `save()`. Same reasoning as
+    upstream for contact points (`contact_points_from_rdf`).
+
+    The field is left untouched rather than set to `None`, which means it keeps
+    whatever `get_dataset` seeded from the source -- so the item shows the
+    source's organization while a real run would file the dataset under a new
+    one. That is exactly the question a preview is used to answer, so it is said
+    out loud: `process_dataset` collects these onto `item.logs`, which the
+    preview API returns.
+
+    `warning`, not `info`: `init_logging` puts the app logger at WARNING outside
+    debug, and the collector hangs off that logger - an `info` would be dropped
+    before it ever became a record. Warning is also the honest level here, and
+    this branch only runs on a preview, so it cannot become noise on a scheduled
+    harvest.
+    """
+    organization = Organization.objects(acronym=acronym).first()
+    if organization:
+        return organization
+    if backend.dryrun:
+        log.warning(
+            "Organization %s does not exist yet; a real harvest would create it, "
+            "the preview does not",
+            # `repr` and bounded, like the other warnings here: the value is
+            # remote and these records are returned in the preview response.
+            repr(acronym)[:200],
+        )
+        return None
+    # `is not None`, not `or`: a source that publishes an empty title or
+    # description keeps it empty, as it does today. Only a field the source does
+    # not carry at all falls back to the acronym.
+    organization = Organization(
+        acronym=acronym,
+        name=name if name is not None else acronym,
+        description=description if description is not None else acronym,
+    )
+    organization.save()
+    return organization
 
 
 def build_resource_url(raw_url: str) -> str:
