@@ -131,7 +131,13 @@ class OGCBackend(BaseBackend):
         # Set basic dataset fields
         dataset.title = item_data["title"]
         dataset.description = item_data["description"]
-        dataset.tags = ["ogcapi.dgterritorio.gov.pt"]
+        # The source's own host. The constant that stood here named the DGT OGC
+        # API, so every dataset harvested from any other OGC source -- the TML
+        # collections, the one source configured -- carried the DGT's tag. The
+        # tag list is rebuilt on every run, so the old tag goes on the first
+        # harvest. An empty hostname would fail `TagListField` on its minimum
+        # length.
+        dataset.tags = [self.source.domain] if self.source.domain else []
 
         # Add keywords as tags
         keywords = item_data.get("keywords", [])

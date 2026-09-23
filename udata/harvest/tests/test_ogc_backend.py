@@ -510,6 +510,25 @@ class OGCTMLPayloadTest(PytestOnlyDBTestCase):
         ]
         assert {r.url: r.id for r in dataset.resources} == kept_ids
 
+    def test_the_source_hostname_is_the_tag_not_dgterritorio(self, rmock):
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+
+        # `TagListField` slugifies, as it did with the constant.
+        assert "geoportal-example-pt" in dataset.tags
+        assert "ogcapi-dgterritorio-gov-pt" not in dataset.tags
+
+    def test_a_re_harvest_drops_the_old_dgterritorio_tag(self, rmock):
+        """The datasets in production already carry it; no migration removes it."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        dataset = self._harvest(rmock, source)
+        dataset.tags.append("ogcapi.dgterritorio.gov.pt")
+        dataset.save()
+
+        dataset = self._harvest(rmock, source)
+
+        assert "ogcapi-dgterritorio-gov-pt" not in dataset.tags
+
     def test_a_manual_upload_survives_the_transition(self, rmock):
         """Resources uploaded on the portal never belonged to the harvester."""
         source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
