@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- **chore(harvest): the harvester configuration no longer offers backends this portal does not
+  run, and the guesses the backends had each written for themselves are now shared**
+  - **`maaf` is no longer enabled.** It harvests the French agriculture ministry -- an `fr-lo`
+    licence, French frequencies, `country/fr` zones -- and this portal has no source on it
+    (production, read on 2026-09-18: 49 sources, deleted included, none on `maaf`). The
+    backend stays in the tree and keeps its tests, so an upstream sync still applies cleanly;
+    it is only dropped from `HARVESTER_BACKENDS`, which is what `GET /api/1/harvest/backends/`
+    and the creation wizard offer. `MIGRATION_URL` goes with it: it belonged to the dadosGov
+    harvester, removed in July, and nothing has read it since.
+  - **A name left in that list is invisible**, because an unmatched name is silently ignored --
+    which is how `dgtIne` and `dadosGov` both survived there for months. The suite runs on
+    `settings.Testing`, so it never read `udata.cfg` at all; a test now parses the literal out
+    of the file and checks every name against the registered entry points.
+  - ⚠️ **Each environment has its own `udata.cfg`.** Before promoting, count the sources per
+    backend there (`db.harvest_source.aggregate` by `backend`) and drop `"maaf"` and
+    `MIGRATION_URL` from that environment's file too, then restart the Celery worker and beat:
+    the backend registry is read in-process, and a source left on a disabled backend fails its
+    next scheduled run with `ValueError: Backend maaf unknown`.
+  - **One publisher lookup instead of two.** `ckanpt` and `odspt` both mapped a remote
+    publisher acronym onto a local organization, creating it outside a dryrun and warning
+    inside one, and the same preview bug had to be fixed twice because the block existed
+    twice. It is now `resolve_publisher_organization` in `harvester_utils`. The callers keep
+    what actually differs: `ckanpt` passes the CKAN title and description, `odspt` has neither
+    in its feed. The fallback to the acronym is on `is not None`, not on truthiness, so a
+    source that publishes an empty description still stores an empty one. A source that
+    publishes an explicit `null` title does change: the organization is now created under the
+    acronym, where before `Organization.name` being required failed the whole item.
+  - **One format guess per MIME type instead of two**, `guess_format_from_mime`, beside the
+    single URL guess that was already there: a curated table, then `mimetypes`, then the URL,
+    then the fallback. The table is consulted first because the standard library answers
+    `application/xml` with `.xsl` and knows none of the `application/csv|xls|xlsx` spellings
+    the sources send. `ogc` keeps only the spelling of the two formats it publishes under a
+    name that is not the upper-cased one (`GeoJSON`, `JSON-LD`); every `encodingFormat` that
+    source publishes resolves to the format it resolved to before.
+  - **Four results do change, all for `odspt`, all corrections**: `application/xml` resolves
+    to `xml` rather than `xsl`; `application/csv`, `application/xls` and `application/xlsx`
+    resolve at all, where before they returned nothing; an attachment with no `mimetype` no
+    longer raises `AttributeError` and fails its whole item; and the fallback reads the last
+    path segment through `guess_url_format` instead of splitting the whole URL, which is the
+    guard added for the APAmbiente catalogue. Two more only reach `ogc` through MIME types its
+    source does not publish: `application/vnd.ms-excel` now reads `XLS` rather than
+    `VND.MS-EXCEL`, and `application/octet-stream` reads `BIN` rather than `OCTET-STREAM`. A
+    type padded with whitespace also stops carrying that padding into the format, where
+    `text/csv ` used to be published as `CSV `.
+  - **Housekeeping with no behaviour attached**: `dgt` and `ogc` log through a module-level
+    `log` like every other backend, instead of building an instance logger in an `__init__`
+    that did nothing else; `ine` stops re-importing `os` inside five methods that the module
+    already imports it for; and the generated "Here you comes your implementation" comment is
+    gone.
+
 - **fix(harvest): a harvest source whose validator was removed from the database no longer
   takes the whole sources listing down**
   - **One bad document answered for all of them.** Marshalling a source dereferences
