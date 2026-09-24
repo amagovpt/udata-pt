@@ -11,9 +11,16 @@ from mongoengine.connection import get_db
 
 from udata.tests.api import PytestOnlyDBTestCase
 
-from .test_ckanpt_migrations import load_migration
+from .test_ckanpt_migrations import MIGRATIONS, load_migration
 
-MIGRATION = "2026-09-16-drop-harvest-source-url-text-index.py"
+MIGRATION = "2026-08-24-drop-harvest-source-url-text-index.py"
+
+# The first migration to touch `HarvestSource` through mongoengine triggers
+# `ensure_indexes`, which MongoDB refuses while the old text index is there. So
+# the index migration has to sort before every migration that reads the model
+# and can be pending at the same time as it -- the ckanpt ones of 2026-08-25
+# were, and tst failed on the first of them before the index was ever replaced.
+FIRST_MIGRATION_THAT_CAN_BE_PENDING_WITH_IT = "2026-08-25"
 
 CREDENTIALED_URL = "https://harvestuser:sup3rs3cr3t@www.ine.pt/broken.xml"
 
@@ -93,3 +100,19 @@ class DropHarvestSourceURLTextIndexMigrationTest(PytestOnlyDBTestCase):
         self.migrate(get_db())
 
         assert not any("limpa" in record.getMessage() for record in caplog.records)
+
+
+def test_index_migration_sorts_before_the_migrations_that_read_the_model():
+    """Filename order is execution order (`migrations.list_available`)."""
+    later = sorted(
+        path.name
+        for path in MIGRATIONS.glob("*.py")
+        if path.name >= FIRST_MIGRATION_THAT_CAN_BE_PENDING_WITH_IT
+        and path.name != MIGRATION
+        and "udata.harvest.models" in path.read_text()
+    )
+
+    assert later, "the migrations this ordering protects have moved; update the test"
+    assert MIGRATION < later[0], (
+        f"{later[0]} would trigger `ensure_indexes` before {MIGRATION} drops the old index"
+    )
