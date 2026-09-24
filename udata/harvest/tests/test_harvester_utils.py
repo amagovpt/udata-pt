@@ -9,6 +9,7 @@ import pytest
 
 from ..backends.tools.harvester_utils import (
     MIME_FORMATS,
+    bbox_to_spatial_coverage,
     build_resource_url,
     collapse_duplicated_path,
     guess_format_from_mime,
@@ -214,3 +215,42 @@ class GuessFormatFromMimeTest:
     def test_the_fallback_is_the_last_resort(self):
         assert guess_format_from_mime(None, None, fallback="unknown") == "unknown"
         assert guess_format_from_mime("application/x-made-up", fallback="remote") == "remote"
+
+
+class BboxToSpatialCoverageTest:
+    """The one bbox -> `SpatialCoverage` step the DGT, OGC and ODS backends share."""
+
+    def test_a_box_becomes_a_multipolygon_coverage(self):
+        coverage = bbox_to_spatial_coverage([(-8.13, 37.46, -7.77, 37.68)])
+        assert coverage.geom["type"] == "MultiPolygon"
+        (ring,) = coverage.geom["coordinates"][0]
+        assert ring[0] == [-8.13, 37.46]
+
+    def test_several_boxes_become_several_polygons(self):
+        coverage = bbox_to_spatial_coverage(
+            [(-8.49, 39.52, -6.69, 41.81), (-31.27, 36.93, -25.01, 39.72)]
+        )
+        assert len(coverage.geom["coordinates"]) == 2
+
+    def test_no_box_yields_no_coverage(self):
+        assert bbox_to_spatial_coverage([]) is None
+
+    @pytest.mark.parametrize(
+        "box",
+        [
+            (float("nan"),) * 4,
+            (float("-inf"), 37.0, -7.0, float("inf")),
+            # Projected metres, not degrees.
+            (-120000, -300000, 165000, 280000),
+            (-8.13, 37.46, -7.77),
+            ("west", "south", "east", "north"),
+        ],
+    )
+    def test_an_unusable_box_yields_no_coverage(self, box):
+        assert bbox_to_spatial_coverage([box]) is None
+
+    def test_an_unusable_box_is_dropped_and_the_rest_kept(self):
+        coverage = bbox_to_spatial_coverage(
+            [(-120000, -300000, 165000, 280000), (-8.13, 37.46, -7.77, 37.68)]
+        )
+        assert len(coverage.geom["coordinates"]) == 1
