@@ -26,7 +26,7 @@ from ..backends import (
     HarvestFilter,
     get_all_backends,
 )
-from ..exceptions import HarvestException
+from ..exceptions import HarvestException, HarvestRemoteBlocked
 from .factories import HarvestSourceFactory
 
 
@@ -245,6 +245,26 @@ class BaseBackendTest(PytestOnlyDBTestCase):
         backend.get(url, headers={"Sec-Fetch-Mode": "cors"})
 
         assert rmock.last_request.headers["Sec-Fetch-Mode"] == "cors"
+
+    def test_cloudflare_challenge_raises_remote_blocked(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://harvestuser:sup3rs3cr3t@dados.example.pt/api/3/action/package_list"
+        rmock.get(
+            url,
+            status_code=403,
+            text="Just a moment...",
+            headers={"cf-mitigated": "challenge", "Content-Type": "text/html"},
+        )
+
+        with pytest.raises(HarvestRemoteBlocked) as excinfo:
+            backend.get(url)
+
+        message = str(excinfo.value)
+        assert "dados.example.pt" in message
+        assert "anti-bot challenge" in message
+        assert "Client Error" not in message
+        assert "sup3rs3cr3t" not in message
+        assert "harvestuser" not in message
 
     def test_harvest_item_remote_url(self):
         n = 3

@@ -3,6 +3,7 @@ import random
 import time
 import traceback
 from datetime import UTC, date, datetime, timedelta
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import requests
@@ -16,7 +17,12 @@ from udata.core.dataset.models import HarvestDatasetMetadata
 from udata.models import Dataset, User
 from udata.utils import raise_if_redirect, safe_unicode
 
-from ..exceptions import HarvestException, HarvestSkipException, HarvestValidationError
+from ..exceptions import (
+    HarvestException,
+    HarvestRemoteBlocked,
+    HarvestSkipException,
+    HarvestValidationError,
+)
 from ..models import (
     HarvestError,
     HarvestItem,
@@ -212,6 +218,16 @@ class BaseBackend(object):
                 delay = min(delay * 2, max_delay) if delay else 1
         if not kwargs["allow_redirects"]:
             raise_if_redirect(response)
+        if response.headers.get("cf-mitigated") == "challenge":
+            # A challenge page is never the content asked for, and the 403 it
+            # comes with reads like a dados.gov.pt permission error. Only the
+            # host is named: the URL may carry credentials (LEDG-2477).
+            response.close()
+            raise HarvestRemoteBlocked(
+                f"The remote source {urlsplit(response.url).hostname} refused this "
+                "server with an anti-bot challenge (Cloudflare). This is not a "
+                "dados.gov.pt permission error: the publisher must allow the harvester."
+            )
         return response
 
     def head(self, url, headers={}, **kwargs):
