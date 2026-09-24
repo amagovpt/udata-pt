@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **fix(harvest): the harvest source text index is replaced before any other pending
+  migration reads the model**
+  - `udata db migrate` failed on tst at `2026-08-25-ckanpt-description-config-to-extra-configs`
+    with `IndexOptionsConflict`, and every migration after it was skipped. Migrations run in
+    filename order, and that one is the first to touch `HarvestSource` through mongoengine, so
+    it triggered `ensure_indexes` for the model's `name`-only text index against a database
+    that still had `name_text_url_text` -- the index the `2026-09-16` migration drops, which
+    had not run yet because it sorted after. Any database with the three pending at once
+    (tst, ppr, production) fails the same way.
+  - The index migration is now dated `2026-08-24`, so it sorts before every migration that
+    reads the model; a test pins that order. A database that already ran it under the old
+    date runs it again harmlessly: nothing covers `url` any more, so nothing is dropped, and
+    the report writes nothing. The failed `2026-08-25` record is retried by `udata db migrate`
+    on its own -- a KO record is not a skip -- so no `unrecord` is needed on tst.
+
+- **fix(harvest): harvesters pass Cloudflare managed challenges, and a challenge is named as such
+  instead of a generic 403**
+  - **Every harvester request now sends `Sec-Fetch-Mode: navigate`.** `dados.cm-lisboa.pt` sits
+    behind a Cloudflare managed challenge that answers 403 to any client sending no `Sec-Fetch-*`
+    header, which `requests` never does, so the source failed on every run and every preview.
+    Measured: that one header, with the uData User-Agent unchanged, turns the 403 into the CKAN
+    catalogue. It is set in `BaseBackend.get_headers`, so all backends send it; a caller's own
+    header still wins.
+  - **A challenge no longer reads as a dados.gov.pt permission error.** It used to surface as
+    `403 Client Error: Forbidden for url: ...`. The shared HTTP helper now raises
+    `HarvestRemoteBlocked` on a `cf-mitigated: challenge` response, with a message naming only the
+    remote host and saying the publisher refused the server. Requests owslib issues on its own
+    (`cswudata`) get neither the header nor the check.
+  - **A Cloudflare block without a challenge is named too.** A block or rate limit answers 403/429
+    with Cloudflare's own error page and no `cf-mitigated` header, and it showed up right after a
+    full harvest of the source. That page is recognised by its markers (`cf-error-details`,
+    `Cloudflare Ray ID`), because an origin 403 served through Cloudflare also carries
+    `server: cloudflare`, and the message gives the HTTP status and the Ray ID for the publisher
+    to trace. A 403 that Cloudflare did not generate behaves as before.
+
 - **feat(harvest): the `dgt`, `ogc` and `odspt` harvesters read what their sources publish
   instead of constants**
   - **The TML datasets no longer carry the DGT's tag.** `ogc` tagged every dataset
