@@ -23,6 +23,18 @@ URL is already redacted for readers without `edit`, and the search no longer
 confirms it. So this names the sources and lets the operator choose.
 
 An inventory of production found none, so the expected output is a zero.
+
+Dated before the change it belongs to, on purpose. Migrations run in filename
+order, and the first one to touch `HarvestSource` through mongoengine is the one
+that triggers `ensure_indexes` -- against the model's new index, on a database
+that still has the old one. The `2026-08-25-ckanpt-*` migrations do exactly that,
+so with this file dated after them, a database that had none of the three
+pending (tst, ppr, production) failed on the first of them with
+`IndexOptionsConflict` before this one ever ran. Sorting this file first is what
+guarantees the index is replaced before any other migration reads the model. A
+database that already ran it under the old date runs it again, harmlessly: no
+index covers `url` any more, so there is nothing to drop, and the report writes
+nothing.
 """
 
 import logging

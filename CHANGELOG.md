@@ -2,6 +2,138 @@
 
 ## Unreleased
 
+- **fix(harvest): the harvest source text index is replaced before any other pending
+  migration reads the model**
+  - `udata db migrate` failed on tst at `2026-08-25-ckanpt-description-config-to-extra-configs`
+    with `IndexOptionsConflict`, and every migration after it was skipped. Migrations run in
+    filename order, and that one is the first to touch `HarvestSource` through mongoengine, so
+    it triggered `ensure_indexes` for the model's `name`-only text index against a database
+    that still had `name_text_url_text` -- the index the `2026-09-16` migration drops, which
+    had not run yet because it sorted after. Any database with the three pending at once
+    (tst, ppr, production) fails the same way.
+  - The index migration is now dated `2026-08-24`, so it sorts before every migration that
+    reads the model; a test pins that order. A database that already ran it under the old
+    date runs it again harmlessly: nothing covers `url` any more, so nothing is dropped, and
+    the report writes nothing. The failed `2026-08-25` record is retried by `udata db migrate`
+    on its own -- a KO record is not a skip -- so no `unrecord` is needed on tst.
+
+- **fix(harvest): harvesters pass Cloudflare managed challenges, and a challenge is named as such
+  instead of a generic 403**
+  - **Every harvester request now sends `Sec-Fetch-Mode: navigate`.** `dados.cm-lisboa.pt` sits
+    behind a Cloudflare managed challenge that answers 403 to any client sending no `Sec-Fetch-*`
+    header, which `requests` never does, so the source failed on every run and every preview.
+    Measured: that one header, with the uData User-Agent unchanged, turns the 403 into the CKAN
+    catalogue. It is set in `BaseBackend.get_headers`, so all backends send it; a caller's own
+    header still wins.
+  - **A challenge no longer reads as a dados.gov.pt permission error.** It used to surface as
+    `403 Client Error: Forbidden for url: ...`. The shared HTTP helper now raises
+    `HarvestRemoteBlocked` on a `cf-mitigated: challenge` response, with a message naming only the
+    remote host and saying the publisher refused the server. Requests owslib issues on its own
+    (`cswudata`) get neither the header nor the check.
+  - **A Cloudflare block without a challenge is named too.** A block or rate limit answers 403/429
+    with Cloudflare's own error page and no `cf-mitigated` header, and it showed up right after a
+    full harvest of the source. That page is recognised by its markers (`cf-error-details`,
+    `Cloudflare Ray ID`), because an origin 403 served through Cloudflare also carries
+    `server: cloudflare`, and the message gives the HTTP status and the Ray ID for the publisher
+    to trace. A 403 that Cloudflare did not generate behaves as before.
+
+- **feat(harvest): the `dgt`, `ogc` and `odspt` harvesters read what their sources publish
+  instead of constants**
+  - **The TML datasets no longer carry the DGT's tag.** `ogc` tagged every dataset
+    `ogcapi.dgterritorio.gov.pt`, whatever the source, and the one OGC source configured is
+    `geoportal.tmlmobilidade.pt`. `ogc` and `dgt` now tag with the source's own hostname, as
+    `cswudata` and `ckanpt` already did. The tag list is rebuilt on every harvest, so the wrong
+    tag goes on the first run after deploy, with no migration. For the SNIG source the tag does
+    not change: its hostname is the one the constant named.
+  - **The public listing sorts DGT and ODS datasets by the source's dates.** The listing sorts
+    on `created_at_internal`, and neither backend wrote it, so every harvested dataset sorted
+    by the day it was first harvested. DGT now writes the publication date there (the
+    reference date when there is none) and ODS writes `dcat.issued`, else `dcat.created`,
+    which is the precedence `Dataset.created_at` already shows. The order of the listing
+    changes for those datasets on the first harvest. DGT also reads `changeDate` into
+    `harvest.modified_at` and `last_modified_internal`, and ODS records `dcat.created` and
+    `dcat.issued` on the harvest metadata.
+  - **ODS datasets get a real frequency.** They were all harvested as `unknown`, although the
+    SNS source publishes `dcat.accrualperiodicity` on 143 of its 144 datasets. The value goes
+    through the Portuguese periodicity map the INE harvesters use, which gains the spellings
+    this source uses (`Diária`, `Quinzenal`, `Quadrimestral`, `annual`, `monthly`) without
+    changing any value INE already maps. A combination such as `Anual | Mensal` resolves to the
+    most frequent of its parts, and a qualifier in parentheses is ignored. That parsing stays
+    in `odspt`, so the shared map still matches exactly.
+  - **Spatial coverage for OGC and ODS**, from the schema.org `GeoShape` box and from
+    `metas.bbox`, through one shared `bbox_to_spatial_coverage` helper that DGT now uses too.
+    The TML box is read `lon,lat`, the order that source writes, although schema.org
+    specifies `lat,lon`.
+  - **DGT datasets get a publisher contact point** from `responsibleParty`: the entry for the
+    resource first, then the one for the metadata, then `orgNameSNIG` with a name only. The
+    contact point code moves out of `ogc.py` into `attach_publisher_contact`, so both
+    backends share the `dryrun` handling. Address and phone are not kept, since
+    `ContactPoint` has no field for them. A name or email the model would refuse is dropped
+    rather than failing the item.
+  - **OGC**: a collection with no licence of its own takes the catalogue's before falling back
+    to `notspecified`. `temporalCoverage` becomes the dataset's temporal coverage when it names
+    dates. The raw `temporal_coverage` extra, which held `None/None` on every TML dataset, is
+    removed. The collection's `url` becomes `harvest.remote_url` once it validates.
+  - **ODS**: `dcat.creator`, `dcat.contributor` and `dcat.spatial` reach the extras
+    (`ods:creator`, `ods:contributor`, `ods:spatial`), sanitized. `dcat.temporal` is free prose
+    and is not parsed. The French `LICENSES` map is gone: `metas.license` is empty on every
+    SNS dataset, so the default licence was already what stood.
+  - The tests run on one record of each source, recorded verbatim (`dgt/snig_record.json`,
+    `odspt/sns_dataset.json`, and the existing `ogc/tml_collection.jsonld`).
+  - ⚠️ **Restart the Celery `worker` and `beat` after deploying**, or the scheduled harvests
+    keep running the old in-memory code. There is no migration: every field above is written
+    on the next harvest of each source.
+
+- **chore(harvest): the harvester configuration no longer offers backends this portal does not
+  run, and the guesses the backends had each written for themselves are now shared**
+  - **`maaf` is no longer enabled.** It harvests the French agriculture ministry -- an `fr-lo`
+    licence, French frequencies, `country/fr` zones -- and this portal has no source on it
+    (production, read on 2026-09-18: 49 sources, deleted included, none on `maaf`). The
+    backend stays in the tree and keeps its tests, so an upstream sync still applies cleanly;
+    it is only dropped from `HARVESTER_BACKENDS`, which is what `GET /api/1/harvest/backends/`
+    and the creation wizard offer. `MIGRATION_URL` goes with it: it belonged to the dadosGov
+    harvester, removed in July, and nothing has read it since.
+  - **A name left in that list is invisible**, because an unmatched name is silently ignored --
+    which is how `dgtIne` and `dadosGov` both survived there for months. The suite runs on
+    `settings.Testing`, so it never read `udata.cfg` at all; a test now parses the literal out
+    of the file and checks every name against the registered entry points.
+  - ⚠️ **Each environment has its own `udata.cfg`.** Before promoting, count the sources per
+    backend there (`db.harvest_source.aggregate` by `backend`) and drop `"maaf"` and
+    `MIGRATION_URL` from that environment's file too, then restart the Celery worker and beat:
+    the backend registry is read in-process, and a source left on a disabled backend fails its
+    next scheduled run with `ValueError: Backend maaf unknown`.
+  - **One publisher lookup instead of two.** `ckanpt` and `odspt` both mapped a remote
+    publisher acronym onto a local organization, creating it outside a dryrun and warning
+    inside one, and the same preview bug had to be fixed twice because the block existed
+    twice. It is now `resolve_publisher_organization` in `harvester_utils`. The callers keep
+    what actually differs: `ckanpt` passes the CKAN title and description, `odspt` has neither
+    in its feed. The fallback to the acronym is on `is not None`, not on truthiness, so a
+    source that publishes an empty description still stores an empty one. A source that
+    publishes an explicit `null` title does change: the organization is now created under the
+    acronym, where before `Organization.name` being required failed the whole item.
+  - **One format guess per MIME type instead of two**, `guess_format_from_mime`, beside the
+    single URL guess that was already there: a curated table, then `mimetypes`, then the URL,
+    then the fallback. The table is consulted first because the standard library answers
+    `application/xml` with `.xsl` and knows none of the `application/csv|xls|xlsx` spellings
+    the sources send. `ogc` keeps only the spelling of the two formats it publishes under a
+    name that is not the upper-cased one (`GeoJSON`, `JSON-LD`); every `encodingFormat` that
+    source publishes resolves to the format it resolved to before.
+  - **Four results do change, all for `odspt`, all corrections**: `application/xml` resolves
+    to `xml` rather than `xsl`; `application/csv`, `application/xls` and `application/xlsx`
+    resolve at all, where before they returned nothing; an attachment with no `mimetype` no
+    longer raises `AttributeError` and fails its whole item; and the fallback reads the last
+    path segment through `guess_url_format` instead of splitting the whole URL, which is the
+    guard added for the APAmbiente catalogue. Two more only reach `ogc` through MIME types its
+    source does not publish: `application/vnd.ms-excel` now reads `XLS` rather than
+    `VND.MS-EXCEL`, and `application/octet-stream` reads `BIN` rather than `OCTET-STREAM`. A
+    type padded with whitespace also stops carrying that padding into the format, where
+    `text/csv ` used to be published as `CSV `.
+  - **Housekeeping with no behaviour attached**: `dgt` and `ogc` log through a module-level
+    `log` like every other backend, instead of building an instance logger in an `__init__`
+    that did nothing else; `ine` stops re-importing `os` inside five methods that the module
+    already imports it for; and the generated "Here you comes your implementation" comment is
+    gone.
+
 - **fix(harvest): a harvest source whose validator was removed from the database no longer
   takes the whole sources listing down**
   - **One bad document answered for all of them.** Marshalling a source dereferences

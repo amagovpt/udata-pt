@@ -1,0 +1,134 @@
+{
+  "@from": "1",
+  "@to": "1",
+  "metadata": [
+    {
+      "abstract": "Serviço de visualização (WMS) da Carta da temperatura máxima do ar mensal, valores médios 1971-2000, obtida por regressão multivariada com altitude e distância ao litoral, variáveis explicativas, e krigagem normal dos resíduos.",
+      "serviceType": "view",
+      "responsibleParty": [
+        "Contacto|metadata|Instituto Português do Mar e da Atmosfera, I.P. (IPMA, I.P.)||info@ipma.pt|||Rua C do Aeroporto s/n, Lisboa, 1749-077, Portugal|(351) 218 447 000||1",
+        "Contacto|resource|Instituto Português do Mar e da Atmosfera, I.P. (IPMA, I.P.)||maps.services@ipma.pt|Grupo de Desenvolvimento da DivSI (Divisão de Sistemas de Informação, Comunicações e Desenvolvimento Tecnológico)||Rua C do Aeroporto, Lisboa, 1749-077, Portugal|(351) 218 447 000||1"
+      ],
+      "type": [
+        "service",
+        "service-view"
+      ],
+      "legalConstraints": [
+        "Acesso público sem restrições",
+        "O acesso à informação disponibilizada é público mas a sua utilização não poderá ter fins lucrativos ou ofensivos e deverá, sempre, referir a fonte de informação IPMA, I.P."
+      ],
+      "isHarvested": "n",
+      "displayOrder": "0",
+      "referenceDateOrd": "2016-06-17",
+      "docLocale": "por",
+      "popularity": "381",
+      "referenceDateRange": "01_2015_higher",
+      "changeDate": "2018-04-07",
+      "keyword": [
+        "Clima",
+        "IPMA, I.P.",
+        "Temperatura máxima do Ar",
+        "infoMapAccessService",
+        "janeiro"
+      ],
+      "publishedForGroup": [
+        "2",
+        "1"
+      ],
+      "identifier": "PT100-ho19712000-jan-avgr-txavgr",
+      "mdLanguage": [
+        "eng",
+        "por"
+      ],
+      "crsDetails": [
+        {
+          "code": "EPSG:http://www.opengis.net/def/crs/EPSG/0/4258",
+          "name": "",
+          "url": ""
+        },
+        {
+          "code": "EPSG:http://www.opengis.net/def/crs/EPSG/0/4326",
+          "name": "",
+          "url": ""
+        }
+      ],
+      "cartografia": "cartografia_undefined",
+      "maintenanceAndUpdateFrequency_text": "Não planeada",
+      "dataType": "dataType_undefined",
+      "format": "WMS",
+      "root": "gmd:MD_Metadata",
+      "isTemplate": "n",
+      "valid": "-1",
+      "feedbackCount": "0",
+      "rating": "0",
+      "source": "d6e23b8d-8746-4fb0-9ce7-e027c67b2076",
+      "updateFrequency": "notPlanned",
+      "orgNameSNIG": "Instituto Português do Mar e da Atmosfera, I.P. (IPMA, I.P.)",
+      "geoBox": "-9.53|36.92|-6.17|42.18",
+      "geographicCoverage": "geographicCoverage_undefined",
+      "owner": "20387",
+      "defaultAbstract": "Serviço de visualização (WMS) da Carta da temperatura máxima do ar mensal, valores médios 1971-2000, obtida por regressão multivariada com altitude e distância ao litoral, variáveis explicativas, e krigagem normal dos resíduos.",
+      "link": "||http://portaldoclima.pt/thredds/wms/ipmadt/ho/PT100-ho19712000-jan-avgr-txavgr.nc?service=WMS&request=GetCapabilities|OGC:WMS|application/vnd.ogc.wms_xml|1",
+      "dataPolicy": "Dados abertos",
+      "defaultTitle": "Serviço de visualização, média da Temperatura Máxima do Ar, Janeiro 1971-2000",
+      "resolutionRange": "resolution_undefined",
+      "openServiceType": "view",
+      "denominatorRange": "denominator_undefined",
+      "creationDate": "2016-06-17",
+      "standardName": "ISO 19115",
+      "crs": [
+        "http://www.opengis.net/def/crs/EPSG/0/4258::EPSG",
+        "http://www.opengis.net/def/crs/EPSG/0/4326::EPSG"
+      ],
+      "dataFormat": "dataFormat_other",
+      "logo": "/images/logos/d6e23b8d-8746-4fb0-9ce7-e027c67b2076.png",
+      "title": "Serviço de visualização, média da Temperatura Máxima do Ar, Janeiro 1971-2000",
+      "geographicCoverageDesc": "geographicCoverage_undefined",
+      "keywordGroup": {
+        "keywords": [
+          {
+            "value": "IPMA, I.P.",
+            "link": ""
+          },
+          {
+            "value": "Temperatura máxima do Ar",
+            "link": ""
+          },
+          {
+            "value": "janeiro",
+            "link": ""
+          },
+          {
+            "value": "Clima",
+            "link": ""
+          }
+        ],
+        "ISO - 19119 geographic services taxonomy": [
+          {
+            "value": "infoMapAccessService",
+            "link": ""
+          }
+        ]
+      },
+      "groupOwner": "2",
+      "referenceDate": "2016-06-17",
+      "_locale": "por",
+      "geonet:info": {
+        "@xmlns:geonet": "http://www.fao.org/geonetwork",
+        "id": "37248",
+        "uuid": "PT100-ho19712000-jan-avgr-txavgr-wms",
+        "schema": "iso19139.pt.mig.2.0",
+        "createDate": "2021-12-10T17:30:11",
+        "changeDate": "2021-12-10T17:30:11",
+        "source": "d6e23b8d-8746-4fb0-9ce7-e027c67b2076",
+        "isPublishedToAll": "true",
+        "view": "true",
+        "notify": "false",
+        "download": "true",
+        "dynamic": "true",
+        "featured": "false",
+        "selected": "false"
+      }
+    }
+  ]
+}
