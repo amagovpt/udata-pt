@@ -12,11 +12,11 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 from udata.harvest.models import HarvestItem
-from udata.models import Organization, SpatialCoverage
+from udata.models import SpatialCoverage
 from udata.utils import safe_unicode
 
 from .ckan.harvesters import ALLOWED_RESOURCE_TYPES, CkanBackend
-from .tools.harvester_utils import normalize_url_slashes
+from .tools.harvester_utils import normalize_url_slashes, resolve_publisher_organization
 
 log = logging.getLogger(__name__)
 
@@ -187,44 +187,14 @@ class CkanPTBackend(CkanBackend):
         # Upstream never touches `dataset.organization`. This portal maps the remote
         # CKAN organization onto a local one by acronym, creating it when it is new.
         acronym = data["organization"]["name"]
-        organization = Organization.objects(acronym=acronym).first()
+        organization = resolve_publisher_organization(
+            self,
+            acronym,
+            name=data["organization"]["title"],
+            description=data["organization"]["description"],
+        )
         if organization:
             dataset.organization = organization
-        elif not self.dryrun:
-            organization = Organization(
-                acronym=acronym,
-                name=data["organization"]["title"],
-                description=data["organization"]["description"],
-            )
-            organization.save()
-            dataset.organization = organization
-        else:
-            # A preview creates nothing, so an organization that does not exist yet
-            # cannot be shown on the item: `organization` is a `ReferenceField` and
-            # mongoengine refuses to reference an unsaved document, which would fail
-            # the whole item on the `validate()` a dryrun runs instead of `save()`.
-            # Same reasoning as upstream for contact points
-            # (`contact_points_from_rdf`).
-            #
-            # The field is left untouched rather than set to `None`, which means it
-            # keeps whatever `get_dataset` seeded from the source - so the item shows
-            # the source's organization while a real run would file the dataset under
-            # a new one. That is exactly the question a preview is used to answer, so
-            # it is said out loud: `process_dataset` collects these onto `item.logs`,
-            # which the preview API returns.
-            #
-            # `warning`, not `info`: `init_logging` puts the app logger at WARNING
-            # outside debug, and the collector hangs off that logger - an `info`
-            # would be dropped before it ever became a record. Warning is also the
-            # honest level here, and this branch only runs on a preview, so it
-            # cannot become noise on a scheduled harvest.
-            log.warning(
-                "Organization %s does not exist yet; a real harvest would create it, "
-                "the preview does not",
-                # `repr` and bounded, like the other warnings here: the value is
-                # remote and these records are returned in the preview response.
-                repr(acronym)[:200],
-            )
 
         # Which source a dataset came from, as a tag. `super()` rebuilds the tag list
         # from the remote ones, so this has to come after it.

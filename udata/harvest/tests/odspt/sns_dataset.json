@@ -1,0 +1,264 @@
+{
+  "nhits": 1,
+  "datasets": [
+    {
+      "datasetid": "taxa-de-mortalidade-por-avc-isquemico-e-hemorragico",
+      "metas": {
+        "domain": "spms",
+        "staged": false,
+        "visibility": "domain",
+        "metadata_processed": "2026-09-09T15:03:43.114329+00:00",
+        "data_processed": "2026-09-09T15:03:43.061445+00:00",
+        "modified": "2026-09-09T15:03:43.061445+00:00",
+        "description": "<p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"><font face=\"Arial, sans-serif\"><span style=\"font-size: 14.6667px;\">Monitorização mensal da taxa de mortalidade por AVC Isquémico e Hemorrágico, nos 30 dias subsequentes ao episódio, discriminada por entidade de saúde.</span></font></p><p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"><font face=\"Arial, sans-serif\"><span style=\"font-size: 14.6667px;\"><b>Observações:</b></span></font></p><p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"></p><p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"><font face=\"Arial, sans-serif\"><span style=\"font-size: 14.6667px;\">Os dados relativos ao mês n-2, publicados até ao último dia útil do mês n, têm caráter provisório, sujeitos a eventuais atualizações.</span></font></p>",
+        "publisher": "ACSS",
+        "theme": [
+          "Qualidade"
+        ],
+        "title": "Mortalidade por AVC Isquémico e Hemorrágico",
+        "keyword": [
+          "Mortalidade",
+          "AVC",
+          "Cuidados Hospitalares"
+        ],
+        "federated": false,
+        "modified_updates_on_metadata_change": true,
+        "geographic_reference_auto": true,
+        "modified_updates_on_data_change": true,
+        "bbox": {
+          "coordinates": [
+            [
+              [
+                -6.768198050558567,
+                41.80565318092704
+              ],
+              [
+                -9.418267076835036,
+                41.80565318092704
+              ],
+              [
+                -9.418267076835036,
+                37.02389728277922
+              ],
+              [
+                -6.768198050558567,
+                37.02389728277922
+              ],
+              [
+                -6.768198050558567,
+                41.80565318092704
+              ]
+            ]
+          ],
+          "type": "Polygon"
+        },
+        "metadata_languages": [
+          "pt"
+        ],
+        "geographic_reference": [
+          "world_pt"
+        ],
+        "language": "pt",
+        "geometry_types": [
+          "Point"
+        ],
+        "territory": [
+          "Portugal"
+        ],
+        "records_count": 6957,
+        "source-data": "SICA (Integração com sistema fonte BDMH)",
+        "measure-unit": "Percentagem (%)",
+        "formula": "Nº Falecidos AVC Hemorrágico em 30 dias / Nº Episódios AVC Hemorrágicos X 100 ; Nº Falecidos AVC Isquémicos em 30 dias / Nº Episódios AVC Isquémicos X 100",
+        "dataset-id-number": "67"
+      },
+      "has_records": true,
+      "data_visible": true,
+      "features": [
+        "geo",
+        "timeserie",
+        "analyze"
+      ],
+      "attachments": [],
+      "alternative_exports": [],
+      "fields": [
+        {
+          "name": "tempo",
+          "annotations": [
+            {
+              "args": [
+                "month"
+              ],
+              "name": "timeserie_precision"
+            },
+            {
+              "name": "facet"
+            },
+            {
+              "args": [
+                "-alphanum"
+              ],
+              "name": "facetsort"
+            },
+            {
+              "name": "timerangeFilter"
+            }
+          ],
+          "label": "Período",
+          "type": "date"
+        },
+        {
+          "name": "regiao",
+          "annotations": [
+            {
+              "name": "facet"
+            }
+          ],
+          "label": "Região",
+          "type": "text"
+        },
+        {
+          "name": "instituicao",
+          "annotations": [
+            {
+              "name": "facet"
+            }
+          ],
+          "label": "Instituição",
+          "type": "text"
+        },
+        {
+          "name": "localizacao_geografica",
+          "annotations": [
+            {
+              "args": [
+                "-count"
+              ],
+              "name": "facetsort"
+            }
+          ],
+          "label": "Localização Geográfica",
+          "type": "geo_point_2d"
+        },
+        {
+          "name": "mortalidade_avc_hemorragico_30_dias",
+          "annotations": [
+            {
+              "args": [
+                "%"
+              ],
+              "name": "unit"
+            },
+            {
+              "args": [
+                2
+              ],
+              "name": "decimals"
+            }
+          ],
+          "label": "Mortalidade AVC Hemorrágico 30 dias",
+          "type": "double"
+        },
+        {
+          "name": "mortalidade_avc_isquemico_30_dias",
+          "annotations": [
+            {
+              "args": [
+                "%"
+              ],
+              "name": "unit"
+            },
+            {
+              "args": [
+                2
+              ],
+              "name": "decimals"
+            }
+          ],
+          "label": "Mortalidade AVC Isquémico 30 dias",
+          "type": "double"
+        }
+      ],
+      "basic_metas": {
+        "default": {
+          "metadata_processed": "2026-09-09T15:03:43.114329+00:00",
+          "data_processed": "2026-09-09T15:03:43.061445+00:00",
+          "modified": "2026-09-09T15:03:43.061445+00:00",
+          "description": "<p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"><font face=\"Arial, sans-serif\"><span style=\"font-size: 14.6667px;\">Monitorização mensal da taxa de mortalidade por AVC Isquémico e Hemorrágico, nos 30 dias subsequentes ao episódio, discriminada por entidade de saúde.</span></font></p><p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"><font face=\"Arial, sans-serif\"><span style=\"font-size: 14.6667px;\"><b>Observações:</b></span></font></p><p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"></p><p style=\"margin: 0cm 0cm 12pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial;\"><font face=\"Arial, sans-serif\"><span style=\"font-size: 14.6667px;\">Os dados relativos ao mês n-2, publicados até ao último dia útil do mês n, têm caráter provisório, sujeitos a eventuais atualizações.</span></font></p>",
+          "publisher": "ACSS",
+          "theme": [
+            "Qualidade"
+          ],
+          "title": "Mortalidade por AVC Isquémico e Hemorrágico",
+          "keyword": [
+            "Mortalidade",
+            "AVC",
+            "Cuidados Hospitalares"
+          ],
+          "federated": false,
+          "modified_updates_on_metadata_change": true,
+          "geographic_reference_auto": true,
+          "modified_updates_on_data_change": true,
+          "bbox": {
+            "coordinates": [
+              [
+                [
+                  -6.768198050558567,
+                  41.80565318092704
+                ],
+                [
+                  -9.418267076835036,
+                  41.80565318092704
+                ],
+                [
+                  -9.418267076835036,
+                  37.02389728277922
+                ],
+                [
+                  -6.768198050558567,
+                  37.02389728277922
+                ],
+                [
+                  -6.768198050558567,
+                  41.80565318092704
+                ]
+              ]
+            ],
+            "type": "Polygon"
+          },
+          "metadata_languages": [
+            "pt"
+          ],
+          "geographic_reference": [
+            "world_pt"
+          ],
+          "language": "pt",
+          "geometry_types": [
+            "Point"
+          ],
+          "territory": [
+            "Portugal"
+          ],
+          "records_count": 6957
+        },
+        "custom": {
+          "source-data": "SICA (Integração com sistema fonte BDMH)",
+          "measure-unit": "Percentagem (%)",
+          "formula": "Nº Falecidos AVC Hemorrágico em 30 dias / Nº Episódios AVC Hemorrágicos X 100 ; Nº Falecidos AVC Isquémicos em 30 dias / Nº Episódios AVC Isquémicos X 100",
+          "dataset-id-number": "67"
+        }
+      },
+      "interop_metas": {
+        "dcat": {
+          "created": "2016-01-24T00:00:00+00:00",
+          "issued": "2018-12-31T00:00:00+00:00",
+          "accrualperiodicity": "Mensal",
+          "creator": "ACSS",
+          "contributor": "SPMS",
+          "spatial": "Portugal Continental",
+          "temporal": "janeiro de 2013 a maio de 2026 (valores acumulados)"
+        }
+      },
+      "extra_metas": {}
+    }
+  ]
+}

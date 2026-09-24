@@ -1,23 +1,31 @@
+import logging
 import re
 
+from email_validator import EmailNotValidError, validate_email
+from flask import current_app
+
+from udata.core.contact_point.models import check_no_urls
 from udata.core.dataset.models import HarvestDatasetMetadata
-from udata.core.spatial.models import SpatialCoverage
 from udata.core.utils.sanitization import sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.models import HarvestItem
 from udata.models import License
+from udata.mongo.errors import FieldValidationError
 from udata.utils import safe_harvest_datetime
 
 from .tools.harvester_utils import (
     DERIVED_LICENSE_EXTRA,  # noqa: F401  -- re-exported: the tests import it from here
     OGC_SERVICE_FORMATS,
-    bbox_to_multipolygon,
+    attach_publisher_contact,
+    bbox_to_spatial_coverage,
     guess_url_format,
     map_iso_maintenance_frequency,
     reset_maintenance_frequency_warnings,
     settle_harvested_license,
     sync_resources,
 )
+
+log = logging.getLogger(__name__)
 
 # The SNIG index publishes the licence as free text inside `legalConstraints`.
 # It is never fed to `License.guess`: that falls back to a Damerau-Levenshtein
@@ -261,12 +269,6 @@ class DGTBackend(BaseBackend):
     # (snig.dgterritorio.gov.pt) present a valid certificate (checked 2026-07).
     display_name = "Harvester DGT"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        import logging
-
-        self.logger = logging.getLogger(__name__)
-
     @staticmethod
     def _legal_constraints(record: dict) -> list[str]:
         """Normalize the record's `legalConstraints` into a list of strings.
@@ -445,6 +447,88 @@ class DGTBackend(BaseBackend):
                 groups.append(dates)
         return groups
 
+    @staticmethod
+    def _publisher_contact(record: dict) -> dict | None:
+        """The publisher contact the record names, as `{"name", "email"}`.
+
+        `responsibleParty` is a list of
+        `role|scope|organisation||email|...|address|phone||order` strings --
+        checked against the IPMA record recorded on 2026-09-23 -- with one
+        entry for whoever is responsible for the `resource` and another for the
+        `metadata`, and they need not share an email. The resource's entry is
+        preferred, since that is who publishes the data. Without either,
+        `orgNameSNIG` still names the organisation, with no email.
+
+        Address and phone are not kept: `ContactPoint` has nowhere to put them.
+        A name or email the model would refuse at save time -- a URL in the
+        name, an address that is not one -- is dropped here instead, because
+        the refusal would fail the whole item over a contact.
+        """
+        parties = record.get("responsibleParty")
+        if isinstance(parties, str):
+            parties = [parties]
+        elif not isinstance(parties, list):
+            parties = []
+
+        by_scope = {}
+        for entry in parties:
+            if not isinstance(entry, str):
+                continue
+            parts = entry.split("|")
+            if len(parts) < 5:
+                continue
+            name = sanitize_strict(parts[2]).strip()
+            if name:
+                by_scope.setdefault(parts[1].strip(), (name, parts[4].strip()))
+
+        name, email = by_scope.get("resource") or by_scope.get("metadata") or (None, None)
+        if not name:
+            fallback = record.get("orgNameSNIG")
+            if isinstance(fallback, list):
+                fallback = next((value for value in fallback if isinstance(value, str)), None)
+            name = sanitize_strict(fallback).strip() if isinstance(fallback, str) else None
+            email = None
+        if not name:
+            return None
+
+        try:
+            check_no_urls(name, "name")
+        except FieldValidationError:
+            return None
+        if email:
+            # The model's `check_is_email` only runs on API patches, never on
+            # `save()`, so this is the one check a harvested email gets. Shape
+            # only, never deliverability, as `saml_govpt` does: email_validator
+            # defaults `check_deliverability` to True and
+            # `SECURITY_EMAIL_VALIDATOR_ARGS` is only set in `settings.Testing`,
+            # so without the override this would run a live MX lookup per record
+            # -- and a resolver blip would drop the email on one run and bring it
+            # back on the next, minting a second contact point.
+            validator_args = {
+                "check_deliverability": False,
+                **(current_app.config.get("SECURITY_EMAIL_VALIDATOR_ARGS") or {}),
+            }
+            try:
+                validate_email(email, **validator_args)
+            except EmailNotValidError:
+                email = None
+        # `ContactPoint.name` and `email` are both bounded at 255.
+        return {"name": name[:255], "email": email[:255] if email else None}
+
+    @staticmethod
+    def _change_dates(record: dict) -> list[str]:
+        """The record's `changeDate` values, the last time the source says it changed.
+
+        A bare string on the records sampled, tolerated as a list for the same
+        reason the publication dates are.
+        """
+        value = record.get("changeDate")
+        if isinstance(value, str):
+            value = [value]
+        elif not isinstance(value, list):
+            return []
+        return [entry for entry in value if isinstance(entry, str) and entry.strip()]
+
     def inner_harvest(self):
         # An unmapped frequency is warned about once per harvest, not once per
         # dataset; without the reset it would be silenced for the lifetime of
@@ -465,12 +549,12 @@ class DGTBackend(BaseBackend):
         elif isinstance(metadata, str) and data.get("@to") == "1":
             # Se for string e @to == "1", não é possível processar como dict, então ignora ou loga erro
             msg = ("Error: metadata é uma string, não um dict: %r", metadata)
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         elif isinstance(metadata, str) and data.get("@to") == "0":
             msg = "Erro: Metadados vazios. Nenhum dataset disponível."
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         elif not isinstance(metadata, list):
@@ -478,7 +562,7 @@ class DGTBackend(BaseBackend):
 
         if not metadata:
             msg = "Erro: Metadados vazios. Nenhum dataset disponível."
-            self.logger.error(msg)
+            log.error(msg)
             raise Exception(msg)
 
         # Loop through the metadata and process each item
@@ -492,6 +576,8 @@ class DGTBackend(BaseBackend):
                 "legal_constraints": self._legal_constraints(each),
             }
             item["created_at"] = self._publication_dates(each)
+            item["modified_at"] = self._change_dates(each)
+            item["publisher"] = self._publisher_contact(each)
             item["update_frequency"] = self._update_frequency(each)
             item["geo_boxes"] = self._geo_boxes(each)
 
@@ -508,7 +594,7 @@ class DGTBackend(BaseBackend):
             for link in resources:
                 parsed = self._parse_link(link)
                 if parsed is None:
-                    self.logger.warning(
+                    log.warning(
                         "DGT: skipping a link of %s that names no resource: %r",
                         item["remote_id"],
                         link,
@@ -523,18 +609,16 @@ class DGTBackend(BaseBackend):
     def inner_process_dataset(self, item: HarvestItem, **kwargs):
         """Process harvested data into a dataset"""
         dataset = self.get_dataset(item.remote_id)
-        # Here you comes your implementation. You should :
-        # - fetch the remote dataset (if necessary)
-        # - validate the fetched payload
-        # - map its content to the dataset fields
-        # - store extra significant data in the `extra` attribute
-        # - map resources data
         data = kwargs.get("items")
 
         # Set basic dataset fields
         dataset.title = data["title"]
         dataset.license = self._license_for(dataset, item, data)
-        dataset.tags = ["snig.dgterritorio.gov.pt"]
+        # The source's own host, as `cswudata` and `ckanpt` tag theirs. The
+        # constant that stood here was right only for the one SNIG instance it
+        # was written against; a DGT source on any other host carried it too.
+        # An empty hostname would fail `TagListField` on its minimum length.
+        dataset.tags = [self.source.domain] if self.source.domain else []
         dataset.description = data["description"]
 
         # `Dataset.created_at` is a read-only property -- it reads
@@ -561,7 +645,30 @@ class DGTBackend(BaseBackend):
             # published on the first of the three, not on whichever the index
             # happened to list first.
             dataset.harvest.created_at = min(published)
+            # The public listing sorts on `created_at_internal`
+            # (`DEFAULT_SORTING`), not on the property, so without this every
+            # harvested record would sort as if it had been published on the
+            # day it was first harvested. Same fix as `ckanpt`.
+            dataset.created_at_internal = dataset.harvest.created_at
             break
+
+        changed = [
+            parsed
+            for parsed in (
+                safe_harvest_datetime(value, "DGT change date", refuse_future=True)
+                for value in data.get("modified_at") or []
+            )
+            if parsed
+        ]
+        if changed:
+            if not dataset.harvest:
+                dataset.harvest = HarvestDatasetMetadata()
+            # The latest of them: the record last changed on the last date it
+            # lists. `harvest.modified_at` is what `Dataset.last_modified`
+            # reads; `last_modified_internal` is its fallback and what the
+            # search sorts on as `last_update`.
+            dataset.harvest.modified_at = max(changed)
+            dataset.last_modified_internal = dataset.harvest.modified_at
 
         # `unknown` when the source says nothing. The field itself has no
         # default and was `None` on these datasets until now; both read as
@@ -575,16 +682,17 @@ class DGTBackend(BaseBackend):
         # `DERIVED_LICENSE_EXTRA` style of guard the licence has.
         dataset.frequency = map_iso_maintenance_frequency(data.get("update_frequency"))
 
-        boxes = data.get("geo_boxes")
-        if boxes:
+        coverage = bbox_to_spatial_coverage(data.get("geo_boxes") or [])
+        if coverage:
             # Replaces the whole coverage: `SpatialCoverage.clean` refuses
             # `zones` and `geom` together, so the two cannot be merged.
             #
-            # Not wrapped in a try: `_geo_boxes` has already rejected anything
-            # that is not four finite coordinates in range, and what the model
-            # would raise for a bad geometry is a mongoengine `ValidationError`
-            # at `save()` -- outside any handler that could sit here.
-            dataset.spatial = SpatialCoverage(geom=bbox_to_multipolygon(boxes))
+            # Not wrapped in a try: `_geo_boxes` and the helper have already
+            # rejected anything that is not four finite coordinates in range,
+            # and what the model would raise for a bad geometry is a
+            # mongoengine `ValidationError` at `save()` -- outside any handler
+            # that could sit here.
+            dataset.spatial = coverage
 
         # Add keywords as tags
         if data.get("keywords"):
@@ -616,6 +724,10 @@ class DGTBackend(BaseBackend):
 
         sync_resources(dataset, resources)
 
+        publisher = data.get("publisher")
+        if publisher:
+            attach_publisher_contact(self, dataset, publisher["name"], publisher["email"])
+
         # Add extra metadata
         dataset.extras["harvest:name"] = self.source.name
         # Kept so the licence decision can be audited without going back to the
@@ -638,7 +750,7 @@ class DGTBackend(BaseBackend):
             # The portal does not carry this licence yet. Visible on purpose:
             # silently landing on a near neighbour is how a record ends up
             # granting more than its source does.
-            self.logger.warning(
+            log.warning(
                 "DGT record %r declares licence %r, which the portal does not have",
                 item.remote_id,
                 license_id,
