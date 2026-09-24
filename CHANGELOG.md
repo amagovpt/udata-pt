@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **fix(harvest): harvesters pass Cloudflare managed challenges, and a challenge is named as such
+  instead of a generic 403**
+  - **Every harvester request now sends `Sec-Fetch-Mode: navigate`.** `dados.cm-lisboa.pt` sits
+    behind a Cloudflare managed challenge that answers 403 to any client sending no `Sec-Fetch-*`
+    header, which `requests` never does, so the source failed on every run and every preview.
+    Measured: that one header, with the uData User-Agent unchanged, turns the 403 into the CKAN
+    catalogue. It is set in `BaseBackend.get_headers`, so all backends send it; a caller's own
+    header still wins.
+  - **A challenge no longer reads as a dados.gov.pt permission error.** It used to surface as
+    `403 Client Error: Forbidden for url: ...`. The shared HTTP helper now raises
+    `HarvestRemoteBlocked` on a `cf-mitigated: challenge` response, with a message naming only the
+    remote host and saying the publisher refused the server. A 403 without that header behaves as
+    before. Requests owslib issues on its own (`cswudata`) get neither the header nor the check.
+
 - **feat(harvest): the `dgt`, `ogc` and `odspt` harvesters read what their sources publish
   instead of constants**
   - **The TML datasets no longer carry the DGT's tag.** `ogc` tagged every dataset
