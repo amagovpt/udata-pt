@@ -13,8 +13,14 @@
   - **A challenge no longer reads as a dados.gov.pt permission error.** It used to surface as
     `403 Client Error: Forbidden for url: ...`. The shared HTTP helper now raises
     `HarvestRemoteBlocked` on a `cf-mitigated: challenge` response, with a message naming only the
-    remote host and saying the publisher refused the server. A 403 without that header behaves as
-    before. Requests owslib issues on its own (`cswudata`) get neither the header nor the check.
+    remote host and saying the publisher refused the server. Requests owslib issues on its own
+    (`cswudata`) get neither the header nor the check.
+  - **A Cloudflare block without a challenge is named too.** A block or rate limit answers 403/429
+    with Cloudflare's own error page and no `cf-mitigated` header, and it showed up right after a
+    full harvest of the source. That page is recognised by its markers (`cf-error-details`,
+    `Cloudflare Ray ID`), because an origin 403 served through Cloudflare also carries
+    `server: cloudflare`, and the message gives the HTTP status and the Ray ID for the publisher
+    to trace. A 403 that Cloudflare did not generate behaves as before.
 
 - **feat(harvest): the `dgt`, `ogc` and `odspt` harvesters read what their sources publish
   instead of constants**
