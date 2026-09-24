@@ -26,7 +26,7 @@ from ..backends import (
     HarvestFilter,
     get_all_backends,
 )
-from ..exceptions import HarvestException
+from ..exceptions import HarvestException, HarvestRemoteBlocked
 from .factories import HarvestSourceFactory
 
 
@@ -226,6 +226,78 @@ class BaseBackendTest(PytestOnlyDBTestCase):
                 getattr(backend, method)(url, data={})
             else:
                 getattr(backend, method)(url)
+
+    def test_default_headers_include_sec_fetch_mode(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://www.example.com/"
+        rmock.get(url, text="ok")
+
+        backend.get(url)
+
+        assert rmock.last_request.headers["Sec-Fetch-Mode"] == "navigate"
+        assert rmock.last_request.headers["User-Agent"] == "uData/0.1 fake-backend"
+
+    def test_caller_headers_override_defaults(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://www.example.com/"
+        rmock.get(url, text="ok")
+
+        backend.get(url, headers={"Sec-Fetch-Mode": "cors"})
+
+        assert rmock.last_request.headers["Sec-Fetch-Mode"] == "cors"
+
+    def test_cloudflare_challenge_raises_remote_blocked(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://harvestuser:sup3rs3cr3t@dados.example.pt/api/3/action/package_list"
+        rmock.get(
+            url,
+            status_code=403,
+            text="Just a moment...",
+            headers={"cf-mitigated": "challenge", "Content-Type": "text/html"},
+        )
+
+        with pytest.raises(HarvestRemoteBlocked) as excinfo:
+            backend.get(url)
+
+        message = str(excinfo.value)
+        assert "dados.example.pt" in message
+        assert "anti-bot challenge" in message
+        assert "Client Error" not in message
+        assert "sup3rs3cr3t" not in message
+        assert "harvestuser" not in message
+
+    def test_cloudflare_block_raises_remote_blocked(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://dados.example.pt/api/3/action/package_list"
+        rmock.get(
+            url,
+            status_code=403,
+            text='<html><div id="cf-error-details">Access denied</div></html>',
+            headers={"server": "cloudflare", "Content-Type": "text/html", "cf-ray": "abc123-LIS"},
+        )
+
+        with pytest.raises(HarvestRemoteBlocked) as excinfo:
+            backend.get(url)
+
+        message = str(excinfo.value)
+        assert "dados.example.pt" in message
+        assert "HTTP 403" in message
+        assert "Ray ID abc123-LIS" in message
+        assert "Client Error" not in message
+
+    def test_origin_403_behind_cloudflare_is_returned(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://dados.example.pt/private"
+        rmock.get(
+            url,
+            status_code=403,
+            text="<html><body>Forbidden</body></html>",
+            headers={"server": "cloudflare", "Content-Type": "text/html"},
+        )
+
+        response = backend.get(url)
+
+        assert response.status_code == 403
 
     def test_harvest_item_remote_url(self):
         n = 3

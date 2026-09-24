@@ -34,6 +34,51 @@ class CkanBackendErrorsTest(PytestOnlyDBTestCase):
         # HTML is detected and does not clutter the message
         assert html not in error.message
 
+    def test_cloudflare_challenge_error(self, rmock):
+        # Cloudflare managed challenge: a 403 HTML page, not the CKAN API
+        source = HarvestSourceFactory(backend="ckan", url=CKAN_URL)
+
+        rmock.get(
+            API_URL,
+            text="Just a moment...",
+            status_code=403,
+            headers={"Content-Type": "text/html", "cf-mitigated": "challenge"},
+        )
+
+        actions.run(source)
+
+        source.reload()
+
+        job = source.get_last_job()
+        assert job.status == "failed"
+        assert len(job.errors) == 1
+        error = job.errors[0]
+        assert "anti-bot challenge" in error.message
+        assert "harvest.me" in error.message
+        assert "Client Error" not in error.message
+
+    def test_cloudflare_block_error(self, rmock):
+        # Cloudflare block or rate limit: its own error page, no challenge header
+        source = HarvestSourceFactory(backend="ckan", url=CKAN_URL)
+
+        rmock.get(
+            API_URL,
+            text="<html><p>Cloudflare Ray ID: abc123</p></html>",
+            status_code=403,
+            headers={"Content-Type": "text/html", "server": "cloudflare"},
+        )
+
+        actions.run(source)
+
+        source.reload()
+
+        job = source.get_last_job()
+        assert job.status == "failed"
+        assert len(job.errors) == 1
+        error = job.errors[0]
+        assert "blocked this server (Cloudflare, HTTP 403)" in error.message
+        assert "Client Error" not in error.message
+
     @pytest.mark.parametrize("code", STATUS_CODE)
     def test_plain_text_error(self, rmock, code):
         source = HarvestSourceFactory(backend="ckan", url=CKAN_URL)
