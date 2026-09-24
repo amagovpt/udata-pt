@@ -227,6 +227,10 @@ class BaseBackend(object):
         return {
             # TODO: extract site title and version
             "User-Agent": "uData/0.1 {0.name}".format(self),
+            # Cloudflare managed challenges answer 403 to any client that sends
+            # no `Sec-Fetch-*` header, which `requests` never does
+            # (dados.cm-lisboa.pt). This one header is enough to pass.
+            "Sec-Fetch-Mode": "navigate",
         }
 
     def has_feature(self, key):

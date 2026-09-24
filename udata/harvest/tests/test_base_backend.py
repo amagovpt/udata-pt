@@ -227,6 +227,25 @@ class BaseBackendTest(PytestOnlyDBTestCase):
             else:
                 getattr(backend, method)(url)
 
+    def test_default_headers_include_sec_fetch_mode(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://www.example.com/"
+        rmock.get(url, text="ok")
+
+        backend.get(url)
+
+        assert rmock.last_request.headers["Sec-Fetch-Mode"] == "navigate"
+        assert rmock.last_request.headers["User-Agent"] == "uData/0.1 fake-backend"
+
+    def test_caller_headers_override_defaults(self, rmock):
+        backend = FakeBackend(HarvestSourceFactory())
+        url = "https://www.example.com/"
+        rmock.get(url, text="ok")
+
+        backend.get(url, headers={"Sec-Fetch-Mode": "cors"})
+
+        assert rmock.last_request.headers["Sec-Fetch-Mode"] == "cors"
+
     def test_harvest_item_remote_url(self):
         n = 3
         source = HarvestSourceFactory(
