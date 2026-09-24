@@ -14,3 +14,9 @@ class HarvestValidationError(HarvestException):
     """Raised when an harvested item is invalid"""
 
     pass
+
+
+class HarvestRemoteBlocked(HarvestException):
+    """Raised when the remote source answers with an anti-bot challenge instead of content"""
+
+    pass
