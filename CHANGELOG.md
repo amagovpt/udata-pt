@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **fix(harvest): the harvest source text index is replaced before any other pending
+  migration reads the model**
+  - `udata db migrate` failed on tst at `2026-08-25-ckanpt-description-config-to-extra-configs`
+    with `IndexOptionsConflict`, and every migration after it was skipped. Migrations run in
+    filename order, and that one is the first to touch `HarvestSource` through mongoengine, so
+    it triggered `ensure_indexes` for the model's `name`-only text index against a database
+    that still had `name_text_url_text` -- the index the `2026-09-16` migration drops, which
+    had not run yet because it sorted after. Any database with the three pending at once
+    (tst, ppr, production) fails the same way.
+  - The index migration is now dated `2026-08-24`, so it sorts before every migration that
+    reads the model; a test pins that order. A database that already ran it under the old
+    date runs it again harmlessly: nothing covers `url` any more, so nothing is dropped, and
+    the report writes nothing. The failed `2026-08-25` record is retried by `udata db migrate`
+    on its own -- a KO record is not a skip -- so no `unrecord` is needed on tst.
+
 - **fix(harvest): harvesters pass Cloudflare managed challenges, and a challenge is named as such
   instead of a generic 403**
   - **Every harvester request now sends `Sec-Fetch-Mode: navigate`.** `dados.cm-lisboa.pt` sits
