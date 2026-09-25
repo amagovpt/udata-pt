@@ -1,7 +1,7 @@
 import os
 import re
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -12,6 +12,7 @@ from udata.core.organization.factories import OrganizationFactory
 from udata.core.user.factories import UserFactory
 from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
+from udata.utils import to_naive_datetime
 
 from ..backends.ine import INE_HVD_FEED_URL, INEBackend, INEDownloadIncomplete
 from .factories import HarvestSourceFactory
@@ -1016,6 +1017,40 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
         assert dataset.harvest.backend == INEBackend.display_name
         assert dataset.harvest.backend != "ine"
         assert dataset.harvest.backend
+
+    def test_last_update_is_the_source_date_not_the_harvest_time(self, rmock, tmp_path):
+        """The bulk write never runs `Dataset.clean()`, which is what computes it elsewhere."""
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        assert dataset.last_update == datetime(2026, 2, 4)
+        assert dataset.last_update == to_naive_datetime(dataset.harvest.modified_at)
+
+    def test_quality_cached_reflects_the_frequency_read_from_the_source(self, rmock, tmp_path):
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        # The stored field, read before `quality`: that property falls back to computing
+        # on the fly when the cache is empty, and edits the cached dict in memory.
+        assert dataset.quality_cached["update_frequency"] is True
+        assert dataset.quality["update_frequency"] is True
+
+    def test_a_rewrite_bumps_last_modified_internal(self, rmock, tmp_path):
+        """The field `udata search index --from-datetime` filters on."""
+        source = self._source()
+        _job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"
+        )
+        before = dataset.last_modified_internal
+
+        job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Anual", last_update="04-02-2026"
+        )
+
+        assert [item.status for item in job.items] == ["done"]
+        assert dataset.last_modified_internal > before
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])

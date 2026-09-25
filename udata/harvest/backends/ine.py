@@ -638,7 +638,29 @@ class INEBackend(BaseBackend):
                 base_slug = slugify(html.unescape(dataset.title), to_lower=True)
                 dataset.slug = f"{base_slug}-{remote_id}" if base_slug else f"ine-{remote_id}"
 
+        # Last on purpose: every field below is derived from the metadata set above.
+        self._refresh_derived_fields(dataset)
+
         return dataset
+
+    def _refresh_derived_fields(self, dataset):
+        """Write by hand what `Dataset.clean()` and `save()` would have written.
+
+        The bulk write path hands `to_mongo()` straight to pymongo, so `clean()` never runs
+        and these stayed at whatever the document held: `last_update` at the harvest time
+        instead of the source date, `quality_cached` empty or stale, so the visible score
+        ignored the frequency read from the source, and `last_modified_internal` untouched,
+        so `udata search index --from-datetime` never saw the rewrite. Same approach as
+        `Dataset.add_resource`, which also bypasses `save()`.
+
+        Order matters, as in `clean()`: the quality's `next_update` is computed from
+        `last_update`. And it has to run after `license` is assigned: `compute_quality()`
+        reads it, and a `License` still lazy from the prefetch would cost one query per
+        indicator. Everything else it reads is in memory, resources included.
+        """
+        dataset.last_update = dataset.compute_last_update()
+        dataset.quality_cached = dataset.compute_quality()
+        dataset.last_modified_internal = datetime.now(timezone.utc)
 
     # --------------------------
     # Flush bulk com tratamento de BulkWriteError
