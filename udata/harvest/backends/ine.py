@@ -23,7 +23,7 @@ from udata.harvest.backends.base import BaseBackend
 from udata.harvest.exceptions import HarvestValidationError
 from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
-from udata.utils import safe_harvest_datetime, safe_unicode
+from udata.utils import safe_harvest_datetime, safe_unicode, to_naive_datetime
 
 from ..url_filter import redact_url_credentials
 from .tools.harvester_utils import (
@@ -544,6 +544,19 @@ class INEBackend(BaseBackend):
 
         current_uri = (dataset.harvest.uri if dataset.harvest else None) or None
         if current_uri != (new_md.get("remote_url") or None):
+            return True
+
+        # Fields `_refresh_derived_fields` writes, because the bulk path never runs
+        # `Dataset.clean()`. Datasets written before it existed carry the harvest time as
+        # `last_update` and an empty or stale `quality_cached`, and match on everything
+        # above, so without these they would never heal. Only what follows from the
+        # harvested metadata is compared: the rest of `quality_cached` moves with the link
+        # checker, and comparing it would rewrite the dataset every night.
+        if to_naive_datetime(dataset.last_update) != dataset.compute_last_update():
+            return True
+
+        cached = dataset.quality_cached or {}
+        if not cached or cached.get("update_frequency") != dataset.has_frequency:
             return True
 
         return False
