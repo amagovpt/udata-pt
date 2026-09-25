@@ -226,6 +226,36 @@ It's possible to index or reindex only last modified documents.
 time udata search index -f 2022-02-20-20-02
 ```
 
+The `-f` filter selects datasets by `last_modified_internal`. That field is set by
+`Dataset.save()`, so a write that bypasses it is invisible to an incremental run unless it sets
+the field itself. No such write triggers a reindex either: the per-document reindex is a
+`post_save` hook, so between runs the index only follows these writes when someone runs one.
+
+### After deploying the INE derived-fields fix: one full dataset reindex
+
+The `ine` harvester writes through pymongo `bulk_write`, not `save()`. Until this fix it never
+set `last_modified_internal`, `last_update` or `quality_cached`, so everything its harvests
+changed since then (frequency, source extras, the `www-ine-pt` tag, and now the source date as
+`last_update`) is in MongoDB but not in the search index, and no `-f` timestamp reaches it.
+
+The order matters:
+
+1. Deploy, then restart the Celery worker **and** beat (they run harvesters from in-memory code).
+2. Wait for the first `ine` harvest to finish. It rewrites all ~13k INE datasets once, because
+   every one of them carries a stale `last_update`; later harvests settle back to rewriting only
+   what changed. A reindex run before this harvest would index the old `last_update`.
+3. Reindex the datasets in place, which needs no alias change since no mapping changes:
+
+   ```shell
+   time udata search index dataset
+   ```
+
+The full run is the safe choice rather than the only working one: since that first harvest
+stamps `last_modified_internal` on every INE dataset, `-f <deploy time>` run after it would
+also reach them. It is recommended because it does not depend on the harvest having
+rewritten every dataset. From then on the backend stamps the field, and incremental runs see
+its writes.
+
 ## Workers
 
 Start a worker with:

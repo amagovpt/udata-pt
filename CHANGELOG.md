@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **fix(harvest): INE datasets get the source date as `last_update` and a quality score that
+  counts their frequency**
+  - The `ine` backend writes through pymongo `bulk_write`, so `Dataset.clean()` never ran:
+    `last_update` stayed at the harvest time instead of the date the source publishes,
+    `quality_cached` never saw the frequency now read from the source (the visible score did not
+    rise), and `last_modified_internal` was untouched, so `udata search index -f` missed every
+    INE rewrite. The bulk path now computes all three itself before writing, as
+    `Dataset.add_resource` does. Measured cost: about 20 µs per dataset, a quarter of a second
+    for the 13,154 indicators.
+  - Change detection now treats a stale `last_update`, or a `quality_cached` that is missing or
+    disagrees on `update_frequency`, as a change, so the datasets already stored heal
+    themselves. Only that key of the cache is compared: the rest follows the link checker and
+    would force a rewrite every night.
+  - **Expect the first `ine` harvest after this deploy to rewrite all ~13k INE datasets once**,
+    then settle. They will then sort together at the top of "recently updated" in search, which
+    orders by `last_modified_internal`.
+  - **Deploy steps:** restart the Celery worker and beat; wait for that first `ine` harvest to
+    finish; then run one full dataset reindex (`udata search index dataset`), because what
+    earlier INE harvests wrote never reached the index and no `-f` timestamp selects it. The
+    order and the reasons are in `docs/administrative-tasks.md`.
+
 - **fix(harvest): the harvest source text index is replaced before any other pending
   migration reads the model**
   - `udata db migrate` failed on tst at `2026-08-25-ckanpt-description-config-to-extra-configs`
