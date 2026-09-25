@@ -1038,7 +1038,7 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
         assert dataset.quality["update_frequency"] is True
 
     def test_a_rewrite_bumps_last_modified_internal(self, rmock, tmp_path):
-        """The field `udata search index --from-datetime` filters on."""
+        """The field `udata search index -f` filters on."""
         source = self._source()
         _job, dataset = self._harvest(
             rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"

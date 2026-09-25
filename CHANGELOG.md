@@ -16,8 +16,9 @@
     themselves. Only that key of the cache is compared: the rest follows the link checker and
     would force a rewrite every night.
   - **Expect the first `ine` harvest after this deploy to rewrite all ~13k INE datasets once**,
-    then settle. They will then sort together at the top of "recently updated" in search, which
-    orders by `last_modified_internal`.
+    then settle. Lists sorted by `-last_update` (the v1 datasets API, the admin organisation
+    list) will then place INE datasets by their source date, so they stop crowding the top after
+    every harvest.
   - **Deploy steps:** restart the Celery worker and beat; wait for that first `ine` harvest to
     finish; then run one full dataset reindex (`udata search index dataset`), because what
     earlier INE harvests wrote never reached the index and no `-f` timestamp selects it. The

@@ -663,7 +663,7 @@ class INEBackend(BaseBackend):
         and these stayed at whatever the document held: `last_update` at the harvest time
         instead of the source date, `quality_cached` empty or stale, so the visible score
         ignored the frequency read from the source, and `last_modified_internal` untouched,
-        so `udata search index --from-datetime` never saw the rewrite. Same approach as
+        so `udata search index -f` never saw the rewrite. Same approach as
         `Dataset.add_resource`, which also bypasses `save()`.
 
         Order matters, as in `clean()`: the quality's `next_update` is computed from
