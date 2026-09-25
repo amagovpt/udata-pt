@@ -1,7 +1,7 @@
 import os
 import re
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -12,6 +12,7 @@ from udata.core.organization.factories import OrganizationFactory
 from udata.core.user.factories import UserFactory
 from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
+from udata.utils import to_naive_datetime
 
 from ..backends.ine import INE_HVD_FEED_URL, INEBackend, INEDownloadIncomplete
 from .factories import HarvestSourceFactory
@@ -1017,6 +1018,40 @@ class INESourceMetadataTest(PytestOnlyDBTestCase):
         assert dataset.harvest.backend != "ine"
         assert dataset.harvest.backend
 
+    def test_last_update_is_the_source_date_not_the_harvest_time(self, rmock, tmp_path):
+        """The bulk write never runs `Dataset.clean()`, which is what computes it elsewhere."""
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        assert dataset.last_update == datetime(2026, 2, 4)
+        assert dataset.last_update == to_naive_datetime(dataset.harvest.modified_at)
+
+    def test_quality_cached_reflects_the_frequency_read_from_the_source(self, rmock, tmp_path):
+        _job, dataset = self._harvest(
+            rmock, tmp_path, self._source(), periodicity="Mensal", last_update="04-02-2026"
+        )
+
+        # The stored field, read before `quality`: that property falls back to computing
+        # on the fly when the cache is empty, and edits the cached dict in memory.
+        assert dataset.quality_cached["update_frequency"] is True
+        assert dataset.quality["update_frequency"] is True
+
+    def test_a_rewrite_bumps_last_modified_internal(self, rmock, tmp_path):
+        """The field `udata search index -f` filters on."""
+        source = self._source()
+        _job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Mensal", last_update="04-02-2026"
+        )
+        before = dataset.last_modified_internal
+
+        job, dataset = self._harvest(
+            rmock, tmp_path, source, periodicity="Anual", last_update="04-02-2026"
+        )
+
+        assert [item.status for item in job.items] == ["done"]
+        assert dataset.last_modified_internal > before
+
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])
 class INEHasChangedTest(PytestOnlyDBTestCase):
@@ -1099,6 +1134,92 @@ class INEHasChangedTest(PytestOnlyDBTestCase):
         backend, md = self._backend_and_md(source)
 
         assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_stale_last_update_alone_is_detected(self, rmock, tmp_path):
+        """The harvest time the bulk path used to leave, not the source date."""
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(
+            source, rmock, tmp_path, set__last_update=datetime(2026, 9, 18, 14, 34, 12)
+        )
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_stale_quality_cached_alone_is_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(
+            source, rmock, tmp_path, set__quality_cached={"update_frequency": False}
+        )
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_missing_quality_cached_alone_is_detected(self, rmock, tmp_path):
+        source = self._source()
+        dataset = self._as_the_old_code_left_it(source, rmock, tmp_path, set__quality_cached={})
+        backend, md = self._backend_and_md(source)
+
+        assert backend._has_changed(dataset, md, "0001") is True
+
+    def test_a_newer_source_last_update_alone_is_detected(self, rmock, tmp_path):
+        """Caught through the raw `last_update_remote` extra, which also feeds modified_at.
+
+        Pinned here because the derived `last_update` is only as fresh as that comparison:
+        drop the extra and a source that only moves its date would be skipped for good.
+        """
+        source = self._source()
+        self._harvest(rmock, tmp_path, source)
+        backend = INEBackend(source)
+        xml = _catalog_xml(["0001"], **{**self.FIXTURE, "last_update": "05-03-2026"})
+        md = backend._extract_metadata(ET.fromstring(xml).find("indicator"))
+
+        assert backend._has_changed(self._dataset(source), md, "0001") is True
+
+    def test_a_source_without_last_update_settles_instead_of_churning(self, rmock, tmp_path):
+        """Without a source date the harvest time is stored, and must not count as a change."""
+        source = self._source()
+        fixture = {k: v for k, v in self.FIXTURE.items() if k != "last_update"}
+        for _ in range(2):
+            rmock.get(INE_URL, text=_catalog_xml(["0001"], **fixture))
+            rmock.get(INE_HVD_URL, text="<indicators/>")
+            backend = INEBackend(source)
+            backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+            job = backend.harvest()
+
+        assert [item.status for item in job.items] == ["skipped"]
+
+    def test_existing_dataset_with_stale_derived_fields_is_healed_on_the_next_harvest(
+        self, rmock, tmp_path
+    ):
+        """Criteria 1 and 2 on a dataset the bulk path wrote before the fix, then no churn."""
+        source = self._source()
+        self._harvest(rmock, tmp_path, source)
+        # Complete, as a real stale cache is: the score reads every key.
+        stale_quality = {
+            **self._dataset(source).quality_cached,
+            "update_frequency": False,
+            "next_update_for_update_fulfilled_in_time": None,
+        }
+        self._as_the_old_code_left_it(
+            source,
+            rmock,
+            tmp_path,
+            set__last_update=datetime(2026, 9, 18, 14, 34, 12),
+            set__quality_cached=stale_quality,
+        )
+        score_before = self._dataset(source).quality["score"]
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["done"]
+        dataset = self._dataset(source)
+        assert dataset.last_update == datetime(2026, 2, 4)
+        assert dataset.quality_cached["update_frequency"] is True
+        assert dataset.quality["score"] > score_before
+
+        job = self._harvest(rmock, tmp_path, source)
+
+        assert [item.status for item in job.items] == ["skipped"]
 
     def test_existing_dataset_without_the_new_metadata_is_rewritten_on_the_next_harvest(
         self, rmock, tmp_path
