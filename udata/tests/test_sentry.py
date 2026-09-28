@@ -36,8 +36,8 @@ TRUNCATED_TOKEN = "".join(f"{i:03d}" for i in range(100))
 def raise_a_harvest_error_longer_than_the_sdk_limit():
     """Raise what a CSW harvest raises over a huge response, URL at the end.
 
-    The filler is short words on purpose: one long run of letters next to an
-    `@` makes `_URL_USERINFO_RE` quadratic, and this string is walked several
+    The filler is short words on purpose: one long run of letters anywhere in a
+    string that holds an `@` makes `_URL_USERINFO_RE` quadratic, and this string is walked several
     times. The username is assembled inline, never held in a local of its own:
     the frames' source context -- this very function's lines -- and its locals
     are part of the event too.
@@ -122,10 +122,37 @@ class ScrubURLCredentialsTest:
         so a credential that lost its `@` is the unterminated tail."""
         assert scrub_url_credentials({"message": value}, {})["message"] == expected
 
-    def test_a_truncated_url_valued_key_is_redacted(self):
-        event = {"request": {"url": "https://harvestuser:sup3rs3..."}}
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("https://harvestuser:sup3rs3...", "https://***..."),
+            # A `{` stops the prose regex, not `urlsplit`: the netloc goes whole.
+            ("https://harvestuser:p{ss...", "https://***..."),
+            # Cut in the path: its `//` is not an authority.
+            (
+                "https://www.ine.pt/files//report@2026...",
+                "https://www.ine.pt/files//report@2026...",
+            ),
+        ],
+    )
+    def test_a_truncated_url_valued_key_is_redacted(self, value, expected):
+        event = {"request": {"url": value}}
 
-        assert scrub_url_credentials(event, {})["request"]["url"] == "https://***..."
+        assert scrub_url_credentials(event, {})["request"]["url"] == expected
+
+    def test_a_value_the_sdk_cut_by_bytes_is_redacted(self):
+        """Non-ASCII text is cut by UTF-8 bytes, not characters, so the cut
+        lands at a length no `max_value_length` comparison would predict."""
+        from sentry_sdk.utils import strip_string
+
+        value = "ç" * 49_950 + " https://harvestuser:" + TRUNCATED_TOKEN + "@www.ine.pt/csw"
+        cut = strip_string(value, max_length=100_000).value
+
+        scrubbed = scrub_url_credentials({"message": cut}, {})["message"]
+
+        assert TRUNCATED_TOKEN[:20] in cut
+        assert "harvestuser" not in scrubbed
+        assert not [window for window in _token_windows() if window in scrubbed]
 
     def test_every_logentry_key_is_redacted(self):
         """`formatted` is the string Sentry displays, and the ticket's list of
@@ -455,12 +482,17 @@ class SentryInitAppTest(PytestOnlyTestCase):
                 def capture_envelope(self, envelope):
                     sent.append(envelope.get_event())
 
+            # Everything `init_app` passes, so an option it adds later -- a
+            # `max_value_length`, a `custom_repr` -- is exercised here too. Only
+            # the transport and the integrations, which patch globals, differ.
             client = sentry_sdk.Client(
-                dsn="https://abc123@sentry.example.com/1",
-                transport=InMemoryTransport,
-                default_integrations=False,
-                before_send=before_send,
-                event_scrubber=wired["event_scrubber"],
+                **{
+                    **wired,
+                    "transport": InMemoryTransport,
+                    "integrations": [],
+                    "default_integrations": False,
+                    "before_send": before_send,
+                }
             )
             try:
                 raise_a_harvest_error_longer_than_the_sdk_limit()

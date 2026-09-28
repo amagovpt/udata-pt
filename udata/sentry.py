@@ -95,9 +95,9 @@ def _redact_truncated_tail(value: str) -> str:
     `@` is gone and `redact_url_credentials` has nothing to anchor on, so the
     username and a prefix of the password would ship. But a head-keeping cut
     also means that userinfo runs to the very end of the string: a `//`
-    followed only by authority characters up to the marker. No legitimate
-    authority ends without a `/`, `?`, space or quote after it, so replacing
-    that tail costs at most part of a hostname in a value already cut short.
+    followed only by authority characters up to the marker. A value the SDK
+    did not cut rarely ends that way, so replacing that tail costs at most part
+    of a hostname, in a value that ends in `...` either way.
     """
     if not value.endswith(_TRUNCATION_MARKER):
         return value
@@ -106,6 +106,29 @@ def _redact_truncated_tail(value: str) -> str:
     if start == -1 or not _AUTHORITY_TAIL_RE.fullmatch(body, start + 2):
         return value
     return f"{body[: start + 2]}***{_TRUNCATION_MARKER}"
+
+
+def _redact_truncated_url(value: str) -> str:
+    """`_redact_truncated_tail` for a value expected to be a whole URL.
+
+    Split, for the reason `_redact_url_value` splits: if the netloc runs to the
+    cut, all of it goes, whatever characters the password holds -- the tail
+    regex stops at a `{` that `urlsplit` accepts. A cut past the netloc leaves
+    the value alone, so a `//` in the path is never mistaken for an authority.
+    Anything that is not a bare URL falls back to the prose rule.
+    """
+    if not value.endswith(_TRUNCATION_MARKER) or value.split() != [value]:
+        return _redact_truncated_tail(value)
+    body = value[: -len(_TRUNCATION_MARKER)]
+    try:
+        parts = urlsplit(body)
+    except ValueError:
+        return _redact_truncated_tail(value)
+    if not parts.scheme or not parts.netloc:
+        return _redact_truncated_tail(value)
+    if parts.path or parts.query or parts.fragment:
+        return value
+    return f"{parts.scheme}://***{_TRUNCATION_MARKER}"
 
 
 def _is_secret_key(key) -> bool:
@@ -157,7 +180,7 @@ def _redact_in_place(node, depth: int = 0):
                 # `[Filtered]` -- nothing under this name may be sent.
                 node[key] = _FILTERED
             elif key in _URL_VALUED_KEYS and isinstance(value, str):
-                node[key] = _redact_truncated_tail(_redact_url_value(value))
+                node[key] = _redact_truncated_url(_redact_url_value(value))
             else:
                 node[key] = _redact_in_place(value, depth + 1)
         return node
