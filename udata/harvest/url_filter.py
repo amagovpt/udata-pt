@@ -87,9 +87,10 @@ def check_harvest_url(url: str) -> None:
         )
 
 
-# The authority of a URL, up to the `@` that ends its userinfo. The scheme is
-# optional because `udata.uris.validate` accepts a scheme-relative URL
-# (`//user:pass@host/x`), so a source really can be stored in that shape.
+# The authority of a URL, up to the `@` that ends its userinfo. The match
+# starts at the `//` and leaves the scheme out: the scheme was only ever
+# rewritten as it was, and leaving it out also covers the scheme-relative URL
+# that `udata.uris.validate` accepts (`//user:pass@host/x`).
 #
 # The character class is the authority alphabet of RFC 3986 (unreserved,
 # percent-encoded, sub-delims, `:`, `@`, and the brackets of an IPv6 literal).
@@ -101,10 +102,14 @@ def check_harvest_url(url: str) -> None:
 #
 # `@` is inside the class on purpose: being greedy, the match then ends at the
 # LAST `@` of the authority, which is what redacts a password containing an
-# unencoded `@`. There is no nested quantifier, so matching stays linear.
-_URL_USERINFO_RE = re.compile(
-    r"(?i)((?:[a-z][a-z0-9+.\-]*:)?//)[A-Za-z0-9\-._~%!$&'()*+,;=:@\[\]]*@"
-)
+# unencoded `@`.
+#
+# Matching is linear because `/` is not in the class: a match can only start at
+# a `//`, and the run after one `//` never contains the next. Do not put an
+# optional scheme back in front of the `//`: it is retried at every position of
+# any long `[a-z0-9+.-]` run, and one `@` anywhere in the text then makes the
+# scan quadratic (20k characters took 1.5s).
+_URL_USERINFO_RE = re.compile(r"(//)[A-Za-z0-9\-._~%!$&'()*+,;=:@\[\]]*@")
 
 
 def redact_url_credentials(text: str | None) -> str | None:
@@ -226,7 +231,7 @@ def check_harvest_url_credentials(url: str) -> None:
         # waved through: `check_harvest_url` runs next on the same value and
         # `urlparse` fails on it too, which rejects it as an invalid source
         # URL. Falling back to `_URL_USERINFO_RE` here would only change that
-        # message, and would run a quadratic scan over caller-supplied input.
+        # message.
         return
     if "@" in netloc:
         raise HarvestURLForbidden(_("Credentials in URL are not allowed"))
