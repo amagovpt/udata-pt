@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **fix(sentry): a harvest error longer than Sentry's value limit no longer ships the credential
+  its truncation cut in half**
+  - The SDK serializes every event before `before_send`, and serialization cuts each string over
+    `max_value_length` (100 000) to its head plus `...`. When the cut fell between a URL userinfo
+    and its `@`, `redact_url_credentials` had no `@` to anchor on, and the username and a prefix
+    of the password reached Sentry -- in the exception value and in the frame locals holding the
+    raw response. Harvest errors really are that long: they carry whole CSW documents.
+  - `before_send` now also redacts the tail such a cut leaves: a `//` followed only by authority
+    characters up to the `...`. A head-keeping cut means the lost `@` would have come after the
+    end of the string, and no legitimate authority ends without a `/`, `?`, space or quote, so the
+    only cost is part of a hostname in a value already cut short.
+  - **Why here and not where the messages are built.** Redacting or capping `HarvestError` and
+    `HarvestException` at the source covers only the call sites we can enumerate. The leak is the
+    raw exception and the frame locals the logging integration attaches -- a `msg` local holding
+    the response text, `requests` or `lxml` exceptions that never pass through our code -- and
+    neither option reaches those. Raising `max_value_length` only moves the cut: a CSW document
+    has no size limit, and every event would get heavier.
+  - `HarvestError.details` (`traceback.format_exc()`) is not affected: the model redacts `message`
+    and `details` over the full text before anything cuts it, and neither is sent to Sentry.
+  - Not covered, as before this change: a frame local whose `repr()` escapes `'` as `\'`, and a
+    password with characters outside the authority alphabet.
+
 - **fix(harvest): INE datasets get the source date as `last_update` and a quality score that
   counts their frequency**
   - The `ine` backend writes through pymongo `bulk_write`, so `Dataset.clean()` never ran:
