@@ -35,6 +35,10 @@ class RedactURLCredentialsTest:
             ("https://user:p@ss@data.example.com/x", "https://***@data.example.com/x"),
             ("https://user:p%40ss@data.example.com/x", "https://***@data.example.com/x"),
             ("HTTPS://USER:PASS@DATA.EXAMPLE.COM/x", "HTTPS://***@DATA.EXAMPLE.COM/x"),
+            # The scheme is outside the match and must come back as it was, and
+            # `udata.uris` accepts a scheme-relative URL.
+            ("ftp://u:p@host.pt/x", "ftp://***@host.pt/x"),
+            ("//u:p@host.pt/x", "//***@host.pt/x"),
             # Two URLs in one message must not be collapsed into one match.
             (
                 "tried https://u1:p1@a.example.com/x then https://u2:p2@b.example.com/y",
@@ -73,6 +77,22 @@ class RedactURLCredentialsTest:
         """A long message without a match must not hang the save path."""
         text = "https://" + "a" * 20000 + "/x"
         assert redact_url_credentials(text) == text
+
+    def test_redacts_a_long_message_with_an_at_sign_in_linear_time(self):
+        """A long alphanumeric run anywhere in a message with an `@` must stay cheap.
+
+        An optional scheme prefix before `//` was retried at every position of
+        such a run, which made the scan quadratic: 0.4s at 10k characters, 6s
+        at 40k, about 40s at 100k -- on the Sentry `before_send` and harvest
+        error save paths, synchronously.
+        """
+        import time
+
+        run = "a1" * 50_000
+        started = time.perf_counter()
+        redacted = redact_url_credentials(run + " https://u:p@host.pt/x")
+        assert time.perf_counter() - started < 1
+        assert redacted == run + " https://***@host.pt/x"
 
 
 class RedactURLCredentialsInURLTest:
