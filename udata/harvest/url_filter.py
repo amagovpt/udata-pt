@@ -109,7 +109,11 @@ def check_harvest_url(url: str) -> None:
 # optional scheme back in front of the `//`: it is retried at every position of
 # any long `[a-z0-9+.-]` run, and one `@` anywhere in the text then makes the
 # scan quadratic (20k characters took 1.5s).
-_URL_USERINFO_RE = re.compile(r"(//)[A-Za-z0-9\-._~%!$&'()*+,;=:@\[\]]*@")
+#
+# `(?i)` looks redundant next to `A-Za-z`, but under Unicode case folding it
+# also admits `ſ`, `İ`, `ı` and the Kelvin sign to the class, so a userinfo
+# containing one of them is still redacted.
+_URL_USERINFO_RE = re.compile(r"(?i)(//)[A-Za-z0-9\-._~%!$&'()*+,;=:@\[\]]*@")
 
 
 def redact_url_credentials(text: str | None) -> str | None:

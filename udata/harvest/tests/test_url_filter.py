@@ -39,6 +39,8 @@ class RedactURLCredentialsTest:
             # `udata.uris` accepts a scheme-relative URL.
             ("ftp://u:p@host.pt/x", "ftp://***@host.pt/x"),
             ("//u:p@host.pt/x", "//***@host.pt/x"),
+            # `(?i)` folds these into the class: `ſ` matches `s`.
+            ("https://admin:\u017fecret@host.pt/x", "https://***@host.pt/x"),
             # Two URLs in one message must not be collapsed into one match.
             (
                 "tried https://u1:p1@a.example.com/x then https://u2:p2@b.example.com/y",
