@@ -5,6 +5,7 @@ import pytest
 import requests
 from sentry_sdk.scrubber import EventScrubber
 
+from udata.harvest.exceptions import HarvestException
 from udata.sentry import _FILTERED, _MAX_SCRUB_DEPTH, init_app, scrub_url_credentials
 from udata.tests import PytestOnlyTestCase
 
@@ -25,6 +26,34 @@ def raise_requests_error():
     response.status_code = 500
     response.url = CREDENTIALED_URL
     response.raise_for_status()
+
+
+# A basic-auth token of distinct characters, so any 20-character window of it
+# found in an event is a leak and not a coincidence.
+TRUNCATED_TOKEN = "".join(f"{i:03d}" for i in range(100))
+
+
+def raise_a_harvest_error_longer_than_the_sdk_limit():
+    """Raise what a CSW harvest raises over a huge response, URL at the end.
+
+    The filler is short words on purpose: one long run of letters anywhere in a
+    string that holds an `@` makes `_URL_USERINFO_RE` quadratic, and this string is walked several
+    times. The username is assembled inline, never held in a local of its own:
+    the frames' source context -- this very function's lines -- and its locals
+    are part of the event too.
+    """
+    # 99_806 characters before the URL, so the SDK's cut at 99_997 lands 171
+    # characters into the token, well before its `@`.
+    msg = (
+        "lorem ipsum " * 8316
+        + " dados@ine.pt "
+        + f"https://{'harvest' + 'user'}:{TRUNCATED_TOKEN}@www.ine.pt/csw"
+    )
+    raise HarvestException(msg)
+
+
+def _token_windows(size=20):
+    return {TRUNCATED_TOKEN[i : i + size] for i in range(len(TRUNCATED_TOKEN) - size + 1)}
 
 
 def _nested_deeper_than_the_walk_follows():
@@ -66,6 +95,64 @@ class ScrubURLCredentialsTest:
         assert PASSWORD not in scrubbed
         assert "harvestuser" not in scrubbed
         assert "https://***@www.ine.pt/broken.xml" in scrubbed
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            # The SDK's cut fell inside the password: its `@` is gone.
+            ("failed https://harvestuser:sup3rs3...", "failed https://***..."),
+            # Inside the username -- which alone may be the secret.
+            ("failed https://harvestu...", "failed https://***..."),
+            # An `@` earlier in the text must not switch the tail check off.
+            (
+                "contact dados@ine.pt, then https://harvestuser:sup3r...",
+                "contact dados@ine.pt, then https://***...",
+            ),
+            # An unencoded `@` in the password, cut after it: the regex takes
+            # the userinfo up to that `@` and the tail takes the rest.
+            ("failed https://harvestuser:p@ssw...", "failed https://***..."),
+            # A cut past the authority leaves nothing to redact.
+            ("failed https://www.ine.pt/csw/rec...", "failed https://www.ine.pt/csw/rec..."),
+            # No truncation marker: not a cut, left alone.
+            ("host is https://www.ine.pt", "host is https://www.ine.pt"),
+        ],
+    )
+    def test_a_credential_the_sdk_truncation_cut_before_its_at_is_redacted(self, value, expected):
+        """`serialize()` cuts every value before `before_send`, keeping the head,
+        so a credential that lost its `@` is the unterminated tail."""
+        assert scrub_url_credentials({"message": value}, {})["message"] == expected
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("https://harvestuser:sup3rs3...", "https://***..."),
+            # A `{` stops the prose regex, not `urlsplit`: the netloc goes whole.
+            ("https://harvestuser:p{ss...", "https://***..."),
+            # Cut in the path: its `//` is not an authority.
+            (
+                "https://www.ine.pt/files//report@2026...",
+                "https://www.ine.pt/files//report@2026...",
+            ),
+        ],
+    )
+    def test_a_truncated_url_valued_key_is_redacted(self, value, expected):
+        event = {"request": {"url": value}}
+
+        assert scrub_url_credentials(event, {})["request"]["url"] == expected
+
+    def test_a_value_the_sdk_cut_by_bytes_is_redacted(self):
+        """Non-ASCII text is cut by UTF-8 bytes, not characters, so the cut
+        lands at a length no `max_value_length` comparison would predict."""
+        from sentry_sdk.utils import strip_string
+
+        value = "ç" * 49_950 + " https://harvestuser:" + TRUNCATED_TOKEN + "@www.ine.pt/csw"
+        cut = strip_string(value, max_length=100_000).value
+
+        scrubbed = scrub_url_credentials({"message": cut}, {})["message"]
+
+        assert TRUNCATED_TOKEN[:20] in cut
+        assert "harvestuser" not in scrubbed
+        assert not [window for window in _token_windows() if window in scrubbed]
 
     def test_every_logentry_key_is_redacted(self):
         """`formatted` is the string Sentry displays, and the ticket's list of
@@ -369,3 +456,68 @@ class SentryInitAppTest(PytestOnlyTestCase):
         EventScrubber().scrub_event(event)
 
         assert vars_["headers"]["Authorization"] == PASSWORD
+
+    def test_a_harvest_error_longer_than_the_sdk_limit_reaches_sentry_without_the_credential(
+        self, mocker
+    ):
+        """The acceptance criterion, through the SDK's real pipeline.
+
+        A real `Client` with an in-memory transport: frame vars serialized at
+        capture, the scrubber, `serialize()` and its truncation, then
+        `before_send`, in production order and with no network.
+        """
+        import sentry_sdk
+        from sentry_sdk.transport import Transport
+        from sentry_sdk.utils import event_from_exception
+
+        init = mocker.patch("sentry_sdk.init")
+        self.app.config["SENTRY_DSN"] = "https://abc123@sentry.example.com/1"
+        init_app(self.app)
+        wired = init.call_args.kwargs
+
+        def send(before_send):
+            sent = []
+
+            class InMemoryTransport(Transport):
+                def capture_envelope(self, envelope):
+                    sent.append(envelope.get_event())
+
+            # Everything `init_app` passes, so an option it adds later -- a
+            # `max_value_length`, a `custom_repr` -- is exercised here too. Only
+            # the transport and the integrations, which patch globals, differ.
+            client = sentry_sdk.Client(
+                **{
+                    **wired,
+                    "transport": InMemoryTransport,
+                    "integrations": [],
+                    "default_integrations": False,
+                    "before_send": before_send,
+                }
+            )
+            try:
+                raise_a_harvest_error_longer_than_the_sdk_limit()
+            except HarvestException:
+                client.capture_event(
+                    *event_from_exception(sys.exc_info(), client_options=client.options)
+                )
+            return sent[0]
+
+        def exposed_strings(event):
+            exception = event["exception"]["values"][0]
+            frame_vars = [frame.get("vars", {}) for frame in exception["stacktrace"]["frames"]]
+            return json.dumps([exception["value"], frame_vars])
+
+        # Guard the guard: without `before_send`, the cut lands where the
+        # ticket says -- a prefix of the token ships and its `@` does not.
+        unscrubbed = exposed_strings(send(None))
+        assert "harvestuser" in unscrubbed
+        assert TRUNCATED_TOKEN[:20] in unscrubbed
+        assert "@www.ine.pt" not in unscrubbed
+
+        event = send(wired["before_send"])
+
+        exposed = exposed_strings(event)
+        assert "harvestuser" not in exposed
+        whole_event = json.dumps(event)
+        assert not [window for window in _token_windows() if window in whole_event]
+        assert "https://***..." in event["exception"]["values"][0]["value"]

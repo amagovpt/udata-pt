@@ -77,6 +77,59 @@ _SECRET_VALUED_KEYS = frozenset(
 # by either side reads the same in Sentry.
 _FILTERED = "[Filtered]"
 
+# What `sentry_sdk.utils.strip_string` appends to every value it cuts. It keeps
+# the head, and it runs inside `serialize()` -- before `before_send` -- on every
+# string over `max_value_length` (100_000 by default), frame vars included.
+_TRUNCATION_MARKER = "..."
+
+# The RFC 3986 authority alphabet of `url_filter._URL_USERINFO_RE`, `@`
+# included, anchored by `fullmatch` from just after a `//` to the end of the
+# string. `/` is outside the class, so each string is scanned once.
+_AUTHORITY_TAIL_RE = re.compile(r"[A-Za-z0-9\-._~%!$&'()*+,;=:@\[\]]*")
+
+
+def _redact_truncated_tail(value: str) -> str:
+    """Redact the authority a truncation left unterminated at the end of `value`.
+
+    When the SDK's cut falls between the start of a userinfo and its `@`, the
+    `@` is gone and `redact_url_credentials` has nothing to anchor on, so the
+    username and a prefix of the password would ship. But a head-keeping cut
+    also means that userinfo runs to the very end of the string: a `//`
+    followed only by authority characters up to the marker. A value the SDK
+    did not cut rarely ends that way, so replacing that tail costs at most part
+    of a hostname, in a value that ends in `...` either way.
+    """
+    if not value.endswith(_TRUNCATION_MARKER):
+        return value
+    body = value[: -len(_TRUNCATION_MARKER)]
+    start = body.rfind("//")
+    if start == -1 or not _AUTHORITY_TAIL_RE.fullmatch(body, start + 2):
+        return value
+    return f"{body[: start + 2]}***{_TRUNCATION_MARKER}"
+
+
+def _redact_truncated_url(value: str) -> str:
+    """`_redact_truncated_tail` for a value expected to be a whole URL.
+
+    Split, for the reason `_redact_url_value` splits: if the netloc runs to the
+    cut, all of it goes, whatever characters the password holds -- the tail
+    regex stops at a `{` that `urlsplit` accepts. A cut past the netloc leaves
+    the value alone, so a `//` in the path is never mistaken for an authority.
+    Anything that is not a bare URL falls back to the prose rule.
+    """
+    if not value.endswith(_TRUNCATION_MARKER) or value.split() != [value]:
+        return _redact_truncated_tail(value)
+    body = value[: -len(_TRUNCATION_MARKER)]
+    try:
+        parts = urlsplit(body)
+    except ValueError:
+        return _redact_truncated_tail(value)
+    if not parts.scheme or not parts.netloc:
+        return _redact_truncated_tail(value)
+    if parts.path or parts.query or parts.fragment:
+        return value
+    return f"{parts.scheme}://***{_TRUNCATION_MARKER}"
+
 
 def _is_secret_key(key) -> bool:
     """Whether a dict key names a secret, ignoring spelling.
@@ -117,7 +170,7 @@ def _redact_in_place(node, depth: int = 0):
         # subtree nobody scrubbed.
         raise ValueError("event nested deeper than the scrubber follows")
     if isinstance(node, str):
-        return redact_url_credentials(node)
+        return _redact_truncated_tail(redact_url_credentials(node))
     if isinstance(node, dict):
         # Rebinding existing keys does not resize the dict, so iterating it
         # while assigning is safe.
@@ -127,7 +180,7 @@ def _redact_in_place(node, depth: int = 0):
                 # `[Filtered]` -- nothing under this name may be sent.
                 node[key] = _FILTERED
             elif key in _URL_VALUED_KEYS and isinstance(value, str):
-                node[key] = _redact_url_value(value)
+                node[key] = _redact_truncated_url(_redact_url_value(value))
             else:
                 node[key] = _redact_in_place(value, depth + 1)
         return node
@@ -173,6 +226,15 @@ def scrub_url_credentials(event, hint):
     `Authorization` header), which is the scrubber's job and not this one's,
     since no regex over the value can tell an API key from any other string
     (LEDG-2514).
+
+    The event it receives is already truncated: `_prepare_event` serializes
+    before calling it, and serialization cuts every string over
+    `max_value_length` to its head plus `...`. A cut between a userinfo and its
+    `@` leaves nothing for the regex to find, so each string also goes through
+    `_redact_truncated_tail`, which recognises the unterminated authority such a
+    cut leaves at the end. Raising `max_value_length` would only move the cut
+    -- a CSW document has no size limit -- and redacting where harvest messages
+    are built would miss the frame locals holding the raw response.
 
     Anything it cannot walk is dropped rather than sent: losing one report
     costs visibility, letting one through costs the credential.
