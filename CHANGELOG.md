@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+- **fix(harvest): URL credential redaction no longer takes seconds on a long message with an `@`**
+  - `redact_url_credentials` runs on every Sentry event (`before_send`), on every `HarvestError`
+    message and details, and on harvest log lines. Its regex put an optional scheme in front of
+    the `//`, and that optional prefix was retried at every position of any long `[a-z0-9+.-]`
+    run -- a hex or base64 blob, a run of digits. One `@` anywhere in the text, such as an email
+    address, was enough to make the scan quadratic: 0.4s at 10k characters, 6s at 40k, about 40s
+    at 100k, which is the size a harvest error with a whole CSW document reaches. The early exit
+    on "no `@` at all" never covered that case.
+  - The match now starts at the `//` and leaves the scheme out. The scheme was only captured to be
+    written back unchanged, so the output is the same for every input; the search becomes linear
+    because `/` is not in the authority class. A 100k-character message now takes well under a
+    millisecond.
+
+- **fix(sentry): a harvest error longer than Sentry's value limit no longer ships the credential
+  its truncation cut in half**
+  - The SDK serializes every event before `before_send`, and serialization cuts each string over
+    `max_value_length` (100 000) to its head plus `...`. When the cut fell between a URL userinfo
+    and its `@`, `redact_url_credentials` had no `@` to anchor on, and the username and a prefix
+    of the password reached Sentry -- in the exception value and in the frame locals holding the
+    raw response. Harvest errors really are that long: they carry whole CSW documents.
+  - `before_send` now also redacts the tail such a cut leaves: a `//` followed only by authority
+    characters up to the `...`. A head-keeping cut means the lost `@` would have come after the
+    end of the string, and no legitimate authority ends without a `/`, `?`, space or quote, so the
+    only cost is part of a hostname in a value already cut short.
+  - **Why here and not where the messages are built.** Redacting or capping `HarvestError` and
+    `HarvestException` at the source covers only the call sites we can enumerate. The leak is the
+    raw exception and the frame locals the logging integration attaches -- a `msg` local holding
+    the response text, `requests` or `lxml` exceptions that never pass through our code -- and
+    neither option reaches those. Raising `max_value_length` only moves the cut: a CSW document
+    has no size limit, and every event would get heavier.
+  - `HarvestError.details` (`traceback.format_exc()`) is not affected: the model redacts `message`
+    and `details` over the full text before anything cuts it, and neither is sent to Sentry.
+  - Not covered, as before this change: a frame local whose `repr()` escapes `'` as `\'`, and a
+    password with characters outside the authority alphabet.
+
+- **fix(harvest): INE datasets get the source date as `last_update` and a quality score that
+  counts their frequency**
+  - The `ine` backend writes through pymongo `bulk_write`, so `Dataset.clean()` never ran:
+    `last_update` stayed at the harvest time instead of the date the source publishes,
+    `quality_cached` never saw the frequency now read from the source (the visible score did not
+    rise), and `last_modified_internal` was untouched, so `udata search index -f` missed every
+    INE rewrite. The bulk path now computes all three itself before writing, as
+    `Dataset.add_resource` does. Measured cost: about 20 µs per dataset, a quarter of a second
+    for the 13,154 indicators.
+  - Change detection now treats a stale `last_update`, or a `quality_cached` that is missing or
+    disagrees on `update_frequency`, as a change, so the datasets already stored heal
+    themselves. Only that key of the cache is compared: the rest follows the link checker and
+    would force a rewrite every night.
+  - **Expect the first `ine` harvest after this deploy to rewrite all ~13k INE datasets once**,
+    then settle. Lists sorted by `-last_update` (the v1 datasets API, the admin organisation
+    list) will then place INE datasets by their source date, so they stop crowding the top after
+    every harvest.
+  - **Deploy steps:** restart the Celery worker and beat; wait for that first `ine` harvest to
+    finish; then run one full dataset reindex (`udata search index dataset`), because what
+    earlier INE harvests wrote never reached the index and no `-f` timestamp selects it. The
+    order and the reasons are in `docs/administrative-tasks.md`.
+
 - **fix(harvest): the harvest source text index is replaced before any other pending
   migration reads the model**
   - `udata db migrate` failed on tst at `2026-08-25-ckanpt-description-config-to-extra-configs`
