@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **fix(harvest): URL credential redaction no longer takes seconds on a long message with an `@`**
+  - `redact_url_credentials` runs on every Sentry event (`before_send`), on every `HarvestError`
+    message and details, and on harvest log lines. Its regex put an optional scheme in front of
+    the `//`, and that optional prefix was retried at every position of any long `[a-z0-9+.-]`
+    run -- a hex or base64 blob, a run of digits. One `@` anywhere in the text, such as an email
+    address, was enough to make the scan quadratic: 0.4s at 10k characters, 6s at 40k, about 40s
+    at 100k, which is the size a harvest error with a whole CSW document reaches. The early exit
+    on "no `@` at all" never covered that case.
+  - The match now starts at the `//` and leaves the scheme out. The scheme was only captured to be
+    written back unchanged, so the output is the same for every input; the search becomes linear
+    because `/` is not in the authority class. A 100k-character message now takes well under a
+    millisecond.
+
 - **fix(sentry): a harvest error longer than Sentry's value limit no longer ships the credential
   its truncation cut in half**
   - The SDK serializes every event before `before_send`, and serialization cuts each string over
