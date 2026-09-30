@@ -2,12 +2,18 @@ import logging
 
 import click
 from flask import current_app
+from mongoengine import NotUniqueError
 
 from udata.commands import cli, success
 from udata.core.dataservices.models import Dataservice
+from udata.core.jobs.models import PeriodicTask
+from udata.core.metrics.tasks import compute_site_metrics
 from udata.models import Dataset, GeoZone, Organization, Reuse, Site, User
 
 log = logging.getLogger(__name__)
+
+SITE_METRICS_JOB = "compute-site-metrics"
+SITE_METRICS_DEFAULT_CRON = "0 4 * * *"
 
 
 @cli.group("metrics")
@@ -158,3 +164,41 @@ def update(
                     continue
 
     success("All metrics have been updated")
+
+
+@grp.command()
+def bootstrap():
+    """Compute site metrics and schedule their refresh if it was never done
+
+    Idempotent, so it is safe to run on every startup: a fresh database has no
+    site metrics and no PeriodicTask for them, which leaves the homepage counters
+    at zero until someone runs the job by hand. Existing metrics and an existing
+    schedule (whatever its crontab) are left untouched.
+    """
+    site, _ = Site.objects.get_or_create(
+        id=current_app.config["SITE_ID"],
+        updates={
+            "title": current_app.config.get("SITE_TITLE"),
+            "keywords": current_app.config.get("SITE_KEYWORDS", []),
+        },
+    )
+    if "datasets" not in (site.metrics or {}):
+        log.info("Site metrics were never computed, computing them now")
+        compute_site_metrics.run()
+
+    if not PeriodicTask.objects(task=SITE_METRICS_JOB).count():
+        log.info(f"Scheduling {SITE_METRICS_JOB} with crontab {SITE_METRICS_DEFAULT_CRON}")
+        try:
+            PeriodicTask.objects.create(
+                task=SITE_METRICS_JOB,
+                name=f"Job {SITE_METRICS_JOB}",
+                description=f"Periodic {SITE_METRICS_JOB} job",
+                enabled=True,
+                args=[],
+                kwargs={},
+                crontab=PeriodicTask.Crontab.parse(SITE_METRICS_DEFAULT_CRON),
+            )
+        except NotUniqueError:
+            log.info(f"{SITE_METRICS_JOB} was scheduled concurrently")
+
+    success("Site metrics bootstrapped")

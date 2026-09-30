@@ -104,6 +104,18 @@ class PublicReadLiftedAboveIpDefaultTest(PytestOnlyAPITestCase):
         for endpoint in ("api.licenses", "api.dataset_frequencies", "api.reuse_types"):
             self._assert_survives(url_for(endpoint))
 
+    @pytest.mark.options(**RATELIMIT_OPTIONS)
+    def test_site_home_lifted(self):
+        """The aggregated homepage payload is fetched server-side by Next on
+        every homepage render, so it reaches the backend from one origin IP —
+        the frontend container, which sends no ``X-Forwarded-For`` and so keys
+        on the Docker gateway for every visitor at once. Under the old IP-keyed
+        default that ceiling was 200/hour *and* 1000/day, while a 10s ISR window
+        drives up to 360 calls/hour: the endpoint exhausted its own bucket and
+        started returning 429, which the frontend renders as a homepage with
+        zero datasets, zero organizations and no news (LEDG-2579)."""
+        self._assert_survives(url_for("api.site_home"))
+
 
 class PublicReadLimiterActuallyEngagesTest(PytestOnlyAPITestCase):
     """The lift must not silently disable the limiter: driving one endpoint past
