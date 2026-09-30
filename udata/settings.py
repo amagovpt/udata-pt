@@ -426,7 +426,6 @@ class Defaults(object):
     TRACKING_BLACKLIST = [
         "api.notifications",
         "api.check_dataset_resource",
-        "api.avatar",
     ]
 
     DELETE_ME = True
