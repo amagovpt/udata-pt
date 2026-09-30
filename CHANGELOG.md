@@ -6,10 +6,13 @@
   - `GET /api/1/avatars/<identifier>/<size>/` drew a pydenticon from a hash of the identifier.
     It never read the database, so the access-control finding reported against it did not hold:
     any string produced an image, and an existing user id was indistinguishable from an invented
-    one. What it did have was a `size` with no ceiling, drawn before any validation -- 150 costs
-    0.04s and 37MB, 20000 costs 31s and 1.5GB. The only brake was the IP-keyed global rate limit,
-    which collapses into a single shared bucket behind the WAF, and the memoized cache grew a new
-    entry for every `(identifier, size)` pair on top of that.
+    one. What it did have was a `size` with no ceiling, drawn before any validation. Measured
+    through the endpoint itself: `size=150` answers in 0.01s with a 433-byte PNG, `size=10000`
+    takes 1.9s and 553MB of RSS, and `size=20000` takes 7s, peaks at 1.7GB and returns a 1.6MB
+    image -- all to an anonymous caller. The only brake was the IP-keyed global rate limit, which
+    collapses into a single shared bucket behind the WAF, so a couple of hundred requests an hour
+    were enough; and the memoized cache grew a new entry for every `(identifier, size)` pair on
+    top of that.
   - Nothing consumed it. Uploaded avatars are served as files by the storage, the serialization
     returns `None` when a user has none instead of falling back to an identicon, and the frontend
     draws its own placeholder. Removing the route closes the resource-exhaustion vector outright
