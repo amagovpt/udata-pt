@@ -21,10 +21,14 @@ from udata.tests.helpers import assert200, assert404
 
 REMOVED_ENDPOINT = "api.avatar"
 REMOVED_PATH_PREFIX = "/avatars/"
+# Positive control. Without it "the route is gone" and "the API never loaded" look
+# identical, and an absence test that cannot tell them apart proves nothing.
+LIVE_ENDPOINT = "api.user_avatar"
 
 
 class AvatarEndpointRemovedTest(PytestOnlyAPITestCase):
     def test_avatar_route_returns_404(self):
+        assert200(self.get(url_for("api.specs")))  # the API is mounted and dispatching
         # `url_map.strict_slashes` is False app-wide, so both spellings used to answer
         # 200 and production exposed both. Close both.
         for path in ("/api/1/avatars/anything/150/", "/api/1/avatars/anything/150"):
@@ -35,6 +39,7 @@ class AvatarEndpointRemovedTest(PytestOnlyAPITestCase):
         # the endpoint exists but the arguments do not match, so it would not tell a
         # removed name apart from a name re-registered with another signature.
         endpoints = {rule.endpoint for rule in current_app.url_map.iter_rules()}
+        assert LIVE_ENDPOINT in endpoints  # the map is populated
         assert REMOVED_ENDPOINT not in endpoints
 
     def test_avatar_namespace_absent_from_swagger(self):
