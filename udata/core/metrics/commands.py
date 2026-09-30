@@ -13,7 +13,7 @@ from udata.models import Dataset, GeoZone, Organization, Reuse, Site, User
 log = logging.getLogger(__name__)
 
 SITE_METRICS_JOB = "compute-site-metrics"
-SITE_METRICS_DEFAULT_CRON = "0 * * * *"
+SITE_METRICS_DEFAULT_CRON = "0 4 * * *"
 
 
 @cli.group("metrics")
