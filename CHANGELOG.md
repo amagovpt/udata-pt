@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **fix(site): the public homepage no longer renders zeros when its aggregated endpoint is throttled**
+  - `/api/1/site/home/` carried no explicit rate limit, so it fell under the IP-keyed
+    `RATELIMIT_DEFAULT` ("1000 per day; 200 per hour"). The endpoint is fetched server-side by the
+    Next.js homepage on every render, container to container, so it carries no `X-Forwarded-For`
+    for `ProxyFix` to resolve and every visitor collapses into the frontend's own origin IP. The
+    homepage's 10s ISR window drives up to 360 calls/hour against that 200/hour ceiling, and once
+    the 1000/day cap is spent the endpoint stays throttled for the rest of the day.
+  - The frontend reads the resulting 429 as "no data" and renders 0 datasets, 0 organizations,
+    0 reuses, 0 users, an empty dataset list and an empty news section -- indistinguishable from
+    data loss, while the database held 20 968 datasets throughout.
+  - The endpoint now carries `PUBLIC_READ_LIMIT` (300/min, 6000/hour) keyed by `user_or_ip`, the
+    constant built for non-search-backed public reads, which deliberately has no per-day cap:
+    under IP-collapse a daily cap becomes a site-wide daily block. Third endpoint to need this
+    after `GET /api/1/me/` and the listing pages; the regression suite that covers that class now
+    includes the homepage.
+
 - **fix(harvest): URL credential redaction no longer takes seconds on a long message with an `@`**
   - `redact_url_credentials` runs on every Sentry event (`before_send`), on every `HarvestError`
     message and details, and on harvest log lines. Its regex put an optional scheme in front of

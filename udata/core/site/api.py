@@ -10,7 +10,13 @@ from flask import current_app, json, make_response, redirect, request, url_for
 from flask_login import current_user
 
 from udata.api import API, api, fields
-from udata.api.limits import CONTACT_SUBMIT_LIMIT, EXPORT_LIMIT, PUBLIC_SEARCH_LIMIT, user_or_ip
+from udata.api.limits import (
+    CONTACT_SUBMIT_LIMIT,
+    EXPORT_LIMIT,
+    PUBLIC_READ_LIMIT,
+    PUBLIC_SEARCH_LIMIT,
+    user_or_ip,
+)
 from udata.api_fields import patch
 from udata.app import cache, limiter
 from udata.auth import admin_permission
@@ -212,6 +218,28 @@ class SiteContactAPI(API):
 
 @api.route("/site/home/", endpoint="site_home")
 class SiteHomeAPI(API):
+    """Aggregated payload for the public homepage (LEDG-1860).
+
+    GET: generous public-read limit. This endpoint is fetched server-side by
+    the Next.js homepage on every render, container to container, so it carries
+    no `X-Forwarded-For` for ProxyFix to resolve and every visitor collapses
+    into the frontend's own origin IP. Without this it falls under the IP-keyed
+    `RATELIMIT_DEFAULT`, whose 200/hour is then a shared ceiling for the whole
+    site while the 10s ISR window drives up to 360 calls/hour — and whose
+    1000/day, once spent, keeps the homepage down for the rest of the day. The
+    frontend renders that 429 as zero datasets, zero organizations and no news
+    (LEDG-2579). `PUBLIC_READ_LIMIT` has no per-day cap for exactly this
+    reason; see `udata/api/limits.py`.
+    """
+
+    decorators = [
+        limiter.limit(
+            PUBLIC_READ_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc(id="get_site_home")
     @cache.cached(timeout=300, key_prefix="site_home")
     def get(self):
