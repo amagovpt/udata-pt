@@ -5,6 +5,7 @@ from flask import current_app
 
 from udata.commands import IS_TTY, cli, success
 from udata.core.dataset.commands import licenses
+from udata.core.metrics.commands import bootstrap as metrics_bootstrap
 from udata.core.spatial.commands import load as spatial_load
 from udata.core.user import commands as user_commands
 from udata.i18n import gettext as _
@@ -45,5 +46,8 @@ def init(ctx):
         text = _("Do you want to create some sample data?")
         if click.confirm(text, default=True):
             ctx.invoke(import_fixtures)
+
+    log.info("Compute site metrics and schedule their refresh if needed")
+    ctx.invoke(metrics_bootstrap)
 
     success(_("Your udata instance is ready!"))

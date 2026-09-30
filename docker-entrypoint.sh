@@ -36,5 +36,7 @@ while ! nc -z "$MONGO_HOST" "$MONGO_PORT" 2>/dev/null; do
 done
 echo "[entrypoint] MongoDB is up. Running database migrations..."
 uv run udata db migrate
+echo "[entrypoint] Bootstrapping site metrics if needed..."
+uv run udata metrics bootstrap
 
 exec "$@"
