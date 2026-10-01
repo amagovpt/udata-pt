@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import defusedxml.ElementTree as DET
 import requests
+import urllib3
 from flask import current_app
 from slugify import slugify
 
@@ -53,12 +54,60 @@ INE_SOURCE_EXTRAS = (
 
 
 class INEDownloadIncomplete(Exception):
-    """Raised when the downloaded XML is truncated (partial/aborted transfer).
+    """Raised when the catalogue stream ended without a complete document.
 
-    The INE endpoint is slow and frequently drops the connection mid-stream,
-    leaving a truncated file that later breaks ET.iterparse. This is treated as
-    a retryable error so the whole download (request + body) can be retried.
+    The INE endpoint is slow and frequently drops the connection mid-stream.
+    This is treated as a retryable error so the whole transfer (request + body)
+    can be retried.
     """
+
+
+# What ends one transfer attempt and is worth another: the connection or the
+# body failing, and the body arriving broken (a truncated document, or the error
+# page INE appends to a 200 response). Deliberately narrow — a defusedxml refusal
+# (`EntitiesForbidden`/`DTDForbidden` are `ValueError`s), a bug in
+# `_extract_metadata` or a database error must fail the job at once, not be
+# retried five times with backoff as if the source had dropped the connection.
+_STREAM_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    urllib3.exceptions.ProtocolError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    ET.ParseError,
+    INEDownloadIncomplete,
+)
+
+
+class _INECatalogStream:
+    """File-like view over a streamed catalogue response, teeing it to disk.
+
+    `iterparse` only needs `read()`, so the catalogue is parsed while it is still
+    arriving and every byte is copied into `part_path` on the way. The copy is
+    what becomes the cached catalogue once the document turns out complete; the
+    parse is what lets the indicators that did arrive be processed even when the
+    source cuts the body halfway.
+    """
+
+    def __init__(self, response, part_path: str, chunk_size: int = 8192):
+        self._chunks = response.iter_content(chunk_size=chunk_size)
+        self._file = open(part_path, "wb")
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        # One network chunk per call: `iterparse` accepts short reads, and
+        # handing bytes over as soon as they arrive is the whole point.
+        for chunk in self._chunks:
+            if chunk:
+                self._file.write(chunk)
+                self.bytes_read += len(chunk)
+                return chunk
+        return b""
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
 
 
 class INEBackend(BaseBackend):
@@ -103,6 +152,18 @@ class INEBackend(BaseBackend):
 
         self._cc_by_license = None
         self._catalog_truncated = False
+        # Set when every transfer attempt was cut after some indicators had
+        # already been processed: those stay updated, but the run did not see the
+        # whole catalogue, so nothing may be archived from it.
+        self._catalog_partial = False
+        # remote_ids already processed in this run. Shared by every transfer
+        # attempt, so a retry, which re-reads the catalogue from the top, skips
+        # what an earlier attempt handled instead of pushing a second HarvestItem.
+        self._seen: set[str] = set()
+        self._stats = dict.fromkeys(("processed", "changed", "created", "skipped", "failed"), 0)
+        self._pending_items: list[HarvestItem] = []
+        self._dataset_collection = None
+        self._parsed_count = 0
 
         if self.dryrun:
             # Previews must not share the download path with the real harvest.
@@ -154,98 +215,6 @@ class INEBackend(BaseBackend):
                 os.remove(path)
         except OSError:
             pass
-
-    def _download_to_file(self, url: str, dest_path: str) -> None:
-        """Download the XML to a local file, retrying the full transfer (request +
-        streamed body) and validating the result before accepting it.
-
-        `BaseBackend.get` only protects the initial GET, not the body
-        streaming via `iter_content`. The INE endpoint drops the connection
-        mid-stream (SSL EOF / ConnectionReset / ChunkedEncodingError) or times
-        out, leaving a truncated XML that breaks `ET.iterparse` with a
-        ParseError. Here we retry the whole download and only accept a file that
-        ends with the closing root tag (and matches Content-Length when the
-        server advertises it). As a last resort we reuse a previously cached
-        valid file so a transient INE outage does not fail the whole job.
-
-        Delays/timeouts come from the HARVEST_HTTP_* settings; only the retry
-        budget is INE-specific (`DOWNLOAD_MAX_RETRIES`) because each retry
-        re-transfers the whole catalog.
-        """
-
-        tmp_path = f"{dest_path}.part"
-        delay = self.http_retry_initial_delay
-        max_delay = self.http_retry_max_delay
-        last_exc: Exception | None = None
-
-        for attempt in range(1, self.DOWNLOAD_MAX_RETRIES + 1):
-            try:
-                # Guarded fetch (SSRF check, LEDG-1729 / VULN-2084): the
-                # connection-setup retry lives in BaseBackend; the loop here
-                # retries the full body transfer on truncation.
-                resp = self.get(url, stream=True, timeout=self.http_timeout)
-                resp.raise_for_status()
-
-                cl = resp.headers.get("Content-Length")
-                expected = int(cl) if cl and cl.isdigit() else None
-
-                written = 0
-                with open(tmp_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            written += len(chunk)
-
-                if expected is not None and written != expected:
-                    raise INEDownloadIncomplete(f"tamanho incompleto: {written}/{expected} bytes")
-                if not self._is_complete_xml(tmp_path):
-                    raise INEDownloadIncomplete("XML truncado: root <catalog> não fechado")
-
-                os.replace(tmp_path, dest_path)
-                self._log.info(
-                    "[INE] Download completo e validado: %s bytes (tentativa %s)",
-                    written,
-                    attempt,
-                )
-                return
-
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.ChunkedEncodingError,
-                ConnectionResetError,
-                ConnectionAbortedError,
-                INEDownloadIncomplete,
-            ) as e:
-                last_exc = e
-                self._safe_remove(tmp_path)
-                self._log.warning(
-                    "[INE] Download falhou/truncado (tentativa %s/%s): %s",
-                    attempt,
-                    self.DOWNLOAD_MAX_RETRIES,
-                    e,
-                )
-                if attempt >= self.DOWNLOAD_MAX_RETRIES:
-                    break
-                jitter = random.uniform(0, 0.1 * delay)
-                time.sleep(min(delay + jitter, max_delay))
-                delay = min(delay * 2, max_delay) if delay else 1
-            except requests.exceptions.RequestException:
-                self._safe_remove(tmp_path)
-                raise
-
-        # Todas as tentativas falharam: reutilizar último ficheiro válido em cache
-        if os.path.exists(dest_path) and self._is_complete_xml(dest_path):
-            self._log.warning(
-                "[INE] Download falhou após %s tentativas; a reutilizar ficheiro válido em cache: %s",
-                self.DOWNLOAD_MAX_RETRIES,
-                dest_path,
-            )
-            return
-
-        raise last_exc or requests.exceptions.RequestException(
-            "[INE] Falha no download do XML após todas as tentativas"
-        )
 
     # --------------------------
     # Normalização de tags
@@ -770,12 +739,21 @@ class INEBackend(BaseBackend):
         `max_items` — which is every preview, since `actions.preview` always
         passes `HARVEST_PREVIEW_MAX_ITEMS`. Without this, a preview of a source
         whose real harvest has been failing for longer than the grace period
-        would report the entire rest of the catalog as archived.
+        would report the entire rest of the catalog as archived. A stream the
+        source cut midway (`_catalog_partial`) is the same situation.
         """
         if self._catalog_truncated:
             self._log.warning(
                 "[INE] Autoarchive ignorado: o catálogo foi truncado em max_items=%s",
                 self.max_items,
+            )
+            return
+        if self._catalog_partial:
+            # Same reasoning for a stream the source cut: everything past the cut
+            # would look gone from the catalogue.
+            self._log.warning(
+                "[INE] Autoarchive ignorado: o catálogo só foi lido em parte (%s indicadores)",
+                len(self._seen),
             )
             return
         super().autoarchive()
@@ -811,346 +789,449 @@ class INEBackend(BaseBackend):
         start_time = time.time()
         self.HVD_INDICATOR_IDS = self._fetch_hvd_ids()
 
-        try:
-            # Download com retry + validação de integridade, processado e removido.
-            self._log.info(
-                "[INE] Baixando XML e salvando em %s (será removido após processamento)...",
-                self.LOCAL_FILE_PATH,
-            )
-            self._download_to_file(self.source.url, self.LOCAL_FILE_PATH)
-            self._log.info("[INE] Download concluído.")
-            source_context = self.LOCAL_FILE_PATH
-
-            # Fase 1: Criação do iterador sobre o XML
-            # Hardened parser: the catalog body is remote and, through the
-            # preview endpoint, caller-supplied. defusedxml refuses DTD entity
-            # definitions and external references by default, which is what
-            # turns a billion-laughs body from a worker-memory DoS into a clean
-            # harvest failure. The elements it yields are ordinary stdlib ones,
-            # so `elem.clear()` and the `ET.Element` type hints still hold — the
-            # stdlib import stays because defusedxml does not re-export Element.
-            context = DET.iterparse(source_context, events=("start", "end"))
-            context = iter(context)
-            event, root = next(context)  # Pega o elemento raiz
-
-            metadata_map = {}  # {remote_id: metadata_dict}
-            total_parsed = 0
-            # `max_items` has to be honoured here, not in phase 2. The convention
-            # elsewhere is to call `has_reached_max_items()` per item, but that
-            # reads `len(self.job.items)` and this backend only pushes into that
-            # list every `BULK_SIZE * 2` items (or at the very end), so for a
-            # 20-item preview it would never be true. Cutting the parse in
-            # document order is what the dcat backend does too.
-            truncated = False
-
-            for event, elem in context:
-                if event == "end" and elem.tag == "indicator":
-                    # Checked before processing, not after: deciding on the way in
-                    # means a catalog holding exactly `max_items` indicators ends
-                    # the loop naturally and is not reported as truncated.
-                    if self.max_items and len(metadata_map) >= self.max_items:
-                        truncated = True
-                        break
-
-                    total_parsed += 1
-                    md = self._extract_metadata(elem)
-                    remote_id = elem.get("id")
-
-                    # Skip items without title (mandatory field)
-                    if remote_id and md.get("title"):
-                        metadata_map[remote_id] = md
-                    elif remote_id:
-                        self._log.warning("[INE] Skipping item %s: missing title", remote_id)
-
-                    elem.clear()
-                    root.clear()  # Limpa memoria da arvore XML
-
-            self._log.info(
-                "[INE] Parsing XML concluído. Total items: %s. Iniciando processamento...",
-                total_parsed,
-            )
-
-            self._catalog_truncated = truncated
-
-            if truncated and not self.dryrun:
-                # Expected in a preview, worth an error on a real harvest: with
-                # `source.autoarchive` on, everything below the cut would be
-                # archived as if it had disappeared from the remote catalog.
-                self._log.warning(
-                    "[INE] max_items=%s atingido: nem todos os indicadores foram retirados",
-                    self.max_items,
-                )
-                self.job.errors.append(
-                    HarvestError(
-                        message=(
-                            f"{self.max_items} max items reached, not all datasets were retrieved"
-                        )
-                    )
-                )
-
-        except Exception as e:
-            self._log.error("[INE] Erro no download/parsing do XML: %s", e)
-            raise
-
-        # --- Fim Fase 1, Inicio Fase 2 (Processamento) ---
-        self._log.info(
-            "[INE] Fase 2: change detection + bulk_write (bulk_size=%s)",
-            self.BULK_SIZE,
-        )
-
-        from pymongo import ReplaceOne, UpdateOne
-
-        ops = []
-        op_ids = []
-        # Lista temporária para HarvestItems deste batch
-        batch_harvest_items = []
-
-        dataset_collection = None
-
-        changed = 0
-        created = 0
-        skipped = 0
-        failed = 0
-        processed = 0
-
-        # Para reporting no Job
         if not hasattr(self, "job") or self.job is None:
             self._log.warning(
                 "[INE] Atenção: self.job não existe. O progresso não será visível na UI."
             )
 
-        # Processar em batches para eficiência com escrita em massa.
-        # Estratégia: iterar metadados em chunks, fazer change detection,
-        # acumular operações Mongo, e fazer flush quando atinge BULK_SIZE.
-        all_items = list(metadata_map.items())
-        total_items = len(all_items)
+        try:
+            complete, last_error = self._harvest_live()
+            if complete:
+                # Once the whole catalogue went through, the cached copy has
+                # nothing left to offer this run.
+                self._cleanup_local_file()
+            elif self._seen:
+                self._mark_partial(last_error)
+            elif self._is_complete_xml(self.LOCAL_FILE_PATH):
+                self._harvest_snapshot(last_error)
+            else:
+                raise last_error
+        except Exception as e:
+            self._log.error("[INE] Erro no download/parsing do XML: %s", e)
+            raise
+        finally:
+            self._flush_pending_items()
 
-        # Processar em chunks do tamanho do bulk_size
-        for i in range(0, total_items, self.BULK_SIZE):
-            chunk = all_items[i : i + self.BULK_SIZE]
-
-            # --- Passo A: Pré-buscar datasets (1 query para o chunk inteiro) ---
-            existing = self._prefetch_datasets([remote_id for remote_id, _ in chunk])
-            for remote_id, md in chunk:
-                md["__dataset_obj"] = existing.get(remote_id) or self._new_dataset()
-
-            # --- Passo B: Processamento do chunk ---
-            # Guarda remote_ids de datasets criados para buscar IDs depois
-            created_remote_ids = []
-
-            for remote_id, md in chunk:
-                processed += 1
-                item_status = "done"
-                dataset = md.pop("__dataset_obj")  # recupera e limpa
-
-                try:
-                    if dataset_collection is None:
-                        dataset_collection = dataset._get_collection()
-
-                    # Verifica se o dataset existe baseado no harvest.remote_id
-                    # O get_dataset retorna um dataset existente (com id) ou um novo (sem id)
-                    is_existing = (
-                        getattr(dataset, "harvest", None) is not None
-                        and getattr(dataset.harvest, "remote_id", None) == remote_id
-                        and getattr(dataset, "id", None) is not None
-                    )
-
-                    if is_existing:
-                        # Every other backend reaches an existing record through
-                        # `BaseBackend.get_dataset`, which asks this right after
-                        # the lookup. This one used to as well; the FAST 2-phase
-                        # rewrite (4dc13d6eb) took it off that shared path in
-                        # favour of a bulk lookup and a bulk write, so when the
-                        # guard was later added to `get_dataset` this backend
-                        # silently missed it — nothing here ever asked whether
-                        # the record it was about to overwrite belongs to
-                        # somebody else. Note the guard is blind to records with
-                        # no owner at all: an orphan is still adopted, upstream
-                        # behaviour shared with `get_dataset`.
-                        # It is asked here rather than in the
-                        # prefetch because the prefetch has no per-item error
-                        # handling — raising there would lose the whole chunk,
-                        # whereas the `except` below fails this one item and
-                        # carries on, which is what `process_dataset` does.
-                        # Asked before `_has_changed` too, for the same reason
-                        # the precedent asks before knowing whether anything
-                        # changed: an unchanged record owned by someone else
-                        # must not be quietly reported as "skipped" against
-                        # this source either. The CREATE branch needs no guard,
-                        # since it can only be reached with a `_new_dataset()`
-                        # already owned by this source.
-                        self.ensure_unique_ownership(dataset)
-
-                    # ========================================
-                    # CASO 1: Dataset já existe na base de dados
-                    # ========================================
-                    if is_existing:
-                        # Verificar se houve alterações nos metadados
-                        if self.CHECK_CHANGES and not self._has_changed(dataset, md, remote_id):
-                            # Sem alterações -> SKIP
-                            skipped += 1
-                            item_status = "skipped"
-                            self._log.debug("[INE] SKIP: remote_id=%s (sem alterações)", remote_id)
-                        else:
-                            # Com alterações -> UPDATE
-                            self._apply_metadata_to_dataset(dataset, remote_id, md)
-                            doc = dataset.to_mongo()
-                            doc_dict = dict(doc)
-                            _id = doc_dict.get("_id", dataset.id)
-                            ops.append(ReplaceOne({"_id": _id}, doc_dict, upsert=False))
-                            op_ids.append(remote_id)
-                            changed += 1
-                            self._log.debug(
-                                "[INE] UPDATE: remote_id=%s (metadados alterados)",
-                                remote_id,
-                            )
-
-                        # HarvestItem para datasets existentes
-                        if self.job:
-                            h_item = HarvestItem(remote_id=remote_id, status=item_status)
-                            h_item.dataset = dataset.id
-                            batch_harvest_items.append(h_item)
-
-                    # ========================================
-                    # CASO 2: Dataset não existe -> CREATE
-                    # ========================================
-                    else:
-                        self._apply_metadata_to_dataset(dataset, remote_id, md)
-                        doc = dataset.to_mongo()
-                        doc_dict = dict(doc)
-                        # Remover _id pois será gerado pelo MongoDB
-                        doc_dict.pop("_id", None)
-                        ops.append(
-                            UpdateOne(
-                                {
-                                    "harvest.remote_id": str(remote_id),
-                                    "harvest.source_id": (
-                                        str(self.source.id) if self.source.id else None
-                                    ),
-                                },
-                                {"$setOnInsert": doc_dict},
-                                upsert=True,
-                            )
-                        )
-                        op_ids.append(remote_id)
-                        created += 1
-                        created_remote_ids.append(remote_id)
-                        self._log.debug("[INE] CREATE: remote_id=%s (novo dataset)", remote_id)
-
-                except Exception as e:
-                    failed += 1
-                    item_status = "failed"
-                    if isinstance(e, HarvestValidationError):
-                        # A refusal, not a crash: `process_dataset` logs these at
-                        # info too. A rejected catalogue can fail every one of
-                        # 13k items, and a full traceback each would bury the
-                        # log without adding anything the message does not say.
-                        self._log.info(
-                            "[INE] Recusado na fase 2 para remote_id=%s: %s", remote_id, e
-                        )
-                    else:
-                        self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
-                    # The message is carried onto the item, as `process_dataset`
-                    # does: a job over 13k items reporting `failed` with an empty
-                    # `errors` list tells the operator nothing about which of
-                    # them is an ownership conflict, or who the other owner is.
-                    # Truncated because the items are pushed into one job
-                    # document: 13k unbounded messages (a mongoengine or pymongo
-                    # error runs to a kilobyte) would carry the job past the
-                    # 16 MB BSON limit and lose the whole record of a harvest
-                    # whose writes already landed.
-                    if self.job:
-                        h_item = HarvestItem(
-                            remote_id=remote_id,
-                            status=item_status,
-                            # Redact before truncating: a cut landing inside the
-                            # userinfo would leave a prefix of the password that
-                            # the constructor can no longer recognise as one.
-                            errors=[
-                                HarvestError(message=redact_url_credentials(safe_unicode(e))[:500])
-                            ],
-                        )
-                        # Kept so the job links to the dataset in conflict; the
-                        # message names the other owner, not the record.
-                        h_item.dataset = getattr(dataset, "id", None)
-                        batch_harvest_items.append(h_item)
-
-            # --- Fim do loop do chunk ---
-
-            # Flush Ops por chunk. Tem de acontecer ANTES do lookup dos IDs
-            # criados, senão os upserts ainda não estão na BD e os
-            # HarvestItems ficam sem referência ao dataset.
-            if ops and dataset_collection is not None:
-                self._flush_bulk(dataset_collection, ops, op_ids)
-                ops, op_ids = [], []
-
-            # Buscar IDs dos datasets criados (1 query por chunk) e criar HarvestItems
-            if self.job and created_remote_ids and dataset_collection is not None:
-                id_by_rid = {}
-                try:
-                    cursor = dataset_collection.find(
-                        {
-                            "harvest.remote_id": {"$in": [str(r) for r in created_remote_ids]},
-                            "harvest.source_id": (str(self.source.id) if self.source.id else None),
-                        },
-                        {"_id": 1, "harvest.remote_id": 1},
-                    )
-                    id_by_rid = {doc["harvest"]["remote_id"]: doc["_id"] for doc in cursor}
-                except Exception:
-                    self._log.warning(
-                        "[INE] Não foi possível buscar IDs dos datasets criados neste chunk"
-                    )
-                for rid in created_remote_ids:
-                    h_item = HarvestItem(remote_id=rid, status="done")
-                    if str(rid) in id_by_rid:
-                        h_item.dataset = id_by_rid[str(rid)]
-                    batch_harvest_items.append(h_item)
-
-            if self.job and len(batch_harvest_items) >= (self.BULK_SIZE * 2):
-                added = len(batch_harvest_items)
-                self._append_job_items(batch_harvest_items)
-                self._log.info(
-                    "[INE] Job items: +%s (total %s)",
-                    added,
-                    len(self.job.items),
+        if self._catalog_truncated and not self.dryrun:
+            # Expected in a preview, worth an error on a real harvest: with
+            # `source.autoarchive` on, everything below the cut would be
+            # archived as if it had disappeared from the remote catalog.
+            self._log.warning(
+                "[INE] max_items=%s atingido: nem todos os indicadores foram retirados",
+                self.max_items,
+            )
+            self.job.errors.append(
+                HarvestError(
+                    message=(f"{self.max_items} max items reached, not all datasets were retrieved")
                 )
-                batch_harvest_items = []
-
-            if processed % (self.LOG_EVERY * 5) == 0:
-                self._log.info(
-                    "[INE] Fase 2 progresso: processed=%s changed=%s created=%s skipped=%s failed=%s",
-                    processed,
-                    changed,
-                    created,
-                    skipped,
-                    failed,
-                )
-
-        # Final Flush Ops
-        if ops and dataset_collection is not None:
-            self._flush_bulk(dataset_collection, ops, op_ids)
-
-        # Final Flush Job Items
-        if self.job and batch_harvest_items:
-            added = len(batch_harvest_items)
-            self._append_job_items(batch_harvest_items)
-            self._log.info(
-                "[INE] Final job items: +%s (total %s)",
-                added,
-                len(self.job.items),
             )
 
         total_time = time.time() - start_time
+        stats = self._stats
         self._log.info(
-            "[INE] FAST MODE concluído em %ss (%.1f min) | processed=%s changed=%s created=%s skipped=%s failed=%s",
+            "[INE] FAST MODE concluído em %ss (%.1f min) | parsed=%s processed=%s changed=%s "
+            "created=%s skipped=%s failed=%s",
             round(total_time, 1),
             total_time / 60,
-            processed,
-            changed,
-            created,
-            skipped,
-            failed,
+            self._parsed_count,
+            stats["processed"],
+            stats["changed"],
+            stats["created"],
+            stats["skipped"],
+            stats["failed"],
         )
 
-        # Remover ficheiro descarregado após processamento bem-sucedido
-        self._cleanup_local_file()
+    def _harvest_live(self) -> tuple[bool, Exception | None]:
+        """Stream the catalogue from the source, processing it as it arrives.
+
+        Each attempt re-requests the catalogue from the top: the endpoint
+        ignores `Range` and has no paging, so there is nothing to resume from.
+        Indicators an earlier attempt already processed are skipped (`_seen`),
+        which makes a retry cost the transfer only.
+
+        Returns whether an attempt read the whole catalogue (or stopped at
+        `max_items` by design), and the error that ended the last attempt.
+        """
+        path = self.LOCAL_FILE_PATH
+        delay = self.http_retry_initial_delay
+        max_delay = self.http_retry_max_delay
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.DOWNLOAD_MAX_RETRIES + 1):
+            # Unique per attempt and per process: two runs of the same source
+            # must never interleave their writes into one file.
+            part = f"{path}.{os.getpid()}-{uuid4().hex[:8]}.part"
+            error: Exception | None = None
+            try:
+                try:
+                    # Guarded fetch (SSRF check, LEDG-1729 / VULN-2084): the
+                    # connection-setup retry lives in BaseBackend; this loop
+                    # retries the body transfer.
+                    response = self.get(self.source.url, stream=True, timeout=self.http_timeout)
+                    response.raise_for_status()
+                except _STREAM_ERRORS as e:
+                    error = e
+                else:
+                    stream = _INECatalogStream(response, part)
+                    try:
+                        error = self._harvest_indicators(self._iter_indicators(stream))
+                    finally:
+                        stream.close()
+                        response.close()
+
+                    if error is None and self._catalog_truncated:
+                        return True, None
+                    if error is None and not self._is_complete_xml(part):
+                        error = INEDownloadIncomplete("XML truncado: root <catalog> não fechado")
+                    if error is None:
+                        os.replace(part, path)
+                        self._log.info(
+                            "[INE] Catálogo completo e validado: %s bytes (tentativa %s)",
+                            stream.bytes_read,
+                            attempt,
+                        )
+                        return True, None
+            finally:
+                self._safe_remove(part)
+
+            last_error = error
+            self._log.warning(
+                "[INE] Download falhou/truncado (tentativa %s/%s, %s indicadores processados): %s",
+                attempt,
+                self.DOWNLOAD_MAX_RETRIES,
+                len(self._seen),
+                redact_url_credentials(safe_unicode(error)),
+            )
+            if attempt < self.DOWNLOAD_MAX_RETRIES:
+                jitter = random.uniform(0, 0.1 * delay)
+                time.sleep(min(delay + jitter, max_delay))
+                delay = min(delay * 2, max_delay) if delay else 1
+
+        return False, last_error
+
+    def _harvest_snapshot(self, last_error: Exception | None) -> None:
+        """Process the last complete catalogue kept on disk.
+
+        Only reached when no attempt delivered a single indicator. Never used to
+        complete a partial run: the database already reflects that file, so
+        replaying it over a run that did reach the source would at best change
+        nothing and at worst roll back what the source just updated.
+        """
+        self._log.warning(
+            "[INE] Download falhou após %s tentativas (%s); a usar o catálogo em cache: %s",
+            self.DOWNLOAD_MAX_RETRIES,
+            redact_url_credentials(safe_unicode(last_error)),
+            self.LOCAL_FILE_PATH,
+        )
+        error = self._harvest_indicators(self._iter_indicators(self.LOCAL_FILE_PATH))
+        if error is not None:
+            raise error
+
+    def _mark_partial(self, last_error: Exception | None) -> None:
+        """Record a run whose every attempt was cut after some indicators."""
+        self._catalog_partial = True
+        self.job.data["partial"] = True
+        self._log.warning(
+            "[INE] Execução parcial: o catálogo foi cortado após %s indicadores: %s",
+            len(self._seen),
+            redact_url_credentials(safe_unicode(last_error)),
+        )
+        self.job.errors.append(
+            HarvestError(
+                message=(
+                    f"catalogue stream cut after {len(self._seen)} indicators; "
+                    "received indicators were updated, autoarchive skipped "
+                    f"({safe_unicode(last_error)})"
+                )
+            )
+        )
+
+    def _iter_indicators(self, source):
+        """Yield `(remote_id, metadata)` for each complete `<indicator>`.
+
+        `source` is a path or a file-like object (the live stream). Only an
+        indicator whose closing tag was parsed is yielded, so whatever the
+        source appends after a cut can never become a half-read dataset.
+        """
+        # Hardened parser: the catalog body is remote and, through the
+        # preview endpoint, caller-supplied. defusedxml refuses DTD entity
+        # definitions and external references by default, which is what
+        # turns a billion-laughs body from a worker-memory DoS into a clean
+        # harvest failure. The elements it yields are ordinary stdlib ones,
+        # so `elem.clear()` and the `ET.Element` type hints still hold — the
+        # stdlib import stays because defusedxml does not re-export Element.
+        context = iter(DET.iterparse(source, events=("start", "end")))
+        _event, root = next(context)  # Pega o elemento raiz
+
+        for event, elem in context:
+            if event == "end" and elem.tag == "indicator":
+                self._parsed_count += 1
+                md = self._extract_metadata(elem)
+                remote_id = elem.get("id")
+
+                # Skip items without title (mandatory field)
+                if remote_id and md.get("title"):
+                    yield remote_id, md
+                elif remote_id:
+                    self._log.warning("[INE] Skipping item %s: missing title", remote_id)
+
+                elem.clear()
+                root.clear()  # Limpa memoria da arvore XML
+
+    def _harvest_indicators(self, indicators) -> Exception | None:
+        """Process indicators in chunks of `BULK_SIZE` as they are parsed.
+
+        Returns the stream error that ended the iteration, or `None` when it
+        ran to the end or stopped at `max_items`. Only pulling the next
+        indicator is guarded: an error raised while *processing* a chunk is not
+        a transfer failure and propagates, so a database problem is never
+        retried as if the source had dropped the connection.
+        """
+        iterator = iter(indicators)
+        buffer: list[tuple[str, dict]] = []
+        error: Exception | None = None
+        while True:
+            try:
+                remote_id, md = next(iterator)
+            except StopIteration:
+                break
+            except _STREAM_ERRORS as e:
+                error = e
+                break
+            if remote_id in self._seen:
+                continue
+            # `max_items` has to be honoured here, while parsing. The convention
+            # elsewhere is to call `has_reached_max_items()` per item, but that
+            # reads `len(self.job.items)` and this backend only pushes into that
+            # list every `BULK_SIZE * 2` items (or at the very end), so for a
+            # 20-item preview it would never be true. Checked before processing,
+            # not after: a catalog holding exactly `max_items` indicators ends
+            # the loop naturally and is not reported as truncated.
+            if self.max_items and len(self._seen) >= self.max_items:
+                self._catalog_truncated = True
+                break
+            self._seen.add(remote_id)
+            buffer.append((remote_id, md))
+            if len(buffer) >= self.BULK_SIZE:
+                self._process_chunk(buffer)
+                buffer = []
+
+        # The indicators parsed before a cut are complete: process them too.
+        if buffer:
+            self._process_chunk(buffer)
+        return error
+
+    def _process_chunk(self, chunk: list[tuple[str, dict]]) -> None:
+        """Change detection + bulk write for one chunk of parsed indicators."""
+        from pymongo import ReplaceOne, UpdateOne
+
+        ops = []
+        op_ids = []
+
+        # --- Passo A: Pré-buscar datasets (1 query para o chunk inteiro) ---
+        existing = self._prefetch_datasets([remote_id for remote_id, _ in chunk])
+        for remote_id, md in chunk:
+            md["__dataset_obj"] = existing.get(remote_id) or self._new_dataset()
+
+        # --- Passo B: Processamento do chunk ---
+        # Guarda remote_ids de datasets criados para buscar IDs depois
+        created_remote_ids = []
+
+        for remote_id, md in chunk:
+            self._stats["processed"] += 1
+            item_status = "done"
+            dataset = md.pop("__dataset_obj")  # recupera e limpa
+
+            try:
+                if self._dataset_collection is None:
+                    self._dataset_collection = dataset._get_collection()
+
+                # Verifica se o dataset existe baseado no harvest.remote_id
+                # O get_dataset retorna um dataset existente (com id) ou um novo (sem id)
+                is_existing = (
+                    getattr(dataset, "harvest", None) is not None
+                    and getattr(dataset.harvest, "remote_id", None) == remote_id
+                    and getattr(dataset, "id", None) is not None
+                )
+
+                if is_existing:
+                    # Every other backend reaches an existing record through
+                    # `BaseBackend.get_dataset`, which asks this right after
+                    # the lookup. This one used to as well; the FAST 2-phase
+                    # rewrite (4dc13d6eb) took it off that shared path in
+                    # favour of a bulk lookup and a bulk write, so when the
+                    # guard was later added to `get_dataset` this backend
+                    # silently missed it — nothing here ever asked whether
+                    # the record it was about to overwrite belongs to
+                    # somebody else. Note the guard is blind to records with
+                    # no owner at all: an orphan is still adopted, upstream
+                    # behaviour shared with `get_dataset`.
+                    # It is asked here rather than in the
+                    # prefetch because the prefetch has no per-item error
+                    # handling — raising there would lose the whole chunk,
+                    # whereas the `except` below fails this one item and
+                    # carries on, which is what `process_dataset` does.
+                    # Asked before `_has_changed` too, for the same reason
+                    # the precedent asks before knowing whether anything
+                    # changed: an unchanged record owned by someone else
+                    # must not be quietly reported as "skipped" against
+                    # this source either. The CREATE branch needs no guard,
+                    # since it can only be reached with a `_new_dataset()`
+                    # already owned by this source.
+                    self.ensure_unique_ownership(dataset)
+
+                # ========================================
+                # CASO 1: Dataset já existe na base de dados
+                # ========================================
+                if is_existing:
+                    # Verificar se houve alterações nos metadados
+                    if self.CHECK_CHANGES and not self._has_changed(dataset, md, remote_id):
+                        # Sem alterações -> SKIP
+                        self._stats["skipped"] += 1
+                        item_status = "skipped"
+                        self._log.debug("[INE] SKIP: remote_id=%s (sem alterações)", remote_id)
+                    else:
+                        # Com alterações -> UPDATE
+                        self._apply_metadata_to_dataset(dataset, remote_id, md)
+                        doc = dataset.to_mongo()
+                        doc_dict = dict(doc)
+                        _id = doc_dict.get("_id", dataset.id)
+                        ops.append(ReplaceOne({"_id": _id}, doc_dict, upsert=False))
+                        op_ids.append(remote_id)
+                        self._stats["changed"] += 1
+                        self._log.debug(
+                            "[INE] UPDATE: remote_id=%s (metadados alterados)",
+                            remote_id,
+                        )
+
+                    # HarvestItem para datasets existentes
+                    if self.job:
+                        h_item = HarvestItem(remote_id=remote_id, status=item_status)
+                        h_item.dataset = dataset.id
+                        self._pending_items.append(h_item)
+
+                # ========================================
+                # CASO 2: Dataset não existe -> CREATE
+                # ========================================
+                else:
+                    self._apply_metadata_to_dataset(dataset, remote_id, md)
+                    doc = dataset.to_mongo()
+                    doc_dict = dict(doc)
+                    # Remover _id pois será gerado pelo MongoDB
+                    doc_dict.pop("_id", None)
+                    ops.append(
+                        UpdateOne(
+                            {
+                                "harvest.remote_id": str(remote_id),
+                                "harvest.source_id": (
+                                    str(self.source.id) if self.source.id else None
+                                ),
+                            },
+                            {"$setOnInsert": doc_dict},
+                            upsert=True,
+                        )
+                    )
+                    op_ids.append(remote_id)
+                    self._stats["created"] += 1
+                    created_remote_ids.append(remote_id)
+                    self._log.debug("[INE] CREATE: remote_id=%s (novo dataset)", remote_id)
+
+            except Exception as e:
+                self._stats["failed"] += 1
+                item_status = "failed"
+                if isinstance(e, HarvestValidationError):
+                    # A refusal, not a crash: `process_dataset` logs these at
+                    # info too. A rejected catalogue can fail every one of
+                    # 13k items, and a full traceback each would bury the
+                    # log without adding anything the message does not say.
+                    self._log.info("[INE] Recusado na fase 2 para remote_id=%s: %s", remote_id, e)
+                else:
+                    self._log.exception("[INE] Falha na fase 2 para remote_id=%s", remote_id)
+                # The message is carried onto the item, as `process_dataset`
+                # does: a job over 13k items reporting `failed` with an empty
+                # `errors` list tells the operator nothing about which of
+                # them is an ownership conflict, or who the other owner is.
+                # Truncated because the items are pushed into one job
+                # document: 13k unbounded messages (a mongoengine or pymongo
+                # error runs to a kilobyte) would carry the job past the
+                # 16 MB BSON limit and lose the whole record of a harvest
+                # whose writes already landed.
+                if self.job:
+                    h_item = HarvestItem(
+                        remote_id=remote_id,
+                        status=item_status,
+                        # Redact before truncating: a cut landing inside the
+                        # userinfo would leave a prefix of the password that
+                        # the constructor can no longer recognise as one.
+                        errors=[
+                            HarvestError(message=redact_url_credentials(safe_unicode(e))[:500])
+                        ],
+                    )
+                    # Kept so the job links to the dataset in conflict; the
+                    # message names the other owner, not the record.
+                    h_item.dataset = getattr(dataset, "id", None)
+                    self._pending_items.append(h_item)
+
+        # --- Fim do loop do chunk ---
+
+        # Flush Ops por chunk. Tem de acontecer ANTES do lookup dos IDs
+        # criados, senão os upserts ainda não estão na BD e os
+        # HarvestItems ficam sem referência ao dataset.
+        if ops and self._dataset_collection is not None:
+            self._flush_bulk(self._dataset_collection, ops, op_ids)
+
+        # Buscar IDs dos datasets criados (1 query por chunk) e criar HarvestItems
+        if self.job and created_remote_ids and self._dataset_collection is not None:
+            id_by_rid = {}
+            try:
+                cursor = self._dataset_collection.find(
+                    {
+                        "harvest.remote_id": {"$in": [str(r) for r in created_remote_ids]},
+                        "harvest.source_id": (str(self.source.id) if self.source.id else None),
+                    },
+                    {"_id": 1, "harvest.remote_id": 1},
+                )
+                id_by_rid = {doc["harvest"]["remote_id"]: doc["_id"] for doc in cursor}
+            except Exception:
+                self._log.warning(
+                    "[INE] Não foi possível buscar IDs dos datasets criados neste chunk"
+                )
+            for rid in created_remote_ids:
+                h_item = HarvestItem(remote_id=rid, status="done")
+                if str(rid) in id_by_rid:
+                    h_item.dataset = id_by_rid[str(rid)]
+                self._pending_items.append(h_item)
+
+        if self.job and len(self._pending_items) >= (self.BULK_SIZE * 2):
+            added = len(self._pending_items)
+            self._append_job_items(self._pending_items)
+            self._log.info(
+                "[INE] Job items: +%s (total %s)",
+                added,
+                len(self.job.items),
+            )
+            self._pending_items = []
+
+        stats = self._stats
+        if stats["processed"] % (self.LOG_EVERY * 5) == 0:
+            self._log.info(
+                "[INE] Fase 2 progresso: processed=%s changed=%s created=%s skipped=%s failed=%s",
+                stats["processed"],
+                stats["changed"],
+                stats["created"],
+                stats["skipped"],
+                stats["failed"],
+            )
+
+    def _flush_pending_items(self) -> None:
+        if not (self.job and self._pending_items):
+            return
+        added = len(self._pending_items)
+        try:
+            self._append_job_items(self._pending_items)
+        except Exception:
+            # Runs from a `finally`: never let it hide the error that got us here.
+            self._log.exception("[INE] Falha ao gravar %s job items", added)
+            return
+        self._pending_items = []
+        self._log.info("[INE] Final job items: +%s (total %s)", added, len(self.job.items))

@@ -1,7 +1,9 @@
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
+from glob import glob
 
 import pytest
 
@@ -14,7 +16,7 @@ from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import to_naive_datetime
 
-from ..backends.ine import INE_HVD_FEED_URL, INEBackend, INEDownloadIncomplete
+from ..backends.ine import INE_HVD_FEED_URL, INEBackend
 from .factories import HarvestSourceFactory
 
 INE_URL = "https://www.ine.pt/ine/xml_indic.jsp?opc=2&lang=PT"
@@ -59,52 +61,6 @@ class INEIsCompleteXmlTest(PytestOnlyDBTestCase):
 
     def test_missing_file_is_rejected(self, tmp_path):
         assert self._backend()._is_complete_xml(str(tmp_path / "nope.xml")) is False
-
-
-class INEDownloadToFileTest(PytestOnlyDBTestCase):
-    def _backend(self, monkeypatch):
-        # Avoid real backoff sleeps between retries.
-        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
-        source = HarvestSourceFactory(backend="ine", url=INE_URL)
-        backend = INEBackend(source)
-        backend.MAX_RETRIES = 3
-        return backend
-
-    def test_retries_truncated_download_then_succeeds(self, rmock, monkeypatch, tmp_path):
-        # First transfer is truncated (connection dropped), second one is complete.
-        rmock.get(INE_URL, [{"text": TRUNCATED_XML}, {"text": COMPLETE_XML}])
-        dest = tmp_path / "ine.xml"
-
-        self._backend(monkeypatch)._download_to_file(INE_URL, str(dest))
-
-        assert dest.exists()
-        content = dest.read_text()
-        assert "</catalog>" in content
-        assert "Indicador A" in content
-        # No leftover .part file
-        assert not (tmp_path / "ine.xml.part").exists()
-
-    def test_falls_back_to_cached_valid_file_when_all_attempts_fail(
-        self, rmock, monkeypatch, tmp_path
-    ):
-        rmock.get(INE_URL, text=TRUNCATED_XML)
-        dest = tmp_path / "ine.xml"
-        dest.write_text(COMPLETE_XML)  # previously cached valid download
-
-        # Should not raise: the last valid file is reused.
-        self._backend(monkeypatch)._download_to_file(INE_URL, str(dest))
-
-        assert dest.read_text() == COMPLETE_XML
-
-    def test_raises_when_truncated_and_no_cache(self, rmock, monkeypatch, tmp_path):
-        rmock.get(INE_URL, text=TRUNCATED_XML)
-        dest = tmp_path / "ine.xml"
-
-        with pytest.raises(INEDownloadIncomplete):
-            self._backend(monkeypatch)._download_to_file(INE_URL, str(dest))
-
-        assert not dest.exists()
-        assert not (tmp_path / "ine.xml.part").exists()
 
 
 class INEPrefetchDatasetsTest(PytestOnlyDBTestCase):
@@ -1281,3 +1237,185 @@ class INEHasChangedTest(PytestOnlyDBTestCase):
         job = backend.harvest()
 
         assert [item.status for item in job.items] == ["skipped"]
+
+
+def _truncated_catalog_xml(ids, **kwargs):
+    """The same catalogue with the stream cut right before the closing root tag."""
+    body = _catalog_xml(ids, **kwargs)
+    return body[: -len("</catalog>\n")]
+
+
+# What the INE endpoint appended to a 200 response when it cut the catalogue on
+# 2026-10-01, trimmed. The `<init>` frame matters: it parses as a start tag.
+JAVA_ERROR_PAGE = (
+    "\njavax.naming.NameNotFoundException: jdbc/conexaoBDDDS -- service jboss.naming\n"
+    "\tat io.undertow.servlet.handlers.ServletHandler.handleRequest(ServletHandler.java:74)\n"
+    "\tat org.jboss.as.naming.ServiceBasedNamingStore.<init>(ServiceBasedNamingStore.java:12)\n"
+)
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEStreamingHarvestTest(PytestOnlyDBTestCase):
+    """The catalogue is processed while it streams in.
+
+    The INE endpoint sends ~30 KB/s and cuts the body halfway, still with a 200.
+    Processing as it arrives is what keeps the indicators that did arrive, and
+    the cut must neither archive the rest nor damage the cached catalogue.
+    """
+
+    IDS = ["0001", "0002", "0003", "0004", "0005"]
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _backend(self, monkeypatch, tmp_path, source):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        # Small enough that five indicators span several chunks and a cut lands
+        # with a partly filled buffer.
+        backend.BULK_SIZE = 2
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, body):
+        responses = body if isinstance(body, list) else [{"text": body}]
+        rmock.get(INE_URL, responses)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        return self._backend(monkeypatch, tmp_path, source).harvest()
+
+    def _stale_dataset(self, source, remote_id="9999"):
+        return DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id=remote_id,
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=date.today() - timedelta(days=400),
+            )
+        )
+
+    def _cached_catalog(self, tmp_path):
+        cached = tmp_path / "ine.xml"
+        cached.write_text(_catalog_xml(["0001", "0002"]))
+        old = time.time() - 3600
+        os.utime(cached, (old, old))
+        return cached, cached.read_bytes(), os.path.getmtime(cached)
+
+    def _remote_ids(self, source):
+        return sorted(
+            d.harvest.remote_id
+            for d in Dataset.objects(__raw__={"harvest.source_id": str(source.id)})
+        )
+
+    def test_truncated_stream_updates_received_indicators_and_skips_autoarchive(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        source = self._source(autoarchive=True)
+        stale = self._stale_dataset(source)
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, _truncated_catalog_xml(self.IDS))
+
+        assert job.status == "done"
+        assert self._remote_ids(source) == self.IDS + ["9999"]
+        assert [item.status for item in job.items] == ["done"] * 5
+        assert not any(item.status == "archived" for item in job.items)
+        stale.reload()
+        assert stale.harvest.archived_at is None
+        job.reload()
+        assert job.data["partial"] is True
+        assert "catalogue stream cut after 5 indicators" in job.errors[-1].message
+
+    def test_truncated_stream_leaves_the_existing_file_untouched(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        cached, content, mtime = self._cached_catalog(tmp_path)
+
+        self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), _truncated_catalog_xml(self.IDS)
+        )
+
+        assert cached.read_bytes() == content
+        assert os.path.getmtime(cached) == mtime
+        assert glob(str(tmp_path / "*.part")) == []
+
+    def test_junk_after_the_cut_does_not_create_a_corrupt_indicator(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        cached, content, mtime = self._cached_catalog(tmp_path)
+        source = self._source()
+        # Cut inside the third indicator, then the error page.
+        body = (
+            _truncated_catalog_xml(["0001", "0002"])
+            + "<indicator id='0003'>\n<title>Indic"
+            + JAVA_ERROR_PAGE
+        )
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, body)
+
+        assert self._remote_ids(source) == ["0001", "0002"]
+        assert job.data["partial"] is True
+        assert cached.read_bytes() == content
+        assert os.path.getmtime(cached) == mtime
+
+    def test_retry_completes_without_duplicate_items(self, rmock, monkeypatch, tmp_path):
+        source = self._source(autoarchive=True)
+        stale = self._stale_dataset(source)
+
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            source,
+            [
+                {"text": _truncated_catalog_xml(self.IDS[:3])},
+                {"text": _catalog_xml(self.IDS)},
+            ],
+        )
+
+        harvested = [item for item in job.items if item.status != "archived"]
+        assert sorted(item.remote_id for item in harvested) == self.IDS
+        assert all(item.status == "done" for item in harvested)
+        # The retry ran to the end, so autoarchive did too.
+        archived = [item for item in job.items if item.status == "archived"]
+        assert [item.remote_id for item in archived] == ["9999"]
+        stale.reload()
+        assert stale.harvest.archived_at is not None
+        assert "partial" not in job.data
+        assert job.errors == []
+        assert glob(str(tmp_path / "*.part")) == []
+
+    def test_failure_before_any_indicator_falls_back_to_the_existing_complete_file(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        self._cached_catalog(tmp_path)
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, "")
+
+        assert job.status == "done"
+        assert self._remote_ids(source) == ["0001", "0002"]
+        assert [item.status for item in job.items] == ["done"] * 2
+
+    def test_failure_without_file_fails_the_job(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, "")
+
+        assert job.status == "failed"
+        assert self._remote_ids(source) == []
+        catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
+        assert len(catalog_requests) == 2
+
+    def test_processing_errors_are_not_retried(self, rmock, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            INEBackend, "_extract_metadata", lambda self, elem: (_ for _ in ()).throw(KeyError("x"))
+        )
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, _catalog_xml(self.IDS))
+
+        assert job.status == "failed"
+        catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
+        assert len(catalog_requests) == 1
