@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **refactor(api)!: the unauthenticated identicon endpoint is gone**
+  - `GET /api/1/avatars/<identifier>/<size>/` drew a pydenticon from a hash of the identifier.
+    It never read the database, so the access-control finding reported against it did not hold:
+    any string produced an image, and an existing user id was indistinguishable from an invented
+    one. What it did have was a `size` with no ceiling, drawn before any validation. Measured
+    through the endpoint itself: `size=150` answers in 0.01s with a 433-byte PNG, `size=10000`
+    takes 1.9s and 553MB of RSS, and `size=20000` takes 7s, peaks at 1.7GB and returns a 1.6MB
+    image -- all to an anonymous caller. The only brake was the IP-keyed global rate limit, which
+    collapses into a single shared bucket behind the WAF, so a couple of hundred requests an hour
+    were enough; and the memoized cache grew a new entry for every `(identifier, size)` pair on
+    top of that.
+  - Nothing consumed it. Uploaded avatars are served as files by the storage, the serialization
+    returns `None` when a user has none instead of falling back to an identicon, and the frontend
+    draws its own placeholder. Removing the route closes the resource-exhaustion vector outright
+    rather than capping a size nobody asked for.
+  - The `TRACKING_BLACKLIST` entry, the `AVATAR_INTERNAL_*` settings, their documentation section
+    and the `pydenticon` dependency go with it. Avatar upload, serving and deletion are untouched.
+  - **Breaking**: the route now answers 404 and the namespace no longer appears in the Swagger spec.
+
 - **fix(site): the public homepage no longer renders zeros when its aggregated endpoint is throttled**
   - `/api/1/site/home/` carried no explicit rate limit, so it fell under the IP-keyed
     `RATELIMIT_DEFAULT` ("1000 per day; 200 per hour"). The endpoint is fetched server-side by the
