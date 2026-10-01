@@ -1192,6 +1192,84 @@ class DiscussionsTest(APITestCase):
 
 
 class NotifyDiscussionsTest(APITestCase):
+    def organization_discussion(self, poster, messages):
+        """An organization with two members, and a discussion held on the organization."""
+        admin = UserFactory()
+        editor = UserFactory()
+        org = OrganizationFactory(
+            members=[Member(user=admin, role="admin"), Member(user=editor, role="editor")]
+        )
+        discussion = Discussion.objects.create(
+            subject=org, user=poster, title=faker.sentence(), discussion=messages
+        )
+        return org, admin, editor, discussion
+
+    def test_new_discussion_mail_organization_subject(self):
+        poster = UserFactory()
+        message = Message(content=faker.sentence(), posted_by=poster)
+        _org, admin, editor, discussion = self.organization_discussion(poster, [message])
+
+        with capture_mails() as mails:
+            notify_new_discussion(discussion.id)
+
+        expected_recipients = (admin.email, editor.email)
+        self.assertEqual(len(mails), len(expected_recipients))
+        for mail in mails:
+            self.assertIn(mail.recipients[0], expected_recipients)
+            self.assertNotIn(poster.email, mail.recipients)
+
+        for member in (admin, editor):
+            notifications = Notification.objects(user=member)
+            self.assertEqual(len(notifications), 1)
+            self.assertEqual(notifications[0].details.status, DiscussionStatus.NEW_DISCUSSION)
+
+    def test_new_comment_mail_organization_subject(self):
+        poster = UserFactory()
+        commenter = UserFactory()
+        messages = [
+            Message(content=faker.sentence(), posted_by=poster),
+            Message(content=faker.sentence(), posted_by=commenter),
+        ]
+        _org, admin, editor, discussion = self.organization_discussion(poster, messages)
+
+        with capture_mails() as mails:
+            notify_new_discussion_comment(discussion.id, message=len(discussion.discussion) - 1)
+
+        # The members and the original poster hear about it; the commenter does not.
+        expected_recipients = (admin.email, editor.email, poster.email)
+        self.assertEqual(len(mails), len(expected_recipients))
+        for mail in mails:
+            self.assertIn(mail.recipients[0], expected_recipients)
+            self.assertNotIn(commenter.email, mail.recipients)
+
+        for member in (admin, editor):
+            notifications = Notification.objects(user=member)
+            self.assertEqual(len(notifications), 1)
+            self.assertEqual(notifications[0].details.status, DiscussionStatus.NEW_COMMENT)
+
+    def test_discussion_closed_mail_organization_subject(self):
+        poster = UserFactory()
+        message = Message(content=faker.sentence(), posted_by=poster)
+        _org, admin, editor, discussion = self.organization_discussion(poster, [message])
+        discussion.closed = datetime.now(UTC)
+        discussion.closed_by = admin
+        discussion.save()
+
+        with capture_mails() as mails:
+            notify_discussion_closed(discussion.id)
+
+        # The remaining members and the participants hear about it; the admin who closed
+        # it does not get told about their own action.
+        expected_recipients = (editor.email, poster.email)
+        self.assertEqual(len(mails), len(expected_recipients))
+        for mail in mails:
+            self.assertIn(mail.recipients[0], expected_recipients)
+            self.assertNotIn(admin.email, mail.recipients)
+
+        notifications = Notification.objects(user=editor)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0].details.status, DiscussionStatus.CLOSED)
+
     def test_new_discussion_mail(self):
         user = UserFactory()
         owner = UserFactory()

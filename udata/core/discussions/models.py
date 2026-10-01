@@ -198,8 +198,18 @@ class Discussion(SpamMixin, Linkable, Document):
 
     def owner_recipients(self, sender=None):
         """Return the list of users that should be notified about this discussion."""
+        from udata.core.organization.models import Organization
+
         recipients = {m.posted_by.id: m.posted_by for m in self.discussion}
-        if getattr(self.subject, "organization", None):
+        if isinstance(self.subject, Organization):
+            # An organization is the subject of the discussions held on its own page, and
+            # owns itself: its members are the people to notify. `member.user` is not
+            # required, and one dangling member would otherwise break every notification
+            # for that organization -- `notify_new_member` guards the same way.
+            for member in self.subject.members:
+                if member.user:
+                    recipients[member.user.id] = member.user
+        elif getattr(self.subject, "organization", None):
             for member in self.subject.organization.members:
                 recipients[member.user.id] = member.user
         elif getattr(self.subject, "owner", None):
