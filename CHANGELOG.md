@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **fix(discussions): a discussion can be held on an organization itself**
+  - An organization has always been a valid discussion subject -- the organization page offers
+    "Nova discussão" and the documents are in the database -- but it was the only subject class
+    nothing downstream knew how to handle, so every path that touched one broke in a different
+    way. Opening one answered 500: the metrics hook calls `count_discussions()` on whatever the
+    discussion points at, and `Organization` never had the method. The document was saved before
+    the signal fired, so the discussion existed and the caller saw an error.
+  - Closing one answered 500 too, for an unrelated reason: the subject-owner permission goes
+    through `OwnablePermission`, which reads `subject.organization` and `subject.owner`, and an
+    organization has neither -- it does not even derive from `Owned`. Serialising one failed more
+    quietly, because flask-restx swallows the error and emits null permissions, which left the
+    organization's own admins without edit or delete on their page. An organization owns itself,
+    so it now gets the needs `OwnablePermission` computes for an asset it owns: admin and editor,
+    the editors included so they moderate an organization's discussions as they do its datasets'.
+    A defensive `getattr` would have been worse than the crash: `Permission` prepends
+    `RoleNeed("admin")`, so a permission with no needs is sysadmins-only, not everyone.
+  - Nobody was notified either. The tuple of subjects that notify did not list organizations, so
+    the three notification tasks logged "Unrecognized discussion subject type" and returned. The
+    members are now the recipients, guarding against a member whose user reference is dangling --
+    the field is not required, and one such member would otherwise break every notification for
+    that organization.
+  - Purging an organization left its discussions behind, pointing at a document that no longer
+    exists; it now goes through the same helper dataset, reuse, dataservice and topic already use.
+  - Organizations gained the `discussions` and `discussions_open` metrics, so the API reports the
+    counts the other subjects already reported, and a migration recounts the organizations that
+    already have discussions.
+
 - **refactor(api)!: the unauthenticated identicon endpoint is gone**
   - `GET /api/1/avatars/<identifier>/<size>/` drew a pydenticon from a hash of the identifier.
     It never read the database, so the access-control finding reported against it did not hold:
