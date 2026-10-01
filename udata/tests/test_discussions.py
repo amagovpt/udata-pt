@@ -737,6 +737,29 @@ class DiscussionsTest(APITestCase):
         )
         self.assert403(response)
 
+    def test_organization_discussions_metrics(self):
+        """An organization counts the discussions held on the organization itself."""
+        org = OrganizationFactory()
+        user = UserFactory()
+        message = Message(content="bla bla", posted_by=user)
+        discussion = Discussion.objects.create(
+            subject=org, user=user, title="test discussion", discussion=[message]
+        )
+        on_new_discussion.send(discussion)
+
+        org.reload()
+        self.assertEqual(org.get_metrics()["discussions"], 1)
+        self.assertEqual(org.get_metrics()["discussions_open"], 1)
+
+        discussion.closed = datetime.now(UTC)
+        discussion.closed_by = user
+        discussion.save()
+        on_discussion_closed.send(discussion)
+
+        org.reload()
+        self.assertEqual(org.get_metrics()["discussions"], 1)
+        self.assertEqual(org.get_metrics()["discussions_open"], 0)
+
     def test_close_discussion_without_message(self):
         owner = self.login()
         user = UserFactory()
