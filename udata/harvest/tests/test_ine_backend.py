@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from glob import glob
 
 import pytest
+import requests
 import urllib3
 
 from udata.core.dataset.constants import UpdateFrequency
@@ -1627,7 +1628,20 @@ class INEErrorPageScannerTest:
         assert scanner.feed(b"<catalog>\n<indicator id='1'></indicator>\njav") is None
         found = scanner.feed(b"ax.naming.NameNotFoundException")
 
-        assert found == (-3, b"javax.")
+        assert found == (-3, b"javax.naming.")
+
+    def test_stack_frame_lookalike_in_a_description_is_accepted(self):
+        # A false positive would cut every run at the same byte, forever.
+        scanner = _ErrorPageScanner()
+        text = b"<catalog><indicator id='1'><description>Ponte de Lima\n\tat 2020"
+
+        assert scanner.feed(text + b" Exception javax</description></indicator>") is None
+
+    def test_bom_split_across_chunks_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"\xef") is None
+        assert scanner.feed(b"\xbb\xbf<catalog>") is None
 
     def test_html_element_inside_an_indicator_is_accepted(self):
         scanner = _ErrorPageScanner()
@@ -1770,3 +1784,146 @@ class INEInstrumentationTest(PytestOnlyDBTestCase):
 
         assert job.data["snapshot"]["used"] is True
         assert "timings" in job.data
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEReviewEdgeCasesTest(PytestOnlyDBTestCase):
+    """Failure paths around the stream: HTTP errors, a lost final push, a snapshot
+    older than a partial run, and leftovers of a killed worker."""
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _backend(self, monkeypatch, tmp_path, source):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, responses):
+        rmock.get(INE_URL, responses)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        return self._backend(monkeypatch, tmp_path, source).harvest()
+
+    def _snapshot(self, tmp_path, ids, age_seconds=3600, **kwargs):
+        snapshot = tmp_path / "ine.xml"
+        snapshot.write_text(_catalog_xml(ids, **kwargs))
+        old = time.time() - age_seconds
+        os.utime(snapshot, (old, old))
+        return snapshot
+
+    def test_server_error_is_retried(self, rmock, monkeypatch, tmp_path):
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            [{"status_code": 503, "text": "busy"}, {"text": _catalog_xml(["0001"])}],
+        )
+
+        assert job.status == "done"
+        assert job.errors == []
+        assert [item.status for item in job.items] == ["done"]
+
+    def test_server_error_falls_back_to_the_snapshot(self, rmock, monkeypatch, tmp_path):
+        self._snapshot(tmp_path, ["0001"])
+
+        job = self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), [{"status_code": 502, "text": "x"}]
+        )
+
+        assert job.status == "done"
+        assert job.data["snapshot"]["used"] is True
+        assert job.errors[-1].message.startswith("INE source error:")
+
+    def test_client_error_still_fails_at_once(self, rmock, monkeypatch, tmp_path):
+        self._snapshot(tmp_path, ["0001"])
+
+        job = self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), [{"status_code": 404, "text": "x"}]
+        )
+
+        assert job.status == "failed"
+        catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
+        assert len(catalog_requests) == 1
+
+    def test_network_failure_without_snapshot_is_a_network_error(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            [{"exc": requests.exceptions.ConnectTimeout("timed out")}],
+        )
+
+        assert job.status == "failed"
+        assert job.errors[-1].message.startswith("INE network error:")
+
+    def test_lost_final_push_fails_the_job_instead_of_archiving(self, rmock, monkeypatch, tmp_path):
+        source = self._source(autoarchive=True)
+        stale = DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id="0002",
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=date.today() - timedelta(days=400),
+            )
+        )
+
+        def broken_push(self, items):
+            raise RuntimeError("job document too large")
+
+        monkeypatch.setattr(INEBackend, "_append_job_items", broken_push)
+
+        job = self._harvest(
+            rmock, monkeypatch, tmp_path, source, [{"text": _catalog_xml(["0001", "0002"])}]
+        )
+
+        assert job.status == "failed"
+        stale.reload()
+        assert stale.harvest.archived_at is None
+
+    def test_snapshot_fallback_does_not_roll_back_a_later_partial_run(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        source = self._source()
+        self._snapshot(tmp_path, ["0001", "0002"], revision=" (old)")
+        # A partial run reaches the source after the snapshot was taken.
+        self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            source,
+            [{"text": _truncated_catalog_xml(["0001"], revision=" (new)")}],
+        )
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, [{"text": ""}])
+
+        assert job.data["snapshot"]["used"] is True
+        newer = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        assert newer.description.startswith("Descrição 0001 (new)")
+        only_in_snapshot = Dataset.objects(__raw__={"harvest.remote_id": "0002"}).first()
+        assert only_in_snapshot.description.startswith("Descrição 0002 (old)")
+        statuses = {item.remote_id: item.status for item in job.items}
+        assert statuses == {"0001": "skipped", "0002": "done"}
+
+    def test_parts_left_by_a_killed_worker_are_removed(self, rmock, monkeypatch, tmp_path):
+        stale_part = tmp_path / "ine.xml.123-deadbeef.part"
+        stale_part.write_text("<catalog>")
+        old = time.time() - 3 * 24 * 3600
+        os.utime(stale_part, (old, old))
+        fresh_part = tmp_path / "ine.xml.456-cafebabe.part"
+        fresh_part.write_text("<catalog>")
+
+        self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), [{"text": _catalog_xml(["0001"])}]
+        )
+
+        assert not stale_part.exists()
+        # Possibly another worker's live transfer: left alone.
+        assert fresh_part.exists()

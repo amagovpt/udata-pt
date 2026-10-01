@@ -27,6 +27,9 @@
   - The error page is detected as it arrives (stack-trace markers, and a head that is not XML) and
     classified with the new `HarvestSourceError`; job errors now start with `INE source error:` or
     `INE network error:`. Indicators sharing a chunk with the error page are still processed.
+  - An HTTP 5xx from the source is retried and falls back like a cut stream (a 4xx still fails at
+    once). A snapshot fallback leaves alone the datasets a later partial run already updated, so an
+    older snapshot never rolls them back.
   - Each phase is timed (`download_parse`, `prefetch`, `change_detection`, `serialize`,
     `bulk_write`, `autoarchive`, `total`) into the log and `job.data`, together with every
     download attempt's bytes, duration and failure reason.

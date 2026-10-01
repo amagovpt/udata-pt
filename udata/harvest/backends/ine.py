@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import html
 import os
 import random
@@ -23,7 +24,6 @@ from udata.core.dataset.constants import UpdateFrequency
 from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
 from udata.harvest.exceptions import (
-    HarvestException,
     HarvestSourceError,
     HarvestValidationError,
 )
@@ -86,9 +86,12 @@ _STREAM_ERRORS = (
 
 # Stack-trace text the INE application server appends to a 200 response when it
 # gives up midway (`javax.naming.NameNotFoundException: jdbc/... at io.undertow...`).
-# Only markers that cannot occur in a valid catalogue: "Exception", `<html` or
-# `<!DOCTYPE` could, `<html>` being an element of every `<indicator>`.
-_ERROR_PAGE_MARKERS = (b"javax.", b"io.undertow", b"\n\tat ")
+# Qualified Java names only, which no indicator text carries: a false positive is
+# not harmless, since a marker inside a description would cut every run at the
+# same byte and leave the job partial forever. So no "Exception", no bare
+# newline-tab-"at " frame prefix, and no `<html`/`<!DOCTYPE` (`<html>` is an
+# element of every `<indicator>`).
+_ERROR_PAGE_MARKERS = (b"javax.naming.", b"at io.undertow.")
 _UTF8_BOM = b"\xef\xbb\xbf"
 _XML_HEADS = (b"<?xml", b"<catalog")
 
@@ -139,6 +142,8 @@ class _ErrorPageScanner:
     def _check_head(self, chunk: bytes) -> None:
         self._head += chunk
         head = self._head
+        if len(head) < len(_UTF8_BOM) and _UTF8_BOM.startswith(head):
+            return  # a BOM split across chunks
         if head.startswith(_UTF8_BOM):
             head = head[len(_UTF8_BOM) :]
         head = head.lstrip()
@@ -269,6 +274,9 @@ class INEBackend(BaseBackend):
         # Age in seconds of the snapshot this run fell back on, `None` when the
         # catalogue came from the source.
         self._snapshot_fallback_age: float | None = None
+        # Set on a snapshot fallback: datasets harvested after the snapshot was
+        # taken are newer than it and left untouched.
+        self._snapshot_cutoff: datetime | None = None
 
         if self.dryrun:
             # Previews must not share the catalogue path with the real harvest:
@@ -987,11 +995,17 @@ class INEBackend(BaseBackend):
                     self._harvest_snapshot(last_error)
                 else:
                     self._raise_classified(last_error)
-        except Exception as e:
-            self._log.error("[INE] Erro no download/parsing do XML: %s", e)
-            raise
-        finally:
+            # Allowed to raise: `harvest()` runs autoarchive right after, from
+            # `job.items`, and items that failed to land would read as gone.
             self._flush_pending_items()
+        except Exception as e:
+            self._log.error(
+                "[INE] Erro no download/parsing do XML: %s",
+                redact_url_credentials(safe_unicode(e)),
+            )
+            # Keep the record of what was processed, without hiding `e`.
+            self._flush_pending_items(swallow=True)
+            raise
 
         if self._catalog_truncated and not self.dryrun:
             # Expected in a preview, worth an error on a real harvest: with
@@ -1035,6 +1049,7 @@ class INEBackend(BaseBackend):
         """
         path = self._snapshot_path()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._remove_stale_parts(path)
         delay = self.http_retry_initial_delay
         max_delay = self.http_retry_max_delay
         last_error: Exception | None = None
@@ -1053,11 +1068,20 @@ class INEBackend(BaseBackend):
                     # retries the body transfer.
                     with self._timed("download_parse"):
                         response = self.get(self.source.url, stream=True, timeout=self.http_timeout)
-                    response.raise_for_status()
+                    if response.status_code >= 500:
+                        # The source failing to serve, like the error page it
+                        # appends to a 200: retried, then the snapshot.
+                        response.close()
+                        raise HarvestSourceError(f"HTTP {response.status_code} from the source")
                 except _STREAM_ERRORS as e:
                     error = e
                 else:
-                    stream = _INECatalogStream(response, part)
+                    try:
+                        response.raise_for_status()
+                        stream = _INECatalogStream(response, part)
+                    except BaseException:
+                        response.close()
+                        raise
                     try:
                         error = self._harvest_indicators(self._iter_indicators(stream))
                     finally:
@@ -1099,6 +1123,22 @@ class INEBackend(BaseBackend):
 
         return False, last_error
 
+    def _remove_stale_parts(self, path: str) -> None:
+        """Delete `.part` files a killed worker left next to the snapshot.
+
+        The `finally` of each attempt removes its own file, but not when the
+        process dies mid-transfer, and on the persistent volume nothing else
+        ever would. A day is far beyond any single run.
+        """
+        cutoff = time.time() - 24 * 3600
+        for leftover in glob.glob(f"{glob.escape(path)}.*.part"):
+            try:
+                if os.path.getmtime(leftover) < cutoff:
+                    os.remove(leftover)
+                    self._log.info("[INE] Ficheiro parcial órfão removido: %s", leftover)
+            except OSError:
+                pass
+
     def _harvest_snapshot(self, last_error: Exception | None) -> None:
         """Process the last complete catalogue kept on disk.
 
@@ -1137,9 +1177,19 @@ class INEBackend(BaseBackend):
                 )
             )
         )
+        # A partial run after the snapshot was taken may have written newer source
+        # data; replaying the snapshot over it would roll those datasets back.
+        self._snapshot_cutoff = datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)
         error = self._harvest_indicators(self._iter_indicators(path))
         if error is not None:
             raise error
+
+    def _newer_than_snapshot(self, dataset) -> bool:
+        """Whether a fallback run must leave `dataset` alone (see `_harvest_snapshot`)."""
+        if self._snapshot_cutoff is None or not dataset.harvest:
+            return False
+        last_update = dataset.harvest.last_update
+        return last_update is not None and to_naive_datetime(last_update) > self._snapshot_cutoff
 
     def _raise_classified(self, last_error: Exception | None) -> None:
         """Fail the job with an error that says whose fault it was."""
@@ -1147,11 +1197,13 @@ class INEBackend(BaseBackend):
         message = (
             f"INE {kind} error: catalogue download failed after "
             f"{self.DOWNLOAD_MAX_RETRIES} attempts and no snapshot is available "
-            f"({safe_unicode(last_error)})"
+            f"({redact_url_credentials(safe_unicode(last_error))})"
         )
         if kind == "source":
             raise HarvestSourceError(message) from last_error
-        raise HarvestException(message) from last_error
+        # A `requests` connection error on purpose: `BaseBackend.harvest` logs
+        # those as a warning, where any other exception becomes an error report.
+        raise requests.exceptions.ConnectionError(message) from last_error
 
     def _mark_partial(self, last_error: Exception | None) -> None:
         """Record a run whose every attempt was cut after some indicators."""
@@ -1317,7 +1369,9 @@ class INEBackend(BaseBackend):
                 if is_existing:
                     # Verificar se houve alterações nos metadados
                     unchanged = False
-                    if self.CHECK_CHANGES:
+                    if self._newer_than_snapshot(dataset):
+                        unchanged = True
+                    elif self.CHECK_CHANGES:
                         with self._timed("change_detection"):
                             unchanged = not self._has_changed(dataset, md, remote_id)
                     if unchanged:
@@ -1460,14 +1514,20 @@ class INEBackend(BaseBackend):
                 stats["failed"],
             )
 
-    def _flush_pending_items(self) -> None:
+    def _flush_pending_items(self, swallow: bool = False) -> None:
+        """Push the job items still buffered.
+
+        `swallow` is for the error path only, where raising would hide the
+        error already propagating.
+        """
         if not (self.job and self._pending_items):
             return
         added = len(self._pending_items)
         try:
             self._append_job_items(self._pending_items)
         except Exception:
-            # Runs from a `finally`: never let it hide the error that got us here.
+            if not swallow:
+                raise
             self._log.exception("[INE] Falha ao gravar %s job items", added)
             return
         self._pending_items = []
