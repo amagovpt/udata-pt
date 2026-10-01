@@ -756,9 +756,11 @@ class DiscussionsTest(APITestCase):
             )
             self.assert201(response)
 
-        # The `permissions` block is marshalled on every discussion response: it used to
-        # raise on an organization subject, taking the whole response down with it.
-        self.assertIn("permissions", response.json)
+        # This covers creating, counting and listing. It deliberately asserts nothing
+        # about `permissions`: on the creation path the subject is not resolved the way
+        # it is on a reread, so the subject-owner branch is never reached here and any
+        # assertion about it would pass with the fix reverted. The branch is proven by
+        # `test_close_discussion_on_organization_permissions`, which does go red without it.
         self.assertEqual(response.json["subject"]["class"], "Organization")
 
         org.reload()
@@ -820,14 +822,22 @@ class DiscussionsTest(APITestCase):
             on_new_discussion.send(discussion)
             return discussion
 
-        # A user with no tie to the organization cannot close its discussions.
-        discussion = open_discussion()
-        self.login()
-        response = self.post(
-            url_for("api.discussion", id=discussion.id),
-            {"comment": "close bla bla", "close": True},
-        )
-        self.assert403(response)
+        # Nobody outside the organization's admins and editors closes its discussions:
+        # not a stranger, not a partial editor, not an admin of a different organization.
+        partial_editor = UserFactory()
+        org.members.append(Member(user=partial_editor, role="partial_editor"))
+        org.save()
+        other_org_admin = UserFactory()
+        OrganizationFactory(members=[Member(user=other_org_admin, role="admin")])
+
+        for refused in (None, partial_editor, other_org_admin):
+            discussion = open_discussion()
+            self.login(refused) if refused else self.login()
+            response = self.post(
+                url_for("api.discussion", id=discussion.id),
+                {"comment": "close bla bla", "close": True},
+            )
+            self.assert403(response)
 
         # Replying, on the other hand, is open to any authenticated user.
         response = self.post(url_for("api.discussion", id=discussion.id), {"comment": "me too"})

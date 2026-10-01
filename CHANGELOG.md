@@ -12,17 +12,18 @@
   - Closing one answered 500 too, for an unrelated reason: the subject-owner permission goes
     through `OwnablePermission`, which reads `subject.organization` and `subject.owner`, and an
     organization has neither -- it does not even derive from `Owned`. Serialising one failed more
-    quietly, because flask-restx swallows the error and emits null permissions, which left the
-    organization's own admins without edit or delete on their page. An organization owns itself,
+    quietly, because flask-restx swallows the error and emits a null `permissions` block: the
+    whole block, so the author of a thread lost edit and delete on their own discussion even
+    though those permissions never consult the subject at all. An organization owns itself,
     so it now gets the needs `OwnablePermission` computes for an asset it owns: admin and editor,
     the editors included so they moderate an organization's discussions as they do its datasets'.
     A defensive `getattr` would have been worse than the crash: `Permission` prepends
     `RoleNeed("admin")`, so a permission with no needs is sysadmins-only, not everyone.
   - Nobody was notified either. The tuple of subjects that notify did not list organizations, so
     the three notification tasks logged "Unrecognized discussion subject type" and returned. The
-    members are now the recipients, guarding against a member whose user reference is dangling --
-    the field is not required, and one such member would otherwise break every notification for
-    that organization.
+    members are now the recipients, guarding against a member carrying no user at all -- the
+    field is not required, and one such member would otherwise break every notification for that
+    organization.
   - Purging an organization left its discussions behind, pointing at a document that no longer
     exists; it now goes through the same helper dataset, reuse, dataservice and topic already use.
   - Organizations gained the `discussions` and `discussions_open` metrics, so the API reports the

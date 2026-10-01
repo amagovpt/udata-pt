@@ -203,9 +203,12 @@ class Discussion(SpamMixin, Linkable, Document):
         recipients = {m.posted_by.id: m.posted_by for m in self.discussion}
         if isinstance(self.subject, Organization):
             # An organization is the subject of the discussions held on its own page, and
-            # owns itself: its members are the people to notify. `member.user` is not
-            # required, and one dangling member would otherwise break every notification
-            # for that organization -- `notify_new_member` guards the same way.
+            # owns itself: its members are the people to notify. `member.user` is not a
+            # required field, so a member can carry none at all -- `notify_new_member`
+            # guards the same way. A member pointing at a user that no longer exists is a
+            # different matter: dereferencing it raises, and this guard does not catch
+            # that. Nothing hard-deletes users today (`mark_as_deleted` strips the member
+            # from every live organization), so that case stays theoretical.
             for member in self.subject.members:
                 if member.user:
                     recipients[member.user.id] = member.user
