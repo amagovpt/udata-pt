@@ -116,7 +116,9 @@ class INEBackend(BaseBackend):
     1) Parse XML -> metadados em memória
     2) Change detection + bulk_write no Mongo (muito mais rápido)
 
-    O catálogo é descarregado de self.source.url para LOCAL_FILE_PATH, processado e removido.
+    O catálogo é lido em streaming de self.source.url e processado à medida que chega; a
+    última cópia completa fica como snapshot persistente (HARVEST_SNAPSHOT_DIR), usado
+    quando nenhuma tentativa entrega um único indicador.
 
     Robustez:
     - Captura BulkWriteError, extrai bwe.details['writeErrors'] e isola operação falhada
@@ -138,7 +140,10 @@ class INEBackend(BaseBackend):
     BULK_SIZE = 500
     LOG_EVERY = 200
     CHECK_CHANGES = True
-    LOCAL_FILE_PATH = "/tmp/ine.xml"
+    # Explicit catalogue path. `None` means the per-source snapshot under
+    # `snapshot_dir`; previews set a throwaway path of their own, and tests point
+    # it into a temporary directory.
+    LOCAL_FILE_PATH: str | None = None
 
     # Regex patterns
     _KW_SPLIT_RE = re.compile(r"\s*(?:;|,|/|\n|\r|\t|\s+-\s+)\s*")
@@ -164,17 +169,16 @@ class INEBackend(BaseBackend):
         self._pending_items: list[HarvestItem] = []
         self._dataset_collection = None
         self._parsed_count = 0
+        # Age in seconds of the snapshot this run fell back on, `None` when the
+        # catalogue came from the source.
+        self._snapshot_fallback_age: float | None = None
 
         if self.dryrun:
-            # Previews must not share the download path with the real harvest.
-            # `LOCAL_FILE_PATH` is a class attribute, so every INE run in the
-            # process reads and writes the same file: a preview could overwrite
-            # the catalog a running harvest was reading, and its cleanup deletes
-            # the cached file that harvest falls back on. The real harvest keeps
-            # the shared path deliberately — that cache is what saves it when the
-            # slow INE endpoint drops the connection on every attempt. The cost
-            # of the split is disk: the body is downloaded before any `max_items`
-            # cut, so N concurrent previews now hold N bodies instead of one.
+            # Previews must not share the catalogue path with the real harvest:
+            # a preview could overwrite the snapshot a running harvest was
+            # reading, and its cleanup would delete the snapshot that harvest
+            # falls back on when the slow INE endpoint drops the connection on
+            # every attempt. A preview's file is throwaway and removed after it.
             self.LOCAL_FILE_PATH = os.path.join(
                 tempfile.gettempdir(), f"ine-preview-{uuid4().hex}.xml"
             )
@@ -723,11 +727,9 @@ class INEBackend(BaseBackend):
             self._inner_harvest()
         finally:
             if self.dryrun:
-                # The success-path cleanup at the end of `_inner_harvest` does not
-                # run when phase 2 raises, and the phase 1 handler leaves the file
-                # in place. Both are fine for the real harvest,
-                # which reuses one shared path; a preview owns a unique file per
-                # instance and would leave it behind for good.
+                # A real harvest keeps its catalogue as the snapshot it falls back
+                # on; a preview owns a unique throwaway file and would leave it
+                # behind for good.
                 self._cleanup_local_file()
 
     def autoarchive(self):
@@ -740,7 +742,8 @@ class INEBackend(BaseBackend):
         passes `HARVEST_PREVIEW_MAX_ITEMS`. Without this, a preview of a source
         whose real harvest has been failing for longer than the grace period
         would report the entire rest of the catalog as archived. A stream the
-        source cut midway (`_catalog_partial`) is the same situation.
+        source cut midway (`_catalog_partial`) is the same situation, and so is a
+        run fed from the snapshot.
         """
         if self._catalog_truncated:
             self._log.warning(
@@ -756,22 +759,49 @@ class INEBackend(BaseBackend):
                 len(self._seen),
             )
             return
+        if self._snapshot_fallback_age is not None:
+            # An old snapshot proves nothing about what the source removed since.
+            self._log.warning(
+                "[INE] Autoarchive ignorado: o catálogo veio do snapshot (%.0fs)",
+                self._snapshot_fallback_age,
+            )
+            return
         super().autoarchive()
 
+    @property
+    def snapshot_dir(self) -> str:
+        """Where real harvests keep their last complete catalogue.
+
+        Defaults under `FS_ROOT`, which deployments mount as a persistent volume
+        shared by app and worker (`/dadosgov/fs`), so the snapshot survives a
+        worker restart where `/tmp` did not. Not under any registered storage, so
+        it is never served by `/s/`.
+        """
+        configured = current_app.config.get("HARVEST_SNAPSHOT_DIR")
+        if configured:
+            return configured
+        # Same default `flask_storage` gives `FS_ROOT` when it is not configured.
+        fs_root = current_app.config.get("FS_ROOT") or os.path.join(current_app.instance_path, "fs")
+        return os.path.join(fs_root, "harvest-snapshots")
+
+    def _snapshot_path(self) -> str:
+        """The catalogue file of this run, one per source.
+
+        Resolved lazily rather than in `__init__`, so an override of
+        `LOCAL_FILE_PATH` set after construction still applies.
+        """
+        if self.LOCAL_FILE_PATH:
+            return self.LOCAL_FILE_PATH
+        return os.path.join(self.snapshot_dir, f"ine-{self.source.id}.xml")
+
     def _cleanup_local_file(self):
+        path = self._snapshot_path()
         try:
-            if os.path.exists(self.LOCAL_FILE_PATH):
-                os.remove(self.LOCAL_FILE_PATH)
-                self._log.info(
-                    "[INE] Ficheiro descarregado removido após processamento: %s",
-                    self.LOCAL_FILE_PATH,
-                )
+            if os.path.exists(path):
+                os.remove(path)
+                self._log.info("[INE] Ficheiro do preview removido: %s", path)
         except Exception as e:
-            self._log.warning(
-                "[INE] Falha ao remover ficheiro %s: %s",
-                self.LOCAL_FILE_PATH,
-                e,
-            )
+            self._log.warning("[INE] Falha ao remover ficheiro %s: %s", path, e)
 
     def _inner_harvest(self):
         # Redacted here too: this line runs on every harvest, and an INFO
@@ -796,16 +826,13 @@ class INEBackend(BaseBackend):
 
         try:
             complete, last_error = self._harvest_live()
-            if complete:
-                # Once the whole catalogue went through, the cached copy has
-                # nothing left to offer this run.
-                self._cleanup_local_file()
-            elif self._seen:
-                self._mark_partial(last_error)
-            elif self._is_complete_xml(self.LOCAL_FILE_PATH):
-                self._harvest_snapshot(last_error)
-            else:
-                raise last_error
+            if not complete:
+                if self._seen:
+                    self._mark_partial(last_error)
+                elif self._is_complete_xml(self._snapshot_path()):
+                    self._harvest_snapshot(last_error)
+                else:
+                    raise last_error
         except Exception as e:
             self._log.error("[INE] Erro no download/parsing do XML: %s", e)
             raise
@@ -852,7 +879,8 @@ class INEBackend(BaseBackend):
         Returns whether an attempt read the whole catalogue (or stopped at
         `max_items` by design), and the error that ended the last attempt.
         """
-        path = self.LOCAL_FILE_PATH
+        path = self._snapshot_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         delay = self.http_retry_initial_delay
         max_delay = self.http_retry_max_delay
         last_error: Exception | None = None
@@ -917,13 +945,36 @@ class INEBackend(BaseBackend):
         replaying it over a run that did reach the source would at best change
         nothing and at worst roll back what the source just updated.
         """
+        path = self._snapshot_path()
+        # `os.replace` keeps the mtime of the `.part` file, which is when the
+        # download that produced the snapshot finished.
+        mtime = os.path.getmtime(path)
+        self._snapshot_fallback_age = time.time() - mtime
+        taken_at = datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        age_hours = self._snapshot_fallback_age / 3600
         self._log.warning(
-            "[INE] Download falhou após %s tentativas (%s); a usar o catálogo em cache: %s",
+            "[INE] Download falhou após %s tentativas (%s); a usar o snapshot de %s (%.1f h): %s",
             self.DOWNLOAD_MAX_RETRIES,
             redact_url_credentials(safe_unicode(last_error)),
-            self.LOCAL_FILE_PATH,
+            taken_at,
+            age_hours,
+            path,
         )
-        error = self._harvest_indicators(self._iter_indicators(self.LOCAL_FILE_PATH))
+        self.job.data["snapshot"] = {
+            "used": True,
+            "age_seconds": round(self._snapshot_fallback_age, 1),
+            "path": path,
+        }
+        self.job.errors.append(
+            HarvestError(
+                message=(
+                    f"catalogue download failed after {self.DOWNLOAD_MAX_RETRIES} attempts; "
+                    f"using snapshot from {taken_at} ({age_hours:.1f} h old), "
+                    f"autoarchive skipped ({safe_unicode(last_error)})"
+                )
+            )
+        )
+        error = self._harvest_indicators(self._iter_indicators(path))
         if error is not None:
             raise error
 

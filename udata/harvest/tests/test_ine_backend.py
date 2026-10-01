@@ -549,11 +549,11 @@ class INEPreviewReportsItemsTest(PytestOnlyDBTestCase):
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])
 class INELocalFilePathTest(PytestOnlyDBTestCase):
-    """A preview must not share the download file with the real harvest.
+    """A preview must not share the catalogue file with the real harvest.
 
-    `LOCAL_FILE_PATH` is a class attribute, so every INE run in the process used
-    the same file: a preview could overwrite the catalog a running harvest was
-    reading, and its cleanup deleted the cached file that harvest falls back on.
+    The real harvest keeps its catalogue as the snapshot it falls back on: a
+    preview writing there could overwrite the catalog a running harvest was
+    reading, and its cleanup would delete the snapshot.
     """
 
     def _source(self):
@@ -576,14 +576,18 @@ class INELocalFilePathTest(PytestOnlyDBTestCase):
         first = INEBackend(source, dryrun=True)
         second = INEBackend(source, dryrun=True)
 
-        assert first.LOCAL_FILE_PATH != second.LOCAL_FILE_PATH
-        assert first.LOCAL_FILE_PATH != INEBackend.LOCAL_FILE_PATH
-        assert second.LOCAL_FILE_PATH != INEBackend.LOCAL_FILE_PATH
+        snapshot = INEBackend(source)._snapshot_path()
+        assert first._snapshot_path() != second._snapshot_path()
+        assert first._snapshot_path() != snapshot
+        assert second._snapshot_path() != snapshot
 
-    def test_real_harvest_keeps_the_shared_path(self):
-        # Deliberate: the shared file is the download cache `_download_to_file`
-        # falls back on when every attempt against the slow INE endpoint fails.
-        assert INEBackend(self._source()).LOCAL_FILE_PATH == INEBackend.LOCAL_FILE_PATH
+    def test_real_harvest_uses_the_persistent_snapshot_path(self):
+        # Deliberate: the snapshot is what the harvest falls back on when every
+        # attempt against the slow INE endpoint fails.
+        backend = INEBackend(self._source())
+        assert backend._snapshot_path() == os.path.join(
+            backend.snapshot_dir, f"ine-{backend.source.id}.xml"
+        )
 
     def test_preview_leaves_the_harvest_cache_alone(self, rmock, tmp_path, monkeypatch):
         # Both the shared path and the per-instance one have to land inside
@@ -1419,3 +1423,101 @@ class INEStreamingHarvestTest(PytestOnlyDBTestCase):
         assert job.status == "failed"
         catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
         assert len(catalog_requests) == 1
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESnapshotTest(PytestOnlyDBTestCase):
+    """The last complete catalogue is a persistent, per-source snapshot.
+
+    It used to live in `/tmp/ine.xml`, shared by every INE source, deleted after
+    every successful run and lost on every container restart, so the fallback it
+    was meant to provide was rarely there when the source failed.
+    """
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _harvest(self, rmock, monkeypatch, source, body):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        rmock.get(INE_URL, text=body)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend.harvest()
+
+    def _snapshot(self, tmp_path, source, age_seconds=3600):
+        snapshot = tmp_path / f"ine-{source.id}.xml"
+        snapshot.write_text(_catalog_xml(["0001", "0002"]))
+        old = time.time() - age_seconds
+        os.utime(snapshot, (old, old))
+        return snapshot, snapshot.read_bytes(), os.path.getmtime(snapshot)
+
+    @pytest.fixture
+    def snapshot_dir(self, app, tmp_path, monkeypatch):
+        monkeypatch.setitem(app.config, "HARVEST_SNAPSHOT_DIR", str(tmp_path))
+        return tmp_path
+
+    def test_snapshot_path_follows_the_setting_and_the_source_id(self, snapshot_dir):
+        source = self._source()
+
+        assert INEBackend(source)._snapshot_path() == str(snapshot_dir / f"ine-{source.id}.xml")
+
+    def test_snapshot_dir_defaults_under_fs_root(self, app, instance_path, monkeypatch):
+        monkeypatch.setitem(app.config, "HARVEST_SNAPSHOT_DIR", None)
+
+        path = INEBackend(self._source())._snapshot_path()
+
+        assert path.startswith(os.path.join(app.config["FS_ROOT"], "harvest-snapshots"))
+
+    def test_successful_harvest_keeps_the_snapshot(self, rmock, monkeypatch, snapshot_dir):
+        source = self._source()
+        body = _catalog_xml(["0001", "0002", "0003"])
+
+        job = self._harvest(rmock, monkeypatch, source, body)
+
+        assert job.status == "done"
+        snapshot = snapshot_dir / f"ine-{source.id}.xml"
+        assert snapshot.read_text() == body
+        assert glob(str(snapshot_dir / "*.part")) == []
+
+    def test_fallback_records_the_snapshot_age_and_skips_autoarchive(
+        self, rmock, monkeypatch, snapshot_dir
+    ):
+        source = self._source(autoarchive=True)
+        stale = DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id="9999",
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=date.today() - timedelta(days=400),
+            )
+        )
+        snapshot, content, mtime = self._snapshot(snapshot_dir, source)
+
+        job = self._harvest(rmock, monkeypatch, source, "")
+
+        assert job.status == "done"
+        job.reload()
+        assert job.data["snapshot"]["used"] is True
+        assert abs(job.data["snapshot"]["age_seconds"] - 3600) < 60
+        assert "using snapshot" in job.errors[-1].message
+        assert [item.status for item in job.items] == ["done"] * 2
+        stale.reload()
+        assert stale.harvest.archived_at is None
+        assert snapshot.read_bytes() == content
+        assert os.path.getmtime(snapshot) == mtime
+
+    def test_partial_run_does_not_overwrite_the_snapshot(self, rmock, monkeypatch, snapshot_dir):
+        source = self._source()
+        snapshot, content, mtime = self._snapshot(snapshot_dir, source)
+
+        job = self._harvest(
+            rmock, monkeypatch, source, _truncated_catalog_xml(["0001", "0002", "0003"])
+        )
+
+        assert job.data["partial"] is True
+        assert snapshot.read_bytes() == content
+        assert os.path.getmtime(snapshot) == mtime
+        assert glob(str(snapshot_dir / "*.part")) == []

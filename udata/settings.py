@@ -395,6 +395,11 @@ class Defaults(object):
     # The number of days since last harvesting date when a missing dataset is archived
     HARVEST_AUTOARCHIVE_GRACE_DAYS = 7
 
+    # Directory where harvesters that download a whole catalogue (INE) keep the last
+    # complete copy, to fall back on when the source fails. Must be persistent and
+    # shared by the workers; defaults to `<FS_ROOT>/harvest-snapshots`.
+    HARVEST_SNAPSHOT_DIR = None
+
     HARVEST_VALIDATION_CONTACT_FORM = None
 
     HARVEST_MAX_CATALOG_SIZE_IN_MONGO = None  # Defaults to the size of a MongoDB document
