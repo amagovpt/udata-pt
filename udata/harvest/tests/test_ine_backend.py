@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import time
@@ -6,6 +7,7 @@ from datetime import date, datetime, timedelta
 from glob import glob
 
 import pytest
+import urllib3
 
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import DatasetFactory
@@ -16,7 +18,8 @@ from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import to_naive_datetime
 
-from ..backends.ine import INE_HVD_FEED_URL, INEBackend
+from ..backends.ine import INE_HVD_FEED_URL, INEBackend, _ErrorPageScanner, _INECatalogStream
+from ..exceptions import HarvestSourceError
 from .factories import HarvestSourceFactory
 
 INE_URL = "https://www.ine.pt/ine/xml_indic.jsp?opc=2&lang=PT"
@@ -1521,3 +1524,138 @@ class INESnapshotTest(PytestOnlyDBTestCase):
         assert snapshot.read_bytes() == content
         assert os.path.getmtime(snapshot) == mtime
         assert glob(str(snapshot_dir / "*.part")) == []
+
+
+class _CutBody(io.RawIOBase):
+    """A response body that delivers `data`, then fails like a dropped connection."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if not self._data:
+            raise urllib3.exceptions.ProtocolError("Connection broken: IncompleteRead")
+        size = min(len(buffer), len(self._data))
+        buffer[:size], self._data = self._data[:size], self._data[size:]
+        return size
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESourceErrorTest(PytestOnlyDBTestCase):
+    """The error page INE appends to a 200 response is the source's fault, not the
+    network's, and the job has to say which one it was."""
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, **response):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        rmock.get(INE_URL, **response)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend.harvest()
+
+    def _remote_ids(self, source):
+        return sorted(
+            d.harvest.remote_id
+            for d in Dataset.objects(__raw__={"harvest.source_id": str(source.id)})
+        )
+
+    def test_error_page_with_http_200_is_a_source_error(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        body = _truncated_catalog_xml(["0001", "0002"]) + JAVA_ERROR_PAGE
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, text=body)
+
+        assert job.errors[-1].message.startswith("INE source error:")
+        assert "error page in the response body" in job.errors[-1].message
+        assert job.data["partial"] is True
+        # Both indicators shared the chunk with the error page and still went through.
+        assert self._remote_ids(source) == ["0001", "0002"]
+
+    def test_error_page_leaves_the_snapshot_untouched(self, rmock, monkeypatch, tmp_path):
+        snapshot = tmp_path / "ine.xml"
+        snapshot.write_text(_catalog_xml(["0001"]))
+        old = time.time() - 3600
+        os.utime(snapshot, (old, old))
+        content, mtime = snapshot.read_bytes(), os.path.getmtime(snapshot)
+
+        self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            text=_truncated_catalog_xml(["0001", "0002"]) + JAVA_ERROR_PAGE,
+        )
+
+        assert snapshot.read_bytes() == content
+        assert os.path.getmtime(snapshot) == mtime
+        assert glob(str(tmp_path / "*.part")) == []
+
+    def test_chunked_encoding_error_is_a_network_error(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        # Padded to exactly one 8 KiB read, so both indicators reach the parser
+        # before the read that fails.
+        data = _truncated_catalog_xml(["0001", "0002"]).encode().ljust(8192, b"\n")
+        responses = [{"body": _CutBody(data)}, {"body": _CutBody(data)}]
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, response_list=responses)
+
+        assert job.errors[-1].message.startswith("INE network error:")
+        assert job.data["partial"] is True
+        assert self._remote_ids(source) == ["0001", "0002"]
+
+    def test_source_error_without_snapshot_fails_the_job(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, text=JAVA_ERROR_PAGE)
+
+        assert job.status == "failed"
+        assert job.errors[-1].message.startswith("INE source error:")
+        assert self._remote_ids(source) == []
+
+
+class INEErrorPageScannerTest:
+    def test_marker_split_across_chunks_is_detected(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"<catalog>\n<indicator id='1'></indicator>\njav") is None
+        found = scanner.feed(b"ax.naming.NameNotFoundException")
+
+        assert found == (-3, b"javax.")
+
+    def test_html_element_inside_an_indicator_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"<catalog><indicator id='1'><html><bdd_url>x</bdd_url></html>") is None
+
+    def test_bom_before_the_declaration_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"\xef\xbb\xbf\n\n<?xml version='1.0'?><catalog>") is None
+
+    def test_head_split_across_chunks_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"\n\n\n<cat") is None
+        assert scanner.feed(b"alog><indicator id='1'/>") is None
+
+    def test_non_xml_head_is_rejected(self):
+        with pytest.raises(HarvestSourceError):
+            _ErrorPageScanner().feed(b"<!DOCTYPE html><html><body>Erro</body></html>")
+
+    def test_bytes_before_the_marker_are_returned_before_the_error(self, tmp_path):
+        good = b"<catalog><indicator id='1'><title>A</title></indicator>"
+        response = type("Response", (), {})()
+        response.iter_content = lambda chunk_size: iter([good + b"\njavax.naming.Foo"])
+        stream = _INECatalogStream(response, str(tmp_path / "x.part"))
+
+        assert stream.read(16384) == good + b"\n"
+        with pytest.raises(HarvestSourceError):
+            stream.read(16384)
+        stream.close()

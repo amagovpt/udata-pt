@@ -21,7 +21,11 @@ from slugify import slugify
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.utils.sanitization import sanitize_markdown_html, sanitize_strict
 from udata.harvest.backends.base import BaseBackend
-from udata.harvest.exceptions import HarvestValidationError
+from udata.harvest.exceptions import (
+    HarvestException,
+    HarvestSourceError,
+    HarvestValidationError,
+)
 from udata.harvest.models import HarvestError, HarvestItem, HarvestJob
 from udata.models import Dataset, License
 from udata.utils import safe_harvest_datetime, safe_unicode, to_naive_datetime
@@ -53,7 +57,7 @@ INE_SOURCE_EXTRAS = (
 )
 
 
-class INEDownloadIncomplete(Exception):
+class INEDownloadIncomplete(HarvestSourceError):
     """Raised when the catalogue stream ended without a complete document.
 
     The INE endpoint is slow and frequently drops the connection mid-stream.
@@ -76,8 +80,75 @@ _STREAM_ERRORS = (
     ConnectionResetError,
     ConnectionAbortedError,
     ET.ParseError,
-    INEDownloadIncomplete,
+    HarvestSourceError,
 )
+
+# Stack-trace text the INE application server appends to a 200 response when it
+# gives up midway (`javax.naming.NameNotFoundException: jdbc/... at io.undertow...`).
+# Only markers that cannot occur in a valid catalogue: "Exception", `<html` or
+# `<!DOCTYPE` could, `<html>` being an element of every `<indicator>`.
+_ERROR_PAGE_MARKERS = (b"javax.", b"io.undertow", b"\n\tat ")
+_UTF8_BOM = b"\xef\xbb\xbf"
+_XML_HEADS = (b"<?xml", b"<catalog")
+
+
+def _classify_stream_error(exc: Exception | None) -> str:
+    """`source` when the body arrived but was wrong, `network` when it did not arrive."""
+    return "source" if isinstance(exc, (HarvestSourceError, ET.ParseError)) else "network"
+
+
+class _ErrorPageScanner:
+    """Spot, as the bytes arrive, a response that is not the catalogue.
+
+    The head is checked once: the first bytes past an optional BOM and blank
+    lines must open an XML document. Then every chunk is searched for the stack
+    trace markers, keeping a short tail so a marker split across two chunks is
+    still found. Without this the junk only surfaced as a parse error once the
+    source closed the connection, minutes later.
+    """
+
+    _TAIL = max(len(m) for m in _ERROR_PAGE_MARKERS) - 1
+
+    def __init__(self):
+        self._head = b""
+        self._head_checked = False
+        self._tail = b""
+        self.bytes_seen = 0
+
+    def feed(self, chunk: bytes) -> tuple[int, bytes] | None:
+        """Return `(offset, marker)` when an error page starts in `chunk`.
+
+        `offset` is relative to `chunk` and is negative when the marker began in
+        the previous chunk. Raises `HarvestSourceError` when the head is not XML.
+        """
+        if not self._head_checked:
+            self._check_head(chunk)
+        window = self._tail + chunk
+        found = None
+        for marker in _ERROR_PAGE_MARKERS:
+            index = window.find(marker)
+            if index != -1 and (found is None or index < found[0]):
+                found = (index, marker)
+        self.bytes_seen += len(chunk)
+        if found is not None:
+            return found[0] - len(self._tail), found[1]
+        self._tail = window[-self._TAIL :]
+        return None
+
+    def _check_head(self, chunk: bytes) -> None:
+        self._head += chunk
+        head = self._head
+        if head.startswith(_UTF8_BOM):
+            head = head[len(_UTF8_BOM) :]
+        head = head.lstrip()
+        if len(head) < max(len(h) for h in _XML_HEADS) and any(
+            h.startswith(head) for h in _XML_HEADS
+        ):
+            return  # not enough bytes yet to decide
+        self._head_checked = True
+        self._head = b""
+        if not head.startswith(_XML_HEADS):
+            raise HarvestSourceError(f"non-XML response body: {head[:60]!r}")
 
 
 class _INECatalogStream:
@@ -93,16 +164,35 @@ class _INECatalogStream:
     def __init__(self, response, part_path: str, chunk_size: int = 8192):
         self._chunks = response.iter_content(chunk_size=chunk_size)
         self._file = open(part_path, "wb")
+        self._scanner = _ErrorPageScanner()
+        self._pending_error: HarvestSourceError | None = None
         self.bytes_read = 0
 
     def read(self, size: int = -1) -> bytes:
         # One network chunk per call: `iterparse` accepts short reads, and
         # handing bytes over as soon as they arrive is the whole point.
+        if self._pending_error is not None:
+            raise self._pending_error
         for chunk in self._chunks:
+            if not chunk:
+                continue
+            found = self._scanner.feed(chunk)
+            if found is not None:
+                offset, marker = found
+                chunk = chunk[: max(offset, 0)]
+                # Raised on the *next* read: the bytes before the marker go to
+                # the parser first, so the complete indicators sharing a chunk
+                # with the error page are still yielded instead of lost.
+                self._pending_error = HarvestSourceError(
+                    f"error page in the response body ({marker.decode().strip()}) "
+                    f"after {self.bytes_read + len(chunk)} bytes"
+                )
+            self._file.write(chunk)
+            self.bytes_read += len(chunk)
             if chunk:
-                self._file.write(chunk)
-                self.bytes_read += len(chunk)
                 return chunk
+            if self._pending_error is not None:
+                raise self._pending_error
         return b""
 
     def close(self) -> None:
@@ -832,7 +922,7 @@ class INEBackend(BaseBackend):
                 elif self._is_complete_xml(self._snapshot_path()):
                     self._harvest_snapshot(last_error)
                 else:
-                    raise last_error
+                    self._raise_classified(last_error)
         except Exception as e:
             self._log.error("[INE] Erro no download/parsing do XML: %s", e)
             raise
@@ -968,6 +1058,7 @@ class INEBackend(BaseBackend):
         self.job.errors.append(
             HarvestError(
                 message=(
+                    f"INE {_classify_stream_error(last_error)} error: "
                     f"catalogue download failed after {self.DOWNLOAD_MAX_RETRIES} attempts; "
                     f"using snapshot from {taken_at} ({age_hours:.1f} h old), "
                     f"autoarchive skipped ({safe_unicode(last_error)})"
@@ -977,6 +1068,18 @@ class INEBackend(BaseBackend):
         error = self._harvest_indicators(self._iter_indicators(path))
         if error is not None:
             raise error
+
+    def _raise_classified(self, last_error: Exception | None) -> None:
+        """Fail the job with an error that says whose fault it was."""
+        kind = _classify_stream_error(last_error)
+        message = (
+            f"INE {kind} error: catalogue download failed after "
+            f"{self.DOWNLOAD_MAX_RETRIES} attempts and no snapshot is available "
+            f"({safe_unicode(last_error)})"
+        )
+        if kind == "source":
+            raise HarvestSourceError(message) from last_error
+        raise HarvestException(message) from last_error
 
     def _mark_partial(self, last_error: Exception | None) -> None:
         """Record a run whose every attempt was cut after some indicators."""
@@ -990,6 +1093,7 @@ class INEBackend(BaseBackend):
         self.job.errors.append(
             HarvestError(
                 message=(
+                    f"INE {_classify_stream_error(last_error)} error: "
                     f"catalogue stream cut after {len(self._seen)} indicators; "
                     "received indicators were updated, autoarchive skipped "
                     f"({safe_unicode(last_error)})"
