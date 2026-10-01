@@ -67,9 +67,7 @@ class INEBackend(BaseBackend):
     1) Parse XML -> metadados em memória
     2) Change detection + bulk_write no Mongo (muito mais rápido)
 
-    Configuração de ficheiro:
-    - IS_TEST_MODE = True: usa /tmp/ine.xml (você adiciona/remove manualmente)
-    - IS_TEST_MODE = False: descarrega de self.source.url, processa e remove automaticamente
+    O catálogo é descarregado de self.source.url para LOCAL_FILE_PATH, processado e removido.
 
     Robustez:
     - Captura BulkWriteError, extrai bwe.details['writeErrors'] e isola operação falhada
@@ -88,11 +86,9 @@ class INEBackend(BaseBackend):
     DOWNLOAD_MAX_RETRIES = 5
 
     # Harvester Configuration
-    IS_TEST_MODE = False  # True: usa ficheiro em /tmp/ine.xml (você gere) | False: download automático com limpeza
     BULK_SIZE = 500
     LOG_EVERY = 200
     CHECK_CHANGES = True
-    USE_LOCAL_FILE = True  # True: salva/reutiliza /tmp/ine.xml | False: baixa direto para RAM
     LOCAL_FILE_PATH = "/tmp/ine.xml"
 
     # Regex patterns
@@ -108,7 +104,7 @@ class INEBackend(BaseBackend):
         self._cc_by_license = None
         self._catalog_truncated = False
 
-        if self.dryrun and not self.IS_TEST_MODE:
+        if self.dryrun:
             # Previews must not share the download path with the real harvest.
             # `LOCAL_FILE_PATH` is a class attribute, so every INE run in the
             # process reads and writes the same file: a preview could overwrite
@@ -118,8 +114,6 @@ class INEBackend(BaseBackend):
             # slow INE endpoint drops the connection on every attempt. The cost
             # of the split is disk: the body is downloaded before any `max_items`
             # cut, so N concurrent previews now hold N bodies instead of one.
-            # `IS_TEST_MODE` is excluded because there the file is placed at the
-            # class path by hand, and overriding it would make every run fail.
             self.LOCAL_FILE_PATH = os.path.join(
                 tempfile.gettempdir(), f"ine-preview-{uuid4().hex}.xml"
             )
@@ -130,13 +124,6 @@ class INEBackend(BaseBackend):
             import logging
 
             self._log = logging.getLogger(__name__)
-
-        self._log.info(
-            "[INE] Harvester iniciado: bulk_size=%s, log_every=%s, check_changes=%s",
-            self.BULK_SIZE,
-            self.LOG_EVERY,
-            self.CHECK_CHANGES,
-        )
 
     # --------------------------
     # Download robusto com validação de integridade
@@ -766,10 +753,10 @@ class INEBackend(BaseBackend):
         try:
             self._inner_harvest()
         finally:
-            if self.dryrun and not self.IS_TEST_MODE:
+            if self.dryrun:
                 # The success-path cleanup at the end of `_inner_harvest` does not
-                # run when phase 2 raises, and the phase 1 handler keeps the file
-                # on purpose, for debugging. Both are fine for the real harvest,
+                # run when phase 2 raises, and the phase 1 handler leaves the file
+                # in place. Both are fine for the real harvest,
                 # which reuses one shared path; a preview owns a unique file per
                 # instance and would leave it behind for good.
                 self._cleanup_local_file()
@@ -794,8 +781,6 @@ class INEBackend(BaseBackend):
         super().autoarchive()
 
     def _cleanup_local_file(self):
-        if not self.USE_LOCAL_FILE:
-            return
         try:
             if os.path.exists(self.LOCAL_FILE_PATH):
                 os.remove(self.LOCAL_FILE_PATH)
@@ -817,57 +802,26 @@ class INEBackend(BaseBackend):
             "[INE] Iniciando harvester de %s", redact_url_credentials(str(self.source.url))
         )
         self._log.info(
-            "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s, TestMode=%s",
+            "[INE] Config: BulkSize=%s, LogEvery=%s, CheckChanges=%s",
             self.BULK_SIZE,
             self.LOG_EVERY,
             self.CHECK_CHANGES,
-            self.IS_TEST_MODE,
         )
 
         start_time = time.time()
         self.HVD_INDICATOR_IDS = self._fetch_hvd_ids()
 
         try:
-            from io import BytesIO
-
-            # Determina a fonte do XML baseado no modo de operação
-            if self.IS_TEST_MODE:
-                # Modo teste: usa ficheiro em /tmp/ine.xml (usuário responsável por gerenciá-lo)
-                if not os.path.exists(self.LOCAL_FILE_PATH):
-                    raise FileNotFoundError(
-                        f"[INE] Modo teste ativo mas ficheiro não encontrado: {self.LOCAL_FILE_PATH}"
-                    )
-                self._log.info(
-                    "[INE] Modo TESTE: usando ficheiro local %s (você gere remoção)",
-                    self.LOCAL_FILE_PATH,
-                )
-                source_context = self.LOCAL_FILE_PATH
-            elif self.USE_LOCAL_FILE:
-                # Modo produção com ficheiro local: baixa (com retry + validação de
-                # integridade), processa e remove.
-                self._log.info(
-                    "[INE] Baixando XML e salvando em %s (será removido após processamento)...",
-                    self.LOCAL_FILE_PATH,
-                )
-                self._download_to_file(self.source.url, self.LOCAL_FILE_PATH)
-                self._log.info("[INE] Download concluído.")
-                source_context = self.LOCAL_FILE_PATH
-            else:
-                # Modo memória: baixa direto para RAM
-                self._log.info("[INE] Baixando XML para memória...")
-                # Guarded fetch (SSRF check + retry/timeout) via BaseBackend
-                resp = self.get(self.source.url)
-                resp.raise_for_status()
-                content = resp.content
-                # Validação de integridade: rejeitar transferência truncada
-                if b"</catalog>" not in content[-8192:]:
-                    raise INEDownloadIncomplete(
-                        "XML truncado em memória: root <catalog> não fechado"
-                    )
-                source_context = BytesIO(content)
+            # Download com retry + validação de integridade, processado e removido.
+            self._log.info(
+                "[INE] Baixando XML e salvando em %s (será removido após processamento)...",
+                self.LOCAL_FILE_PATH,
+            )
+            self._download_to_file(self.source.url, self.LOCAL_FILE_PATH)
+            self._log.info("[INE] Download concluído.")
+            source_context = self.LOCAL_FILE_PATH
 
             # Fase 1: Criação do iterador sobre o XML
-            # source_context pode ser file path ou file-like object (BytesIO)
             # Hardened parser: the catalog body is remote and, through the
             # preview endpoint, caller-supplied. defusedxml refuses DTD entity
             # definitions and external references by default, which is what
@@ -936,25 +890,6 @@ class INEBackend(BaseBackend):
 
         except Exception as e:
             self._log.error("[INE] Erro no download/parsing do XML: %s", e)
-            # Remover ficheiro descarregado em caso de erro (não remover em modo teste)
-            if not self.IS_TEST_MODE and self.USE_LOCAL_FILE:
-                try:
-                    if os.path.exists(self.LOCAL_FILE_PATH):
-                        # os.remove(self.LOCAL_FILE_PATH)
-                        self._log.info(
-                            "[INE] Ficheiro mantido para debug após erro: %s",
-                            self.LOCAL_FILE_PATH,
-                        )
-                        self._log.info(
-                            "[INE] Ficheiro mantido para debug após erro: %s",
-                            self.LOCAL_FILE_PATH,
-                        )
-                except Exception as cleanup_e:
-                    self._log.warning(
-                        "[INE] Falha ao remover ficheiro após erro %s: %s",
-                        self.LOCAL_FILE_PATH,
-                        cleanup_e,
-                    )
             raise
 
         # --- Fim Fase 1, Inicio Fase 2 (Processamento) ---
@@ -1218,6 +1153,4 @@ class INEBackend(BaseBackend):
         )
 
         # Remover ficheiro descarregado após processamento bem-sucedido
-        # (não remover em modo teste)
-        if not self.IS_TEST_MODE:
-            self._cleanup_local_file()
+        self._cleanup_local_file()
