@@ -737,6 +737,122 @@ class DiscussionsTest(APITestCase):
         )
         self.assert403(response)
 
+    def test_new_discussion_on_organization(self):
+        """A discussion can be opened on an organization itself, and read back."""
+        user = self.login()
+        org = OrganizationFactory()
+
+        with assert_emit(on_new_discussion):
+            response = self.post(
+                url_for("api.discussions"),
+                {
+                    "title": "test title",
+                    "comment": "bla bla",
+                    "subject": {
+                        "class": "Organization",
+                        "id": org.id,
+                    },
+                },
+            )
+            self.assert201(response)
+
+        # The `permissions` block is marshalled on every discussion response: it used to
+        # raise on an organization subject, taking the whole response down with it.
+        self.assertIn("permissions", response.json)
+        self.assertEqual(response.json["subject"]["class"], "Organization")
+
+        org.reload()
+        self.assertEqual(org.get_metrics()["discussions"], 1)
+        self.assertEqual(org.get_metrics()["discussions_open"], 1)
+
+        discussions = Discussion.objects(subject=org)
+        self.assertEqual(len(discussions), 1)
+        self.assertEqual(discussions[0].user, user)
+
+        response = self.get(url_for("api.discussions", **{"for": str(org.id)}))
+        self.assert200(response)
+        self.assertEqual(len(response.json["data"]), 1)
+
+    def test_list_discussions_for_organization_subject(self):
+        """`for=<org>` returns the organization's own discussions, not its content's."""
+        org = OrganizationFactory()
+        user = UserFactory()
+
+        own = Discussion.objects.create(
+            subject=org,
+            user=user,
+            title="discussion about the organization",
+            discussion=[Message(content=faker.sentence(), posted_by=user)],
+        )
+        # The organization's content gets discussions of its own; none of them belong to
+        # the organization's tab.
+        for factory in (DatasetFactory, ReuseFactory, DataserviceFactory):
+            Discussion.objects.create(
+                subject=factory(organization=org),
+                user=user,
+                title="discussion about a published asset",
+                discussion=[Message(content=faker.sentence(), posted_by=user)],
+            )
+
+        response = self.get(url_for("api.discussions", **{"for": str(org.id)}))
+        self.assert200(response)
+
+        self.assertEqual(len(response.json["data"]), 1)
+        self.assertEqual(response.json["data"][0]["id"], str(own.id))
+        self.assertEqual(response.json["data"][0]["subject"]["class"], "Organization")
+
+    def test_close_discussion_on_organization_permissions(self):
+        """Admins and editors of the organization moderate its own discussions."""
+        author = UserFactory()
+        admin = UserFactory()
+        editor = UserFactory()
+        org = OrganizationFactory(
+            members=[Member(user=admin, role="admin"), Member(user=editor, role="editor")]
+        )
+
+        def open_discussion():
+            discussion = Discussion.objects.create(
+                subject=org,
+                user=author,
+                title="test discussion",
+                discussion=[Message(content="bla bla", posted_by=author)],
+            )
+            on_new_discussion.send(discussion)
+            return discussion
+
+        # A user with no tie to the organization cannot close its discussions.
+        discussion = open_discussion()
+        self.login()
+        response = self.post(
+            url_for("api.discussion", id=discussion.id),
+            {"comment": "close bla bla", "close": True},
+        )
+        self.assert403(response)
+
+        # Replying, on the other hand, is open to any authenticated user.
+        response = self.post(url_for("api.discussion", id=discussion.id), {"comment": "me too"})
+        self.assert200(response)
+
+        for member in (admin, editor):
+            discussion = open_discussion()
+            self.login(member)
+            response = self.post(
+                url_for("api.discussion", id=discussion.id),
+                {"comment": "close bla bla", "close": True},
+            )
+            self.assert200(response)
+            self.assertIsNotNone(response.json["closed"])
+
+        # The author keeps editing and deleting their own discussion.
+        discussion = open_discussion()
+        self.login(author)
+        response = self.put(url_for("api.discussion", id=discussion.id), {"title": "new title"})
+        self.assert200(response)
+        self.assertEqual(response.json["title"], "new title")
+
+        response = self.delete(url_for("api.discussion", id=discussion.id))
+        self.assertStatus(response, 204)
+
     def test_organization_discussions_metrics(self):
         """An organization counts the discussions held on the organization itself."""
         org = OrganizationFactory()
