@@ -8,6 +8,7 @@ import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -259,6 +260,12 @@ class INEBackend(BaseBackend):
         self._pending_items: list[HarvestItem] = []
         self._dataset_collection = None
         self._parsed_count = 0
+        # Per-phase durations, in seconds, written to the log and to `job.data`.
+        # The clock is an instance attribute so a test can drive it without
+        # patching `time.monotonic` for the whole process (pymongo reads it too).
+        self._clock = time.monotonic
+        self._timings: dict[str, float] = {}
+        self._download_attempts: list[dict] = []
         # Age in seconds of the snapshot this run fell back on, `None` when the
         # catalogue came from the source.
         self._snapshot_fallback_age: float | None = None
@@ -756,7 +763,8 @@ class INEBackend(BaseBackend):
 
         t0 = time.time()
         try:
-            res = collection.bulk_write(ops, ordered=False)
+            with self._timed("bulk_write"):
+                res = collection.bulk_write(ops, ordered=False)
             dt = time.time() - t0
             upserted = len(getattr(res, "upserted_ids", {}) or {})
             self._log.info(
@@ -814,8 +822,12 @@ class INEBackend(BaseBackend):
     def inner_harvest(self):
         reset_ine_periodicity_warnings()
         try:
-            self._inner_harvest()
+            with self._timed("total"):
+                self._inner_harvest()
         finally:
+            # Failed runs too: knowing how far a failing run got, and how long
+            # each attempt took, is what the timings are for.
+            self._record_job_data()
             if self.dryrun:
                 # A real harvest keeps its catalogue as the snapshot it falls back
                 # on; a preview owns a unique throwaway file and would leave it
@@ -856,7 +868,59 @@ class INEBackend(BaseBackend):
                 self._snapshot_fallback_age,
             )
             return
-        super().autoarchive()
+        with self._timed("autoarchive"):
+            super().autoarchive()
+        self._record_job_data()
+
+    @contextmanager
+    def _timed(self, key: str):
+        """Add the time spent in the block to `self._timings[key]`."""
+        started = self._clock()
+        try:
+            yield
+        finally:
+            self._timings[key] = self._timings.get(key, 0.0) + (self._clock() - started)
+
+    def _record_attempt(
+        self, attempt: int, started: float, bytes_read: int, error: Exception | None
+    ) -> None:
+        self._download_attempts.append(
+            {
+                "attempt": attempt,
+                "bytes": bytes_read,
+                "seconds": round(self._clock() - started, 3),
+                "kind": _classify_stream_error(error) if error is not None else None,
+                "error": (
+                    redact_url_credentials(safe_unicode(error))[:500] if error is not None else None
+                ),
+            }
+        )
+
+    def _record_job_data(self) -> None:
+        """Write the timings and download attempts to the log and `job.data`.
+
+        Merged into `job.data`, never assigned over it: `partial` and `snapshot`
+        live there too. `HarvestJob.data` is not exposed by the API, so this is
+        an operator's record (read from Mongo), not a contract.
+        """
+        timings = {key: round(value, 3) for key, value in self._timings.items()}
+        attempts = list(self._download_attempts)
+        if getattr(self, "job", None) is not None:
+            self.job.data.update(
+                {
+                    "timings": timings,
+                    "download": {
+                        "attempts": attempts,
+                        "bytes": sum(a["bytes"] for a in attempts),
+                    },
+                }
+            )
+        self._log.info(
+            "[INE] Tempos por fase: %s | tentativas=%s bytes=%s",
+            " ".join(f"{key}={value:.1f}s" for key, value in timings.items()),
+            len(attempts),
+            sum(a["bytes"] for a in attempts),
+        )
 
     @property
     def snapshot_dir(self) -> str:
@@ -980,12 +1044,15 @@ class INEBackend(BaseBackend):
             # must never interleave their writes into one file.
             part = f"{path}.{os.getpid()}-{uuid4().hex[:8]}.part"
             error: Exception | None = None
+            started = self._clock()
+            bytes_read = 0
             try:
                 try:
                     # Guarded fetch (SSRF check, LEDG-1729 / VULN-2084): the
                     # connection-setup retry lives in BaseBackend; this loop
                     # retries the body transfer.
-                    response = self.get(self.source.url, stream=True, timeout=self.http_timeout)
+                    with self._timed("download_parse"):
+                        response = self.get(self.source.url, stream=True, timeout=self.http_timeout)
                     response.raise_for_status()
                 except _STREAM_ERRORS as e:
                     error = e
@@ -996,8 +1063,10 @@ class INEBackend(BaseBackend):
                     finally:
                         stream.close()
                         response.close()
+                        bytes_read = stream.bytes_read
 
                     if error is None and self._catalog_truncated:
+                        self._record_attempt(attempt, started, bytes_read, None)
                         return True, None
                     if error is None and not self._is_complete_xml(part):
                         error = INEDownloadIncomplete("XML truncado: root <catalog> não fechado")
@@ -1005,12 +1074,15 @@ class INEBackend(BaseBackend):
                         os.replace(part, path)
                         self._log.info(
                             "[INE] Catálogo completo e validado: %s bytes (tentativa %s)",
-                            stream.bytes_read,
+                            bytes_read,
                             attempt,
                         )
+                        self._record_attempt(attempt, started, bytes_read, None)
                         return True, None
             finally:
                 self._safe_remove(part)
+
+            self._record_attempt(attempt, started, bytes_read, error)
 
             last_error = error
             self._log.warning(
@@ -1147,7 +1219,10 @@ class INEBackend(BaseBackend):
         error: Exception | None = None
         while True:
             try:
-                remote_id, md = next(iterator)
+                # Time spent here is the transfer plus the parse, and nothing
+                # else: chunk processing runs outside this block.
+                with self._timed("download_parse"):
+                    remote_id, md = next(iterator)
             except StopIteration:
                 break
             except _STREAM_ERRORS as e:
@@ -1184,7 +1259,8 @@ class INEBackend(BaseBackend):
         op_ids = []
 
         # --- Passo A: Pré-buscar datasets (1 query para o chunk inteiro) ---
-        existing = self._prefetch_datasets([remote_id for remote_id, _ in chunk])
+        with self._timed("prefetch"):
+            existing = self._prefetch_datasets([remote_id for remote_id, _ in chunk])
         for remote_id, md in chunk:
             md["__dataset_obj"] = existing.get(remote_id) or self._new_dataset()
 
@@ -1240,15 +1316,20 @@ class INEBackend(BaseBackend):
                 # ========================================
                 if is_existing:
                     # Verificar se houve alterações nos metadados
-                    if self.CHECK_CHANGES and not self._has_changed(dataset, md, remote_id):
+                    unchanged = False
+                    if self.CHECK_CHANGES:
+                        with self._timed("change_detection"):
+                            unchanged = not self._has_changed(dataset, md, remote_id)
+                    if unchanged:
                         # Sem alterações -> SKIP
                         self._stats["skipped"] += 1
                         item_status = "skipped"
                         self._log.debug("[INE] SKIP: remote_id=%s (sem alterações)", remote_id)
                     else:
                         # Com alterações -> UPDATE
-                        self._apply_metadata_to_dataset(dataset, remote_id, md)
-                        doc = dataset.to_mongo()
+                        with self._timed("serialize"):
+                            self._apply_metadata_to_dataset(dataset, remote_id, md)
+                            doc = dataset.to_mongo()
                         doc_dict = dict(doc)
                         _id = doc_dict.get("_id", dataset.id)
                         ops.append(ReplaceOne({"_id": _id}, doc_dict, upsert=False))
@@ -1269,8 +1350,9 @@ class INEBackend(BaseBackend):
                 # CASO 2: Dataset não existe -> CREATE
                 # ========================================
                 else:
-                    self._apply_metadata_to_dataset(dataset, remote_id, md)
-                    doc = dataset.to_mongo()
+                    with self._timed("serialize"):
+                        self._apply_metadata_to_dataset(dataset, remote_id, md)
+                        doc = dataset.to_mongo()
                     doc_dict = dict(doc)
                     # Remover _id pois será gerado pelo MongoDB
                     doc_dict.pop("_id", None)

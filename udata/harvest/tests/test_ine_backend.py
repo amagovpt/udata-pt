@@ -1659,3 +1659,114 @@ class INEErrorPageScannerTest:
         with pytest.raises(HarvestSourceError):
             stream.read(16384)
         stream.close()
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEInstrumentationTest(PytestOnlyDBTestCase):
+    """Every phase is timed into `job.data`, so a slow run says where the time went."""
+
+    PHASES = {"download_parse", "prefetch", "change_detection", "serialize", "bulk_write", "total"}
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _backend(self, monkeypatch, tmp_path, source):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, responses, backend=None):
+        rmock.get(INE_URL, responses)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = backend or self._backend(monkeypatch, tmp_path, source)
+        job = backend.harvest()
+        job.reload()
+        return job
+
+    def test_job_data_records_the_duration_of_each_phase(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        # Harvested once first, so the second run exercises change detection too.
+        body = _catalog_xml(["0001", "0002", "0003"])
+        self._harvest(rmock, monkeypatch, tmp_path, source, [{"text": body}])
+        DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id="0004", source_id=str(source.id), domain=source.domain
+            )
+        )
+        body = _catalog_xml(["0001", "0002", "0003", "0004"], revision=" (rev)")
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, [{"text": body}])
+
+        timings = job.data["timings"]
+        assert self.PHASES <= set(timings)
+        assert all(isinstance(value, float) and value >= 0 for value in timings.values())
+        assert job.data["download"]["bytes"] == len(body.encode())
+        attempts = job.data["download"]["attempts"]
+        assert len(attempts) == 1
+        assert attempts[0]["error"] is None
+
+    def test_failed_attempts_are_recorded_with_bytes_and_reason(self, rmock, monkeypatch, tmp_path):
+        truncated = _truncated_catalog_xml(["0001", "0002"])
+
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            [{"text": truncated}, {"text": _catalog_xml(["0001", "0002"])}],
+        )
+
+        first, second = job.data["download"]["attempts"]
+        assert first["kind"] == "source"
+        assert first["error"]
+        assert first["bytes"] == len(truncated.encode())
+        assert second["error"] is None
+        assert second["kind"] is None
+
+    def test_autoarchive_duration_is_recorded(self, rmock, monkeypatch, tmp_path):
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(autoarchive=True),
+            [{"text": _catalog_xml(["0001"])}],
+        )
+
+        assert isinstance(job.data["timings"]["autoarchive"], float)
+
+    def test_download_parse_excludes_chunk_processing(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        backend = self._backend(monkeypatch, tmp_path, source)
+        now = [0.0]
+        backend._clock = lambda: now[0]
+        process_chunk = backend._process_chunk
+
+        def slow_process_chunk(chunk):
+            now[0] += 100
+            process_chunk(chunk)
+
+        backend._process_chunk = slow_process_chunk
+
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            source,
+            [{"text": _catalog_xml(["0001", "0002"])}],
+            backend=backend,
+        )
+
+        assert job.data["timings"]["download_parse"] < 100
+        assert job.data["timings"]["total"] >= 100
+
+    def test_timings_do_not_drop_the_snapshot_entry(self, rmock, monkeypatch, tmp_path):
+        (tmp_path / "ine.xml").write_text(_catalog_xml(["0001"]))
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, self._source(), [{"text": ""}])
+
+        assert job.data["snapshot"]["used"] is True
+        assert "timings" in job.data
