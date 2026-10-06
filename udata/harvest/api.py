@@ -428,7 +428,10 @@ class SourcesAPI(API):
     # through HTTP, and the backoffice posts one source per submission. Hence
     # HEAVY_CREATE_LIMIT (2/min, 5/h, 10/day), the same profile organization
     # creation carries. Declared at class level, not on the verb: `decorators` run
-    # outside `@api.secure`, so a flood of unauthorized attempts is counted too.
+    # outside `@api.secure`, so attempts that never authenticate are counted too --
+    # but only the credential-less ones. `authentify` is injected into the Api-level
+    # decorators and flask-restx applies those outside the resource's own, so a
+    # request carrying a bogus X-API-KEY is refused before the limiter ever sees it.
     # GET: the listing is a paginated, filterable, text-searched read. Without a
     # limit of its own it would fall under the IP-keyed 200/hour default, which
     # collapses to a shared site-wide ceiling behind the F5/WAF -- and a POST-only

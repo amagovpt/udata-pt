@@ -34,7 +34,12 @@ from udata.harvest.tests.factories import MockBackendsMixin
 from udata.tests.api import PytestOnlyAPITestCase
 from udata.utils import faker
 
-RATELIMIT_OPTIONS = dict(RATELIMIT_ENABLED=True)
+# NOTE: there is deliberately no `@pytest.mark.options(RATELIMIT_ENABLED=True)` here, even
+# though neighbouring rate-limit suites carry it. The marker cannot do anything: `limiter`
+# is a process-wide singleton that captures `enabled` inside `init_app`, and pytest-flask
+# patches `app.config` only after the app fixture has already built the app. The limiter is
+# live by default under `settings.Testing`; the fixture below asserts that rather than
+# decorating the tests with a flag that does nothing.
 
 # Mirrored from udata/api/limits.py.
 HEAVY_CREATE_PER_MIN = 2  # HEAVY_CREATE_LIMIT = "2 per minute; ..."
@@ -66,7 +71,9 @@ def _source_payload():
 @pytest.fixture(autouse=True)
 def _reset_limiter():
     """Clear the shared rate-limit windows around every test so counters from one
-    test never leak spurious 429s into the next."""
+    test never leak spurious 429s into the next, and refuse to run at all if the
+    limiter is disabled -- every assertion below would pass vacuously."""
+    assert limiter.enabled, "the limiter is disabled, so these tests would prove nothing"
     limiter.reset()
     yield
     limiter.reset()
@@ -91,7 +98,6 @@ def _assert_throttled_at(statuses, threshold, endpoint):
 class HarvestSourceCreateRateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase):
     """POST /api/1/harvest/sources/ must carry HEAVY_CREATE_LIMIT."""
 
-    @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_audit_replay_is_blocked(self):
         """The audit's run, replayed against the patched code.
 
@@ -117,7 +123,6 @@ class HarvestSourceCreateRateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase)
             "sources reached the database past the ceiling"
         )
 
-    @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_create_throttles_exactly_at_heavy_create_limit(self):
         """Blocked at 2, not at the 200/h default it used to fall under."""
         self.login()
@@ -127,12 +132,13 @@ class HarvestSourceCreateRateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase)
         )
         _assert_throttled_at(statuses, HEAVY_CREATE_PER_MIN, "harvest_sources")
 
-        assert HEAVY_CREATE_PER_MIN < IP_DEFAULT_PER_HOUR, (
-            "the route must be throttled well before the shared IP-keyed default it "
-            "used to fall under, or the limit made the ceiling looser rather than tighter"
+        # `_assert_throttled_at` alone would also pass under a 3/min limit: it only says
+        # "nothing blocked before N, something blocked after". Pin the cut exactly.
+        assert statuses[HEAVY_CREATE_PER_MIN] in BLOCK_STATUSES, (
+            f"request #{HEAVY_CREATE_PER_MIN + 1} was not the one refused, so the ceiling "
+            f"is not {HEAVY_CREATE_PER_MIN}/min. statuses={statuses}"
         )
 
-    @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_ip_rotation_does_not_bypass_the_user_keyed_limit(self):
         """A rotating proxy pool buys nothing: the key is the user, not the address.
 
@@ -154,8 +160,11 @@ class HarvestSourceCreateRateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase)
         assert statuses.count(201) <= HEAVY_CREATE_PER_MIN, (
             f"rotating the forwarded address bought extra creations. statuses={statuses}"
         )
+        assert statuses.count(429) > 0, (
+            f"nothing was refused, so this run never reached the ceiling and proves "
+            f"nothing about the key. statuses={statuses}"
+        )
 
-    @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_anonymous_attempts_are_counted_before_auth(self):
         """The limit must sit outside the authorization check.
 
@@ -181,7 +190,6 @@ class HarvestSourceCreateRateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase)
 class HarvestSourceListNotThrottledByCreateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase):
     """The listing keeps its own bucket, so creation never starves the backoffice."""
 
-    @pytest.mark.options(**RATELIMIT_OPTIONS)
     def test_get_is_unaffected_by_an_exhausted_create_limit(self):
         url = url_for("api.harvest_sources")
 
@@ -193,10 +201,21 @@ class HarvestSourceListNotThrottledByCreateLimitTest(MockBackendsMixin, PytestOn
             f"statuses={post_statuses}"
         )
 
-        reads = 10
-        assert reads < PUBLIC_SEARCH_PER_MIN, "the read run must stay inside the GET's own limit"
+        # The read run must be long enough to tell the GET's own limit apart from NO
+        # limit: without one, a GET falls back to the IP-keyed RATELIMIT_DEFAULT
+        # (200/hour), so a short run of 10 would answer 200 either way and this test
+        # would pass with the GET limit deleted. Over that default but under
+        # PUBLIC_SEARCH_LIMIT, only the real limit can keep every read at 200.
+        reads = IP_DEFAULT_PER_HOUR + 50
+        assert IP_DEFAULT_PER_HOUR < reads < PUBLIC_SEARCH_PER_MIN, (
+            "the read run must sit above the default it would fall back to and below "
+            "the GET's own per-minute ceiling, or it discriminates between nothing"
+        )
         get_statuses = _statuses(self.get(url) for _ in range(reads))
 
         assert get_statuses == [200] * reads, (
-            f"the listing was throttled by the creation limit. statuses={get_statuses}"
+            f"the listing was throttled. Either the creation limit is leaking into the "
+            f"GET bucket, or the GET carries no limit of its own and fell back to the "
+            f"shared IP-keyed default. distribution="
+            f"{ {s: get_statuses.count(s) for s in set(get_statuses)} }"
         )

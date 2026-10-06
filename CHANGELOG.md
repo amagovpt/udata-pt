@@ -19,6 +19,11 @@
     method-scoped limit, which lets the global defaults back in, so a POST-only limit would have
     left the listing under the same collapsing ceiling. Separate buckets mean a flood of
     creations never starves the backoffice listing.
+  - Two consequences worth knowing before calibrating further. The limit runs before form
+    validation, so a submission refused for a bad URL still consumes a slot: two corrections in
+    a row and the third attempt answers 429. And the hourly and daily caps (5 and 10) bound
+    bulk onboarding through the backoffice — an operator registering many harvesters in one
+    sitting should use the CLI, which does not go through HTTP and is not limited.
 
 - **fix(discussions): a discussion can be held on an organization itself**
   - An organization has always been a valid discussion subject -- the organization page offers
