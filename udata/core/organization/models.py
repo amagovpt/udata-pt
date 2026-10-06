@@ -251,6 +251,8 @@ class Organization(
         "datasets_by_months",
         "datasets_followers_by_months",
         "datasets_reuses_by_months",
+        "discussions",
+        "discussions_open",
         "members",
         "reuses",
         "reuses_by_months",
@@ -501,6 +503,13 @@ class Organization(
         from udata.models import Follow
 
         self.metrics["followers"] = Follow.objects(until=None).followers(self).count()
+        self.save(signal_kwargs={"ignores": ["post_save"]})
+
+    def count_discussions(self):
+        from udata.models import Discussion
+
+        self.metrics["discussions"] = Discussion.objects(subject=self).count()
+        self.metrics["discussions_open"] = Discussion.objects(subject=self, closed=None).count()
         self.save(signal_kwargs={"ignores": ["post_save"]})
 
 
