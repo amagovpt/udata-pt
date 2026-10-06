@@ -29,6 +29,40 @@
   - Organizations gained the `discussions` and `discussions_open` metrics, so the API reports the
     counts the other subjects already reported, and a migration recounts the organizations that
     already have discussions.
+- **perf(harvest): the INE harvester processes its catalogue while it streams and survives the source cutting it**
+  - The INE endpoint sends the ~23 MB catalogue at ~30 KB/s, generates it on the fly and, when it
+    gives up, cuts the body halfway with an HTTP 200 and a Java stack trace appended. The old flow
+    downloaded the whole file before parsing anything, so every cut threw away up to ~13 minutes of
+    transfer, five attempts could add up to over an hour, and a run where every attempt was cut
+    processed nothing. Parsing was never the cost: under a second for the full catalogue, the same
+    from a file or from memory.
+  - The endpoint cannot be asked for less: `Range`, gzip, `If-Modified-Since`/`ETag` and every
+    filter or paging parameter are ignored, and `opc=1&varcd=` takes a single indicator. So the
+    catalogue is now parsed straight from the response (defusedxml `iterparse` over a stream that
+    tees every byte to a unique `.part` file) and processed in chunks of 500 as it arrives. A
+    retry re-reads from the top but skips what an earlier attempt already processed, so it costs
+    the transfer only and pushes no duplicate job item.
+  - When every attempt is cut after some indicators, those stay updated, the job is marked
+    `data.partial` with an error, and autoarchive is skipped, as it already was for a `max_items`
+    truncation. Only a run that received nothing falls back to the cached catalogue.
+  - The cached catalogue is now a persistent snapshot, one file per source, under the new
+    `HARVEST_SNAPSHOT_DIR` setting (default `<FS_ROOT>/harvest-snapshots`, the volume app and
+    worker already share). It used to be `/tmp/ine.xml`: shared by every INE source, deleted after
+    every successful run and lost on every restart. It is replaced atomically only by a complete
+    download; a fallback to it records its age in `data.snapshot` and an error, and skips
+    autoarchive, since an old snapshot proves nothing about what the source removed.
+  - The error page is detected as it arrives (stack-trace markers, and a head that is not XML) and
+    classified with the new `HarvestSourceError`; job errors now start with `INE source error:` or
+    `INE network error:`. Indicators sharing a chunk with the error page are still processed.
+  - An HTTP 5xx from the source is retried and falls back like a cut stream (a 4xx still fails at
+    once). A snapshot fallback leaves alone the datasets a later partial run already updated, so an
+    older snapshot never rolls them back.
+  - Each phase is timed (`download_parse`, `prefetch`, `change_detection`, `serialize`,
+    `bulk_write`, `autoarchive`, `total`) into the log and `job.data`, together with every
+    download attempt's bytes, duration and failure reason.
+  - The dead `IS_TEST_MODE`/`USE_LOCAL_FILE` flags, the unstreamed in-memory mode and the leftover
+    debug code in the download error handler are gone. Restart the Celery worker and beat after
+    deploying: a running worker keeps the old harvester in memory.
 
 - **refactor(api)!: the unauthenticated identicon endpoint is gone**
   - `GET /api/1/avatars/<identifier>/<size>/` drew a pydenticon from a hash of the identifier.
