@@ -119,8 +119,11 @@ class HarvestSourceCreateRateLimitTest(MockBackendsMixin, PytestOnlyAPITestCase)
         assert statuses.count(429) >= AUDIT_REPLAY - HEAVY_CREATE_PER_MIN - 1, (
             f"the flood was not mostly refused. statuses={statuses}"
         )
-        assert HarvestSource.objects.count() <= HEAVY_CREATE_PER_MIN, (
-            "sources reached the database past the ceiling"
+        # Filtered on purpose: an unfiltered count is routed to mongoengine's
+        # estimated_document_count, which can report zero while the rows are there.
+        created_rows = HarvestSource.objects(backend="factory").count()
+        assert created_rows <= HEAVY_CREATE_PER_MIN, (
+            f"{created_rows} sources reached the database past the ceiling"
         )
 
     def test_create_throttles_exactly_at_heavy_create_limit(self):
