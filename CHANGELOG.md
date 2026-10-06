@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **fix(harvest): harvest source creation carries its own per-user rate limit**
+  - `POST /api/1/harvest/sources/` was the one content-creation endpoint of the four an audit
+    flagged for mass form submission that never got a per-endpoint limit. Replaying the audit's
+    run against it produced 201 a hundred times out of a hundred, and 200 sources reached the
+    database before the IP-keyed `RATELIMIT_DEFAULT` ("1000 per day; 200 per hour") finally
+    answered 429. That default is the wrong ceiling twice over: behind the F5/WAF every client
+    arrives from one origin IP, so it is a single shared bucket one caller can spend on
+    everyone's behalf; and creating a source is the heaviest of the four operations, because it
+    schedules recurring crawls against a host the caller supplies.
+  - POST now carries `HEAVY_CREATE_LIMIT` (2/min, 5/h, 10/day), keyed by user rather than
+    address, so rotating a proxy pool buys nothing. It is the profile organization creation
+    already uses, and nothing legitimate creates sources faster: the CLI calls `create_source`
+    directly without going through HTTP, and the backoffice posts one source per submission.
+  - GET carries `PUBLIC_SEARCH_LIMIT`, and not only for symmetry. A GET exempts every
+    method-scoped limit, which lets the global defaults back in, so a POST-only limit would have
+    left the listing under the same collapsing ceiling. Separate buckets mean a flood of
+    creations never starves the backoffice listing.
+
 - **fix(discussions): a discussion can be held on an organization itself**
   - An organization has always been a valid discussion subject -- the organization page offers
     "Nova discussão" and the documents are in the database -- but it was the only subject class
