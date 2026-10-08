@@ -1,5 +1,6 @@
 from udata.core import storages
 from udata.core.badges.tasks import notify_new_badge
+from udata.core.discussions.actions import delete_discussions_for_subject
 from udata.features.notifications.models import Notification
 from udata.models import Activity, ContactPoint, Dataset, Follow, Transfer
 from udata.search import reindex
@@ -24,6 +25,8 @@ def purge_organizations(self):
         log.info(f"Purging organization {organization}")
         # Remove followers
         Follow.objects(following=organization).delete()
+        # Remove discussions
+        delete_discussions_for_subject(organization)
         # Remove activity
         Activity.objects(related_to=organization).delete()
         Activity.objects(organization=organization).delete()

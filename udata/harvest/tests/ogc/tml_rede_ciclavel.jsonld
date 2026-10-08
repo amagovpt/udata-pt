@@ -1,0 +1,133 @@
+{
+  "@type": "Dataset",
+  "@id": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel",
+  "name": "Rede Ciclável",
+  "description": "O presente conjunto de dados representa a rede ciclável existente na Área Metropolitana de Lisboa (AML), reunindo a informação proveniente dos 18 municípios que a compõem. O tema foi desenvolvido no âmbito da elaboração do Plano Metropolitano de Mobilidade Urbana Sustentável (PMMUS) e integra-se na Infraestrutura de Dados Espaciais (IDE) da Transportes Metropolitanos de Lisboa (TML). A informação teve origem em múltiplas fontes municipais e foi alvo de um processo de harmonização e integração espacial rigoroso, que permitiu consolidar num único tema a rede ciclável actualmente existente na AML. O procedimento envolveu a análise comparativa e crítica de diversos dados geográficos fornecidas pelos municípios, identificando os atributos comuns, validando a coerência geométrica e topológica das infraestruturas e garantindo a consistência semântica e descritiva dos dados. O resultado final traduz-se num unico tema geográfico unificado, que representa a totalidade da rede ciclável metropolitana, distinguindo os diferentes tipos de vias cicláveis, os níveis de continuidade entre municípios. Este conjunto de dados constitui um elemento estruturante do sistema metropolitano de mobilidade, permitindo apoiar o planeamento, a monitorização e a promoção de políticas de deslocação sustentável.",
+  "license": "https://creativecommons.org/licenses/by/4.0/",
+  "keywords": [
+    "Portugal",
+    "Municípios",
+    "TML",
+    "dados.gov"
+  ],
+  "spatial": [
+    {
+      "@type": "Place",
+      "geo": {
+        "@type": "GeoShape",
+        "box": "-9.679,38.279 -8.199,39.346"
+      }
+    }
+  ],
+  "temporalCoverage": "2024-12-15T18:24:39+00:00/2025-12-15T18:24:39+00:00",
+  "url": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel",
+  "distribution": [
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/",
+      "encodingFormat": "text/html",
+      "description": "Fonte de Dados",
+      "inLanguage": "pt-PT",
+      "author": "author"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/static/metadados/rede_ciclavel_existente_aml.jsonld",
+      "encodingFormat": "application/ld+json",
+      "description": "Metadados CNMD",
+      "inLanguage": "pt-PT",
+      "author": "author"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api?f=json",
+      "encodingFormat": "application/json",
+      "description": "The landing page of this server as JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api?f=html",
+      "encodingFormat": "text/html",
+      "description": "The landing page of this server as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel?f=json",
+      "encodingFormat": "application/json",
+      "description": "This document as JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel?f=jsonld",
+      "encodingFormat": "application/ld+json",
+      "description": "This document as RDF (JSON-LD)",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel?f=html",
+      "encodingFormat": "text/html",
+      "description": "This document as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/schema?f=json",
+      "encodingFormat": "application/schema+json",
+      "description": "Schema of collection in JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/schema?f=html",
+      "encodingFormat": "text/html",
+      "description": "Schema of collection in HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/queryables?f=json",
+      "encodingFormat": "application/schema+json",
+      "description": "Queryables for this collection as JSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/queryables?f=html",
+      "encodingFormat": "text/html",
+      "description": "Queryables for this collection as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/items?f=json",
+      "encodingFormat": "application/geo+json",
+      "description": "Items as GeoJSON",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/items?f=jsonld",
+      "encodingFormat": "application/ld+json",
+      "description": "Items as RDF (GeoJSON-LD)",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/items?f=html",
+      "encodingFormat": "text/html",
+      "description": "Items as HTML",
+      "inLanguage": "en-US"
+    },
+    {
+      "@type": "DataDownload",
+      "contentURL": "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel/items?f=csv",
+      "encodingFormat": "text/csv; charset=utf-8",
+      "description": "Items as CSV",
+      "inLanguage": "en-US"
+    }
+  ]
+}

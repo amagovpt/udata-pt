@@ -3,7 +3,12 @@ from flask_login import current_user
 from werkzeug.exceptions import BadRequest
 
 from udata.api import API, api, fields
-from udata.api.limits import HARVEST_PREVIEW_LIMIT, user_or_ip
+from udata.api.limits import (
+    HARVEST_PREVIEW_LIMIT,
+    HEAVY_CREATE_LIMIT,
+    PUBLIC_SEARCH_LIMIT,
+    user_or_ip,
+)
 from udata.app import limiter
 from udata.auth import admin_permission
 from udata.core.dataservices.models import Dataservice
@@ -415,6 +420,36 @@ source_parser.add_argument("q", type=str, location="args", help="The search quer
 
 @ns.route("/sources/", endpoint="harvest_sources")
 class SourcesAPI(API):
+    # POST: per-user limit. Creating a source is the heaviest of the four
+    # content-creation routes the audit flagged -- it schedules recurring crawls
+    # against a host the caller supplies, so one flood buys lasting outbound work,
+    # not just stored rows. It is also rare for a legitimate publisher: the CLI
+    # `udata harvest create` calls `actions.create_source` directly without going
+    # through HTTP, and the backoffice posts one source per submission. Hence
+    # HEAVY_CREATE_LIMIT (2/min, 5/h, 10/day), the same profile organization
+    # creation carries. Declared at class level, not on the verb: `decorators` run
+    # outside `@api.secure`, so attempts that never authenticate are counted too --
+    # but only the credential-less ones. `authentify` is injected into the Api-level
+    # decorators and flask-restx applies those outside the resource's own, so a
+    # request carrying a bogus X-API-KEY is refused before the limiter ever sees it.
+    # GET: the listing is a paginated, filterable, text-searched read. Without a
+    # limit of its own it would fall under the IP-keyed 200/hour default, which
+    # collapses to a shared site-wide ceiling behind the F5/WAF -- and a POST-only
+    # limit would not help, since a GET exempts every method-scoped limit and lets
+    # the defaults back in. Separate buckets, so creation never starves the list.
+    decorators = [
+        limiter.limit(
+            HEAVY_CREATE_LIMIT,
+            methods=["POST"],
+            key_func=user_or_ip,
+        ),
+        limiter.limit(
+            PUBLIC_SEARCH_LIMIT,
+            methods=["GET"],
+            key_func=user_or_ip,
+        ),
+    ]
+
     @api.doc("list_harvest_sources")
     @api.expect(source_parser)
     @api.marshal_list_with(source_page_fields)

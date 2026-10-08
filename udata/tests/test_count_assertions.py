@@ -55,7 +55,7 @@ UNFILTERED_COUNT = re.compile(
 # What counts as a test module is pytest's definition, from `pyproject.toml`
 # (`python_files = ["test_*.py"]`), plus everything under a `tests/` directory --
 # not a hand-maintained list, which goes stale the first time someone adds a
-# module outside `tests/` (`udata/core/avatars/test_avatar_api.py` is already one).
+# module outside `tests/`.
 #
 # `udata/migrations/` is excluded deliberately: `test_migrations.py` writes
 # `udata/migrations/test_migration_temp.py` at runtime and removes it in its
