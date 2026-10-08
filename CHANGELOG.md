@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **fix(site): the homepage card can tell how recently a dataset changed**
+  - The lightweight payload behind the homepage carried only `last_modified`, which is frozen
+    at whatever the document held when it was last written. For a harvested dataset that is
+    usually its creation date, so the card reported datasets as untouched for months while
+    their files changed underneath. `last_update`, recomputed from the resources on every
+    save, is the date the card wants, and the full serializer has carried it all along --
+    this payload was the one place a card could not reach it.
+  - Additive: the field is new in the response and ignored by any frontend that does not read
+    it yet, so it can be promoted on its own.
+
 - **feat(harvest): the OGC backend catalogues the CNMD metadata record**
   - The TML collections publish their CNMD metadata as a distribution of their own, a JSON-LD
     document alongside the data downloads, and the portal was dropping it. The selection only
