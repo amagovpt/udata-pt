@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,7 @@ from udata.core.dataservices.factories import (
 )
 from udata.core.dataset.constants import INSPIRE, FormatFamily
 from udata.core.dataset.factories import DatasetFactory, LicenseFactory, ResourceFactory
+from udata.core.dataset.models import Dataset
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.pages.factories import PageFactory
 from udata.core.reuse.factories import ReuseFactory
@@ -737,6 +739,25 @@ class SiteHomeLastUpdateSerializationTest(APITestCase):
 
         target.reload()
         assert item["last_update"] == target.last_update.isoformat()
+
+    def test_home_last_update_is_not_last_modified(self):
+        """The payload carries the field it says it carries.
+
+        Asserting the key exists is not enough: a serializer that put
+        `last_modified` under the `last_update` name passes that, and it is
+        exactly the mistake this endpoint had to begin with. Pinning a distinct
+        value is what tells the two apart.
+        """
+        target = DatasetFactory(title="dataset with distinct dates", resources=[ResourceFactory()])
+        distinct = datetime(2020, 5, 17, 9, 30, tzinfo=UTC)
+        Dataset.objects(id=target.id).update(set__last_update=distinct)
+
+        item = self._home_item(target)
+
+        target.reload()
+        assert item["last_update"] == target.last_update.isoformat()
+        assert item["last_update"] != item["last_modified"]
+        assert item["last_update"].startswith("2020-05-17")
 
     def test_home_serializes_last_update_without_resources(self):
         """No resources is not an empty date: the computation falls back to the dataset's."""

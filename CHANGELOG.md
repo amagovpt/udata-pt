@@ -10,7 +10,10 @@
     save, is the date the card wants, and the full serializer has carried it all along --
     this payload was the one place a card could not reach it.
   - Additive: the field is new in the response and ignored by any frontend that does not read
-    it yet, so it can be promoted on its own.
+    it yet, so it can be promoted on its own. Worth knowing for whoever reads it: this field is
+    recomputed from the resources only on a full save, and the resource mutators write through
+    an atomic update that skips that, so it can lag behind a freshly uploaded file. The portal
+    pairs it with `last_modified` rather than trusting it alone.
 
 - **feat(harvest): the OGC backend catalogues the CNMD metadata record**
   - The TML collections publish their CNMD metadata as a distribution of their own, a JSON-LD
