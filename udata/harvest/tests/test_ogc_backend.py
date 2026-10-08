@@ -308,15 +308,18 @@ SCHEMA_URL = "https://geoportal.example.pt/collections/a/schema?f=json"
 ITEMS_JSONLD_URL = "https://geoportal.example.pt/collections/a/items?f=jsonld"
 ITEMS_HTML_URL = "https://geoportal.example.pt/collections/a/items?f=html"
 DOCUMENT_URL = "https://geoportal.example.pt/collections/a?f=json"
+# The metadata record is a static file, not a collection endpoint like the rest.
+METADATA_URL = "https://geoportal.example.pt/static/metadados/a.jsonld"
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
 class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
-    """Only three of the source's distributions are catalogued (LEDG-2512).
+    """Only a handful of the source's distributions are catalogued (LEDG-2512).
 
-    The source publishes thirteen per collection; six are HTML and were already
-    dropped, and of the remaining seven the portal keeps the two item downloads
-    and the collection schema.
+    The source publishes fourteen or fifteen per collection; the HTML ones are
+    dropped on type, and of the rest the portal keeps the item downloads, the
+    collection schema and, where the collection publishes one, the CNMD metadata
+    record -- four in a collection without it, five in one with (LEDG-2597).
     """
 
     def _harvest(self, rmock, source, distributions, name="Dataset A"):
@@ -340,6 +343,44 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, source, distributions)
 
         assert [r.url for r in dataset.resources] == [GEOJSON_URL, ITEMS_JSONLD_URL, SCHEMA_URL]
+
+    def test_the_metadata_distribution_is_catalogued(self, rmock):
+        """The CNMD metadata record joins the catalogued distributions (LEDG-2597)."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(METADATA_URL, "application/ld+json", "Metadados CNMD"),
+            _distribution(GEOJSON_URL, "application/geo+json", "Items as GeoJSON"),
+            _distribution(ITEMS_JSONLD_URL, "application/ld+json", "Items as RDF (GeoJSON-LD)"),
+            _distribution(SCHEMA_URL, "application/schema+json", "Schema of collection in JSON"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        # The label is not the "Items as" prefix, so the title is kept verbatim --
+        # the same way the schema's is. Resources follow the source's order, so the
+        # metadata record opens the list.
+        assert [(r.title, r.format, r.url) for r in dataset.resources] == [
+            ("Metadados CNMD", "JSON-LD", METADATA_URL),
+            ("Dataset A como GeoJSON", "GeoJSON", GEOJSON_URL),
+            ("Dataset A como RDF (GeoJSON-LD)", "JSON-LD", ITEMS_JSONLD_URL),
+            ("Schema of collection in JSON", "SCHEMA+JSON", SCHEMA_URL),
+        ]
+
+    def test_other_ld_json_distributions_stay_dropped(self, rmock):
+        """The criterion is the label, not the type.
+
+        Three distributions share `application/ld+json` and only one belongs in the
+        catalogue; selecting on the type would bring the other two along.
+        """
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(DOCUMENT_URL, "application/ld+json", "This document as RDF (JSON-LD)"),
+            _distribution(METADATA_URL, "application/ld+json", "Metadados CNMD"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        assert [r.url for r in dataset.resources] == [METADATA_URL]
 
     def test_missing_target_does_not_fail_the_harvest(self, rmock):
         """A source that stops publishing one of the three is not an error."""
