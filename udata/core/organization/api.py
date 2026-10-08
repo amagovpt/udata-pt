@@ -15,7 +15,7 @@ from udata.api.limits import (
     UPLOAD_LIMIT,
     user_or_ip,
 )
-from udata.api.parsers import ModelApiParser, normalize_search_query
+from udata.api.parsers import ModelApiParser, diacritic_insensitive_regex
 from udata.app import limiter
 from udata.auth import admin_permission, current_user
 from udata.core import csv
@@ -134,11 +134,12 @@ class OrgApiParser(ModelApiParser):
     @staticmethod
     def parse_filters(organizations, args):
         if args.get("q"):
-            query_str = normalize_search_query(args["q"])
+            # Not `icontains` on a folded query: that strips the accents off one side
+            # only, so "comissão" stopped matching the stored "Comissão". The regex
+            # matches whichever side carries the accent, and escapes everything else.
+            query_regex = diacritic_insensitive_regex(args["q"])
             organizations = organizations.filter(
-                Q(name__icontains=query_str)
-                | Q(acronym__icontains=query_str)
-                | Q(description__icontains=query_str)
+                Q(name=query_regex) | Q(acronym=query_regex) | Q(description=query_regex)
             )
         if args.get("badge"):
             organizations = organizations.filter(badges__kind__in=args["badge"])

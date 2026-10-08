@@ -1373,6 +1373,79 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert response.json[0]["id"] == str(target.id)
         assert "yorgdesconly-abc" not in response.json[0]["name"]
 
+    def listing_ids(self, query):
+        """Organization ids the list endpoint returns for a query."""
+        response = self.get(url_for("api.organizations", q=query))
+        assert200(response)
+        return {o["id"] for o in response.json["data"]}
+
+    def test_organization_list_search_accent_insensitive_both_ways(self):
+        """The accent can sit on the query, on the stored name, or on neither."""
+        agencia = OrganizationFactory(name="Agência para a Reforma Tecnológica do Estado")
+        cmvm = OrganizationFactory(name="Comissão do Mercado de Valores Mobiliários")
+
+        for query in ("agencia", "agência", "Agência", "tecnologica", "tecnológica"):
+            assert str(agencia.id) in self.listing_ids(query), query
+
+        for query in ("mobiliarios", "mobiliários"):
+            assert str(cmvm.id) in self.listing_ids(query), query
+
+    def test_organization_list_search_partial_and_accented_agree(self):
+        """An accented query finds what its accent-less prefix finds."""
+        cmvm = OrganizationFactory(name="Comissão do Mercado de Valores Mobiliários")
+
+        partial = self.listing_ids("comiss")
+        assert str(cmvm.id) in partial
+        # `comiss` expands to a prefix of `comissã`, so it can only ever return more.
+        # What matters is that writing the word properly stops losing results.
+        assert self.listing_ids("comissã") <= partial
+        assert self.listing_ids("comissão") <= partial
+        assert str(cmvm.id) in self.listing_ids("comissã")
+        assert str(cmvm.id) in self.listing_ids("comissão")
+
+    def test_organization_list_search_finds_comissao_nacional_de_eleicoes(self):
+        """The case reported from the field: only the acronym used to work."""
+        cne = OrganizationFactory(name="Comissão Nacional de Eleições", acronym="CNE")
+
+        for query in ("cne", "eleições", "eleicoes", "Comissão Nacional", "comissao nacional"):
+            assert str(cne.id) in self.listing_ids(query), query
+
+    def test_organization_list_search_by_acronym(self):
+        """Acronym search keeps working -- it was the only field that ever did."""
+        target = OrganizationFactory(name="Direção-Geral do Território", acronym="DGTERRITORIO")
+
+        assert str(target.id) in self.listing_ids("dgterritorio")
+        assert str(target.id) in self.listing_ids("DGTERRITORIO")
+
+    def test_organization_list_search_matches_uppercase_accented_name(self):
+        """Case folding is done by the database engine, not by Python."""
+        target = OrganizationFactory(name="AGÊNCIA PARA A MODERNIZAÇÃO ADMINISTRATIVA")
+
+        for query in ("agencia", "agência", "modernizacao", "modernização"):
+            assert str(target.id) in self.listing_ids(query), query
+
+    def test_organization_list_search_regex_metachars_are_literal(self):
+        """The query comes from the URL: it is matched literally, never compiled as a pattern."""
+        target = OrganizationFactory(name="Instituto a.*b Nacional")
+        other = OrganizationFactory(name="Instituto aXXb Nacional")
+
+        ids = self.listing_ids("a.*b")
+        assert str(target.id) in ids
+        assert str(other.id) not in ids
+
+        for query in ("(", "[", "\\", "*", "^", "$", "(a+)+$"):
+            response = self.get(url_for("api.organizations", q=query))
+            assert200(response)
+
+    def test_organization_list_search_non_latin_query_does_not_match_everything(self):
+        """Folding to ASCII would empty the pattern, and an empty pattern matches all."""
+        target = OrganizationFactory(name="日本政府")
+        other = OrganizationFactory(name="Agência para a Reforma Tecnológica do Estado")
+
+        ids = self.listing_ids("日本")
+        assert str(target.id) in ids
+        assert str(other.id) not in ids
+
     def test_search_organizations_list_by_description(self):
         """The list endpoint should find organizations when query matches description but not name"""
         for i in range(3):
