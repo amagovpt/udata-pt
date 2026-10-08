@@ -1196,6 +1196,21 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert Follow.objects.following(user).count() == 0
         assert Follow.objects.followers(user).count() == 0
 
+    def test_suggest_organizations_matches_listing_results(self):
+        """Suggest and listing used to disagree on the same text, in opposite directions."""
+        cne = OrganizationFactory(name="Comissão Nacional de Eleições", acronym="CNE")
+        OrganizationFactory(name="Agência para a Reforma Tecnológica do Estado")
+
+        for query in ("agencia", "agência", "comissão", "eleicoes", "cne"):
+            suggested = {
+                o["id"] for o in self.get(url_for("api.suggest_organizations", q=query)).json
+            }
+            assert suggested == self.listing_ids(query), query
+
+        assert str(cne.id) in {
+            o["id"] for o in self.get(url_for("api.suggest_organizations", q="eleições")).json
+        }
+
     def test_suggest_organizations_api(self):
         """It should suggest organizations"""
         # Both the names and the descriptions are fixed rather than faker-generated.

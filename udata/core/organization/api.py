@@ -935,10 +935,12 @@ class OrganizationSuggestAPI(API):
     def get(self):
         """Organizations suggest endpoint using mongoDB contains"""
         args = suggest_parser.parse_args()
+        # Same matching as the listing: this endpoint used the raw query, so the two
+        # disagreed on the same text -- the listing needed it without accents, this one
+        # needed it with them.
+        query_regex = diacritic_insensitive_regex(args["q"])
         orgs = Organization.objects(
-            Q(name__icontains=args["q"])
-            | Q(acronym__icontains=args["q"])
-            | Q(description__icontains=args["q"]),
+            Q(name=query_regex) | Q(acronym=query_regex) | Q(description=query_regex),
             deleted=None,
         )
         return [
