@@ -713,6 +713,42 @@ class SiteHomeCacheInvalidationTest(APITestCase):
         assert "cached-first reuse" not in fresh_titles
 
 
+class SiteHomeLastUpdateSerializationTest(APITestCase):
+    """LEDG-2599: the homepage card needs the date the resources were last changed.
+
+    `last_modified` is frozen at whatever it was when the document was last written,
+    so a harvested dataset reports its creation date forever. `last_update` is
+    recomputed from the resources on every save, and the full serializer has always
+    carried it -- this lightweight payload was the one place a card could not reach it.
+    """
+
+    def _home_item(self, dataset):
+        self.login(AdminFactory())
+        self.assert200(self.put(url_for("api.site_home_datasets"), [str(dataset.id)]))
+
+        response = self.get(url_for("api.site_home"))
+        self.assert200(response)
+        return next(d for d in response.json["latest_datasets"] if d["title"] == dataset.title)
+
+    def test_home_serializes_last_update(self):
+        target = DatasetFactory(title="dataset with resources", resources=[ResourceFactory()])
+
+        item = self._home_item(target)
+
+        target.reload()
+        assert item["last_update"] == target.last_update.isoformat()
+
+    def test_home_serializes_last_update_without_resources(self):
+        """No resources is not an empty date: the computation falls back to the dataset's."""
+        target = DatasetFactory(title="dataset without resources", resources=[])
+
+        item = self._home_item(target)
+
+        assert item["last_update"] is not None
+        target.reload()
+        assert item["last_update"] == target.last_update.isoformat()
+
+
 class SiteHomeOwnerSerializationTest(APITestCase):
     """LEDG-1861: /site/home/ must expose dataset.owner so user-authored
     datasets can be attributed (and linked to /users/<slug>) on the
