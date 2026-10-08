@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- **fix(organizations): a correctly accented query finds the organization again**
+  - Searching the organizations listing for `comissão` returned nothing while `comiss` returned
+    five, and the Comissão Nacional de Eleições was reachable only through `cne` -- its acronym,
+    the one field with no accents in it. The listing stripped the diacritics off the *query* and
+    then compared it, with `icontains`, against a stored value that keeps its own: `comissão`
+    became `comissao`, which "Comissão" does not contain. Normalising one side only.
+  - The helper that did the stripping promised, in its docstring, that it let `agencia` find
+    `Agência`. It never did -- the stored side was never normalised, so the match failed in both
+    directions and the net effect was purely to lose results that used to be found. The docstring
+    now describes what the function actually does, and where it is still the right thing: ahead of
+    a text-index search, which folds accents on the indexed side. Those five call sites are
+    untouched.
+  - Matching now folds the query to its base letters and expands each one into a character class,
+    so it works whichever side carries the accent, or neither. Folding drops combining marks
+    instead of encoding to ASCII, because `日本` would otherwise fold to the empty string -- and an
+    empty pattern matches every document in the collection. Anything that is not an expandable
+    base letter goes through `re.escape`: the value comes from the URL, and a regex built from
+    unescaped input is a denial-of-service vector.
+  - The suggest endpoint matched the raw query while the listing matched a folded one, so the two
+    disagreed on the same text in opposite directions. They now share the matching, and a test
+    pins them to the same result set.
+  - One change reaches four consumers, none of which needed its own: the v1 listing, the v2
+    search, the aggregated endpoint the public listing page actually calls, and the public
+    organizations CSV. Name, acronym and description all stay searchable.
+  - Two caveats for whoever verifies this by hand. The aggregated endpoint caches for 60 seconds
+    and the frontend caches its response for another 60, so a query tried just before the deploy
+    can keep answering from cache for about two minutes. And a stored name held in decomposed
+    form, with the accent as a separate combining character, still will not match -- worth a look
+    at the harvested names.
+
 - **fix(harvest): harvest source creation carries its own per-user rate limit**
   - `POST /api/1/harvest/sources/` was the one content-creation endpoint of the four an audit
     flagged for mass form submission that never got a per-endpoint limit. Replaying the audit's
