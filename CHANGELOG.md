@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **feat(harvest): the OGC backend catalogues the CNMD metadata record**
+  - The TML collections publish their CNMD metadata as a distribution of their own, a JSON-LD
+    document alongside the data downloads, and the portal was dropping it. The selection only
+    knew two kinds of distribution -- the item downloads and the collection schema -- so the
+    metadata record fell through with everything else the source publishes for its own
+    navigation.
+  - It is matched on its label, the way the schema already is, and not on its media type: three
+    of the collection's distributions are `application/ld+json` -- the metadata record, the
+    collection as RDF and the items as RDF -- and only the first belongs in the catalogue.
+    Nothing else had to change for the resource to come out right. A label that is not the
+    "Items as" prefix already passes through to the resource title verbatim, so the resource is
+    named as the source names it, and `application/ld+json` already maps to the JSON-LD format.
+  - Six collections publish the record today, not only the one the request came with, so the
+    next harvest adds a resource to six datasets. It opens their resource list rather than
+    closing it: resources follow the order the source publishes them in, and the record is the
+    first distribution of the collection. The four resources already catalogued keep their ids,
+    because resources are reconciled by URL.
+
 - **fix(organizations): a correctly accented query finds the organization again**
   - Searching the organizations listing for `comissão` returned nothing while `comiss` returned
     five, and the Comissão Nacional de Eleições was reachable only through `cne` -- its acronym,
