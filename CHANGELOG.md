@@ -19,6 +19,10 @@
     closing it: resources follow the order the source publishes them in, and the record is the
     first distribution of the collection. The four resources already catalogued keep their ids,
     because resources are reconciled by URL.
+  - One consequence to expect on the day it runs: a dataset's last update is the most recent of
+    its resources' own, so the six will report having been updated on the day of that harvest,
+    even though none of their data changed. That is what adding any resource does -- the same
+    jump happened when the source started publishing its CSV -- and it settles after that run.
 
 - **fix(organizations): a correctly accented query finds the organization again**
   - Searching the organizations listing for `comissão` returned nothing while `comiss` returned
