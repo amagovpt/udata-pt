@@ -5,6 +5,14 @@ from udata.api import api
 
 # Base letter -> every diacritic variant it should match. Used to build a regex that
 # matches regardless of which side carries the accent.
+# MongoDB rejects a `$regex` pattern over 16384 bytes with OperationFailure 51091, and
+# nothing above catches it: the listing answers 500, and the CSV export truncates
+# mid-stream behind an already-sent 200. An expanded vowel costs 15 bytes against one for
+# an escaped character, so capping the query at this many characters keeps the worst case
+# (every character a vowel) at 15000 bytes, comfortably inside. Nobody searches with a
+# thousand characters; matching on the first thousand beats refusing to answer.
+_MAX_QUERY_CHARS = 1000
+
 _DIACRITIC_VARIANTS = {
     "a": "aàáâãäå",
     "c": "cç",
@@ -50,15 +58,16 @@ def diacritic_insensitive_regex(query: str) -> re.Pattern:
     a character class covering its variants makes the match work whichever side carries
     the accent.
 
-    Every character that is not an expandable base letter goes through `re.escape`, so a
-    query is always matched literally: the value comes from the URL, and an unescaped
-    regex built from it would be a denial-of-service vector.
+    Every character that is not an expandable base letter goes through `re.escape`, which
+    keeps the query matched literally. MongoEngine's own `icontains` escapes too, so this
+    is parity rather than a new protection -- but the expansion means the pattern is built
+    here, and it has to be built safely.
     """
-    base = _fold_diacritics(query)
+    base = _fold_diacritics(query)[:_MAX_QUERY_CHARS]
     if not base:
         # Nothing survived the fold (a query of combining marks alone). An empty pattern
         # would match every document, so match the original text literally instead.
-        return re.compile(re.escape(query), re.IGNORECASE)
+        return re.compile(re.escape(query[:_MAX_QUERY_CHARS]), re.IGNORECASE)
     pattern = "".join(
         f"[{_DIACRITIC_VARIANTS[ch]}]" if ch in _DIACRITIC_VARIANTS else re.escape(ch)
         for ch in base

@@ -31,6 +31,21 @@ def test_diacritic_insensitive_regex_preserves_non_latin():
     assert not pattern.search("Agência para a Reforma Tecnológica do Estado")
 
 
+def test_diacritic_insensitive_regex_stays_under_the_mongo_pattern_limit():
+    """Expanding every vowel costs 15 bytes, so a long query would blow Mongo's ceiling.
+
+    MongoDB rejects a `$regex` over 16384 bytes, and the driver's OperationFailure is not
+    caught anywhere above this: the listing would answer 500, and the CSV export would
+    truncate mid-stream behind an already-sent 200.
+    """
+    for length in (1_000, 1_093, 5_000, 50_000):
+        pattern = diacritic_insensitive_regex("a" * length).pattern
+        assert len(pattern.encode("utf-8")) <= 16_384, length
+
+    # Short queries still get the expansion -- the fallback must not fire early.
+    assert "[aàáâãäå]" in diacritic_insensitive_regex("agencia").pattern
+
+
 def test_diacritic_insensitive_regex_matches_combining_marks_only_query_literally():
     """A query that folds to nothing falls back to a literal match, never to match-all."""
     pattern = diacritic_insensitive_regex("́")

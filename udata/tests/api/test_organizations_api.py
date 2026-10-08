@@ -1425,8 +1425,21 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         for query in ("cne", "eleições", "eleicoes", "Comissão Nacional", "comissao nacional"):
             assert str(cne.id) in self.listing_ids(query), query
 
+    def test_organization_list_search_very_long_query_does_not_error(self):
+        """A long query must not reach Mongo's 16384-byte pattern ceiling.
+
+        Expanding every vowel costs 15 bytes against one for an escaped character, so the
+        expansion hits the ceiling roughly 15x sooner than the `icontains` it replaced.
+        Past it the driver raises and the request 500s. 1093 is the first length that did.
+        """
+        OrganizationFactory(name="Comissão Nacional de Eleições")
+
+        for length in (1_093, 5_000, 20_000):
+            response = self.get(url_for("api.organizations", q="a" * length))
+            assert200(response)
+
     def test_organization_list_search_by_acronym(self):
-        """Acronym search keeps working -- it was the only field that ever did."""
+        """Parity guard, not evidence for this fix: pure ASCII worked before it too."""
         target = OrganizationFactory(name="Direção-Geral do Território", acronym="DGTERRITORIO")
 
         assert str(target.id) in self.listing_ids("dgterritorio")
@@ -1440,7 +1453,11 @@ class MembershipAPITest(PytestOnlyAPITestCase):
             assert str(target.id) in self.listing_ids(query), query
 
     def test_organization_list_search_regex_metachars_are_literal(self):
-        """The query comes from the URL: it is matched literally, never compiled as a pattern."""
+        """Parity guard: `icontains` escaped too, so this passes before and after the fix.
+
+        Kept because the pattern is now built here rather than by mongoengine, and that
+        construction has to keep escaping -- not because the fix closes a hole.
+        """
         target = OrganizationFactory(name="Instituto a.*b Nacional")
         other = OrganizationFactory(name="Instituto aXXb Nacional")
 
