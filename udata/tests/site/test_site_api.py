@@ -613,6 +613,21 @@ class SiteReusesListingAPITest(APITestCase):
 class SiteOrganizationsListingAPITest(APITestCase):
     """LEDG-1836: aggregated endpoint that replaces 3+N parallel calls with 1."""
 
+    def test_search_is_accent_insensitive(self):
+        """This endpoint, not /api/1/organizations/, is what the public listing page calls.
+
+        It shares `OrgApiParser.parse_filters` with the v1 listing, the v2 search and the
+        public CSV, so the four are fixed by one change -- but the reported symptom was
+        seen here, so this is where it is proven.
+        """
+        cne = OrganizationFactory(name="Comissão Nacional de Eleições", acronym="CNE")
+
+        for query in ("cne", "eleições", "eleicoes", "Comissão Nacional"):
+            response = self.get(url_for("api.site_organizations_listing", q=query))
+            self.assert200(response)
+            ids = [o["id"] for o in response.json["listing"]["data"]]
+            assert str(cne.id) in ids, query
+
     def test_get_returns_aggregated_payload(self):
         OrganizationFactory.create_batch(3)
         certified = OrganizationFactory()
