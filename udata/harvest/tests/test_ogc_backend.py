@@ -308,15 +308,18 @@ SCHEMA_URL = "https://geoportal.example.pt/collections/a/schema?f=json"
 ITEMS_JSONLD_URL = "https://geoportal.example.pt/collections/a/items?f=jsonld"
 ITEMS_HTML_URL = "https://geoportal.example.pt/collections/a/items?f=html"
 DOCUMENT_URL = "https://geoportal.example.pt/collections/a?f=json"
+# The metadata record is a static file, not a collection endpoint like the rest.
+METADATA_URL = "https://geoportal.example.pt/static/metadados/a.jsonld"
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
 class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
-    """Only three of the source's distributions are catalogued (LEDG-2512).
+    """Only a handful of the source's distributions are catalogued (LEDG-2512).
 
-    The source publishes thirteen per collection; six are HTML and were already
-    dropped, and of the remaining seven the portal keeps the two item downloads
-    and the collection schema.
+    The source publishes fourteen or fifteen per collection; the HTML ones are
+    dropped on type, and of the rest the portal keeps the item downloads, the
+    collection schema and, where the collection publishes one, the CNMD metadata
+    record -- four in a collection without it, five in one with (LEDG-2597).
     """
 
     def _harvest(self, rmock, source, distributions, name="Dataset A"):
@@ -340,6 +343,44 @@ class OGCDistributionSelectionTest(PytestOnlyDBTestCase):
         dataset = self._harvest(rmock, source, distributions)
 
         assert [r.url for r in dataset.resources] == [GEOJSON_URL, ITEMS_JSONLD_URL, SCHEMA_URL]
+
+    def test_the_metadata_distribution_is_catalogued(self, rmock):
+        """The CNMD metadata record joins the catalogued distributions (LEDG-2597)."""
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(METADATA_URL, "application/ld+json", "Metadados CNMD"),
+            _distribution(GEOJSON_URL, "application/geo+json", "Items as GeoJSON"),
+            _distribution(ITEMS_JSONLD_URL, "application/ld+json", "Items as RDF (GeoJSON-LD)"),
+            _distribution(SCHEMA_URL, "application/schema+json", "Schema of collection in JSON"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        # The label is not the "Items as" prefix, so the title is kept verbatim --
+        # the same way the schema's is. Resources follow the source's order, so the
+        # metadata record opens the list.
+        assert [(r.title, r.format, r.url) for r in dataset.resources] == [
+            ("Metadados CNMD", "JSON-LD", METADATA_URL),
+            ("Dataset A como GeoJSON", "GeoJSON", GEOJSON_URL),
+            ("Dataset A como RDF (GeoJSON-LD)", "JSON-LD", ITEMS_JSONLD_URL),
+            ("Schema of collection in JSON", "SCHEMA+JSON", SCHEMA_URL),
+        ]
+
+    def test_other_ld_json_distributions_stay_dropped(self, rmock):
+        """The criterion is the label, not the type.
+
+        Three distributions share `application/ld+json` and only one belongs in the
+        catalogue; selecting on the type would bring the other two along.
+        """
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+        distributions = [
+            _distribution(DOCUMENT_URL, "application/ld+json", "This document as RDF (JSON-LD)"),
+            _distribution(METADATA_URL, "application/ld+json", "Metadados CNMD"),
+        ]
+
+        dataset = self._harvest(rmock, source, distributions)
+
+        assert [r.url for r in dataset.resources] == [METADATA_URL]
 
     def test_missing_target_does_not_fail_the_harvest(self, rmock):
         """A source that stops publishing one of the three is not an error."""
@@ -455,6 +496,83 @@ def _tml_item(title="Rede Ciclável"):
     collection["@id"] = "a"
     collection["name"] = title
     return collection
+
+
+TML_RC_COLLECTION = os.path.join(os.path.dirname(__file__), "ogc", "tml_rede_ciclavel.jsonld")
+
+TML_RC_BASE = (
+    "https://geoportal.tmlmobilidade.pt/ogc-api/collections/dados_harmonizados_arte_rede_ciclavel"
+)
+TML_RC_METADATA_URL = (
+    "https://geoportal.tmlmobilidade.pt/ogc-api/static/metadados/rede_ciclavel_existente_aml.jsonld"
+)
+TML_RC_SCHEMA_URL = f"{TML_RC_BASE}/schema?f=json"
+TML_RC_ITEMS_GEOJSON_URL = f"{TML_RC_BASE}/items?f=json"
+TML_RC_ITEMS_JSONLD_URL = f"{TML_RC_BASE}/items?f=jsonld"
+TML_RC_ITEMS_CSV_URL = f"{TML_RC_BASE}/items?f=csv"
+
+
+def _tml_rede_ciclavel_item(title="Rede Ciclável"):
+    """The TML collection that publishes a CNMD metadata record, recorded from the source.
+
+    A second recording rather than an edit of the first: `tml_collection.jsonld`
+    holds a different collection -- `cml_ciclovia_estacionamento` -- which does not
+    publish the metadata record at all, so it cannot prove this. Adding the
+    distribution to it by hand would forge the very `description` field the
+    selection reads, which is what recording instead of transcribing is meant to
+    prevent.
+
+    The two recordings declare fifteen distributions here against thirteen there,
+    but the collections differ by exactly one: the older recording predates the
+    source publishing `Items as CSV`.
+    """
+    with open(TML_RC_COLLECTION, encoding="utf-8") as recorded:
+        collection = json.load(recorded)
+    collection["@id"] = "a"
+    collection["name"] = title
+    return collection
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ogc"])
+class OGCTMLMetadataPayloadTest(PytestOnlyDBTestCase):
+    """The CNMD metadata record, read against the source's own payload (LEDG-2597)."""
+
+    def _harvest(self, rmock, source, title="Rede Ciclável"):
+        rmock.get(OGC_URL, text=_ogc_payload([_tml_rede_ciclavel_item(title)]))
+        job = OGCBackend(source).harvest()
+        assert [item.status for item in job.items] == ["done"]
+        return Dataset.objects(__raw__={"harvest.remote_id": "a"}).first()
+
+    def test_the_recorded_rede_ciclavel_collection_still_has_fifteen_distributions(self):
+        """The fixture is only evidence while it matches what was recorded."""
+        item = _tml_rede_ciclavel_item()
+
+        assert len(item["distribution"]) == 15
+        assert all(dist.get("name") is None for dist in item["distribution"])
+        assert any(dist["description"] == "Metadados CNMD" for dist in item["distribution"])
+
+    def test_the_rede_ciclavel_payload_yields_the_metadata_resource(self, rmock):
+        """Five resources: the four already catalogued, plus the metadata record.
+
+        Order follows the source, and the record is its first distribution, so it
+        opens the list rather than closing it.
+
+        `CSV; CHARSET=UTF-8` is the format production already shows: the source
+        sends `text/csv; charset=utf-8`, the parameter defeats the MIME table and
+        the value falls through. It is asserted as recorded, not as endorsed --
+        preserving it is what this ticket asks for, fixing it is another one.
+        """
+        source = HarvestSourceFactory(backend="ogc", url=OGC_URL, config={})
+
+        dataset = self._harvest(rmock, source)
+
+        assert [(r.title, r.format, r.url) for r in dataset.resources] == [
+            ("Metadados CNMD", "JSON-LD", TML_RC_METADATA_URL),
+            ("Schema of collection in JSON", "SCHEMA+JSON", TML_RC_SCHEMA_URL),
+            ("Rede Ciclável como GeoJSON", "GeoJSON", TML_RC_ITEMS_GEOJSON_URL),
+            ("Rede Ciclável como RDF (GeoJSON-LD)", "JSON-LD", TML_RC_ITEMS_JSONLD_URL),
+            ("Rede Ciclável como CSV", "CSV; CHARSET=UTF-8", TML_RC_ITEMS_CSV_URL),
+        ]
 
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ogc"])

@@ -6,6 +6,7 @@ import pytest
 from flask import url_for
 from pytest_mock import MockerFixture
 
+from udata.app import limiter
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataset.factories import DatasetFactory
 from udata.core.organization.factories import OrganizationFactory
@@ -494,6 +495,13 @@ class HarvestAPITest(MockBackendsMixin, PytestOnlyAPITestCase):
             "https://harvestuser:sup3r?s3cr3t@www.ine.pt/broken.xml",
             "https://harvestuser:sup3r/s3cr3t@www.ine.pt/broken.xml",
         ):
+            # Source creation carries HEAVY_CREATE_LIMIT (2/min, per user), so the
+            # third variant would answer 429 and stop being exercised at all. This
+            # test is about URL validation, not about the limit, and clearing the
+            # window keeps all three variants covered. `pytest.mark.options` cannot
+            # do it: the limiter is a process-wide singleton that captures `enabled`
+            # at `init_app`, before pytest-flask applies the marker's config.
+            limiter.reset()
             data = {"name": faker.word(), "url": url, "backend": "factory"}
 
             response = self.post(url_for("api.harvest_sources"), data)

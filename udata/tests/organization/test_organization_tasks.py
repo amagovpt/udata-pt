@@ -3,8 +3,9 @@ from flask import url_for
 from udata.api.oauth2 import OAuth2Client
 from udata.core import storages
 from udata.core.dataset.factories import DatasetFactory, ResourceFactory
+from udata.core.discussions.models import Discussion, Message
 from udata.core.organization import tasks
-from udata.core.user.factories import AdminFactory
+from udata.core.user.factories import AdminFactory, UserFactory
 from udata.models import ContactPoint, Dataset, Member, Organization, Transfer
 from udata.tests.api import APITestCase
 from udata.tests.helpers import create_test_image
@@ -86,3 +87,26 @@ class OrganizationTasksTest(APITestCase):
 
         organization = Organization.objects(name="delete me").first()
         self.assertIsNone(organization)
+
+    def test_purge_organizations_deletes_discussions(self):
+        """Discussions held on the organization itself go with it."""
+        self.login()
+        org = Organization.objects.create(
+            name="delete me", description="XXX", members=[Member(user=self.user, role="admin")]
+        )
+        user = UserFactory()
+        Discussion.objects.create(
+            subject=org,
+            user=user,
+            title="discussion about the organization",
+            discussion=[Message(content="bla bla", posted_by=user)],
+        )
+        self.assertEqual(Discussion.objects(subject=org).count(), 1)
+
+        response = self.delete(url_for("api.organization", org=org))
+        self.assert204(response)
+
+        tasks.purge_organizations()
+
+        self.assertEqual(Discussion.objects(subject=org).count(), 0)
+        self.assertEqual(len(list(Discussion.objects())), 0)

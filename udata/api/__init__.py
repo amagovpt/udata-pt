@@ -386,7 +386,6 @@ def init_app(app):
     import udata.core.metrics.api  # noqa
     import udata.features.transfer.api  # noqa
     import udata.features.notifications.api  # noqa
-    import udata.core.avatars.api  # noqa
     import udata.harvest.api  # noqa
 
     # api.init_app(app)

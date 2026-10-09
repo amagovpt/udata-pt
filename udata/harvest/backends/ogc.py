@@ -21,11 +21,18 @@ from .tools.harvester_utils import (
 
 log = logging.getLogger(__name__)
 
-# The TML source publishes thirteen distributions per collection and the portal
-# only catalogues three of them: the two item downloads and the collection
-# schema. The labels below are the source's own, matched verbatim (LEDG-2512).
+# The TML source publishes fourteen or fifteen distributions per collection and
+# the portal catalogues a handful: the item downloads, the collection schema and,
+# where the collection has it, the CNMD metadata record -- four distributions in a
+# collection without it, five in one with. The labels below are the source's own,
+# matched verbatim (LEDG-2512).
+#
+# The label is the criterion, never the MIME type: three distributions share
+# `application/ld+json` -- the metadata record, the collection as RDF and the items
+# as RDF -- and only one of the three belongs in the catalogue.
 ITEMS_AS_PREFIX = "Items as "
 SCHEMA_DISTRIBUTION_LABEL = "Schema of collection in JSON"
+METADATA_DISTRIBUTION_LABEL = "Metadados CNMD"
 
 # This source publishes its formats in upper case, and two of them are not the
 # upper-cased format name: `GeoJSON` and `JSON-LD`. The guess itself is shared
@@ -428,5 +435,13 @@ class OGCBackend(BaseBackend):
         return label or "Resource"
 
     def _is_target_distribution(self, label: str) -> bool:
-        """Whether a distribution is one of the three the portal catalogues."""
-        return label.startswith(ITEMS_AS_PREFIX) or label == SCHEMA_DISTRIBUTION_LABEL
+        """Whether a distribution is one the portal catalogues.
+
+        Matched on the label alone. The MIME type cannot discriminate: the metadata
+        record shares `application/ld+json` with two distributions that stay out.
+        """
+        return (
+            label.startswith(ITEMS_AS_PREFIX)
+            or label == SCHEMA_DISTRIBUTION_LABEL
+            or label == METADATA_DISTRIBUTION_LABEL
+        )
