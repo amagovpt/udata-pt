@@ -20,3 +20,13 @@ class HarvestRemoteBlocked(HarvestException):
     """Raised when the remote source answers with an anti-bot challenge instead of content"""
 
     pass
+
+
+class HarvestSourceError(HarvestException):
+    """Raised when the source answers with something other than what was asked for.
+
+    A broken or truncated document, or an error page served with a success status:
+    the source's fault, as opposed to the network failing on the way.
+    """
+
+    pass

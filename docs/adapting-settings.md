@@ -443,37 +443,6 @@ See [Flask-CDN README](https://github.com/libwilliam/flask-cdn#flask-cdn-options
 
 Set this to a domain name. If defined, udata will serve its static assets from this domain.
 
-## Avatars/identicon configuration
-
-Theses settings allow you to customize avatar rendering.
-If defined to anything else than a falsy value, theses settings take precedence over the theme configuration and the default values.
-
-### AVATAR_INTERNAL_SIZE
-
-**default**: `7`
-
-Number of blocks (the matrix size) used by the internal provider.
-
-*E.g.*: `7` will render avatars on a 7x7 matrix
-
-### AVATAR_INTERNAL_FOREGROUND
-
-**default**: `['rgb(45,79,255)', 'rgb(254,180,44)', 'rgb(226,121,234)', 'rgb(30,179,253)', 'rgb(232,77,65)', 'rgb(49,203,115)', 'rgb(141,69,170)']`
-
-A list of foreground colors used by the internal provider to render the avatars
-
-### AVATAR_INTERNAL_BACKGROUND
-
-**default**: `'rgb(224,224,224)'`
-
-The background color used by the internal provider
-
-### AVATAR_INTERNAL_PADDING
-
-**default**: `10`
-
-The padding (in percent) used by the internal provider
-
 ## Notifications configuration
 
 These settings allow you to customize the notification feature.

@@ -737,6 +737,155 @@ class DiscussionsTest(APITestCase):
         )
         self.assert403(response)
 
+    def test_new_discussion_on_organization(self):
+        """A discussion can be opened on an organization itself, and read back."""
+        user = self.login()
+        org = OrganizationFactory()
+
+        with assert_emit(on_new_discussion):
+            response = self.post(
+                url_for("api.discussions"),
+                {
+                    "title": "test title",
+                    "comment": "bla bla",
+                    "subject": {
+                        "class": "Organization",
+                        "id": org.id,
+                    },
+                },
+            )
+            self.assert201(response)
+
+        # This covers creating, counting and listing. It deliberately asserts nothing
+        # about `permissions`: on the creation path the subject is not resolved the way
+        # it is on a reread, so the subject-owner branch is never reached here and any
+        # assertion about it would pass with the fix reverted. The branch is proven by
+        # `test_close_discussion_on_organization_permissions`, which does go red without it.
+        self.assertEqual(response.json["subject"]["class"], "Organization")
+
+        org.reload()
+        self.assertEqual(org.get_metrics()["discussions"], 1)
+        self.assertEqual(org.get_metrics()["discussions_open"], 1)
+
+        discussions = Discussion.objects(subject=org)
+        self.assertEqual(len(discussions), 1)
+        self.assertEqual(discussions[0].user, user)
+
+        response = self.get(url_for("api.discussions", **{"for": str(org.id)}))
+        self.assert200(response)
+        self.assertEqual(len(response.json["data"]), 1)
+
+    def test_list_discussions_for_organization_subject(self):
+        """`for=<org>` returns the organization's own discussions, not its content's."""
+        org = OrganizationFactory()
+        user = UserFactory()
+
+        own = Discussion.objects.create(
+            subject=org,
+            user=user,
+            title="discussion about the organization",
+            discussion=[Message(content=faker.sentence(), posted_by=user)],
+        )
+        # The organization's content gets discussions of its own; none of them belong to
+        # the organization's tab.
+        for factory in (DatasetFactory, ReuseFactory, DataserviceFactory):
+            Discussion.objects.create(
+                subject=factory(organization=org),
+                user=user,
+                title="discussion about a published asset",
+                discussion=[Message(content=faker.sentence(), posted_by=user)],
+            )
+
+        response = self.get(url_for("api.discussions", **{"for": str(org.id)}))
+        self.assert200(response)
+
+        self.assertEqual(len(response.json["data"]), 1)
+        self.assertEqual(response.json["data"][0]["id"], str(own.id))
+        self.assertEqual(response.json["data"][0]["subject"]["class"], "Organization")
+
+    def test_close_discussion_on_organization_permissions(self):
+        """Admins and editors of the organization moderate its own discussions."""
+        author = UserFactory()
+        admin = UserFactory()
+        editor = UserFactory()
+        org = OrganizationFactory(
+            members=[Member(user=admin, role="admin"), Member(user=editor, role="editor")]
+        )
+
+        def open_discussion():
+            discussion = Discussion.objects.create(
+                subject=org,
+                user=author,
+                title="test discussion",
+                discussion=[Message(content="bla bla", posted_by=author)],
+            )
+            on_new_discussion.send(discussion)
+            return discussion
+
+        # Nobody outside the organization's admins and editors closes its discussions:
+        # not a stranger, not a partial editor, not an admin of a different organization.
+        partial_editor = UserFactory()
+        org.members.append(Member(user=partial_editor, role="partial_editor"))
+        org.save()
+        other_org_admin = UserFactory()
+        OrganizationFactory(members=[Member(user=other_org_admin, role="admin")])
+
+        for refused in (None, partial_editor, other_org_admin):
+            discussion = open_discussion()
+            self.login(refused) if refused else self.login()
+            response = self.post(
+                url_for("api.discussion", id=discussion.id),
+                {"comment": "close bla bla", "close": True},
+            )
+            self.assert403(response)
+
+        # Replying, on the other hand, is open to any authenticated user.
+        response = self.post(url_for("api.discussion", id=discussion.id), {"comment": "me too"})
+        self.assert200(response)
+
+        for member in (admin, editor):
+            discussion = open_discussion()
+            self.login(member)
+            response = self.post(
+                url_for("api.discussion", id=discussion.id),
+                {"comment": "close bla bla", "close": True},
+            )
+            self.assert200(response)
+            self.assertIsNotNone(response.json["closed"])
+
+        # The author keeps editing and deleting their own discussion.
+        discussion = open_discussion()
+        self.login(author)
+        response = self.put(url_for("api.discussion", id=discussion.id), {"title": "new title"})
+        self.assert200(response)
+        self.assertEqual(response.json["title"], "new title")
+
+        response = self.delete(url_for("api.discussion", id=discussion.id))
+        self.assertStatus(response, 204)
+
+    def test_organization_discussions_metrics(self):
+        """An organization counts the discussions held on the organization itself."""
+        org = OrganizationFactory()
+        user = UserFactory()
+        message = Message(content="bla bla", posted_by=user)
+        discussion = Discussion.objects.create(
+            subject=org, user=user, title="test discussion", discussion=[message]
+        )
+        on_new_discussion.send(discussion)
+
+        org.reload()
+        self.assertEqual(org.get_metrics()["discussions"], 1)
+        self.assertEqual(org.get_metrics()["discussions_open"], 1)
+
+        discussion.closed = datetime.now(UTC)
+        discussion.closed_by = user
+        discussion.save()
+        on_discussion_closed.send(discussion)
+
+        org.reload()
+        self.assertEqual(org.get_metrics()["discussions"], 1)
+        self.assertEqual(org.get_metrics()["discussions_open"], 0)
+
     def test_close_discussion_without_message(self):
         owner = self.login()
         user = UserFactory()
@@ -1053,6 +1202,84 @@ class DiscussionsTest(APITestCase):
 
 
 class NotifyDiscussionsTest(APITestCase):
+    def organization_discussion(self, poster, messages):
+        """An organization with two members, and a discussion held on the organization."""
+        admin = UserFactory()
+        editor = UserFactory()
+        org = OrganizationFactory(
+            members=[Member(user=admin, role="admin"), Member(user=editor, role="editor")]
+        )
+        discussion = Discussion.objects.create(
+            subject=org, user=poster, title=faker.sentence(), discussion=messages
+        )
+        return org, admin, editor, discussion
+
+    def test_new_discussion_mail_organization_subject(self):
+        poster = UserFactory()
+        message = Message(content=faker.sentence(), posted_by=poster)
+        _org, admin, editor, discussion = self.organization_discussion(poster, [message])
+
+        with capture_mails() as mails:
+            notify_new_discussion(discussion.id)
+
+        expected_recipients = (admin.email, editor.email)
+        self.assertEqual(len(mails), len(expected_recipients))
+        for mail in mails:
+            self.assertIn(mail.recipients[0], expected_recipients)
+            self.assertNotIn(poster.email, mail.recipients)
+
+        for member in (admin, editor):
+            notifications = Notification.objects(user=member)
+            self.assertEqual(len(notifications), 1)
+            self.assertEqual(notifications[0].details.status, DiscussionStatus.NEW_DISCUSSION)
+
+    def test_new_comment_mail_organization_subject(self):
+        poster = UserFactory()
+        commenter = UserFactory()
+        messages = [
+            Message(content=faker.sentence(), posted_by=poster),
+            Message(content=faker.sentence(), posted_by=commenter),
+        ]
+        _org, admin, editor, discussion = self.organization_discussion(poster, messages)
+
+        with capture_mails() as mails:
+            notify_new_discussion_comment(discussion.id, message=len(discussion.discussion) - 1)
+
+        # The members and the original poster hear about it; the commenter does not.
+        expected_recipients = (admin.email, editor.email, poster.email)
+        self.assertEqual(len(mails), len(expected_recipients))
+        for mail in mails:
+            self.assertIn(mail.recipients[0], expected_recipients)
+            self.assertNotIn(commenter.email, mail.recipients)
+
+        for member in (admin, editor):
+            notifications = Notification.objects(user=member)
+            self.assertEqual(len(notifications), 1)
+            self.assertEqual(notifications[0].details.status, DiscussionStatus.NEW_COMMENT)
+
+    def test_discussion_closed_mail_organization_subject(self):
+        poster = UserFactory()
+        message = Message(content=faker.sentence(), posted_by=poster)
+        _org, admin, editor, discussion = self.organization_discussion(poster, [message])
+        discussion.closed = datetime.now(UTC)
+        discussion.closed_by = admin
+        discussion.save()
+
+        with capture_mails() as mails:
+            notify_discussion_closed(discussion.id)
+
+        # The remaining members and the participants hear about it; the admin who closed
+        # it does not get told about their own action.
+        expected_recipients = (editor.email, poster.email)
+        self.assertEqual(len(mails), len(expected_recipients))
+        for mail in mails:
+            self.assertIn(mail.recipients[0], expected_recipients)
+            self.assertNotIn(admin.email, mail.recipients)
+
+        notifications = Notification.objects(user=editor)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0].details.status, DiscussionStatus.CLOSED)
+
     def test_new_discussion_mail(self):
         user = UserFactory()
         owner = UserFactory()

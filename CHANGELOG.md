@@ -2,6 +2,167 @@
 
 ## Unreleased
 
+- **feat(harvest): the OGC backend catalogues the CNMD metadata record**
+  - The TML collections publish their CNMD metadata as a distribution of their own, a JSON-LD
+    document alongside the data downloads, and the portal was dropping it. The selection only
+    knew two kinds of distribution -- the item downloads and the collection schema -- so the
+    metadata record fell through with everything else the source publishes for its own
+    navigation.
+  - It is matched on its label, the way the schema already is, and not on its media type: three
+    of the collection's distributions are `application/ld+json` -- the metadata record, the
+    collection as RDF and the items as RDF -- and only the first belongs in the catalogue.
+    Nothing else had to change for the resource to come out right. A label that is not the
+    "Items as" prefix already passes through to the resource title verbatim, so the resource is
+    named as the source names it, and `application/ld+json` already maps to the JSON-LD format.
+  - Six collections publish the record today, not only the one the request came with, so the
+    next harvest adds a resource to six datasets. It opens their resource list rather than
+    closing it: resources follow the order the source publishes them in, and the record is the
+    first distribution of the collection. The four resources already catalogued keep their ids,
+    because resources are reconciled by URL.
+  - One consequence to expect on the day it runs: a dataset's last update is the most recent of
+    its resources' own, so the six will report having been updated on the day of that harvest,
+    even though none of their data changed. That is what adding any resource does -- the same
+    jump happened when the source started publishing its CSV -- and it settles after that run.
+
+- **fix(organizations): a correctly accented query finds the organization again**
+  - Searching the organizations listing for `comissão` returned nothing while `comiss` returned
+    five, and the Comissão Nacional de Eleições was reachable only through `cne` -- its acronym,
+    the one field with no accents in it. The listing stripped the diacritics off the *query* and
+    then compared it, with `icontains`, against a stored value that keeps its own: `comissão`
+    became `comissao`, which "Comissão" does not contain. Normalising one side only.
+  - The helper that did the stripping promised, in its docstring, that it let `agencia` find
+    `Agência`. It never did -- the stored side was never normalised, so the match failed in both
+    directions and the net effect was purely to lose results that used to be found. The docstring
+    now describes what the function actually does, and where it is still the right thing: ahead of
+    a text-index search, which folds accents on the indexed side. Those five call sites are
+    untouched.
+  - Matching now folds the query to its base letters and expands each one into a character class,
+    so it works whichever side carries the accent, or neither. Folding drops combining marks
+    instead of encoding to ASCII, because `日本` would otherwise fold to the empty string -- and an
+    empty pattern matches every document in the collection. Anything that is not an expandable
+    base letter goes through `re.escape`. MongoEngine's `icontains` escaped too, so that is parity
+    rather than a hole being closed -- but the pattern is built here now, and an expanded vowel
+    costs fifteen bytes against one, so it reaches MongoDB's 16384-byte ceiling fifteen times
+    sooner. Past that ceiling the driver raises, uncaught: the listing answers 500 and the CSV
+    export truncates mid-stream behind a 200 it has already sent. The query is capped at a
+    thousand characters, which no search uses and which keeps the worst case well inside.
+  - The suggest endpoint matched the raw query while the listing matched a folded one, so the two
+    disagreed on the same text in opposite directions. They now share the matching, and a test
+    pins them to the same result set.
+  - One change reaches four consumers, none of which needed its own: the v1 listing, the v2
+    search (through its Mongo path, which is what answers while no Elasticsearch service is
+    configured), the aggregated endpoint the public listing page actually calls, and the public
+    organizations CSV. Name, acronym and description all stay searchable.
+  - Two caveats for whoever verifies this by hand. The aggregated endpoint caches for 60 seconds
+    and the frontend caches its response for another 60, so a query tried just before the deploy
+    can keep answering from cache for about two minutes. And a stored name held in decomposed
+    form, with the accent as a separate combining character, still will not match. Counted on the
+    development database: one organization in 405, and in its description rather than its name.
+
+- **fix(harvest): harvest source creation carries its own per-user rate limit**
+  - `POST /api/1/harvest/sources/` was the one content-creation endpoint of the four an audit
+    flagged for mass form submission that never got a per-endpoint limit. Replaying the audit's
+    run against it produced 201 a hundred times out of a hundred, and 200 sources reached the
+    database before the IP-keyed `RATELIMIT_DEFAULT` ("1000 per day; 200 per hour") finally
+    answered 429. That default is the wrong ceiling twice over: behind the F5/WAF every client
+    arrives from one origin IP, so it is a single shared bucket one caller can spend on
+    everyone's behalf; and creating a source is the heaviest of the four operations, because it
+    schedules recurring crawls against a host the caller supplies.
+  - POST now carries `HEAVY_CREATE_LIMIT` (2/min, 5/h, 10/day), keyed by user rather than
+    address, so rotating a proxy pool buys nothing. It is the profile organization creation
+    already uses, and nothing legitimate creates sources faster: the CLI calls `create_source`
+    directly without going through HTTP, and the backoffice posts one source per submission.
+  - GET carries `PUBLIC_SEARCH_LIMIT`, and not only for symmetry. A GET exempts every
+    method-scoped limit, which lets the global defaults back in, so a POST-only limit would have
+    left the listing under the same collapsing ceiling. Separate buckets mean a flood of
+    creations never starves the backoffice listing.
+  - Two consequences worth knowing before calibrating further. The limit runs before form
+    validation, so a submission refused for a bad URL still consumes a slot: two corrections in
+    a row and the third attempt answers 429. And the hourly and daily caps (5 and 10) bound
+    bulk onboarding through the backoffice — an operator registering many harvesters in one
+    sitting should use the CLI, which does not go through HTTP and is not limited.
+
+- **fix(discussions): a discussion can be held on an organization itself**
+  - An organization has always been a valid discussion subject -- the organization page offers
+    "Nova discussão" and the documents are in the database -- but it was the only subject class
+    nothing downstream knew how to handle, so every path that touched one broke in a different
+    way. Opening one answered 500: the metrics hook calls `count_discussions()` on whatever the
+    discussion points at, and `Organization` never had the method. The document was saved before
+    the signal fired, so the discussion existed and the caller saw an error.
+  - Closing one answered 500 too, for an unrelated reason: the subject-owner permission goes
+    through `OwnablePermission`, which reads `subject.organization` and `subject.owner`, and an
+    organization has neither -- it does not even derive from `Owned`. Serialising one failed more
+    quietly, because flask-restx swallows the error and emits a null `permissions` block: the
+    whole block, so the author of a thread lost edit and delete on their own discussion even
+    though those permissions never consult the subject at all. An organization owns itself,
+    so it now gets the needs `OwnablePermission` computes for an asset it owns: admin and editor,
+    the editors included so they moderate an organization's discussions as they do its datasets'.
+    A defensive `getattr` would have been worse than the crash: `Permission` prepends
+    `RoleNeed("admin")`, so a permission with no needs is sysadmins-only, not everyone.
+  - Nobody was notified either. The tuple of subjects that notify did not list organizations, so
+    the three notification tasks logged "Unrecognized discussion subject type" and returned. The
+    members are now the recipients, guarding against a member carrying no user at all -- the
+    field is not required, and one such member would otherwise break every notification for that
+    organization.
+  - Purging an organization left its discussions behind, pointing at a document that no longer
+    exists; it now goes through the same helper dataset, reuse, dataservice and topic already use.
+  - Organizations gained the `discussions` and `discussions_open` metrics, so the API reports the
+    counts the other subjects already reported, and a migration recounts the organizations that
+    already have discussions.
+- **perf(harvest): the INE harvester processes its catalogue while it streams and survives the source cutting it**
+  - The INE endpoint sends the ~23 MB catalogue at ~30 KB/s, generates it on the fly and, when it
+    gives up, cuts the body halfway with an HTTP 200 and a Java stack trace appended. The old flow
+    downloaded the whole file before parsing anything, so every cut threw away up to ~13 minutes of
+    transfer, five attempts could add up to over an hour, and a run where every attempt was cut
+    processed nothing. Parsing was never the cost: under a second for the full catalogue, the same
+    from a file or from memory.
+  - The endpoint cannot be asked for less: `Range`, gzip, `If-Modified-Since`/`ETag` and every
+    filter or paging parameter are ignored, and `opc=1&varcd=` takes a single indicator. So the
+    catalogue is now parsed straight from the response (defusedxml `iterparse` over a stream that
+    tees every byte to a unique `.part` file) and processed in chunks of 500 as it arrives. A
+    retry re-reads from the top but skips what an earlier attempt already processed, so it costs
+    the transfer only and pushes no duplicate job item.
+  - When every attempt is cut after some indicators, those stay updated, the job is marked
+    `data.partial` with an error, and autoarchive is skipped, as it already was for a `max_items`
+    truncation. Only a run that received nothing falls back to the cached catalogue.
+  - The cached catalogue is now a persistent snapshot, one file per source, under the new
+    `HARVEST_SNAPSHOT_DIR` setting (default `<FS_ROOT>/harvest-snapshots`, the volume app and
+    worker already share). It used to be `/tmp/ine.xml`: shared by every INE source, deleted after
+    every successful run and lost on every restart. It is replaced atomically only by a complete
+    download; a fallback to it records its age in `data.snapshot` and an error, and skips
+    autoarchive, since an old snapshot proves nothing about what the source removed.
+  - The error page is detected as it arrives (stack-trace markers, and a head that is not XML) and
+    classified with the new `HarvestSourceError`; job errors now start with `INE source error:` or
+    `INE network error:`. Indicators sharing a chunk with the error page are still processed.
+  - An HTTP 5xx from the source is retried and falls back like a cut stream (a 4xx still fails at
+    once). A snapshot fallback leaves alone the datasets a later partial run already updated, so an
+    older snapshot never rolls them back.
+  - Each phase is timed (`download_parse`, `prefetch`, `change_detection`, `serialize`,
+    `bulk_write`, `autoarchive`, `total`) into the log and `job.data`, together with every
+    download attempt's bytes, duration and failure reason.
+  - The dead `IS_TEST_MODE`/`USE_LOCAL_FILE` flags, the unstreamed in-memory mode and the leftover
+    debug code in the download error handler are gone. Restart the Celery worker and beat after
+    deploying: a running worker keeps the old harvester in memory.
+
+- **refactor(api)!: the unauthenticated identicon endpoint is gone**
+  - `GET /api/1/avatars/<identifier>/<size>/` drew a pydenticon from a hash of the identifier.
+    It never read the database, so the access-control finding reported against it did not hold:
+    any string produced an image, and an existing user id was indistinguishable from an invented
+    one. What it did have was a `size` with no ceiling, drawn before any validation. Measured
+    through the endpoint itself: `size=150` answers in 0.01s with a 433-byte PNG, `size=10000`
+    takes 1.9s and 553MB of RSS, and `size=20000` takes 7s, peaks at 1.7GB and returns a 1.6MB
+    image -- all to an anonymous caller. The only brake was the IP-keyed global rate limit, which
+    collapses into a single shared bucket behind the WAF, so a couple of hundred requests an hour
+    were enough; and the memoized cache grew a new entry for every `(identifier, size)` pair on
+    top of that.
+  - Nothing consumed it. Uploaded avatars are served as files by the storage, the serialization
+    returns `None` when a user has none instead of falling back to an identicon, and the frontend
+    draws its own placeholder. Removing the route closes the resource-exhaustion vector outright
+    rather than capping a size nobody asked for.
+  - The `TRACKING_BLACKLIST` entry, the `AVATAR_INTERNAL_*` settings, their documentation section
+    and the `pydenticon` dependency go with it. Avatar upload, serving and deletion are untouched.
+  - **Breaking**: the route now answers 404 and the namespace no longer appears in the Swagger spec.
+
 - **fix(site): the public homepage no longer renders zeros when its aggregated endpoint is throttled**
   - `/api/1/site/home/` carried no explicit rate limit, so it fell under the IP-keyed
     `RATELIMIT_DEFAULT` ("1000 per day; 200 per hour"). The endpoint is fetched server-side by the

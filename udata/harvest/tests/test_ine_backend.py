@@ -1,9 +1,14 @@
+import io
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
+from glob import glob
 
 import pytest
+import requests
+import urllib3
 
 from udata.core.dataset.constants import UpdateFrequency
 from udata.core.dataset.factories import DatasetFactory
@@ -14,7 +19,8 @@ from udata.models import Dataset
 from udata.tests.api import PytestOnlyDBTestCase
 from udata.utils import to_naive_datetime
 
-from ..backends.ine import INE_HVD_FEED_URL, INEBackend, INEDownloadIncomplete
+from ..backends.ine import INE_HVD_FEED_URL, INEBackend, _ErrorPageScanner, _INECatalogStream
+from ..exceptions import HarvestSourceError
 from .factories import HarvestSourceFactory
 
 INE_URL = "https://www.ine.pt/ine/xml_indic.jsp?opc=2&lang=PT"
@@ -59,52 +65,6 @@ class INEIsCompleteXmlTest(PytestOnlyDBTestCase):
 
     def test_missing_file_is_rejected(self, tmp_path):
         assert self._backend()._is_complete_xml(str(tmp_path / "nope.xml")) is False
-
-
-class INEDownloadToFileTest(PytestOnlyDBTestCase):
-    def _backend(self, monkeypatch):
-        # Avoid real backoff sleeps between retries.
-        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
-        source = HarvestSourceFactory(backend="ine", url=INE_URL)
-        backend = INEBackend(source)
-        backend.MAX_RETRIES = 3
-        return backend
-
-    def test_retries_truncated_download_then_succeeds(self, rmock, monkeypatch, tmp_path):
-        # First transfer is truncated (connection dropped), second one is complete.
-        rmock.get(INE_URL, [{"text": TRUNCATED_XML}, {"text": COMPLETE_XML}])
-        dest = tmp_path / "ine.xml"
-
-        self._backend(monkeypatch)._download_to_file(INE_URL, str(dest))
-
-        assert dest.exists()
-        content = dest.read_text()
-        assert "</catalog>" in content
-        assert "Indicador A" in content
-        # No leftover .part file
-        assert not (tmp_path / "ine.xml.part").exists()
-
-    def test_falls_back_to_cached_valid_file_when_all_attempts_fail(
-        self, rmock, monkeypatch, tmp_path
-    ):
-        rmock.get(INE_URL, text=TRUNCATED_XML)
-        dest = tmp_path / "ine.xml"
-        dest.write_text(COMPLETE_XML)  # previously cached valid download
-
-        # Should not raise: the last valid file is reused.
-        self._backend(monkeypatch)._download_to_file(INE_URL, str(dest))
-
-        assert dest.read_text() == COMPLETE_XML
-
-    def test_raises_when_truncated_and_no_cache(self, rmock, monkeypatch, tmp_path):
-        rmock.get(INE_URL, text=TRUNCATED_XML)
-        dest = tmp_path / "ine.xml"
-
-        with pytest.raises(INEDownloadIncomplete):
-            self._backend(monkeypatch)._download_to_file(INE_URL, str(dest))
-
-        assert not dest.exists()
-        assert not (tmp_path / "ine.xml.part").exists()
 
 
 class INEPrefetchDatasetsTest(PytestOnlyDBTestCase):
@@ -593,11 +553,11 @@ class INEPreviewReportsItemsTest(PytestOnlyDBTestCase):
 
 @pytest.mark.options(HARVESTER_BACKENDS=["ine"])
 class INELocalFilePathTest(PytestOnlyDBTestCase):
-    """A preview must not share the download file with the real harvest.
+    """A preview must not share the catalogue file with the real harvest.
 
-    `LOCAL_FILE_PATH` is a class attribute, so every INE run in the process used
-    the same file: a preview could overwrite the catalog a running harvest was
-    reading, and its cleanup deleted the cached file that harvest falls back on.
+    The real harvest keeps its catalogue as the snapshot it falls back on: a
+    preview writing there could overwrite the catalog a running harvest was
+    reading, and its cleanup would delete the snapshot.
     """
 
     def _source(self):
@@ -620,14 +580,18 @@ class INELocalFilePathTest(PytestOnlyDBTestCase):
         first = INEBackend(source, dryrun=True)
         second = INEBackend(source, dryrun=True)
 
-        assert first.LOCAL_FILE_PATH != second.LOCAL_FILE_PATH
-        assert first.LOCAL_FILE_PATH != INEBackend.LOCAL_FILE_PATH
-        assert second.LOCAL_FILE_PATH != INEBackend.LOCAL_FILE_PATH
+        snapshot = INEBackend(source)._snapshot_path()
+        assert first._snapshot_path() != second._snapshot_path()
+        assert first._snapshot_path() != snapshot
+        assert second._snapshot_path() != snapshot
 
-    def test_real_harvest_keeps_the_shared_path(self):
-        # Deliberate: the shared file is the download cache `_download_to_file`
-        # falls back on when every attempt against the slow INE endpoint fails.
-        assert INEBackend(self._source()).LOCAL_FILE_PATH == INEBackend.LOCAL_FILE_PATH
+    def test_real_harvest_uses_the_persistent_snapshot_path(self):
+        # Deliberate: the snapshot is what the harvest falls back on when every
+        # attempt against the slow INE endpoint fails.
+        backend = INEBackend(self._source())
+        assert backend._snapshot_path() == os.path.join(
+            backend.snapshot_dir, f"ine-{backend.source.id}.xml"
+        )
 
     def test_preview_leaves_the_harvest_cache_alone(self, rmock, tmp_path, monkeypatch):
         # Both the shared path and the per-instance one have to land inside
@@ -1281,3 +1245,685 @@ class INEHasChangedTest(PytestOnlyDBTestCase):
         job = backend.harvest()
 
         assert [item.status for item in job.items] == ["skipped"]
+
+
+def _truncated_catalog_xml(ids, **kwargs):
+    """The same catalogue with the stream cut right before the closing root tag."""
+    body = _catalog_xml(ids, **kwargs)
+    return body[: -len("</catalog>\n")]
+
+
+# What the INE endpoint appended to a 200 response when it cut the catalogue on
+# 2026-10-01, trimmed. The `<init>` frame matters: it parses as a start tag.
+JAVA_ERROR_PAGE = (
+    "\njavax.naming.NameNotFoundException: jdbc/conexaoBDDDS -- service jboss.naming\n"
+    "\tat io.undertow.servlet.handlers.ServletHandler.handleRequest(ServletHandler.java:74)\n"
+    "\tat org.jboss.as.naming.ServiceBasedNamingStore.<init>(ServiceBasedNamingStore.java:12)\n"
+)
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEStreamingHarvestTest(PytestOnlyDBTestCase):
+    """The catalogue is processed while it streams in.
+
+    The INE endpoint sends ~30 KB/s and cuts the body halfway, still with a 200.
+    Processing as it arrives is what keeps the indicators that did arrive, and
+    the cut must neither archive the rest nor damage the cached catalogue.
+    """
+
+    IDS = ["0001", "0002", "0003", "0004", "0005"]
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _backend(self, monkeypatch, tmp_path, source):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        # Small enough that five indicators span several chunks and a cut lands
+        # with a partly filled buffer.
+        backend.BULK_SIZE = 2
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, body):
+        responses = body if isinstance(body, list) else [{"text": body}]
+        rmock.get(INE_URL, responses)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        return self._backend(monkeypatch, tmp_path, source).harvest()
+
+    def _stale_dataset(self, source, remote_id="9999"):
+        return DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id=remote_id,
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=date.today() - timedelta(days=400),
+            )
+        )
+
+    def _cached_catalog(self, tmp_path):
+        cached = tmp_path / "ine.xml"
+        cached.write_text(_catalog_xml(["0001", "0002"]))
+        old = time.time() - 3600
+        os.utime(cached, (old, old))
+        return cached, cached.read_bytes(), os.path.getmtime(cached)
+
+    def _remote_ids(self, source):
+        return sorted(
+            d.harvest.remote_id
+            for d in Dataset.objects(__raw__={"harvest.source_id": str(source.id)})
+        )
+
+    def test_truncated_stream_updates_received_indicators_and_skips_autoarchive(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        source = self._source(autoarchive=True)
+        stale = self._stale_dataset(source)
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, _truncated_catalog_xml(self.IDS))
+
+        assert job.status == "done"
+        assert self._remote_ids(source) == self.IDS + ["9999"]
+        assert [item.status for item in job.items] == ["done"] * 5
+        assert not any(item.status == "archived" for item in job.items)
+        stale.reload()
+        assert stale.harvest.archived_at is None
+        job.reload()
+        assert job.data["partial"] is True
+        assert "catalogue stream cut after 5 indicators" in job.errors[-1].message
+
+    def test_truncated_stream_leaves_the_existing_file_untouched(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        cached, content, mtime = self._cached_catalog(tmp_path)
+
+        self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), _truncated_catalog_xml(self.IDS)
+        )
+
+        assert cached.read_bytes() == content
+        assert os.path.getmtime(cached) == mtime
+        assert glob(str(tmp_path / "*.part")) == []
+
+    def test_junk_after_the_cut_does_not_create_a_corrupt_indicator(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        cached, content, mtime = self._cached_catalog(tmp_path)
+        source = self._source()
+        # Cut inside the third indicator, then the error page.
+        body = (
+            _truncated_catalog_xml(["0001", "0002"])
+            + "<indicator id='0003'>\n<title>Indic"
+            + JAVA_ERROR_PAGE
+        )
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, body)
+
+        assert self._remote_ids(source) == ["0001", "0002"]
+        assert job.data["partial"] is True
+        assert cached.read_bytes() == content
+        assert os.path.getmtime(cached) == mtime
+
+    def test_retry_completes_without_duplicate_items(self, rmock, monkeypatch, tmp_path):
+        source = self._source(autoarchive=True)
+        stale = self._stale_dataset(source)
+
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            source,
+            [
+                {"text": _truncated_catalog_xml(self.IDS[:3])},
+                {"text": _catalog_xml(self.IDS)},
+            ],
+        )
+
+        harvested = [item for item in job.items if item.status != "archived"]
+        assert sorted(item.remote_id for item in harvested) == self.IDS
+        assert all(item.status == "done" for item in harvested)
+        # The retry ran to the end, so autoarchive did too.
+        archived = [item for item in job.items if item.status == "archived"]
+        assert [item.remote_id for item in archived] == ["9999"]
+        stale.reload()
+        assert stale.harvest.archived_at is not None
+        assert "partial" not in job.data
+        assert job.errors == []
+        assert glob(str(tmp_path / "*.part")) == []
+
+    def test_failure_before_any_indicator_falls_back_to_the_existing_complete_file(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        self._cached_catalog(tmp_path)
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, "")
+
+        assert job.status == "done"
+        assert self._remote_ids(source) == ["0001", "0002"]
+        assert [item.status for item in job.items] == ["done"] * 2
+
+    def test_failure_without_file_fails_the_job(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, "")
+
+        assert job.status == "failed"
+        assert self._remote_ids(source) == []
+        catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
+        assert len(catalog_requests) == 2
+
+    def test_processing_errors_are_not_retried(self, rmock, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            INEBackend, "_extract_metadata", lambda self, elem: (_ for _ in ()).throw(KeyError("x"))
+        )
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, _catalog_xml(self.IDS))
+
+        assert job.status == "failed"
+        catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
+        assert len(catalog_requests) == 1
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESnapshotTest(PytestOnlyDBTestCase):
+    """The last complete catalogue is a persistent, per-source snapshot.
+
+    It used to live in `/tmp/ine.xml`, shared by every INE source, deleted after
+    every successful run and lost on every container restart, so the fallback it
+    was meant to provide was rarely there when the source failed.
+    """
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _harvest(self, rmock, monkeypatch, source, body):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        rmock.get(INE_URL, text=body)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend.harvest()
+
+    def _snapshot(self, tmp_path, source, age_seconds=3600):
+        snapshot = tmp_path / f"ine-{source.id}.xml"
+        snapshot.write_text(_catalog_xml(["0001", "0002"]))
+        old = time.time() - age_seconds
+        os.utime(snapshot, (old, old))
+        return snapshot, snapshot.read_bytes(), os.path.getmtime(snapshot)
+
+    @pytest.fixture
+    def snapshot_dir(self, app, tmp_path, monkeypatch):
+        monkeypatch.setitem(app.config, "HARVEST_SNAPSHOT_DIR", str(tmp_path))
+        return tmp_path
+
+    def test_snapshot_path_follows_the_setting_and_the_source_id(self, snapshot_dir):
+        source = self._source()
+
+        assert INEBackend(source)._snapshot_path() == str(snapshot_dir / f"ine-{source.id}.xml")
+
+    def test_snapshot_dir_defaults_under_fs_root(self, app, instance_path, monkeypatch):
+        monkeypatch.setitem(app.config, "HARVEST_SNAPSHOT_DIR", None)
+
+        path = INEBackend(self._source())._snapshot_path()
+
+        assert path.startswith(os.path.join(app.config["FS_ROOT"], "harvest-snapshots"))
+
+    def test_successful_harvest_keeps_the_snapshot(self, rmock, monkeypatch, snapshot_dir):
+        source = self._source()
+        body = _catalog_xml(["0001", "0002", "0003"])
+
+        job = self._harvest(rmock, monkeypatch, source, body)
+
+        assert job.status == "done"
+        snapshot = snapshot_dir / f"ine-{source.id}.xml"
+        assert snapshot.read_text() == body
+        assert glob(str(snapshot_dir / "*.part")) == []
+
+    def test_fallback_records_the_snapshot_age_and_skips_autoarchive(
+        self, rmock, monkeypatch, snapshot_dir
+    ):
+        source = self._source(autoarchive=True)
+        stale = DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id="9999",
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=date.today() - timedelta(days=400),
+            )
+        )
+        snapshot, content, mtime = self._snapshot(snapshot_dir, source)
+
+        job = self._harvest(rmock, monkeypatch, source, "")
+
+        assert job.status == "done"
+        job.reload()
+        assert job.data["snapshot"]["used"] is True
+        assert abs(job.data["snapshot"]["age_seconds"] - 3600) < 60
+        assert "using snapshot" in job.errors[-1].message
+        assert [item.status for item in job.items] == ["done"] * 2
+        stale.reload()
+        assert stale.harvest.archived_at is None
+        assert snapshot.read_bytes() == content
+        assert os.path.getmtime(snapshot) == mtime
+
+    def test_partial_run_does_not_overwrite_the_snapshot(self, rmock, monkeypatch, snapshot_dir):
+        source = self._source()
+        snapshot, content, mtime = self._snapshot(snapshot_dir, source)
+
+        job = self._harvest(
+            rmock, monkeypatch, source, _truncated_catalog_xml(["0001", "0002", "0003"])
+        )
+
+        assert job.data["partial"] is True
+        assert snapshot.read_bytes() == content
+        assert os.path.getmtime(snapshot) == mtime
+        assert glob(str(snapshot_dir / "*.part")) == []
+
+
+class _CutBody(io.RawIOBase):
+    """A response body that delivers `data`, then fails like a dropped connection."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if not self._data:
+            raise urllib3.exceptions.ProtocolError("Connection broken: IncompleteRead")
+        size = min(len(buffer), len(self._data))
+        buffer[:size], self._data = self._data[:size], self._data[size:]
+        return size
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INESourceErrorTest(PytestOnlyDBTestCase):
+    """The error page INE appends to a 200 response is the source's fault, not the
+    network's, and the job has to say which one it was."""
+
+    def _source(self):
+        return HarvestSourceFactory(backend="ine", url=INE_URL, organization=OrganizationFactory())
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, **response):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        rmock.get(INE_URL, **response)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend.harvest()
+
+    def _remote_ids(self, source):
+        return sorted(
+            d.harvest.remote_id
+            for d in Dataset.objects(__raw__={"harvest.source_id": str(source.id)})
+        )
+
+    def test_error_page_with_http_200_is_a_source_error(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        body = _truncated_catalog_xml(["0001", "0002"]) + JAVA_ERROR_PAGE
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, text=body)
+
+        assert job.errors[-1].message.startswith("INE source error:")
+        assert "error page in the response body" in job.errors[-1].message
+        assert job.data["partial"] is True
+        # Both indicators shared the chunk with the error page and still went through.
+        assert self._remote_ids(source) == ["0001", "0002"]
+
+    def test_error_page_leaves_the_snapshot_untouched(self, rmock, monkeypatch, tmp_path):
+        snapshot = tmp_path / "ine.xml"
+        snapshot.write_text(_catalog_xml(["0001"]))
+        old = time.time() - 3600
+        os.utime(snapshot, (old, old))
+        content, mtime = snapshot.read_bytes(), os.path.getmtime(snapshot)
+
+        self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            text=_truncated_catalog_xml(["0001", "0002"]) + JAVA_ERROR_PAGE,
+        )
+
+        assert snapshot.read_bytes() == content
+        assert os.path.getmtime(snapshot) == mtime
+        assert glob(str(tmp_path / "*.part")) == []
+
+    def test_chunked_encoding_error_is_a_network_error(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        # Padded to exactly one 8 KiB read, so both indicators reach the parser
+        # before the read that fails.
+        data = _truncated_catalog_xml(["0001", "0002"]).encode().ljust(8192, b"\n")
+        responses = [{"body": _CutBody(data)}, {"body": _CutBody(data)}]
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, response_list=responses)
+
+        assert job.errors[-1].message.startswith("INE network error:")
+        assert job.data["partial"] is True
+        assert self._remote_ids(source) == ["0001", "0002"]
+
+    def test_source_error_without_snapshot_fails_the_job(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, text=JAVA_ERROR_PAGE)
+
+        assert job.status == "failed"
+        assert job.errors[-1].message.startswith("INE source error:")
+        assert self._remote_ids(source) == []
+
+
+class INEErrorPageScannerTest:
+    def test_marker_split_across_chunks_is_detected(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"<catalog>\n<indicator id='1'></indicator>\njav") is None
+        found = scanner.feed(b"ax.naming.NameNotFoundException")
+
+        assert found == (-3, b"javax.naming.")
+
+    def test_stack_frame_lookalike_in_a_description_is_accepted(self):
+        # A false positive would cut every run at the same byte, forever.
+        scanner = _ErrorPageScanner()
+        text = b"<catalog><indicator id='1'><description>Ponte de Lima\n\tat 2020"
+
+        assert scanner.feed(text + b" Exception javax</description></indicator>") is None
+
+    def test_bom_split_across_chunks_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"\xef") is None
+        assert scanner.feed(b"\xbb\xbf<catalog>") is None
+
+    def test_html_element_inside_an_indicator_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"<catalog><indicator id='1'><html><bdd_url>x</bdd_url></html>") is None
+
+    def test_bom_before_the_declaration_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"\xef\xbb\xbf\n\n<?xml version='1.0'?><catalog>") is None
+
+    def test_head_split_across_chunks_is_accepted(self):
+        scanner = _ErrorPageScanner()
+
+        assert scanner.feed(b"\n\n\n<cat") is None
+        assert scanner.feed(b"alog><indicator id='1'/>") is None
+
+    def test_non_xml_head_is_rejected(self):
+        with pytest.raises(HarvestSourceError):
+            _ErrorPageScanner().feed(b"<!DOCTYPE html><html><body>Erro</body></html>")
+
+    def test_bytes_before_the_marker_are_returned_before_the_error(self, tmp_path):
+        good = b"<catalog><indicator id='1'><title>A</title></indicator>"
+        response = type("Response", (), {})()
+        response.iter_content = lambda chunk_size: iter([good + b"\njavax.naming.Foo"])
+        stream = _INECatalogStream(response, str(tmp_path / "x.part"))
+
+        assert stream.read(16384) == good + b"\n"
+        with pytest.raises(HarvestSourceError):
+            stream.read(16384)
+        stream.close()
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEInstrumentationTest(PytestOnlyDBTestCase):
+    """Every phase is timed into `job.data`, so a slow run says where the time went."""
+
+    PHASES = {"download_parse", "prefetch", "change_detection", "serialize", "bulk_write", "total"}
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _backend(self, monkeypatch, tmp_path, source):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, responses, backend=None):
+        rmock.get(INE_URL, responses)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        backend = backend or self._backend(monkeypatch, tmp_path, source)
+        job = backend.harvest()
+        job.reload()
+        return job
+
+    def test_job_data_records_the_duration_of_each_phase(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        # Harvested once first, so the second run exercises change detection too.
+        body = _catalog_xml(["0001", "0002", "0003"])
+        self._harvest(rmock, monkeypatch, tmp_path, source, [{"text": body}])
+        DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id="0004", source_id=str(source.id), domain=source.domain
+            )
+        )
+        body = _catalog_xml(["0001", "0002", "0003", "0004"], revision=" (rev)")
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, [{"text": body}])
+
+        timings = job.data["timings"]
+        assert self.PHASES <= set(timings)
+        assert all(isinstance(value, float) and value >= 0 for value in timings.values())
+        assert job.data["download"]["bytes"] == len(body.encode())
+        attempts = job.data["download"]["attempts"]
+        assert len(attempts) == 1
+        assert attempts[0]["error"] is None
+
+    def test_failed_attempts_are_recorded_with_bytes_and_reason(self, rmock, monkeypatch, tmp_path):
+        truncated = _truncated_catalog_xml(["0001", "0002"])
+
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            [{"text": truncated}, {"text": _catalog_xml(["0001", "0002"])}],
+        )
+
+        first, second = job.data["download"]["attempts"]
+        assert first["kind"] == "source"
+        assert first["error"]
+        assert first["bytes"] == len(truncated.encode())
+        assert second["error"] is None
+        assert second["kind"] is None
+
+    def test_autoarchive_duration_is_recorded(self, rmock, monkeypatch, tmp_path):
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(autoarchive=True),
+            [{"text": _catalog_xml(["0001"])}],
+        )
+
+        assert isinstance(job.data["timings"]["autoarchive"], float)
+
+    def test_download_parse_excludes_chunk_processing(self, rmock, monkeypatch, tmp_path):
+        source = self._source()
+        backend = self._backend(monkeypatch, tmp_path, source)
+        now = [0.0]
+        backend._clock = lambda: now[0]
+        process_chunk = backend._process_chunk
+
+        def slow_process_chunk(chunk):
+            now[0] += 100
+            process_chunk(chunk)
+
+        backend._process_chunk = slow_process_chunk
+
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            source,
+            [{"text": _catalog_xml(["0001", "0002"])}],
+            backend=backend,
+        )
+
+        assert job.data["timings"]["download_parse"] < 100
+        assert job.data["timings"]["total"] >= 100
+
+    def test_timings_do_not_drop_the_snapshot_entry(self, rmock, monkeypatch, tmp_path):
+        (tmp_path / "ine.xml").write_text(_catalog_xml(["0001"]))
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, self._source(), [{"text": ""}])
+
+        assert job.data["snapshot"]["used"] is True
+        assert "timings" in job.data
+
+
+@pytest.mark.options(HARVESTER_BACKENDS=["ine"])
+class INEReviewEdgeCasesTest(PytestOnlyDBTestCase):
+    """Failure paths around the stream: HTTP errors, a lost final push, a snapshot
+    older than a partial run, and leftovers of a killed worker."""
+
+    def _source(self, **kwargs):
+        return HarvestSourceFactory(
+            backend="ine", url=INE_URL, organization=OrganizationFactory(), **kwargs
+        )
+
+    def _backend(self, monkeypatch, tmp_path, source):
+        monkeypatch.setattr("udata.harvest.backends.ine.time.sleep", lambda *a, **k: None)
+        backend = INEBackend(source)
+        backend.LOCAL_FILE_PATH = str(tmp_path / "ine.xml")
+        backend.DOWNLOAD_MAX_RETRIES = 2
+        return backend
+
+    def _harvest(self, rmock, monkeypatch, tmp_path, source, responses):
+        rmock.get(INE_URL, responses)
+        rmock.get(INE_HVD_URL, text="<indicators/>")
+        return self._backend(monkeypatch, tmp_path, source).harvest()
+
+    def _snapshot(self, tmp_path, ids, age_seconds=3600, **kwargs):
+        snapshot = tmp_path / "ine.xml"
+        snapshot.write_text(_catalog_xml(ids, **kwargs))
+        old = time.time() - age_seconds
+        os.utime(snapshot, (old, old))
+        return snapshot
+
+    def test_server_error_is_retried(self, rmock, monkeypatch, tmp_path):
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            [{"status_code": 503, "text": "busy"}, {"text": _catalog_xml(["0001"])}],
+        )
+
+        assert job.status == "done"
+        assert job.errors == []
+        assert [item.status for item in job.items] == ["done"]
+
+    def test_server_error_falls_back_to_the_snapshot(self, rmock, monkeypatch, tmp_path):
+        self._snapshot(tmp_path, ["0001"])
+
+        job = self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), [{"status_code": 502, "text": "x"}]
+        )
+
+        assert job.status == "done"
+        assert job.data["snapshot"]["used"] is True
+        assert job.errors[-1].message.startswith("INE source error:")
+
+    def test_client_error_still_fails_at_once(self, rmock, monkeypatch, tmp_path):
+        self._snapshot(tmp_path, ["0001"])
+
+        job = self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), [{"status_code": 404, "text": "x"}]
+        )
+
+        assert job.status == "failed"
+        catalog_requests = [r for r in rmock.request_history if "xml_indic.jsp" in r.url]
+        assert len(catalog_requests) == 1
+
+    def test_network_failure_without_snapshot_is_a_network_error(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        job = self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            self._source(),
+            [{"exc": requests.exceptions.ConnectTimeout("timed out")}],
+        )
+
+        assert job.status == "failed"
+        assert job.errors[-1].message.startswith("INE network error:")
+
+    def test_lost_final_push_fails_the_job_instead_of_archiving(self, rmock, monkeypatch, tmp_path):
+        source = self._source(autoarchive=True)
+        stale = DatasetFactory(
+            harvest=HarvestDatasetMetadata(
+                remote_id="0002",
+                source_id=str(source.id),
+                domain=source.domain,
+                last_update=date.today() - timedelta(days=400),
+            )
+        )
+
+        def broken_push(self, items):
+            raise RuntimeError("job document too large")
+
+        monkeypatch.setattr(INEBackend, "_append_job_items", broken_push)
+
+        job = self._harvest(
+            rmock, monkeypatch, tmp_path, source, [{"text": _catalog_xml(["0001", "0002"])}]
+        )
+
+        assert job.status == "failed"
+        stale.reload()
+        assert stale.harvest.archived_at is None
+
+    def test_snapshot_fallback_does_not_roll_back_a_later_partial_run(
+        self, rmock, monkeypatch, tmp_path
+    ):
+        source = self._source()
+        self._snapshot(tmp_path, ["0001", "0002"], revision=" (old)")
+        # A partial run reaches the source after the snapshot was taken.
+        self._harvest(
+            rmock,
+            monkeypatch,
+            tmp_path,
+            source,
+            [{"text": _truncated_catalog_xml(["0001"], revision=" (new)")}],
+        )
+
+        job = self._harvest(rmock, monkeypatch, tmp_path, source, [{"text": ""}])
+
+        assert job.data["snapshot"]["used"] is True
+        newer = Dataset.objects(__raw__={"harvest.remote_id": "0001"}).first()
+        assert newer.description.startswith("Descrição 0001 (new)")
+        only_in_snapshot = Dataset.objects(__raw__={"harvest.remote_id": "0002"}).first()
+        assert only_in_snapshot.description.startswith("Descrição 0002 (old)")
+        statuses = {item.remote_id: item.status for item in job.items}
+        assert statuses == {"0001": "skipped", "0002": "done"}
+
+    def test_parts_left_by_a_killed_worker_are_removed(self, rmock, monkeypatch, tmp_path):
+        stale_part = tmp_path / "ine.xml.123-deadbeef.part"
+        stale_part.write_text("<catalog>")
+        old = time.time() - 3 * 24 * 3600
+        os.utime(stale_part, (old, old))
+        fresh_part = tmp_path / "ine.xml.456-cafebabe.part"
+        fresh_part.write_text("<catalog>")
+
+        self._harvest(
+            rmock, monkeypatch, tmp_path, self._source(), [{"text": _catalog_xml(["0001"])}]
+        )
+
+        assert not stale_part.exists()
+        # Possibly another worker's live transfer: left alone.
+        assert fresh_part.exists()

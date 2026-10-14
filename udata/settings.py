@@ -395,6 +395,11 @@ class Defaults(object):
     # The number of days since last harvesting date when a missing dataset is archived
     HARVEST_AUTOARCHIVE_GRACE_DAYS = 7
 
+    # Directory where harvesters that download a whole catalogue (INE) keep the last
+    # complete copy, to fall back on when the source fails. Must be persistent and
+    # shared by the workers; defaults to `<FS_ROOT>/harvest-snapshots`.
+    HARVEST_SNAPSHOT_DIR = None
+
     HARVEST_VALIDATION_CONTACT_FORM = None
 
     HARVEST_MAX_CATALOG_SIZE_IN_MONGO = None  # Defaults to the size of a MongoDB document
@@ -426,7 +431,6 @@ class Defaults(object):
     TRACKING_BLACKLIST = [
         "api.notifications",
         "api.check_dataset_resource",
-        "api.avatar",
     ]
 
     DELETE_ME = True
@@ -552,28 +556,6 @@ class Defaults(object):
     # Deployments override it through `udata.cfg` (env `RESOURCES_FILE_MAX_SIZE`)
     # rather than by editing this default.
     RESOURCES_FILE_MAX_SIZE = 1024 * 1024 * 1024
-
-    # Avatar providers parameters
-    # Overrides themes and default parameters
-    # if set to anything else than `None`
-    ###########################################################################
-    # avatar provider used to render user avatars
-    # Number of blocks used by the internal provider
-    AVATAR_INTERNAL_SIZE = 7
-    # List of foreground colors used by the internal provider
-    AVATAR_INTERNAL_FOREGROUND = [
-        "rgb(45,79,255)",
-        "rgb(254,180,44)",
-        "rgb(226,121,234)",
-        "rgb(30,179,253)",
-        "rgb(232,77,65)",
-        "rgb(49,203,115)",
-        "rgb(141,69,170)",
-    ]
-    # Background color used by the internal provider
-    AVATAR_INTERNAL_BACKGROUND = "rgb(224,224,224)"
-    # Padding (in percent) used by the internal provider
-    AVATAR_INTERNAL_PADDING = 10
 
     # Notification settings
     ###########################################################################
