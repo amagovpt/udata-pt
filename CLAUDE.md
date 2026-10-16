@@ -106,6 +106,31 @@ This backend repo (`github.com/amagovpt/udata-pt`) has long-lived environment br
 
 > The PR base is always the **next environment up**, not always `main`. Apply this flow only when the change touches this repo. Check `gh auth status` first — the GitHub CLI is available on some team machines and not on others. When it is authenticated, open the PR with `gh pr create --repo amagovpt/udata-pt --base <base> --head <branch>` and follow CI with `gh pr checks`; otherwise open it via the compare URL `https://github.com/amagovpt/udata-pt/compare/<base>...<head>?expand=1`. See the monorepo `CLAUDE.md` for the cross-repo rule.
 
+### Versioning & Releases
+
+This repo is a fork of [udata](https://github.com/opendatateam/udata) and versions itself as `vX.Y.Z.N`:
+
+- `X.Y.Z` — the upstream udata version the fork is built on. Today: **16.0.0**. Confirm it by ancestry, never by reading `pyproject.toml` (it has been stale before): `git merge-base --is-ancestor refs/tags/upstream/vX.Y.Z origin/main`.
+- `N` — the Portuguese revision. Incremented on every promotion to `main`, reset to `1` on each upstream sync (once synced to 17.14.0, the next release is `17.14.0.1`).
+
+Four segments never collide with upstream, which only ever publishes three, and they sort correctly under PEP 440 (`16.0.0 < 16.0.0.1 < 16.0.1 < 16.1.0`). Do not use `16.0.0+pt.1` (the `+` is invalid as a Docker tag) nor `16.0.0-pt.1` (SemVer sorts a hyphen suffix *before* `16.0.0`).
+
+Cutting a release:
+
+1. The content reaches `main` through the normal promotion flow — never commit or push directly to an environment branch.
+2. Put a `## 16.0.0.N (YYYY-MM-DD)` heading over that release's entries in `CHANGELOG.md`, and set the same number in `version` in `pyproject.toml`.
+3. Run `./tag-version.sh 16.0.0.N --keep-changelog` from a working branch whose HEAD matches `origin/main`. It tags, pushes the tag and opens the GitHub release with the notes read from that changelog section, without rewriting the changelog.
+4. One tag per promotion to `main` — the same cadence `dadosgov-fe` uses.
+
+Never let upstream tags into the main tag namespace; they would mix with this fork's releases. Configure the remote once:
+
+```bash
+git remote add upstream https://github.com/opendatateam/udata.git
+git config remote.upstream.tagOpt --no-tags
+# when you do need to compare against upstream, keep its tags namespaced:
+git fetch upstream '+refs/tags/*:refs/tags/upstream/*' --no-tags
+```
+
 ### Commits — Conventional Commits 1.0.0
 
 Format:

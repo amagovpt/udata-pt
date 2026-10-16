@@ -1,18 +1,23 @@
 #!/bin/bash
 
 # Script to create a git tag and update CHANGELOG.md
-# Usage: ./tag-version.sh <version> [--dry-run] [--breaking PR1,PR2,...]
+# Usage: ./tag-version.sh <version> [--dry-run] [--keep-changelog] [--breaking PR1,PR2,...]
 
 set -e
 
 DRY_RUN=false
 BREAKING_PRS=""
+KEEP_CHANGELOG=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --keep-changelog)
+            KEEP_CHANGELOG=true
             shift
             ;;
         --breaking)
@@ -27,10 +32,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 <version> [--dry-run] [--breaking PR1,PR2,...]"
+    echo "Usage: $0 <version> [--dry-run] [--keep-changelog] [--breaking PR1,PR2,...]"
     echo "Example: $0 11.0.1"
     echo "Example: $0 11.0.1 --dry-run"
     echo "Example: $0 11.0.1 --breaking 3649,3651"
+    echo "Example: $0 16.0.0.13 --keep-changelog   # notes from the existing CHANGELOG section"
     exit 1
 fi
 
@@ -41,17 +47,71 @@ if [ "$DRY_RUN" = true ]; then
     echo ""
 fi
 
-# Check if gh CLI is installed and configured
-if ! command -v gh &> /dev/null; then
+# Resolve the real GitHub CLI. A pyenv shim named 'gh' can shadow it in PATH,
+# so accept only a binary whose --version looks like "gh version X.Y.Z".
+GH_BIN=""
+for cand in "$(command -v gh 2>/dev/null)" /usr/bin/gh /usr/local/bin/gh /snap/bin/gh; do
+    if [ -n "$cand" ] && [ -x "$cand" ] && "$cand" --version 2>/dev/null | head -1 | grep -qE '^gh version [0-9]'; then
+        GH_BIN="$cand"
+        break
+    fi
+done
+
+if [ -z "$GH_BIN" ]; then
     echo "Error: GitHub CLI (gh) is not installed"
     echo "Please install it: https://cli.github.com/"
     exit 1
 fi
 
-if ! gh auth status &> /dev/null; then
+if ! "$GH_BIN" auth status &> /dev/null; then
     echo "Error: GitHub CLI is not authenticated"
     echo "Please run: gh auth login"
     exit 1
+fi
+
+# --keep-changelog: the changelog section was written by hand during the promotion
+# flow. Tag the current origin/main and publish the release with that section as
+# the notes; never rewrite CHANGELOG.md and never push a branch.
+if [ "$KEEP_CHANGELOG" = true ]; then
+    if ! git diff-index --quiet HEAD --; then
+        echo "Error: Working copy is not clean. Please commit or stash your changes."
+        exit 1
+    fi
+
+    git fetch origin main --quiet
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+        echo "Error: HEAD is not at origin/main — a release is always cut from production"
+        echo "HEAD:        $(git rev-parse --short HEAD)"
+        echo "origin/main: $(git rev-parse --short origin/main)"
+        exit 1
+    fi
+
+    if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+        echo "Error: Tag v$VERSION already exists"
+        exit 1
+    fi
+
+    RELEASE_NOTES=$(awk -v hdr="## $VERSION (" 'index($0, hdr) == 1 { found = 1; next } found && /^## / { exit } found { print }' CHANGELOG.md)
+    if [ -z "$(echo "$RELEASE_NOTES" | tr -d '[:space:]')" ]; then
+        echo "Error: no '## $VERSION (<date>)' section found in CHANGELOG.md"
+        echo "Add the section during the promotion flow, then re-run."
+        exit 1
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        echo "Would tag $(git rev-parse --short HEAD) as v$VERSION with these notes:"
+        echo ""
+        echo "$RELEASE_NOTES"
+        exit 0
+    fi
+
+    git tag -a "v$VERSION" -m "Version $VERSION"
+    git push origin "v$VERSION"
+    echo "✓ Pushed tag v$VERSION"
+
+    echo "$RELEASE_NOTES" | "$GH_BIN" release create "v$VERSION" --title "v$VERSION" --notes-file -
+    echo "✓ Created GitHub release v$VERSION"
+    exit 0
 fi
 
 # Detect main branch (master or main)
@@ -296,7 +356,7 @@ git push origin HEAD "v$VERSION"
 echo "✓ Pushed commit and tag v$VERSION to origin"
 
 # Create GitHub release
-echo "$RELEASE_NOTES" | gh release create "v$VERSION" \
+echo "$RELEASE_NOTES" | "$GH_BIN" release create "v$VERSION" \
     --title "v$VERSION" \
     --notes-file -
 

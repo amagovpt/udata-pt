@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "udata"
-version = "15.1.0"
+version = "16.0.0.12"
 # dynamic = ["version"]  # disabled: setuptools-scm needs .git at package root
 description = "Open data portal"
 readme = "README.md"
