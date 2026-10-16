@@ -9,6 +9,15 @@
 
 ## Unreleased
 
+- **chore(release): refuse to tag a version the project does not declare**
+  - `tag-version.sh` created whatever tag it was given, so `v16.0.0.13` could be cut against a
+    `pyproject.toml` still saying `16.0.0.12`. That is not hypothetical: the declared version sat
+    at `15.1.0` long after the fork had moved to 16.0.0, and the portal footer repeated a stale
+    number to visitors for months.
+  - The release now stops with both numbers named and what to do about it. It guards the normal
+    path and the `--keep-changelog` path alike, and reads the declaration itself rather than
+    trusting the caller.
+
 ## 16.0.0.12 (2026-10-14)
 
 - **feat(harvest): the OGC backend catalogues the CNMD metadata record**

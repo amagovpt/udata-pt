@@ -119,8 +119,9 @@ Cutting a release:
 
 1. The content reaches `main` through the normal promotion flow — never commit or push directly to an environment branch.
 2. Put a `## 16.0.0.N (YYYY-MM-DD)` heading over that release's entries in `CHANGELOG.md`, and set the same number in `version` in `pyproject.toml`.
-3. Run `./tag-version.sh 16.0.0.N --keep-changelog` from a working branch whose HEAD matches `origin/main`. It tags, pushes the tag and opens the GitHub release with the notes read from that changelog section, without rewriting the changelog.
-4. One tag per promotion to `main` — the same cadence `dadosgov-fe` uses.
+3. Run `./tag-version.sh 16.0.0.N --keep-changelog` from a working branch whose HEAD matches `origin/main`. It tags, pushes the tag and opens the GitHub release with the notes read from that changelog section, without rewriting the changelog. It refuses to tag when `pyproject.toml` declares a different version than the one being tagged — the two drifting apart is what put a stale number in the portal footer for months.
+4. After the environment is deployed, confirm it is serving what you tagged: `../scripts/check_deployed_version.sh https://dados.gov.pt 16.0.0.N`. The version the API reports comes from the installed distribution metadata, so code deployed without the package being reinstalled keeps answering with the previous one.
+5. One tag per promotion to `main` — the same cadence `dadosgov-fe` uses.
 
 Never let upstream tags into the main tag namespace; they would mix with this fork's releases. Configure the remote once:
 
