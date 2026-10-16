@@ -69,6 +69,27 @@ if ! "$GH_BIN" auth status &> /dev/null; then
     exit 1
 fi
 
+# The version is declared in two places that must agree: the tag about to be
+# created and `version` in pyproject.toml. They drifting apart is not a
+# hypothetical -- pyproject sat at 15.1.0 while the fork had moved to 16.0.0,
+# and the portal footer announced the stale number for months. Refuse rather
+# than record the disagreement in a tag nobody can fix afterwards.
+check_declared_version() {
+    local declared
+    declared=$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+
+    if [ -z "$declared" ]; then
+        echo "Error: could not read 'version' from pyproject.toml"
+        exit 1
+    fi
+
+    if [ "$declared" != "$VERSION" ]; then
+        echo "Error: pyproject.toml declares $declared, but you are tagging $VERSION"
+        echo "Set version = \"$VERSION\" in pyproject.toml, promote it to main, then tag."
+        exit 1
+    fi
+}
+
 # --keep-changelog: the changelog section was written by hand during the promotion
 # flow. Tag the current origin/main and publish the release with that section as
 # the notes; never rewrite CHANGELOG.md and never push a branch.
@@ -90,6 +111,8 @@ if [ "$KEEP_CHANGELOG" = true ]; then
         echo "Error: Tag v$VERSION already exists"
         exit 1
     fi
+
+    check_declared_version
 
     RELEASE_NOTES=$(awk -v hdr="## $VERSION (" 'index($0, hdr) == 1 { found = 1; next } found && /^## / { exit } found { print }' CHANGELOG.md)
     if [ -z "$(echo "$RELEASE_NOTES" | tr -d '[:space:]')" ]; then
@@ -155,6 +178,8 @@ if git rev-parse "v$VERSION" >/dev/null 2>&1; then
     echo "Error: Tag v$VERSION already exists"
     exit 1
 fi
+
+check_declared_version
 
 # Get repository URL for PR links
 GIT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
