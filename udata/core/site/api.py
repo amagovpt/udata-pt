@@ -103,6 +103,12 @@ def _serialize_dataset(dataset):
         "slug": dataset.slug,
         "description": dataset.description,
         "last_modified": (dataset.last_modified.isoformat() if dataset.last_modified else None),
+        # The date the homepage card actually wants: `last_modified` is frozen at the
+        # value it had when the document was last written, which for a harvested dataset
+        # is usually its creation, while `last_update` is recomputed from the resources
+        # on every save. The full serializer has carried it all along; this payload is
+        # the one place a card could not reach it (LEDG-2599).
+        "last_update": dataset.last_update.isoformat() if dataset.last_update else None,
         "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
         "organization": ({"name": org.name, "logo": _serialize_image(org.logo)} if org else None),
         # Owner is the fallback author when no organization is set (LEDG-1861).
