@@ -1,19 +1,15 @@
 # Changelog
 
+> **Versioning.** This is the Portuguese fork of [udata](https://github.com/opendatateam/udata),
+> currently based on upstream **v16.0.0**. Releases are numbered `X.Y.Z.N`, where `X.Y.Z` is the
+> upstream version the fork is built on and `N` is the Portuguese revision: it is incremented on
+> every promotion to `main` and reset to `1` whenever the fork is synced with a newer upstream.
+> Four segments never collide with upstream, which only ever publishes three. Entries from
+> `## 16.0.0 (2026-03-24)` downwards come from upstream.
+
 ## Unreleased
 
-- **fix(site): the homepage card can tell how recently a dataset changed**
-  - The lightweight payload behind the homepage carried only `last_modified`, which is frozen
-    at whatever the document held when it was last written. For a harvested dataset that is
-    usually its creation date, so the card reported datasets as untouched for months while
-    their files changed underneath. `last_update`, recomputed from the resources on every
-    save, is the date the card wants, and the full serializer has carried it all along --
-    this payload was the one place a card could not reach it.
-  - Additive: the field is new in the response and ignored by any frontend that does not read
-    it yet, so it can be promoted on its own. Worth knowing for whoever reads it: this field is
-    recomputed from the resources only on a full save, and the resource mutators write through
-    an atomic update that skips that, so it can lag behind a freshly uploaded file. The portal
-    pairs it with `last_modified` rather than trusting it alone.
+## 16.0.0.12 (2026-10-14)
 
 - **feat(harvest): the OGC backend catalogues the CNMD metadata record**
   - The TML collections publish their CNMD metadata as a distribution of their own, a JSON-LD
@@ -176,6 +172,8 @@
     and the `pydenticon` dependency go with it. Avatar upload, serving and deletion are untouched.
   - **Breaking**: the route now answers 404 and the namespace no longer appears in the Swagger spec.
 
+## 16.0.0.11 (2026-09-30)
+
 - **fix(site): the public homepage no longer renders zeros when its aggregated endpoint is throttled**
   - `/api/1/site/home/` carried no explicit rate limit, so it fell under the IP-keyed
     `RATELIMIT_DEFAULT` ("1000 per day; 200 per hour"). The endpoint is fetched server-side by the
@@ -191,6 +189,8 @@
     under IP-collapse a daily cap becomes a site-wide daily block. Third endpoint to need this
     after `GET /api/1/me/` and the listing pages; the regression suite that covers that class now
     includes the homepage.
+
+## 16.0.0.10 (2026-09-29)
 
 - **fix(harvest): URL credential redaction no longer takes seconds on a long message with an `@`**
   - `redact_url_credentials` runs on every Sentry event (`before_send`), on every `HarvestError`
@@ -248,6 +248,8 @@
     finish; then run one full dataset reindex (`udata search index dataset`), because what
     earlier INE harvests wrote never reached the index and no `-f` timestamp selects it. The
     order and the reasons are in `docs/administrative-tasks.md`.
+
+## 16.0.0.9 (2026-09-24)
 
 - **fix(harvest): the harvest source text index is replaced before any other pending
   migration reads the model**
@@ -380,6 +382,8 @@
     that did nothing else; `ine` stops re-importing `os` inside five methods that the module
     already imports it for; and the generated "Here you comes your implementation" comment is
     gone.
+
+## 16.0.0.8 (2026-09-23)
 
 - **fix(harvest): a harvest source whose validator was removed from the database no longer
   takes the whole sources listing down**
@@ -2715,6 +2719,9 @@
     conclusive on its own — a completed takeover leaves a single dataset on the
     attacker's source and looks exactly like an ordinary harvest — so the
     evidence is the absence of any URI-shaped remote id on more than one source.
+
+## 16.0.0.7 (2026-08-25)
+
 - **feat(dataset)!: filter multiple tags with OR instead of AND**
   - The dataset listing's keyword filter is multi-select, and every other
     multi-select filter already answered OR (`license`, `format`, `frequency`,
@@ -3170,6 +3177,8 @@
     plus the reassembled file, cleaned up after `UPLOAD_MAX_RETENTION`), and the
     frontend sends up to three files in parallel.
 
+## 16.0.0.6 (2026-08-12)
+
 - **fix: restore the twelve tests that had been failing on `develop`**
   - `.gitignore` carried a bare `data` entry, which git matches against any
     file or directory of that name at any depth rather than the local data
@@ -3271,6 +3280,8 @@
     of certified public-service organizations, so it currently covers a subset
     of the tagged datasets.
 
+## 16.0.0.5 (2026-07-27)
+
 - **chore(uwsgi): enable honour-range for static-map downloads** [#176](https://github.com/amagovpt/udata-pt/pull/176)
   - Files under `/s/` are served by the uWSGI static-map, which ignores the
     HTTP `Range` header unless `honour-range` is set — every response was a
@@ -3309,6 +3320,8 @@
   - The frontend adds permanent redirects for old `/pages/*` URLs (links in
     already-sent emails, bookmarks, indexed pages), so stale links keep
     working.
+
+## 16.0.0.4 (2026-07-16)
 
 - **fix(storages): harden chunked uploads against intermittent file corruption** [#167](https://github.com/amagovpt/udata-pt/pull/167)
   - Resource files uploaded/replaced via the admin were sometimes corrupted in
@@ -3529,6 +3542,8 @@
     block mid-crawl). Regression suite in
     `test_extras_writeback_ratelimit_ip_collapse.py`.
 
+## 16.0.0.3 (2026-07-08)
+
 - **fix: stop rejecting valid data files that contain HTML-looking substrings**
   - `validate_upload()` scanned every non-image, non-XML upload for HTML/script
     tokens (`<script`, `javascript:`, `<iframe`, `<object`, `<embed`). This is a
@@ -3583,6 +3598,17 @@
     the tags actually stored on datasets (both export in
     `core/dataset/rdf.py` / `core/dataservices/rdf.py` and import in
     `theme_labels_from_rdf`). The category URIs are unchanged.
+
+## 16.0.0.2 (2026-06-25)
+
+- **fix(storages): enforce the 800 MB resource upload cap on the server**
+  - The limit was advisory on the client only, so a direct API call could store a file of any size.
+- **feat(storages): accept `gpkg` compound archive extensions**
+  - Geopackage archives such as `.gpkg.zip` were rejected by the extension allowlist.
+- **chore(saml): log whether the signing certificate came from the assertion or the metadata**
+  - Signature failures gave no way to tell the two apart, which made CMD/eIDAS incidents hard to read.
+
+## 16.0.0.1 (2026-06-23)
 
 - **feat: add server-side `status` filter to `GET /api/1/reuses/`**
   - The admin/backoffice reuses listing previously filtered by lifecycle status

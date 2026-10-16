@@ -1,5 +1,27 @@
 # Versioning and deprecating
 
+## Portuguese fork (`amagovpt/udata-pt`)
+
+This fork versions itself as `vX.Y.Z.N`, where `X.Y.Z` is the upstream udata release it is built
+on — today **16.0.0** — and `N` is the Portuguese revision, incremented on every promotion to
+`main` and reset to `1` at each upstream sync. Upstream only ever publishes three segments, so a
+fourth one can never collide with it, and PEP 440 orders the result correctly:
+`16.0.0 < 16.0.0.1 < 16.0.1 < 16.1.0`.
+
+Determine the upstream base by ancestry rather than by reading `pyproject.toml`, which has gone
+stale before:
+
+```bash
+git remote add upstream https://github.com/opendatateam/udata.git
+git config remote.upstream.tagOpt --no-tags
+git fetch upstream '+refs/tags/*:refs/tags/upstream/*' --no-tags   # keep their tags namespaced
+git merge-base --is-ancestor refs/tags/upstream/v16.0.0 origin/main && echo "base is 16.0.0"
+```
+
+Releases are cut from `main`, one per promotion, with the changelog section written by hand during
+the promotion flow and `./tag-version.sh <version> --keep-changelog` doing the tag and the GitHub
+release. The rest of this document describes the upstream project's own process.
+
 ## Versioning process
 
 udata follows [Python PEP 440 on versioning][pep440] to version its published releases.
