@@ -8,6 +8,84 @@ on — today **16.0.0** — and `N` is the Portuguese revision, incremented on e
 fourth one can never collide with it, and PEP 440 orders the result correctly:
 `16.0.0 < 16.0.0.1 < 16.0.1 < 16.1.0`.
 
+### Which upstream version is this fork on, and why `pyproject.toml` cannot answer it
+
+**Do not read the version out of `pyproject.toml` or out of what `uv sync` prints.** Both report
+the same frozen literal, and that literal has been wrong for months at a time.
+
+Upstream never writes its version by hand: it declares `dynamic = ["version"]` and lets
+setuptools-scm compute it from the git tag. This fork disabled that and hardcoded a literal
+instead, which was accurate on the day it was written and stopped tracking anything afterwards.
+The result, found in October 2026:
+
+| what | said |
+| --- | --- |
+| `pyproject.toml` in every tag from `v16.0.0.1` to `v16.0.0.12` | `15.1.0` |
+| `uv sync` installing any of them | `udata==15.1.0` |
+| the code in those same commits | upstream **16.0.0** |
+
+The number was eight months stale. The code was not.
+
+#### How to establish the base for real
+
+Three independent checks. Run all three at every upstream sync, and write the answer into
+`pyproject.toml` so the literal stops lying.
+
+**1. Ancestry — is the upstream release fully contained?**
+
+```bash
+git remote add upstream https://github.com/opendatateam/udata.git   # once
+git config remote.upstream.tagOpt --no-tags                          # once
+git fetch upstream '+refs/tags/*:refs/tags/upstream/*' --no-tags
+
+# 0 commits missing means that release is entirely inside this branch
+git rev-list --count refs/tags/upstream/v16.0.0 ^origin/main
+git rev-list --count refs/tags/upstream/v16.1.0 ^origin/main   # expect > 0
+```
+
+The base is the newest upstream release whose count is `0`.
+
+**2. Content — the files that only exist from that release onwards.**
+
+Ancestry alone can mislead: a badly resolved sync can record upstream commits as ancestors while
+dropping what they added. So check the files, too.
+
+```bash
+# what the upstream release actually added and removed
+git diff --name-status --diff-filter=A refs/tags/upstream/v15.1.0 refs/tags/upstream/v16.0.0 -- udata/
+git diff --name-status --diff-filter=D refs/tags/upstream/v15.1.0 refs/tags/upstream/v16.0.0 -- udata/
+
+# then, for the commit you are checking
+git cat-file -e "<ref>":"udata/core/api_token/models.py" && echo present
+```
+
+For the 16.0.0 base this gave 8 added files and 2 removed, and all twelve Portuguese tags carried
+8 of 8 and 0 of 2 — conclusive.
+
+> **Shell trap.** In zsh, `git show $ref:udata/...` silently applies the `:u` parameter modifier
+> and mangles the path, so every check answers "absent". Quote it as `"$ref":"udata/..."`.
+
+**3. Migrations — the check with consequences.**
+
+`udata/migrations/2026-01-28-migrate-apikeys-to-api-tokens.py` exists from 16.0.0 and not before.
+If a database has run it, the deployment is on 16.0.0 whatever any file claims — and labelling
+that code `15.1.0` would invite someone to "go back" to a real 15.1.0 against a migrated
+database. Migrations do not revert.
+
+#### Why the Portuguese revision resets at each sync
+
+`N` does not count Portuguese releases; it counts the revisions that sit **on this upstream
+base**. Measured in October 2026, of 286 files the fork changes against upstream 16.0.0, **114
+are new files of ours and 172 are upstream files we modified** — nearly two thirds. Those 172 do
+not travel to a new base for free: each sync reconciles them, some conflict, some stop making
+sense because upstream solved the same problem differently.
+
+So what comes out of a sync is not "the 13th Portuguese version continuing", it is the first
+Portuguese revision of a new base. Resetting says that; a running counter would claim a history
+that did not happen on that base, and leave a reader asking where `.1` through `.12` of it went.
+It is also what Debian revisions and RPM `Release` fields have done for decades, for the same
+reason: the revision belongs to the combination, not to the packager.
+
 Determine the upstream base by ancestry rather than by reading `pyproject.toml`, which has gone
 stale before:
 
