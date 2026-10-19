@@ -110,8 +110,8 @@ This backend repo (`github.com/amagovpt/udata-pt`) has long-lived environment br
 
 This repo is a fork of [udata](https://github.com/opendatateam/udata) and versions itself as `vX.Y.Z.N`:
 
-- `X.Y.Z` — the upstream udata version the fork is built on. Today: **16.0.0**. Confirm it by ancestry, never by reading `pyproject.toml` (it has been stale before): `git merge-base --is-ancestor refs/tags/upstream/vX.Y.Z origin/main`.
-- `N` — the Portuguese revision. Incremented on every promotion to `main`, reset to `1` on each upstream sync (once synced to 17.14.0, the next release is `17.14.0.1`).
+- `X.Y.Z` — the upstream udata version the fork is built on. Today: **16.0.0**. Confirm it at every upstream sync, and **never by reading `pyproject.toml` or what `uv sync` prints**: that literal said `15.1.0` for eight months while the code was already on 16.0.0, because upstream computes its version from git tags and this fork froze a hand-written one instead. The three checks that do answer it — ancestry, the files a release added and removed, and the migrations already applied — are in [`docs/versioning.md`](docs/versioning.md#which-upstream-version-is-this-fork-on-and-why-pyprojecttoml-cannot-answer-it).
+- `N` — the Portuguese revision. Incremented on every promotion to `main`, and **reset to `1` at each upstream sync** (once synced to 17.14.0, the next release is `17.14.0.1`). It counts the revisions sitting on *this* base, not Portuguese releases ever made: two thirds of what the fork changes are upstream files it modifies, and those are reconciled from scratch at each sync. Same reasoning as Debian revisions and RPM `Release` fields; the long version is in `docs/versioning.md`.
 
 Four segments never collide with upstream, which only ever publishes three, and they sort correctly under PEP 440 (`16.0.0 < 16.0.0.1 < 16.0.1 < 16.1.0`). Do not use `16.0.0+pt.1` (the `+` is invalid as a Docker tag) nor `16.0.0-pt.1` (SemVer sorts a hyphen suffix *before* `16.0.0`).
 
