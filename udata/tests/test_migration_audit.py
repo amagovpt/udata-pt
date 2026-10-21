@@ -236,6 +236,49 @@ class MigrationAuditDBTest(PytestOnlyDBTestCase):
         assert entry["errors"] == 0
         assert entry["messages"] == []
 
+    def test_a_migration_marked_after_failing_shows_why_it_failed(self):
+        """🚩 The state where the detail matters most, and where reading the
+        last operation gives nothing.
+
+        The last op is the marking somebody added: no errors, no traceback.
+        The failure is in the one before, and that is what has to surface --
+        otherwise the most alarming row on the page is also the emptiest.
+        """
+        from udata.db.migration_audit import _entry
+
+        doc = {
+            "ops": [
+                op(success=False, output=[["error", "boom"]], traceback="Traceback: boom"),
+                recorded_only_op(),
+            ]
+        }
+
+        entry = _entry("x.py", doc, on_disk=True)
+
+        assert entry["state"] == RECORDED_AFTER_FAILURE
+        assert entry["messages"] == ["boom"]
+        assert entry["traceback"] == "Traceback: boom"
+
+    def test_a_legacy_record_still_says_when_and_what(self):
+        """Pre-2.0 documents keep date and output at the top level.
+
+        43 of them in a developer database rendered as blank rows until this:
+        the data was there, one level up from where the reader was looking.
+        """
+        from udata.db.migration_audit import _entry
+
+        doc = {
+            "filename": "2015-05-06-migrate-issues.js",
+            "date": datetime(2018, 4, 30, 16, 14, tzinfo=UTC),
+            "output": "Recorded only",
+        }
+
+        entry = _entry("2015-05-06-migrate-issues.js", doc, on_disk=False)
+
+        assert entry["state"] == LEGACY
+        assert entry["date"].startswith("2018-04-30")
+        assert entry["messages"] == ["Recorded only"]
+
     def test_the_payload_never_carries_migration_source(self):
         """add_record stores inspect.getsource() on every operation."""
         migrations.get(self.FILENAME).execute()

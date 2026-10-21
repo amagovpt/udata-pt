@@ -151,6 +151,31 @@ def classify(doc, on_disk):
     return APPLIED
 
 
+def _explaining_op(ops, state):
+    """The operation that accounts for the state, which is not always the last.
+
+    🚩 `recorded_after_failure` is the case this exists for: the last operation
+    is the marking somebody added, which carries no errors and no traceback,
+    while the failure that matters sits in an earlier one. Reading `ops[-1]`
+    blindly leaves the single most useful record on the page with nothing to
+    show -- exactly where somebody most needs to know what went wrong.
+    """
+    if not ops:
+        return None
+
+    if state == RECORDED_AFTER_FAILURE:
+        failed = [op for op in ops if not _is_recorded_only(op) and not op.get("success")]
+        if failed:
+            return failed[-1]
+
+    if state == APPLIED_WITH_ERRORS:
+        executed = [op for op in ops if not _is_recorded_only(op)]
+        if executed:
+            return executed[-1]
+
+    return ops[-1]
+
+
 def _entry(filename, doc, on_disk):
     state = classify(doc, on_disk)
     ops = (doc or {}).get("ops") or []
@@ -161,12 +186,25 @@ def _entry(filename, doc, on_disk):
     last = ops[-1] if ops else None
     date = last.get("date") if last else None
 
-    messages = _error_messages(last) if last else []
+    # 🚩 Legacy records keep their fields at the top level rather than inside
+    # ops: pre-2.0 documents carry `date` and `output` directly. Reading them
+    # turns 43 rows that said nothing into 43 rows that say when they were
+    # recorded, and that they were recorded rather than run.
+    if date is None and isinstance(doc, dict):
+        date = doc.get("date")
+
+    explaining = _explaining_op(ops, state)
+    messages = _error_messages(explaining) if explaining else []
+    if not ops and isinstance(doc, dict) and doc.get("output"):
+        messages = [str(doc["output"])[:MESSAGE_LIMIT]]
+
     # The traceback travels only where it is the answer to a question somebody
     # is asking. Those states are few by definition, and without it "it failed"
     # sends whoever has no shell straight back where they started.
     traceback = (
-        last.get("traceback") if last and state in (FAILED, RECORDED_AFTER_FAILURE) else None
+        explaining.get("traceback")
+        if explaining and state in (FAILED, RECORDED_AFTER_FAILURE)
+        else None
     )
 
     return {
