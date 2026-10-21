@@ -9,6 +9,25 @@
 
 ## Unreleased
 
+- **feat(db): classify every migration record, and serve it to administrators**
+  - A production dump restored into PPR arrived with 34 migrations that claimed to be applied
+    and had never run, and nothing could see it until the backend refused to start. `udata db
+    status` knows three answers, and the green one covers several situations that are not
+    success: a migration recorded without running, one that failed and was marked by hand, one
+    that ran while logging errors and reported OK.
+  - `udata db audit` classifies nine states instead and carries the counts that separate them —
+    how many times a migration was marked, how many real runs failed, how many errors were
+    swallowed. Run against a developer database it immediately found four records the plain
+    command prints as clean dates, one of which swallowed 33 errors.
+  - `GET /api/1/site/migrations/` serves the same classification, closed behind
+    `admin_permission` from the first line: the payload names the schema's internals and carries
+    the tracebacks of failed migrations. Whoever has no shell on an environment no longer needs
+    a deploy to find out what state its schema is in.
+  - The classifier deliberately avoids `Record` and `Migration`: both index `ops[-1]`, so they
+    raise on the records with no operations — the very anomalies worth surfacing — and
+    `Migration()` cannot be built for a record whose file is gone. It also tolerates `output`
+    stored as a plain string, which older records hold.
+
 - **chore(release): refuse to tag a version the project does not declare**
   - `tag-version.sh` created whatever tag it was given, so `v16.0.0.13` could be cut against a
     `pyproject.toml` still saying `16.0.0.12`. That is not hypothetical: the declared version sat
