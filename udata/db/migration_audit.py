@@ -38,6 +38,15 @@ ERROR_LEVELS = ("warning", "error", "critical", "exception")
 MESSAGE_LIMIT = 500
 TRACEBACK_LIMIT = 4000
 
+#: How many of a migration's error messages travel.
+#:
+#: One of them is not enough -- "11 errors logged" with a single line is the
+#: frustration this page exists to end -- and all of them is not safe: a
+#: migration that logs one line per bad dataset can log thousands, and there
+#: are 69 migrations in the same response. Twenty shows the pattern; the full
+#: set is what `udata db audit` and the logs are for.
+MESSAGE_COUNT_LIMIT = 20
+
 NOT_APPLIED = "not_applied"
 LEGACY = "legacy"
 EMPTY_RECORD = "empty_record"
@@ -170,7 +179,10 @@ def _entry(filename, doc, on_disk):
         "marked": len(marked),
         "failed_runs": len(failed_runs),
         "errors": len(messages),
-        "message": messages[-1][:MESSAGE_LIMIT] if messages else None,
+        # The messages themselves, so the page can show what went wrong
+        # instead of only how many times. Capped; `errors` keeps the true
+        # count, so a truncated list never misreports the total.
+        "messages": [message[:MESSAGE_LIMIT] for message in messages[:MESSAGE_COUNT_LIMIT]],
         "traceback": traceback[:TRACEBACK_LIMIT] if traceback else None,
     }
 

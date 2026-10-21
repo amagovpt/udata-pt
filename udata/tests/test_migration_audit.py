@@ -203,6 +203,39 @@ class MigrationAuditDBTest(PytestOnlyDBTestCase):
         assert entry["state"] == APPLIED
         assert entry["marked"] == 0
 
+    def test_the_errors_themselves_travel_not_just_their_count(self):
+        """ "11 errors logged" with nothing to read is the frustration this
+        page exists to end, and whoever is looking has no shell to go and find
+        them in.
+        """
+        from udata.db.migration_audit import MESSAGE_COUNT_LIMIT, _entry
+
+        doc = {
+            "ops": [
+                {
+                    "date": datetime.now(UTC),
+                    "success": True,
+                    "output": [["error", f"dataset {i} could not be converted"] for i in range(30)],
+                }
+            ]
+        }
+
+        entry = _entry("x.py", doc, on_disk=True)
+
+        # The true count is never truncated, so a capped list cannot misreport
+        # how bad it was.
+        assert entry["errors"] == 30
+        assert len(entry["messages"]) == MESSAGE_COUNT_LIMIT
+        assert "dataset 0 could not be converted" in entry["messages"][0]
+
+    def test_a_migration_without_errors_carries_an_empty_list(self):
+        from udata.db.migration_audit import _entry
+
+        entry = _entry("x.py", {"ops": [op()]}, on_disk=True)
+
+        assert entry["errors"] == 0
+        assert entry["messages"] == []
+
     def test_the_payload_never_carries_migration_source(self):
         """add_record stores inspect.getsource() on every operation."""
         migrations.get(self.FILENAME).execute()
