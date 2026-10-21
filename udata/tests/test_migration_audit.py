@@ -277,7 +277,12 @@ class MigrationAuditDBTest(PytestOnlyDBTestCase):
 
         assert entry["state"] == LEGACY
         assert entry["date"].startswith("2018-04-30")
-        assert entry["messages"] == ["Recorded only"]
+        # 🚩 "Recorded only" is not an error, and the page renders `messages`
+        # under "errors logged during the migration". It says the migration was
+        # marked instead of run, which is what `marked` means -- putting it in
+        # the error list sent the reader looking for a failure that never was.
+        assert entry["messages"] == []
+        assert entry["marked"] == 1
 
     def test_the_payload_never_carries_migration_source(self):
         """add_record stores inspect.getsource() on every operation."""

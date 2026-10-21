@@ -183,6 +183,20 @@ def _entry(filename, doc, on_disk):
     marked = [op for op in ops if _is_recorded_only(op)]
     failed_runs = [op for op in executed if not op.get("success")]
 
+    # 🚩 A legacy record carries its output as a top-level string, and in
+    # practice that string is RECORDED_ONLY_MESSAGE: the pre-2.0 documents were
+    # all marked in bulk, never run. That belongs in `marked`, which already
+    # means exactly this -- NOT in `messages`, which is the error lines and
+    # which the page renders under "errors logged during the migration".
+    #
+    # Saying "Recorded only" under that heading was wrong twice over: it is not
+    # an error, and it invited the reader to look for a failure that never
+    # happened.
+    marked_count = len(marked)
+    if not ops and isinstance(doc, dict):
+        if str(doc.get("output") or "") == RECORDED_ONLY_MESSAGE:
+            marked_count = 1
+
     last = ops[-1] if ops else None
     date = last.get("date") if last else None
 
@@ -195,8 +209,6 @@ def _entry(filename, doc, on_disk):
 
     explaining = _explaining_op(ops, state)
     messages = _error_messages(explaining) if explaining else []
-    if not ops and isinstance(doc, dict) and doc.get("output"):
-        messages = [str(doc["output"])[:MESSAGE_LIMIT]]
 
     # The traceback travels only where it is the answer to a question somebody
     # is asking. Those states are few by definition, and without it "it failed"
@@ -214,7 +226,7 @@ def _entry(filename, doc, on_disk):
         "ops": len(ops),
         # These two are what separate "recorded once" from "failed three times
         # and then marked by hand".
-        "marked": len(marked),
+        "marked": marked_count,
         "failed_runs": len(failed_runs),
         "errors": len(messages),
         # The messages themselves, so the page can show what went wrong
