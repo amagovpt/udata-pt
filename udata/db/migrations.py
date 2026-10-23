@@ -16,6 +16,19 @@ from pymongo import ReturnDocument
 
 log = logging.getLogger(__name__)
 
+#: The only trace a migration leaves of having been recorded without running.
+#:
+#: 🚩 There is no field for this. `add_record` is called with type="migrate"
+#: whether the migration ran or was merely recorded, so `Record.ok` answers
+#: True for both and `udata db status` prints them the same green date. A dump
+#: restored from another environment arrives full of exactly these, which is
+#: how LEDG-2654 got 34 migrations that claimed to be applied and were not.
+#:
+#: Shared with udata.db.migration_audit, which classifies by reading it back.
+#: Changing this string without changing that reader would silently delete a
+#: state from the audit -- there is a test that fails instead.
+RECORDED_ONLY_MESSAGE = "Recorded only"
+
 
 class MigrationError(Exception):
     """
@@ -168,7 +181,7 @@ class Migration:
         logger.addHandler(QueueHandler(q))
         logger.propagate = False
 
-        out = [["info", "Recorded only"]] if recordonly else []
+        out = [["info", RECORDED_ONLY_MESSAGE]] if recordonly else []
 
         if not recordonly and not dryrun:
             db = get_db()
