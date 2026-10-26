@@ -869,3 +869,32 @@ class SiteCheckUrlAPI(API):
             return {"reachable": resp.status_code < 500}
         except http_requests.exceptions.RequestException:
             return {"reachable": False, "reason": "connection_failed"}
+
+
+@api.route("/site/migrations/", endpoint="site_migrations")
+class SiteMigrationsAPI(API):
+    @api.secure(admin_permission)
+    @api.doc(id="get_migrations_audit")
+    def get(self):
+        """Classify every database migration record (admin only).
+
+        LEDG-2654: PPR came back from a production dump with 34 migrations
+        claiming to be applied and none of them run, and the only way to see
+        that was a shell on the machine. Whoever has no production access had
+        to request a deploy just to read the state.
+
+        🚨 Admin-only from the first line. The payload names the schema's
+        internals and carries the tracebacks of failed migrations. (The sibling
+        /site/logs/ already serves whole log files to the same audience, so
+        this opens no new door -- but it must not be the endpoint that does.)
+        """
+        from udata.db import migration_audit
+
+        entries = migration_audit.audit_migrations()
+        summary = migration_audit.summarize(entries)
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "migrations": entries,
+            **summary,
+        }

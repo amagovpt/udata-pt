@@ -156,6 +156,31 @@ class MigrationsCommandsTest(PytestOnlyDBTestCase):
         db.test_collection.delete_many({})
         db.migrations.delete_one({"filename": migration_file})
 
+    def test_audit_separates_a_recorded_only_migration_from_an_applied_one(
+        self, migration_file, db
+    ):
+        """What `db status` cannot say, and the reason this command exists.
+
+        A migration recorded without running prints as a plain green date
+        there. Here it has to name itself, or somebody restoring a dump goes on
+        believing the schema is up to date.
+        """
+        self.cli("db migrate --record")
+
+        result = self.cli("db audit")
+
+        assert "recorded only, never ran" in result.output
+        # And the collection was NOT touched: that is what "never ran" means.
+        assert db.test_collection.count_documents({}) == 0
+
+    def test_audit_reports_a_real_run_as_applied(self, migration_file, db):
+        self.cli("db migrate")
+
+        result = self.cli("db audit")
+
+        assert "applied" in result.output
+        assert db.test_collection.count_documents({}) == 1
+
     def test_unrecord_with_complete_filename(self, db):
         """Should unrecord migration with complete filename"""
         db.migrations.insert_one(
