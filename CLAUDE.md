@@ -106,6 +106,32 @@ This backend repo (`github.com/amagovpt/udata-pt`) has long-lived environment br
 
 > The PR base is always the **next environment up**, not always `main`. Apply this flow only when the change touches this repo. Check `gh auth status` first — the GitHub CLI is available on some team machines and not on others. When it is authenticated, open the PR with `gh pr create --repo amagovpt/udata-pt --base <base> --head <branch>` and follow CI with `gh pr checks`; otherwise open it via the compare URL `https://github.com/amagovpt/udata-pt/compare/<base>...<head>?expand=1`. See the monorepo `CLAUDE.md` for the cross-repo rule.
 
+### Versioning & Releases
+
+This repo is a fork of [udata](https://github.com/opendatateam/udata) and versions itself as `vX.Y.Z.N`:
+
+- `X.Y.Z` — the upstream udata version the fork is built on. Today: **16.0.0**. Confirm it at every upstream sync, and **never by reading `pyproject.toml` or what `uv sync` prints**: that literal said `15.1.0` for eight months while the code was already on 16.0.0, because upstream computes its version from git tags and this fork froze a hand-written one instead. The three checks that do answer it — ancestry, the files a release added and removed, and the migrations already applied — are in [`docs/versioning.md`](docs/versioning.md#which-upstream-version-is-this-fork-on-and-why-pyprojecttoml-cannot-answer-it).
+- `N` — the Portuguese revision. Incremented on every promotion to `main`, and **reset to `1` at each upstream sync** (once synced to 17.14.0, the next release is `17.14.0.1`). It counts the revisions sitting on *this* base, not Portuguese releases ever made: two thirds of what the fork changes are upstream files it modifies, and those are reconciled from scratch at each sync. Same reasoning as Debian revisions and RPM `Release` fields; the long version is in `docs/versioning.md`.
+
+Four segments never collide with upstream, which only ever publishes three, and they sort correctly under PEP 440 (`16.0.0 < 16.0.0.1 < 16.0.1 < 16.1.0`). Do not use `16.0.0+pt.1` (the `+` is invalid as a Docker tag) nor `16.0.0-pt.1` (SemVer sorts a hyphen suffix *before* `16.0.0`).
+
+Cutting a release:
+
+1. The content reaches `main` through the normal promotion flow — never commit or push directly to an environment branch.
+2. Put a `## 16.0.0.N (YYYY-MM-DD)` heading over that release's entries in `CHANGELOG.md`, and set the same number in `version` in `pyproject.toml`.
+3. Run `./tag-version.sh 16.0.0.N --keep-changelog` from a working branch whose HEAD matches `origin/main`. It tags, pushes the tag and opens the GitHub release with the notes read from that changelog section, without rewriting the changelog. It refuses to tag when `pyproject.toml` declares a different version than the one being tagged — the two drifting apart is what put a stale number in the portal footer for months.
+4. After the environment is deployed, confirm it is serving what you tagged: `../scripts/check_deployed_version.sh https://dados.gov.pt 16.0.0.N`. The version the API reports comes from the installed distribution metadata, so code deployed without the package being reinstalled keeps answering with the previous one.
+5. One tag per promotion to `main` — the same cadence `dadosgov-fe` uses.
+
+Never let upstream tags into the main tag namespace; they would mix with this fork's releases. Configure the remote once:
+
+```bash
+git remote add upstream https://github.com/opendatateam/udata.git
+git config remote.upstream.tagOpt --no-tags
+# when you do need to compare against upstream, keep its tags namespaced:
+git fetch upstream '+refs/tags/*:refs/tags/upstream/*' --no-tags
+```
+
 ### Commits — Conventional Commits 1.0.0
 
 Format:

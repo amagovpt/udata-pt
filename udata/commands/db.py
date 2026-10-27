@@ -13,7 +13,7 @@ from bson import DBRef
 
 from udata.commands import cli, cyan, echo, green, magenta, red, white, yellow
 from udata.core.dataset.models import Dataset, Resource
-from udata.db import migrations
+from udata.db import migration_audit, migrations
 from udata.mongo.document import get_all_models
 
 # Date format used to for display
@@ -61,6 +61,89 @@ def status():
     """Display the database migrations status"""
     for migration in migrations.list_available():
         log_status(migration, status_label(migration.record))
+
+
+#: How each state is painted. Green is reserved for the one state that means
+#: what it says; the three the plain `status` command also prints green --
+#: recorded-only, recorded-after-failure, applied-with-errors -- are not green
+#: here, which is the entire reason this command exists.
+STATE_COLORS = {
+    migration_audit.APPLIED: green,
+    migration_audit.NOT_APPLIED: yellow,
+    migration_audit.RECORDED_ONLY: yellow,
+    migration_audit.APPLIED_WITH_ERRORS: yellow,
+    migration_audit.FAILED: red,
+    migration_audit.RECORDED_AFTER_FAILURE: red,
+    migration_audit.EMPTY_RECORD: red,
+    migration_audit.ORPHAN: cyan,
+    migration_audit.LEGACY: cyan,
+}
+
+STATE_LABELS = {
+    migration_audit.APPLIED: "applied",
+    migration_audit.NOT_APPLIED: "not applied",
+    migration_audit.RECORDED_ONLY: "recorded only, never ran",
+    migration_audit.APPLIED_WITH_ERRORS: "applied, errors swallowed",
+    migration_audit.FAILED: "failed",
+    migration_audit.RECORDED_AFTER_FAILURE: "marked after failing",
+    migration_audit.EMPTY_RECORD: "empty record",
+    migration_audit.ORPHAN: "orphan record, no file",
+    migration_audit.LEGACY: "legacy record, pre-2.0",
+}
+
+
+@grp.command()
+def audit():
+    """Classify every migration record, beyond applied/not applied.
+
+    `db status` answers in three states and prints a green date for several
+    situations that are not success -- a migration recorded without running,
+    one marked by hand after failing, one that logged errors and reported OK.
+    A dump restored from another environment arrives full of the first kind.
+    """
+    entries = migration_audit.audit_migrations()
+    summary = migration_audit.summarize(entries)
+
+    for entry in entries:
+        state = entry["state"]
+        label = STATE_LABELS[state]
+        detail = _audit_detail(entry)
+        paint = STATE_COLORS[state]
+        name = os.path.splitext(entry["filename"])[0]
+        echo("{:.<70} [{}]{}".format(name + " ", paint(label), detail))
+
+    echo("")
+    for state in migration_audit.ALL_STATES:
+        count = summary["counts"][state]
+        if count:
+            echo("{:>4}  {}".format(count, STATE_COLORS[state](STATE_LABELS[state])))
+
+    echo("")
+    echo("{0} migrations, {1} on disk".format(summary["total"], len(migrations.list_available())))
+    if summary["clean"]:
+        echo(green("No anomalies."))
+    else:
+        echo(red("{0} anomalies.".format(summary["anomalies"])))
+
+    # Always exits 0 on purpose. An environment that has not been migrated yet
+    # legitimately holds not-applied migrations, so a non-zero exit would make
+    # this fail in exactly the moment it is most worth running.
+
+
+def _audit_detail(entry):
+    """The counts that separate 'recorded once' from 'failed three times'."""
+    bits = []
+    if entry["ops"]:
+        bits.append("{0} ops".format(entry["ops"]))
+    if entry["marked"]:
+        bits.append("marked {0}x".format(entry["marked"]))
+    if entry["failed_runs"]:
+        bits.append("{0} failed runs".format(entry["failed_runs"]))
+    if entry["errors"]:
+        bits.append("{0} errors".format(entry["errors"]))
+    if entry["date"]:
+        bits.append(entry["date"][:16].replace("T", " "))
+    return "  " + ", ".join(bits) if bits else ""
 
 
 @grp.command()
