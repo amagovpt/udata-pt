@@ -2494,6 +2494,51 @@ class DatasetResourceAPITest(APITestCase):
         self.assertEqual(response.json[0]["id"], str(target.id))
         self.assertNotIn("ydesconly-xyz", response.json[0]["title"])
 
+    # `last_update` is documented as "The resources last modification date", but the three
+    # resource endpoints write through an atomic update that skips `Dataset.clean()`, the
+    # only place that used to recompute it. These assert the endpoints, not the model
+    # methods: it is the endpoints a publisher actually reaches. The dates are years apart
+    # so that none of them can pass on the one-second slack of `assert_equal_dates`.
+
+    def test_create_resource_updates_last_update(self):
+        dataset = DatasetFactory(
+            owner=self.user, resources=[ResourceFactory(last_modified_internal="2020-01-01")]
+        )
+        self.assertEqual(dataset.last_update.year, 2020)
+
+        data = ResourceFactory.as_dict()
+        data["filetype"] = "remote"
+        response = self.post(url_for("api.resources", dataset=dataset), data)
+        self.assert201(response)
+
+        dataset.reload()
+        self.assertEqual(dataset.last_update.year, datetime.now(UTC).year)
+
+    def test_update_resource_updates_last_update(self):
+        resource = ResourceFactory(last_modified_internal="2020-01-01")
+        dataset = DatasetFactory(owner=self.user, resources=[resource])
+        self.assertEqual(dataset.last_update.year, 2020)
+
+        data = {"title": "New title"}
+        response = self.put(url_for("api.resource", dataset=dataset, rid=str(resource.id)), data)
+        self.assert200(response)
+
+        dataset.reload()
+        self.assertEqual(dataset.last_update.year, datetime.now(UTC).year)
+
+    def test_delete_resource_updates_last_update(self):
+        kept = ResourceFactory(last_modified_internal="2020-01-01")
+        removed = ResourceFactory(last_modified_internal="2024-01-01")
+        dataset = DatasetFactory(owner=self.user, resources=[kept, removed])
+        self.assertEqual(dataset.last_update.year, 2024)
+
+        response = self.delete(url_for("api.resource", dataset=dataset, rid=str(removed.id)))
+        self.assert204(response)
+
+        dataset.reload()
+        # The removed resource no longer speaks for the dataset.
+        self.assertEqual(dataset.last_update.year, 2020)
+
 
 class DatasetReferencesAPITest(APITestCase):
     def test_dataset_licenses_list(self):

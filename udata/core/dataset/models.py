@@ -1004,6 +1004,40 @@ class Dataset(
         obj = cls.objects(slug=id_or_slug).first()
         return obj or cls.objects.get_or_404(id=id_or_slug)
 
+    def _recompute_derived_fields(self):
+        """Write by hand what `clean()` would have written, for the atomic resource paths.
+
+        `add_resource`, `update_resource` and `remove_resource` write through an atomic
+        update that never runs `clean()`, so `last_update` stayed at whatever the document
+        held while the resources changed underneath it. Same bug class as the INE bulk
+        write path, fixed the same way in `INEBackend._refresh_derived_fields`.
+
+        Call it only after `self.resources` already reflects the mutation in memory:
+        `compute_last_update()` and `compute_quality()` both read that list.
+
+        Order matters, and it is not the INE one:
+
+        - `last_modified_internal` is stamped **first**, because with the last resource
+          gone `compute_last_update()` falls through to `self.last_modified`, which derives
+          from it. Stamping afterwards would persist the document's previous date as the
+          resources' date. The INE path never sees this: it always sets
+          `harvest.modified_at`, so it leaves `compute_last_update()` on its first branch.
+          Stamping first is also what `PUT`/`DELETE` on a dataset already do before the
+          `save()` that triggers `clean()`.
+        - `quality_cached` is computed **last**, because its `next_update` is derived from
+          `last_update`. Computing it first — as these three did until now — scores the
+          dataset against a date the same write is about to change.
+        """
+        self.last_modified_internal = datetime.now(UTC)
+        self.last_update = self.compute_last_update()
+        self.quality_cached = self.compute_quality()
+
+        return {
+            "set__last_modified_internal": self.last_modified_internal,
+            "set__last_update": self.last_update,
+            "set__quality_cached": self.quality_cached,
+        }
+
     def add_resource(self, resource: Resource):
         """Perform an atomic prepend for a new resource"""
         resource.validate()
@@ -1014,13 +1048,12 @@ class Dataset(
                 f"Cannot add resource '{resource.title}'. A resource '{existing_resource.title}' already exists with ID '{existing_resource.id}'"
             )
 
-        # only useful for compute_quality(), we will reload to have a clean object
+        # only useful for the derived fields, we will reload to have a clean object
         self.resources.insert(0, resource)
 
         self.update(
-            set__quality_cached=self.compute_quality(),
             push__resources={"$each": [resource.to_mongo()], "$position": 0},
-            set__last_modified_internal=datetime.now(UTC),
+            **self._recompute_derived_fields(),
         )
 
         self.reload()
@@ -1029,27 +1062,25 @@ class Dataset(
     def update_resource(self, resource):
         """Perform an atomic update for an existing resource"""
 
-        # only useful for compute_quality(), we will reload to have a clean object
+        # only useful for the derived fields, we will reload to have a clean object
         index = next(i for i, r in enumerate(self.resources) if r.id == resource.id)
         self.resources[index] = resource
 
         Dataset.objects(id=self.id, resources__id=resource.id).update_one(
-            set__quality_cached=self.compute_quality(),
             set__resources__S=resource,
-            set__last_modified_internal=datetime.now(UTC),
+            **self._recompute_derived_fields(),
         )
 
         self.reload()
         self.on_resource_updated.send(self.__class__, document=self, resource_id=resource.id)
 
     def remove_resource(self, resource):
-        # only useful for compute_quality(), we will reload to have a clean object
+        # only useful for the derived fields, we will reload to have a clean object
         self.resources = [r for r in self.resources if r.id != resource.id]
 
         self.update(
-            set__quality_cached=self.compute_quality(),
             pull__resources__id=resource.id,
-            set__last_modified_internal=datetime.now(UTC),
+            **self._recompute_derived_fields(),
         )
 
         # Deletes resource's file from file storage
