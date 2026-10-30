@@ -121,10 +121,34 @@ class DatasetModelTest(PytestOnlyDBTestCase):
 
     def test_last_update_with_resource(self):
         user = UserFactory()
-        dataset = DatasetFactory(owner=user)
-        resource = ResourceFactory()
+        dataset = DatasetFactory(owner=user, last_modified_internal="2020-01-01")
+        # Years away from the dataset's own date. With both at "now", this assertion
+        # passed on the one-second slack of `assert_equal_dates` whether or not
+        # `add_resource` recomputed anything, and so proved nothing.
+        resource = ResourceFactory(last_modified_internal="2024-03-01")
         dataset.add_resource(resource)
-        assert_equal_dates(dataset.last_update, resource.created_at)
+        assert_equal_dates(dataset.last_update, resource.last_modified)
+
+    def test_last_update_is_not_touched_on_harvested_dataset(self):
+        """A harvest date wins over the resources, and must keep winning.
+
+        `compute_last_update()` returns `harvest.modified_at` without ever looking at
+        the resources. Adding a resource to such a dataset correctly leaves the date
+        alone — pinned here so the next reader sees a decision, not a regression.
+        """
+        dataset = DatasetFactory(
+            owner=UserFactory(),
+            harvest=HarvestDatasetMetadata(
+                backend="DCAT",
+                modified_at=datetime(2026, 1, 15, tzinfo=UTC),
+                source_id="source_id",
+                remote_id="remote_id",
+            ),
+        )
+
+        dataset.add_resource(ResourceFactory(last_modified_internal=datetime.now(UTC)))
+
+        assert_equal_dates(dataset.last_update, datetime(2026, 1, 15, tzinfo=UTC))
 
     def test_last_update_without_resource(self):
         user = UserFactory()
