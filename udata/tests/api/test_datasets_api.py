@@ -50,7 +50,12 @@ from udata.i18n import gettext as _
 from udata.models import CommunityResource, Dataset, Follow, Member
 from udata.mongo.datetime_fields import DateRange
 from udata.tags import TAG_MAX_LENGTH, TAG_MIN_LENGTH
-from udata.tests.helpers import assert200, assert404, create_geozones_fixtures
+from udata.tests.helpers import (
+    assert200,
+    assert404,
+    assert_equal_dates,
+    create_geozones_fixtures,
+)
 from udata.utils import faker, unique_string
 
 from . import APITestCase, PytestOnlyAPITestCase
@@ -2538,6 +2543,30 @@ class DatasetResourceAPITest(APITestCase):
         dataset.reload()
         # The removed resource no longer speaks for the dataset.
         self.assertEqual(dataset.last_update.year, 2020)
+
+    def test_delete_last_resource_does_not_keep_a_stale_last_update(self):
+        """With no resources left, `compute_last_update()` falls back to the dataset date.
+
+        That date is only correct if the same write stamped it first. Stamping it after
+        deriving `last_update` would persist the document's previous date as the date its
+        resources last changed — a value nobody wrote and nothing is true of.
+        """
+        dataset = DatasetFactory(
+            owner=self.user,
+            last_modified_internal="2020-01-01",
+            resources=[ResourceFactory(last_modified_internal="2024-01-01")],
+        )
+        self.assertEqual(dataset.last_update.year, 2024)
+
+        response = self.delete(
+            url_for("api.resource", dataset=dataset, rid=str(dataset.resources[0].id))
+        )
+        self.assert204(response)
+
+        dataset.reload()
+        self.assertEqual(dataset.resources, [])
+        self.assertEqual(dataset.last_update.year, datetime.now(UTC).year)
+        assert_equal_dates(dataset.last_update, dataset.last_modified_internal)
 
 
 class DatasetReferencesAPITest(APITestCase):
