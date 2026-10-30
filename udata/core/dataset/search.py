@@ -35,6 +35,13 @@ class DatasetSearch(ModelSearchAdapter):
     service_class = DatasetService
     consumer_class = DatasetConsumer
 
+    # `last_update` here does not mean the dataset's `last_update`. The search sorts on
+    # `last_modified_internal`, which is a different field, so `sort=last_update` returns
+    # a different order from the Mongo-backed `/api/1/datasets/?sort=last_update`. The
+    # same split is noted in the DGT harvester, which works around it per document.
+    # Left as it is on purpose: aligning the mapping changes the order of the portal's
+    # main listing for every visitor, and `last_modified_internal` is not even a field of
+    # the index, so it is not a one-line swap. Tracked separately in LEDG-2686.
     sorts = {
         "created": "created_at_internal",
         "last_update": "last_modified_internal",
