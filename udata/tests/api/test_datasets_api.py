@@ -2544,6 +2544,33 @@ class DatasetResourceAPITest(APITestCase):
         # The removed resource no longer speaks for the dataset.
         self.assertEqual(dataset.last_update.year, 2020)
 
+    def test_resource_change_rescores_quality_against_the_new_last_update(self):
+        """`quality_cached` must be derived from the new date, not the one being replaced.
+
+        `compute_quality()` stores `next_update_for_update_fulfilled_in_time`, which is
+        `frequency.next_update(last_update)`. Computing quality before `last_update` —
+        which is what these three paths did until now — scores the dataset against the
+        date the same write is about to discard, and nothing else in the suite notices.
+        """
+        dataset = DatasetFactory(
+            owner=self.user,
+            frequency="daily",
+            resources=[ResourceFactory(last_modified_internal="2020-01-01")],
+        )
+        self.assertEqual(
+            dataset.quality_cached["next_update_for_update_fulfilled_in_time"].year, 2020
+        )
+
+        data = ResourceFactory.as_dict()
+        data["filetype"] = "remote"
+        response = self.post(url_for("api.resources", dataset=dataset), data)
+        self.assert201(response)
+
+        dataset.reload()
+        next_update = dataset.quality_cached["next_update_for_update_fulfilled_in_time"]
+        # One day after the new last_update, not one day after 2020-01-01.
+        assert_equal_dates(next_update, dataset.last_update + timedelta(days=1))
+
     def test_delete_last_resource_does_not_keep_a_stale_last_update(self):
         """With no resources left, `compute_last_update()` falls back to the dataset date.
 

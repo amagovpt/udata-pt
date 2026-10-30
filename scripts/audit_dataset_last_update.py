@@ -21,7 +21,10 @@ Flags
     drift.
 
 --limit
-    Stop after this many datasets. For a quick reading on a large catalogue.
+    Stop after this many datasets. Note the bias: `Dataset` orders by
+    `-created_at_internal`, so this samples the *newest* datasets, not a random slice.
+    Newer datasets have had fewer chances to drift, so a limited run understates the
+    problem. Run without it before quoting a number.
 
 --worst
     How many of the worst offenders to list. Defaults to 20.
@@ -75,6 +78,7 @@ def main() -> int:
         branches = Counter()
         total = 0
         unreadable = 0
+        would_write_null = []
         drifted = []
 
         for dataset in queryset:
@@ -90,7 +94,16 @@ def main() -> int:
                 print(f"WARN: could not compute for {dataset.id}: {e}")
                 continue
 
-            if expected is None or dataset.last_update is None:
+            if expected is None:
+                # Not an unreadable document: one where the fix would write `None` into
+                # a required field through `update()`, which does not validate. Reachable
+                # for a legacy dataset with no resources and no stored date. These are
+                # the only documents the fix can make worse, so they are named, not
+                # lumped in with the rest.
+                would_write_null.append(dataset.slug)
+                continue
+
+            if dataset.last_update is None:
                 unreadable += 1
                 continue
 
@@ -101,6 +114,7 @@ def main() -> int:
 
         print(f"datasets inspected: {total}")
         print(f"could not be read:  {unreadable}")
+        print(f"would write null:   {len(would_write_null)}   <- the fix can only worsen these")
         print()
         print("by compute_last_update() branch:")
         for name, count in branches.most_common():
@@ -112,6 +126,12 @@ def main() -> int:
         print(f"stale: {len(drifted)} ({len(drifted) / max(total, 1) * 100:.2f}%)")
         print(f"  would move forward: {len(forward)}")
         print(f"  would move back:    {len(backward)}")
+
+        if would_write_null:
+            print()
+            print("datasets with no computable date (fix them before deploying):")
+            for slug in would_write_null[: args.worst]:
+                print(f"  {slug}")
 
         if drifted:
             print()

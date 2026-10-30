@@ -35,13 +35,19 @@ class DatasetSearch(ModelSearchAdapter):
     service_class = DatasetService
     consumer_class = DatasetConsumer
 
-    # `last_update` here does not mean the dataset's `last_update`. The search sorts on
-    # `last_modified_internal`, which is a different field, so `sort=last_update` returns
-    # a different order from the Mongo-backed `/api/1/datasets/?sort=last_update`. The
-    # same split is noted in the DGT harvester, which works around it per document.
-    # Left as it is on purpose: aligning the mapping changes the order of the portal's
-    # main listing for every visitor, and `last_modified_internal` is not even a field of
-    # the index, so it is not a one-line swap. Tracked separately in LEDG-2686.
+    # `last_update` here does not mean the dataset's `last_update`. It is translated to
+    # `last_modified_internal` — a name `serialize()` below never sends to the index,
+    # which ships `last_update` instead. So the same parameter name reaches the search
+    # service and the Mongo-backed `/api/1/datasets/?sort=last_update` as two different
+    # fields, and what the service does with a sort key it was never given is not decided
+    # here. The DGT harvester notes the same split and works around it per document.
+    #
+    # Left as it is on purpose: whatever the service currently does, changing this
+    # mapping changes the order of the portal's main listing for every visitor, which is
+    # a product decision and not a side effect of fixing a date. Tracked in LEDG-2686.
+    #
+    # Note that `last_update_range` below filters on the indexed `last_update`, so the
+    # facet counts do follow the dataset's real date — it is only the sort that diverges.
     sorts = {
         "created": "created_at_internal",
         "last_update": "last_modified_internal",

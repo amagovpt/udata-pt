@@ -1027,6 +1027,16 @@ class Dataset(
         - `quality_cached` is computed **last**, because its `next_update` is derived from
           `last_update`. Computing it first — as these three did until now — scores the
           dataset against a date the same write is about to change.
+
+        Known limitation, inherited rather than introduced: these values are derived from
+        the in-memory resource list and written with `set__`, while the resource change
+        itself is an operator the server applies. Two concurrent mutations on the same
+        dataset can therefore disagree — one adding a recent resource, another removing a
+        different one, each blind to the other's — and the later write wins with a date
+        computed from a list that was never the real one. `quality_cached` already had
+        this; `last_update` now joins it. Nothing heals it, because these paths never
+        reach `clean()`. Fixing it properly means deriving the value server-side instead
+        of in Python.
         """
         self.last_modified_internal = datetime.now(UTC)
         self.last_update = self.compute_last_update()

@@ -23,18 +23,21 @@
     about to change, so some published quality scores change with this fix.
   - A migration heals the documents already affected, saving only those that actually disagree
     with their resources rather than rewriting the whole catalogue: each save costs a homepage
-    invalidation and a queued reindex. Measured by sampling production beforehand, around 1% of
-    datasets carry a stale date, by up to six months, and **none** of them moves backwards — the
-    date only ever gets closer to the truth. A read-only audit script reports the exact count per
-    environment.
+    invalidation and a queued reindex. Sampling production beforehand found around 1% of datasets
+    carrying a stale date, by up to six months. That sample showed no date moving backwards, but
+    the fix can move one back and that is correct when it does — deleting a dataset's most recent
+    file used to leave the date pointing at a file that no longer exists. A read-only audit
+    script reports the exact count per environment before the migration runs.
   - A test that claimed to assert this behaviour was passing against the broken code: it compared
     two dates created in the same second, inside the one-second slack the helper allows, so it
     would have passed against any implementation. It now uses dates years apart and fails on the
     unfixed code.
-  - Worth knowing for whoever reads it: the search sorts `last_update` on a different field
-    (`last_modified_internal`), so this does not change the order of the portal's main listing —
-    only `/api/1/datasets/?sort=last_update` and the Atom feed. That split is now noted in the
-    code and tracked on its own.
+  - Worth knowing for whoever reads it: the search adapter translates `sort=last_update` to a
+    field the indexer never sends it, so the ordering of the portal's main listing does not
+    follow this fix — only `/api/1/datasets/?sort=last_update` and the Atom feed do. The
+    *filtering* is a different matter and does follow it: the "last 30 days / 12 months / 3
+    years" facet matches on the indexed `last_update`, so those counts shift as datasets are
+    reindexed, which is the point. The sort split is now noted in the code and tracked on its own.
 
 - **feat(db): classify every migration record, and serve it to administrators**
   - A production dump restored into PPR arrived with 34 migrations that claimed to be applied

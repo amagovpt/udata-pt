@@ -23,7 +23,14 @@ datasets to the top of the portal's "most recent" listing for no reason a visito
 see. The corrected `last_update` still reaches the index, because `save()` fires
 `post_save` and the auto-index hook queues the reindex per document.
 
-The final count is the record of how many datasets this environment was serving wrongly.
+The final count is a lower bound on how many datasets this environment was serving
+wrongly: a document whose write succeeded but whose `post_save` receivers then raised is
+logged as an error and not counted. Read it with the error lines, not on its own.
+
+Note also that this iterates every dataset, deleted and private ones included. That is
+deliberate — a hidden dataset carries the same wrong date and would serve it the moment
+it is restored — but it means a soft-deleted document is saved, which re-fires its
+`on_delete` receivers and their metric recounts.
 """
 
 import logging
