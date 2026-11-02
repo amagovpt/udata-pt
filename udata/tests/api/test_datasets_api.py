@@ -50,7 +50,12 @@ from udata.i18n import gettext as _
 from udata.models import CommunityResource, Dataset, Follow, Member
 from udata.mongo.datetime_fields import DateRange
 from udata.tags import TAG_MAX_LENGTH, TAG_MIN_LENGTH
-from udata.tests.helpers import assert200, assert404, create_geozones_fixtures
+from udata.tests.helpers import (
+    assert200,
+    assert404,
+    assert_equal_dates,
+    create_geozones_fixtures,
+)
 from udata.utils import faker, unique_string
 
 from . import APITestCase, PytestOnlyAPITestCase
@@ -2493,6 +2498,102 @@ class DatasetResourceAPITest(APITestCase):
         self.assertEqual(len(response.json), 1)
         self.assertEqual(response.json[0]["id"], str(target.id))
         self.assertNotIn("ydesconly-xyz", response.json[0]["title"])
+
+    # `last_update` is documented as "The resources last modification date", but the three
+    # resource endpoints write through an atomic update that skips `Dataset.clean()`, the
+    # only place that used to recompute it. These assert the endpoints, not the model
+    # methods: it is the endpoints a publisher actually reaches. The dates are years apart
+    # so that none of them can pass on the one-second slack of `assert_equal_dates`.
+
+    def test_create_resource_updates_last_update(self):
+        dataset = DatasetFactory(
+            owner=self.user, resources=[ResourceFactory(last_modified_internal="2020-01-01")]
+        )
+        self.assertEqual(dataset.last_update.year, 2020)
+
+        data = ResourceFactory.as_dict()
+        data["filetype"] = "remote"
+        response = self.post(url_for("api.resources", dataset=dataset), data)
+        self.assert201(response)
+
+        dataset.reload()
+        self.assertEqual(dataset.last_update.year, datetime.now(UTC).year)
+
+    def test_update_resource_updates_last_update(self):
+        resource = ResourceFactory(last_modified_internal="2020-01-01")
+        dataset = DatasetFactory(owner=self.user, resources=[resource])
+        self.assertEqual(dataset.last_update.year, 2020)
+
+        data = {"title": "New title"}
+        response = self.put(url_for("api.resource", dataset=dataset, rid=str(resource.id)), data)
+        self.assert200(response)
+
+        dataset.reload()
+        self.assertEqual(dataset.last_update.year, datetime.now(UTC).year)
+
+    def test_delete_resource_updates_last_update(self):
+        kept = ResourceFactory(last_modified_internal="2020-01-01")
+        removed = ResourceFactory(last_modified_internal="2024-01-01")
+        dataset = DatasetFactory(owner=self.user, resources=[kept, removed])
+        self.assertEqual(dataset.last_update.year, 2024)
+
+        response = self.delete(url_for("api.resource", dataset=dataset, rid=str(removed.id)))
+        self.assert204(response)
+
+        dataset.reload()
+        # The removed resource no longer speaks for the dataset.
+        self.assertEqual(dataset.last_update.year, 2020)
+
+    def test_resource_change_rescores_quality_against_the_new_last_update(self):
+        """`quality_cached` must be derived from the new date, not the one being replaced.
+
+        `compute_quality()` stores `next_update_for_update_fulfilled_in_time`, which is
+        `frequency.next_update(last_update)`. Computing quality before `last_update` —
+        which is what these three paths did until now — scores the dataset against the
+        date the same write is about to discard, and nothing else in the suite notices.
+        """
+        dataset = DatasetFactory(
+            owner=self.user,
+            frequency="daily",
+            resources=[ResourceFactory(last_modified_internal="2020-01-01")],
+        )
+        self.assertEqual(
+            dataset.quality_cached["next_update_for_update_fulfilled_in_time"].year, 2020
+        )
+
+        data = ResourceFactory.as_dict()
+        data["filetype"] = "remote"
+        response = self.post(url_for("api.resources", dataset=dataset), data)
+        self.assert201(response)
+
+        dataset.reload()
+        next_update = dataset.quality_cached["next_update_for_update_fulfilled_in_time"]
+        # One day after the new last_update, not one day after 2020-01-01.
+        assert_equal_dates(next_update, dataset.last_update + timedelta(days=1))
+
+    def test_delete_last_resource_does_not_keep_a_stale_last_update(self):
+        """With no resources left, `compute_last_update()` falls back to the dataset date.
+
+        That date is only correct if the same write stamped it first. Stamping it after
+        deriving `last_update` would persist the document's previous date as the date its
+        resources last changed — a value nobody wrote and nothing is true of.
+        """
+        dataset = DatasetFactory(
+            owner=self.user,
+            last_modified_internal="2020-01-01",
+            resources=[ResourceFactory(last_modified_internal="2024-01-01")],
+        )
+        self.assertEqual(dataset.last_update.year, 2024)
+
+        response = self.delete(
+            url_for("api.resource", dataset=dataset, rid=str(dataset.resources[0].id))
+        )
+        self.assert204(response)
+
+        dataset.reload()
+        self.assertEqual(dataset.resources, [])
+        self.assertEqual(dataset.last_update.year, datetime.now(UTC).year)
+        assert_equal_dates(dataset.last_update, dataset.last_modified_internal)
 
 
 class DatasetReferencesAPITest(APITestCase):

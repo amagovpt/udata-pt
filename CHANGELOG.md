@@ -9,6 +9,36 @@
 
 ## Unreleased
 
+- **fix(dataset): `last_update` now follows the resources, as the API has always claimed it did**
+  - The field is published as "The resources last modification date" and is required, but
+    `Dataset.clean()` was the only place that recomputed it, and the three resource mutators
+    write through an atomic update that never runs `clean()`. Those are exactly what the API
+    calls when a publisher uploads, edits or deletes a file, so a dataset could gain a resource
+    today and still report a year-old date to anyone consuming the API.
+  - The derived fields now go through a single helper on the same atomic write, in an order that
+    is deliberate and documented: the dataset date is stamped first, because with the last
+    resource gone the computation falls back to it and would otherwise persist the document's
+    previous date; `quality_cached` is computed last, because its `next_update` is derived from
+    `last_update`. Until now those three scored the dataset against a date the same write was
+    about to change, so some published quality scores change with this fix.
+  - A migration heals the documents already affected, saving only those that actually disagree
+    with their resources rather than rewriting the whole catalogue: each save costs a homepage
+    invalidation and a queued reindex. Sampling production beforehand found around 1% of datasets
+    carrying a stale date, by up to six months. That sample showed no date moving backwards, but
+    the fix can move one back and that is correct when it does — deleting a dataset's most recent
+    file used to leave the date pointing at a file that no longer exists. A read-only audit
+    script reports the exact count per environment before the migration runs.
+  - A test that claimed to assert this behaviour was passing against the broken code: it compared
+    two dates created in the same second, inside the one-second slack the helper allows, so it
+    would have passed against any implementation. It now uses dates years apart and fails on the
+    unfixed code.
+  - Worth knowing for whoever reads it: the search adapter translates `sort=last_update` to a
+    field the indexer never sends it, so the ordering of the portal's main listing does not
+    follow this fix — only `/api/1/datasets/?sort=last_update` and the Atom feed do. The
+    *filtering* is a different matter and does follow it: the "last 30 days / 12 months / 3
+    years" facet matches on the indexed `last_update`, so those counts shift as datasets are
+    reindexed, which is the point. The sort split is now noted in the code and tracked on its own.
+
 - **feat(db): classify every migration record, and serve it to administrators**
   - A production dump restored into PPR arrived with 34 migrations that claimed to be applied
     and had never run, and nothing could see it until the backend refused to start. `udata db
