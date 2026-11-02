@@ -27,10 +27,9 @@ The final count is a lower bound on how many datasets this environment was servi
 wrongly: a document whose write succeeded but whose `post_save` receivers then raised is
 logged as an error and not counted. Read it with the error lines, not on its own.
 
-Note also that this iterates every dataset, deleted and private ones included. That is
-deliberate — a hidden dataset carries the same wrong date and would serve it the moment
-it is restored — but it means a soft-deleted document is saved, which re-fires its
-`on_delete` receivers and their metric recounts.
+Deleted datasets are excluded, for a reason that is not performance and is explained at
+the queryset below. Private and archived ones are not excluded: they are real datasets
+with real dates.
 """
 
 import logging
@@ -49,10 +48,25 @@ TOLERANCE_SECONDS = 1
 def migrate(db):
     log.info("Looking for datasets whose last_update disagrees with their resources")
 
-    total = Dataset.objects().count()
+    # Deleted datasets are skipped, and the reason is not performance. `Auditable.post_save`
+    # fires `on_delete` for any document carrying `deleted`, and it does so unconditionally
+    # — unlike `on_update`, which is filtered to auditable fields and therefore never fires
+    # for these two. That signal recounts the owning organisation's metrics and saves it,
+    # which stamps the organisation's own `last_modified`: the date its card shows. Fixing
+    # a dataset's date is no reason to overwrite an organisation's.
+    #
+    # Nothing is lost by skipping them. A deleted dataset serves its date to nobody, and
+    # restoring one goes through `save()` and therefore `clean()`, which recomputes the
+    # field — it heals exactly when the date starts mattering again.
+    #
+    # `deleted=None` rather than `.visible()`: the latter also excludes private and
+    # archived datasets, which are real datasets with real dates worth correcting.
+    stale_candidates = Dataset.objects(deleted=None)
+
+    total = stale_candidates.count()
     healed = 0
 
-    with click.progressbar(Dataset.objects().no_cache(), length=total) as datasets:
+    with click.progressbar(stale_candidates.no_cache(), length=total) as datasets:
         for dataset in datasets:
             try:
                 expected = dataset.compute_last_update()

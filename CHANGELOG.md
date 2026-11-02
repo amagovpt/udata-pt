@@ -28,6 +28,13 @@
     the fix can move one back and that is correct when it does — deleting a dataset's most recent
     file used to leave the date pointing at a file that no longer exists. A read-only audit
     script reports the exact count per environment before the migration runs.
+  - The migration skips deleted datasets, and not for speed. `on_delete` is dispatched for any
+    document carrying `deleted` regardless of which fields changed — unlike `on_update`, which is
+    filtered to auditable fields and so never fires for these two — and that signal recounts the
+    owning organisation's metrics and saves it, stamping the organisation's own `last_modified`.
+    Correcting a dataset's date is no reason to overwrite the date an organisation's card shows.
+    Nothing is lost by skipping them: a deleted dataset serves its date to nobody, and restoring
+    one runs `clean()`, which recomputes the field exactly when it starts mattering again.
   - A test that claimed to assert this behaviour was passing against the broken code: it compared
     two dates created in the same second, inside the one-second slack the helper allows, so it
     would have passed against any implementation. It now uses dates years apart and fails on the
