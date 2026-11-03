@@ -46,8 +46,11 @@ class DatasetSearch(ModelSearchAdapter):
     # mapping changes the order of the portal's main listing for every visitor, which is
     # a product decision and not a side effect of fixing a date. Tracked in LEDG-2686.
     #
-    # Note that `last_update_range` below filters on the indexed `last_update`, so the
-    # facet counts do follow the dataset's real date — it is only the sort that diverges.
+    # The same mismatch hits `last_update_range` below, and there the effect is measurable:
+    # the service filters that facet on `last_modified`, which `SearchableDataset` does not
+    # declare and `serialize()` does not send either. Against production, all three ranges
+    # return the full catalogue — the "last 30 days / 12 months / 3 years" filter matches
+    # everything, which is to say it does nothing. Same root cause, same ticket.
     sorts = {
         "created": "created_at_internal",
         "last_update": "last_modified_internal",

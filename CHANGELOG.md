@@ -41,10 +41,12 @@
     unfixed code.
   - Worth knowing for whoever reads it: the search adapter translates `sort=last_update` to a
     field the indexer never sends it, so the ordering of the portal's main listing does not
-    follow this fix — only `/api/1/datasets/?sort=last_update` and the Atom feed do. The
-    *filtering* is a different matter and does follow it: the "last 30 days / 12 months / 3
-    years" facet matches on the indexed `last_update`, so those counts shift as datasets are
-    reindexed, which is the point. The sort split is now noted in the code and tracked on its own.
+    follow this fix — only `/api/1/datasets/?sort=last_update` and the Atom feed do. Looking
+    into that turned up a second, larger mismatch on the same root cause: the service filters
+    the "last 30 days / 12 months / 3 years" facet on `last_modified`, which the dataset index
+    is never sent either, and against production all three ranges return the entire catalogue.
+    That filter currently does nothing. Both are noted in the code and tracked on their own;
+    neither is caused by this change, and neither is fixed by it.
 
 - **feat(db): classify every migration record, and serve it to administrators**
   - A production dump restored into PPR arrived with 34 migrations that claimed to be applied
