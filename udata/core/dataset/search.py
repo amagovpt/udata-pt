@@ -1,7 +1,11 @@
 import datetime
 
 from udata.core.dataset.api import DEFAULT_SORTING, DatasetApiParser
-from udata.core.dataset.constants import FormatFamily, get_format_family
+from udata.core.dataset.constants import (
+    LAST_UPDATE_RANGES,
+    FormatFamily,
+    get_format_family,
+)
 from udata.core.organization.constants import PRODUCER_TYPES
 from udata.core.organization.helpers import get_producer_type
 from udata.core.spatial.constants import ADMIN_LEVEL_MAX
@@ -35,25 +39,33 @@ class DatasetSearch(ModelSearchAdapter):
     service_class = DatasetService
     consumer_class = DatasetConsumer
 
-    # `last_update` here does not mean the dataset's `last_update`. It is translated to
-    # `last_modified_internal` — a name `serialize()` below never sends to the index,
-    # which ships `last_update` instead. So the same parameter name reaches the search
-    # service and the Mongo-backed `/api/1/datasets/?sort=last_update` as two different
-    # fields, and what the service does with a sort key it was never given is not decided
-    # here. The DGT harvester notes the same split and works around it per document.
+    # Read in two places, and the difference matters when editing this. The **keys**
+    # become the accepted `sort` values — `as_request_parser` builds the choices from
+    # them, so renaming one changes the public API and its 400s. The **values** are only
+    # ever used by `parse_sort`, called from `mongo_search` below, which is the path
+    # that answers while no Elasticsearch service is configured — the case today. The
+    # Elasticsearch branch forwards the parameter name as given and renames only
+    # `created`, so it never reads these values at all.
     #
-    # Left as it is on purpose: whatever the service currently does, changing this
-    # mapping changes the order of the portal's main listing for every visitor, which is
-    # a product decision and not a side effect of fixing a date. Tracked in LEDG-2686.
+    # `last_update` now names the same date on both sides: Mongo orders the field of
+    # that name, and Elasticsearch would order the index's `last_update`, which
+    # `serialize()` below feeds from the same value. Same for `last_update_range` — the
+    # Mongo filter and the service both range over `last_update`.
     #
-    # The same mismatch hits `last_update_range` below, and there the effect is measurable:
-    # the service filters that facet on `last_modified`, which `SearchableDataset` does not
-    # declare and `serialize()` does not send either. Against production, all three ranges
-    # return the full catalogue — the "last 30 days / 12 months / 3 years" filter matches
-    # everything, which is to say it does nothing. Same root cause, same ticket.
+    # `created` does **not** agree, and cannot be fixed the same way. `Dataset.created_at`
+    # is a property (harvest issued date, else harvest created date, else the stored
+    # field), so Mongo has nothing to order on and the mapping must point at the stored
+    # `created_at_internal`. But `serialize()` feeds the index from the property, so for
+    # a harvested dataset the two paths would order `created` by different dates. Left
+    # as is deliberately; it needs the property materialised into a field first.
+    #
+    # Ties are the remaining divergence on `last_update`: the service adds relevance as
+    # a second sort key and Mongo adds none, so datasets sharing a date may come back in
+    # different orders. Measured on 19874 visible datasets, 2.6% share their
+    # `last_update` with another — against 5.1% for the field this used to name.
     sorts = {
         "created": "created_at_internal",
-        "last_update": "last_modified_internal",
+        "last_update": "last_update",
         "reuses": "metrics.reuses",
         "followers": "metrics.followers",
         "views": "metrics.views",
@@ -79,7 +91,7 @@ class DatasetSearch(ModelSearchAdapter):
         "access_type": Filter(),
         "format_family": Filter(choices=list(FormatFamily)),
         "producer_type": Filter(choices=list(PRODUCER_TYPES)),
-        "last_update_range": Filter(choices=["last_30_days", "last_12_months", "last_3_years"]),
+        "last_update_range": Filter(choices=list(LAST_UPDATE_RANGES)),
     }
 
     @classmethod
