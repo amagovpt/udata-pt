@@ -53,7 +53,7 @@ class DatasetSearch(ModelSearchAdapter):
     # everything, which is to say it does nothing. Same root cause, same ticket.
     sorts = {
         "created": "created_at_internal",
-        "last_update": "last_modified_internal",
+        "last_update": "last_update",
         "reuses": "metrics.reuses",
         "followers": "metrics.followers",
         "views": "metrics.views",
