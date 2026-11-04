@@ -1,7 +1,11 @@
 import datetime
 
 from udata.core.dataset.api import DEFAULT_SORTING, DatasetApiParser
-from udata.core.dataset.constants import FormatFamily, get_format_family
+from udata.core.dataset.constants import (
+    LAST_UPDATE_RANGES,
+    FormatFamily,
+    get_format_family,
+)
 from udata.core.organization.constants import PRODUCER_TYPES
 from udata.core.organization.helpers import get_producer_type
 from udata.core.spatial.constants import ADMIN_LEVEL_MAX
@@ -79,7 +83,7 @@ class DatasetSearch(ModelSearchAdapter):
         "access_type": Filter(),
         "format_family": Filter(choices=list(FormatFamily)),
         "producer_type": Filter(choices=list(PRODUCER_TYPES)),
-        "last_update_range": Filter(choices=["last_30_days", "last_12_months", "last_3_years"]),
+        "last_update_range": Filter(choices=list(LAST_UPDATE_RANGES)),
     }
 
     @classmethod
