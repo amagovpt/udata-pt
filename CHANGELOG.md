@@ -9,6 +9,36 @@
 
 ## Unreleased
 
+- **fix(search): `last_update` on the dataset search now means the date it names, and its range filter works at all**
+  - Two defects on the same parameter of `/api/2/datasets/search/`, both on the MongoDB path —
+    which is the path that answers, because no Elasticsearch service is configured.
+  - `sort=last_update` ordered on `last_modified_internal`, the reindex watermark, while the
+    same parameter on `/api/1/datasets/` ordered on `last_update`. The same name returned
+    different orders depending on which endpoint answered, and the one that disagreed with its
+    own name was the search endpoint. **The order this endpoint returns changes**, which is the
+    point: it changes to the one the parameter always promised.
+  - `last_update_range` was advertised and ignored. The parser accepts it and rejects an unknown
+    value with 400, but nothing applied it, so "last 30 days", "last 12 months" and "last 3
+    years" all returned the entire catalogue. Measured against production before the fix: with
+    the 30-day window, 16 of 100 results were older than 30 days — the same 16 that came back
+    with no filter at all. It is now applied, and a test pins the three windows to three
+    different counts.
+  - The window reaches back from midnight rather than from the moment of the request, matching
+    how the search service rounds its own boundary, so both sides would select the same
+    documents. Built on `relativedelta`: a year is not 365 days, and the boundary would drift
+    on every leap year.
+  - **Two site CSV exports change too.** They parse their arguments with the same search parser,
+    so they already accepted this filter and silently ignored it. They now honour it, and their
+    output shrinks for anyone passing it.
+  - `last_update` is now indexed. Measured on 19874 visible datasets, sorting on it planned as a
+    blocking sort over a full collection scan, loading whole documents because neither path
+    excludes resources; with the index the sort stage disappears. That sort already ran
+    unindexed on the v1 listing, so the index pays off a path older than this fix.
+  - Replaces the notes left in the search adapter by the resource-date fix, which named the
+    wrong cause: they attributed the range filter to a field the dataset path never uses, and
+    warned about changing the order of the portal's main listing — which does not call this
+    endpoint at all.
+
 - **fix(dataset): `last_update` now follows the resources, as the API has always claimed it did**
   - The field is published as "The resources last modification date" and is required, but
     `Dataset.clean()` was the only place that recomputed it, and the three resource mutators
@@ -39,14 +69,10 @@
     two dates created in the same second, inside the one-second slack the helper allows, so it
     would have passed against any implementation. It now uses dates years apart and fails on the
     unfixed code.
-  - Worth knowing for whoever reads it: the search adapter translates `sort=last_update` to a
-    field the indexer never sends it, so the ordering of the portal's main listing does not
-    follow this fix — only `/api/1/datasets/?sort=last_update` and the Atom feed do. Looking
-    into that turned up a second, larger mismatch on the same root cause: the service filters
-    the "last 30 days / 12 months / 3 years" facet on `last_modified`, which the dataset index
-    is never sent either, and against production all three ranges return the entire catalogue.
-    That filter currently does nothing. Both are noted in the code and tracked on their own;
-    neither is caused by this change, and neither is fixed by it.
+  - Worth knowing for whoever reads it: the search adapter translated `sort=last_update` to a
+    different field, so that ordering did not follow this fix. Chasing it turned up a second
+    problem on the same parameter — the date range filter was advertised and never applied.
+    Both are fixed separately, in the entry below; neither is caused by this change.
 
 - **feat(db): classify every migration record, and serve it to administrators**
   - A production dump restored into PPR arrived with 34 migrations that claimed to be applied

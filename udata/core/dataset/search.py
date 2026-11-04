@@ -39,22 +39,20 @@ class DatasetSearch(ModelSearchAdapter):
     service_class = DatasetService
     consumer_class = DatasetConsumer
 
-    # `last_update` here does not mean the dataset's `last_update`. It is translated to
-    # `last_modified_internal` — a name `serialize()` below never sends to the index,
-    # which ships `last_update` instead. So the same parameter name reaches the search
-    # service and the Mongo-backed `/api/1/datasets/?sort=last_update` as two different
-    # fields, and what the service does with a sort key it was never given is not decided
-    # here. The DGT harvester notes the same split and works around it per document.
+    # `sorts` is read in one place only: `parse_sort`, called from `mongo_search`
+    # below. That is the path that answers while no Elasticsearch service is
+    # configured, which is the case today. The Elasticsearch branch never passes
+    # through here — it forwards the parameter name as given, and the service renames
+    # only `created`.
     #
-    # Left as it is on purpose: whatever the service currently does, changing this
-    # mapping changes the order of the portal's main listing for every visitor, which is
-    # a product decision and not a side effect of fixing a date. Tracked in LEDG-2686.
+    # Both sides therefore name `last_update` now. Mongo orders the field of that name
+    # on the document; Elasticsearch would order the `last_update` of the index, which
+    # `serialize()` below feeds from the same value. Same for `last_update_range`: the
+    # Mongo filter and the service both range over `last_update`.
     #
-    # The same mismatch hits `last_update_range` below, and there the effect is measurable:
-    # the service filters that facet on `last_modified`, which `SearchableDataset` does not
-    # declare and `serialize()` does not send either. Against production, all three ranges
-    # return the full catalogue — the "last 30 days / 12 months / 3 years" filter matches
-    # everything, which is to say it does nothing. Same root cause, same ticket.
+    # They can still disagree on ties — the service adds relevance as a second sort key
+    # and Mongo adds none — so datasets sharing a `last_update` may come back in a
+    # different order from each.
     sorts = {
         "created": "created_at_internal",
         "last_update": "last_update",
