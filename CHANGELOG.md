@@ -9,6 +9,98 @@
 
 ## Unreleased
 
+- **fix(rdf): HVD categories written as the Implementing Regulation writes them are now recognised, so `dcatap:hvdCategory` stops being dropped from the catalogue**
+  - DCAT-AP HVD 2.2.0 requires every HVD dataset and data service to carry at least one
+    `dcatap:hvdCategory`. Records that left it out were invalid for data.europa.eu, and 8 of
+    the 40 production datasets missing it were missing it for this reason alone.
+  - The category is resolved from the dataset's tags, and only the plural spelling was
+    accepted. Directive (EU) 2019/1024 Annex I, its Portuguese transposition and the EU BNA
+    vocabulary all write the six categories in the plural; the Annex of Implementing
+    Regulation (EU) 2023/138 — the legislation the record itself declares in
+    `dcatap:applicableLegislation` — writes them in the singular. A publisher following the
+    Regulation tagged a dataset `geoespacial`, the lookup missed, and the property was never
+    emitted. Only three of the six categories differ, and only in grammatical number.
+  - The alternative spellings are recognised when reading tags and never written when
+    harvesting: the canonical plural stays the only label produced, and no stored tag
+    changes. Tags that merely resemble a category but appear in no legal text are
+    deliberately left out.
+  - The category now reaches all three places it belongs: the dataset, the `dcat:accessService`
+    built for OGC resources, and the data service that serves it. A dataset carrying both
+    spellings of one category still yields a single property, not two.
+  - **What does not change:** with no data migration, `geoespacial` and `geoespaciais` remain
+    two separate entries in the portal's tag facet. The catalogue is corrected; the browsing
+    experience is untouched.
+
+- **fix(search): `last_update` on the dataset search now means the date it names, and its range filter works at all**
+  - Two defects on the same parameter of `/api/2/datasets/search/`, both on the MongoDB path —
+    which is the path that answers, because no Elasticsearch service is configured.
+  - `sort=last_update` ordered on `last_modified_internal`, the reindex watermark, while the
+    same parameter on `/api/1/datasets/` ordered on `last_update`. The same name returned
+    different orders depending on which endpoint answered, and the one that disagreed with its
+    own name was the search endpoint. **The order this endpoint returns changes**, which is the
+    point: it changes to the one the parameter always promised.
+  - `last_update_range` was advertised and ignored. The parser accepts it and rejects an unknown
+    value with 400, but nothing applied it, so "last 30 days", "last 12 months" and "last 3
+    years" all returned the entire catalogue. Measured against production before the fix: with
+    the 30-day window, 16 of 100 results were older than 30 days — the same 16 that came back
+    with no filter at all. It is now applied, and a test pins the three windows to three
+    different counts.
+  - The window reaches back from midnight rather than from the moment of the request, matching
+    how the search service rounds its own boundary, so both sides would select the same
+    documents. Built on `relativedelta`: a year is not 365 days, and the boundary would drift
+    on every leap year.
+  - **Two site CSV exports change too.** They parse their arguments with the same search parser,
+    so they already accepted this filter and silently ignored it. They now honour it, and their
+    output shrinks for anyone passing it.
+  - `last_update` is now indexed, with a migration rather than left to lazy creation on first
+    save. Measured on 19874 visible datasets, sorting on it planned as a blocking sort over a
+    full collection scan, loading whole documents because neither path excludes resources; with
+    the index the sort stage disappears, 188ms to 57ms. That sort already ran unindexed on the
+    v1 listing, so the index pays off a path older than this fix.
+  - On ties, the two paths can still disagree, because the search service adds relevance as a
+    second sort key and Mongo adds none. Measured rather than assumed: 2.6% of datasets share
+    their `last_update` with another, against 5.1% for the field the search used to name — so
+    paging through this sort gets slightly more stable, not less.
+  - Replaces the notes left in the search adapter by the resource-date fix, which named the
+    wrong cause: they attributed the range filter to a field the dataset path never uses, and
+    warned about changing the order of the portal's main listing — which does not call this
+    endpoint at all.
+
+- **fix(dataset): `last_update` now follows the resources, as the API has always claimed it did**
+  - The field is published as "The resources last modification date" and is required, but
+    `Dataset.clean()` was the only place that recomputed it, and the three resource mutators
+    write through an atomic update that never runs `clean()`. Those are exactly what the API
+    calls when a publisher uploads, edits or deletes a file, so a dataset could gain a resource
+    today and still report a year-old date to anyone consuming the API.
+  - The derived fields now go through a single helper on the same atomic write, in an order that
+    is deliberate and documented: the dataset date is stamped first, because with the last
+    resource gone the computation falls back to it and would otherwise persist the document's
+    previous date; `quality_cached` is computed last, because its `next_update` is derived from
+    `last_update`. Until now those three scored the dataset against a date the same write was
+    about to change, so some published quality scores change with this fix.
+  - A migration heals the documents already affected, saving only those that actually disagree
+    with their resources rather than rewriting the whole catalogue: each save costs a homepage
+    invalidation and a queued reindex. Sampling production beforehand found around 1% of datasets
+    carrying a stale date, by up to six months. That sample showed no date moving backwards, but
+    the fix can move one back and that is correct when it does — deleting a dataset's most recent
+    file used to leave the date pointing at a file that no longer exists. A read-only audit
+    script reports the exact count per environment before the migration runs.
+  - The migration skips deleted datasets, and not for speed. `on_delete` is dispatched for any
+    document carrying `deleted` regardless of which fields changed — unlike `on_update`, which is
+    filtered to auditable fields and so never fires for these two — and that signal recounts the
+    owning organisation's metrics and saves it, stamping the organisation's own `last_modified`.
+    Correcting a dataset's date is no reason to overwrite the date an organisation's card shows.
+    Nothing is lost by skipping them: a deleted dataset serves its date to nobody, and restoring
+    one runs `clean()`, which recomputes the field exactly when it starts mattering again.
+  - A test that claimed to assert this behaviour was passing against the broken code: it compared
+    two dates created in the same second, inside the one-second slack the helper allows, so it
+    would have passed against any implementation. It now uses dates years apart and fails on the
+    unfixed code.
+  - Worth knowing for whoever reads it: the search adapter translated `sort=last_update` to a
+    different field, so that ordering did not follow this fix. Chasing it turned up a second
+    problem on the same parameter — the date range filter was advertised and never applied.
+    Both are fixed separately, in the entry below; neither is caused by this change.
+
 - **feat(db): classify every migration record, and serve it to administrators**
   - A production dump restored into PPR arrived with 34 migrations that claimed to be applied
     and had never run, and nothing could see it until the backend refused to start. `udata db

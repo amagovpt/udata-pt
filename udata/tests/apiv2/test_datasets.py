@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
+from dateutil.relativedelta import relativedelta
 from flask import url_for
 from mongoengine.fields import DateTimeField
 
@@ -135,6 +136,64 @@ class DatasetAPIV2Test(APITestCase):
         data = response.json["data"]
         assert len(data) == 2
         assert {d["id"] for d in data} == {str(tag_dataset_1.id), str(tag_dataset_2.id)}
+
+    def test_search_dataset_sorting_last_update(self):
+        """`sort=last_update` must order on `last_update`, not on another date.
+
+        The two fields are written in opposite orders on purpose. With them agreeing,
+        this assertion would hold whichever field the sort names, and would prove
+        nothing. Written atomically so `clean()` does not run: it would recompute
+        `last_update` from the resources and undo the setup.
+        """
+        older_update = DatasetFactory()
+        newer_update = DatasetFactory()
+        Dataset.objects(id=older_update.id).update(
+            set__last_update=datetime(2020, 1, 1),
+            set__last_modified_internal=datetime(2024, 1, 1),
+        )
+        Dataset.objects(id=newer_update.id).update(
+            set__last_update=datetime(2024, 1, 1),
+            set__last_modified_internal=datetime(2020, 1, 1),
+        )
+
+        response = self.get(url_for("apiv2.dataset_search", sort="-last_update"))
+        self.assert200(response)
+        assert response.json["data"][0]["id"] == str(newer_update.id)
+
+        response = self.get(url_for("apiv2.dataset_search", sort="last_update"))
+        self.assert200(response)
+        assert response.json["data"][0]["id"] == str(older_update.id)
+
+    def test_search_dataset_last_update_range(self):
+        """The three windows must select three different sets, not the whole catalogue.
+
+        `last_update_range` was advertised by the parser — an unknown value is already
+        rejected with 400 — while the Mongo path never applied it, so all three windows
+        answered with everything. The dates below sit far from every boundary, so the
+        counts do not drift with the day the suite runs.
+        """
+        now = datetime.now(UTC).replace(tzinfo=None)
+        for dataset, age in (
+            (DatasetFactory(), relativedelta(days=10)),
+            (DatasetFactory(), relativedelta(months=6)),
+            (DatasetFactory(), relativedelta(years=2)),
+            (DatasetFactory(), relativedelta(years=10)),
+        ):
+            Dataset.objects(id=dataset.id).update(set__last_update=now - age)
+
+        expected = {
+            "last_30_days": 1,
+            "last_12_months": 2,
+            "last_3_years": 3,
+        }
+        for window, count in expected.items():
+            response = self.get(url_for("apiv2.dataset_search", last_update_range=window))
+            self.assert200(response)
+            assert response.json["total"] == count, window
+
+        response = self.get(url_for("apiv2.dataset_search"))
+        self.assert200(response)
+        assert response.json["total"] == 4
 
     @pytest.mark.xfail(strict=True, reason=R5)
     def test_search_dataset_badges(self):

@@ -138,10 +138,42 @@ EU_HVD_CATEGORIES = {
     HVD_CATEGORY_STATISTICS: "Estatísticas",
 }
 HVD_LEGISLATION = "http://data.europa.eu/eli/reg_impl/2023/138/oj"
-# The tag a dataset carries for each category, and its reverse. Both derive from
-# the labels, so they follow whatever language those are written in.
+
+# Alternative spellings a dataset may legitimately carry for the same category. Recognised
+# when reading tags, never written when harvesting -- the labels above stay the only ones
+# we produce.
+#
+# The canonical labels are not a style choice: Directive (EU) 2019/1024 Annex I, its
+# Portuguese transposition (Lei 68/2021, art. 27-A) and the EU BNA vocabulary all write the
+# six categories in the plural, word for word. The Annex of Implementing Regulation (EU)
+# 2023/138 -- the very legislation we declare in `dcatap:applicableLegislation` -- writes
+# them in the singular. A publisher following it tags a dataset "geoespacial", the plural
+# lookup misses, and `dcatap:hvdCategory` is never emitted for a dataset that is required
+# to carry one.
+#
+# Only three of the six differ, and only in grammatical number; the other three slugify the
+# same from either text. Enumerated over the production catalogue on 2026-11-03:
+# geoespacial 24 datasets / geoespaciais 12, estatistica 20 / estatisticas 41,
+# meteorologica 1 / meteorologicas 1. The tags `meteorologia`, `observacao-da-terra` and
+# `empresas` also exist in the catalogue but appear in no legal text and on no HVD dataset,
+# so they stay out: we accept what the law writes, nothing more.
+EU_HVD_CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
+    HVD_CATEGORY_METEOROLOGICAL: ("Meteorológica",),
+    HVD_CATEGORY_GEOSPATIAL: ("Geoespacial",),
+    HVD_CATEGORY_STATISTICS: ("Estatística",),
+}
+
+# The tag written for each category when harvesting, derived from the canonical labels, so
+# it follows whatever language those are written in. One tag per category: no alias ever
+# reaches this map, and `theme_labels_from_rdf` reads the labels themselves.
 EU_HVD_CATEGORY_TAGS = {uri: slugify_tag(label) for uri, label in EU_HVD_CATEGORIES.items()}
-TAG_TO_EU_HVD_CATEGORIES = {tag: uri for uri, tag in EU_HVD_CATEGORY_TAGS.items()}
+# Every tag accepted as naming a category, canonical and alias alike. Deliberately not the
+# inverse of the map above: several tags may resolve to the same URI. Aliases go in first so
+# that a canonical tag always wins a collision, should one ever appear.
+TAG_TO_EU_HVD_CATEGORIES = {
+    slugify_tag(alias): uri for uri, aliases in EU_HVD_CATEGORY_ALIASES.items() for alias in aliases
+}
+TAG_TO_EU_HVD_CATEGORIES.update({tag: uri for uri, tag in EU_HVD_CATEGORY_TAGS.items()})
 
 INSPIRE_GEMET_THEME_NAMESPACE = "http://inspire.ec.europa.eu/theme"
 INSPIRE_GEMET_SCHEME_URIS = [

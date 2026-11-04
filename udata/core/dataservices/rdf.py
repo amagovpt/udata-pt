@@ -161,10 +161,17 @@ def dataservice_to_rdf(dataservice: Dataservice, graph=None):
 
     if is_hvd:
         # We also want to automatically add any HVD category tags of the dataservice's datasets.
+        # One probe per accepted tag, so the alternative spellings cost three extra queries
+        # (nine instead of six). Each is bounded by `id__in`, and the map is kept closed over
+        # the legal texts, so this stays linear in something that does not grow.
         dataset_ids = [dat.id for dat in dataservice.datasets]
         for tag in TAG_TO_EU_HVD_CATEGORIES:
             if Dataset.objects(id__in=dataset_ids, tags="hvd").filter(tags=tag).first():
                 hvd_category_tags.add(tag)
+    # This set holds tags, not URIs, so a dataset carrying both spellings of one category
+    # puts two entries here and adds the same triple twice. The graph is a set of triples,
+    # so a single `dcatap:hvdCategory` comes out -- asserted in the tests, because nothing
+    # in this loop would stop a future refactor from emitting the duplicate.
     for tag in hvd_category_tags:
         d.add(DCATAP.hvdCategory, URIRef(TAG_TO_EU_HVD_CATEGORIES[tag]))
 

@@ -665,8 +665,11 @@ class DGTBackend(BaseBackend):
                 dataset.harvest = HarvestDatasetMetadata()
             # The latest of them: the record last changed on the last date it
             # lists. `harvest.modified_at` is what `Dataset.last_modified`
-            # reads; `last_modified_internal` is its fallback and what the
-            # search sorts on as `last_update`.
+            # reads; `last_modified_internal` is its fallback, and the
+            # watermark `udata search index -f` filters on, so the rewrite is
+            # picked up by an incremental reindex. Both writes stay needed.
+            # (It is no longer what `sort=last_update` orders by: that now
+            # names the real `last_update` field.)
             dataset.harvest.modified_at = max(changed)
             dataset.last_modified_internal = dataset.harvest.modified_at
 
