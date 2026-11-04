@@ -663,6 +663,11 @@ class Dataset(
             {"fields": ["$title", "$description", "$acronym"]},
             "created_at_internal",
             "last_modified_internal",
+            # `?sort=last_update` on both the v1 listing and the v2 search orders on
+            # this field. Measured without the index on 19874 visible datasets, the
+            # plan is SORT over COLLSCAN — a blocking sort that loads whole documents,
+            # resources included, because neither path excludes them.
+            "last_update",
             "metrics.reuses",
             "metrics.dataservices",
             "metrics.followers",
