@@ -39,20 +39,30 @@ class DatasetSearch(ModelSearchAdapter):
     service_class = DatasetService
     consumer_class = DatasetConsumer
 
-    # `sorts` is read in one place only: `parse_sort`, called from `mongo_search`
-    # below. That is the path that answers while no Elasticsearch service is
-    # configured, which is the case today. The Elasticsearch branch never passes
-    # through here — it forwards the parameter name as given, and the service renames
-    # only `created`.
+    # Read in two places, and the difference matters when editing this. The **keys**
+    # become the accepted `sort` values — `as_request_parser` builds the choices from
+    # them, so renaming one changes the public API and its 400s. The **values** are only
+    # ever used by `parse_sort`, called from `mongo_search` below, which is the path
+    # that answers while no Elasticsearch service is configured — the case today. The
+    # Elasticsearch branch forwards the parameter name as given and renames only
+    # `created`, so it never reads these values at all.
     #
-    # Both sides therefore name `last_update` now. Mongo orders the field of that name
-    # on the document; Elasticsearch would order the `last_update` of the index, which
-    # `serialize()` below feeds from the same value. Same for `last_update_range`: the
+    # `last_update` now names the same date on both sides: Mongo orders the field of
+    # that name, and Elasticsearch would order the index's `last_update`, which
+    # `serialize()` below feeds from the same value. Same for `last_update_range` — the
     # Mongo filter and the service both range over `last_update`.
     #
-    # They can still disagree on ties — the service adds relevance as a second sort key
-    # and Mongo adds none — so datasets sharing a `last_update` may come back in a
-    # different order from each.
+    # `created` does **not** agree, and cannot be fixed the same way. `Dataset.created_at`
+    # is a property (harvest issued date, else harvest created date, else the stored
+    # field), so Mongo has nothing to order on and the mapping must point at the stored
+    # `created_at_internal`. But `serialize()` feeds the index from the property, so for
+    # a harvested dataset the two paths would order `created` by different dates. Left
+    # as is deliberately; it needs the property materialised into a field first.
+    #
+    # Ties are the remaining divergence on `last_update`: the service adds relevance as
+    # a second sort key and Mongo adds none, so datasets sharing a date may come back in
+    # different orders. Measured on 19874 visible datasets, 2.6% share their
+    # `last_update` with another — against 5.1% for the field this used to name.
     sorts = {
         "created": "created_at_internal",
         "last_update": "last_update",

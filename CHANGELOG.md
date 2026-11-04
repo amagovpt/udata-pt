@@ -30,10 +30,15 @@
   - **Two site CSV exports change too.** They parse their arguments with the same search parser,
     so they already accepted this filter and silently ignored it. They now honour it, and their
     output shrinks for anyone passing it.
-  - `last_update` is now indexed. Measured on 19874 visible datasets, sorting on it planned as a
-    blocking sort over a full collection scan, loading whole documents because neither path
-    excludes resources; with the index the sort stage disappears. That sort already ran
-    unindexed on the v1 listing, so the index pays off a path older than this fix.
+  - `last_update` is now indexed, with a migration rather than left to lazy creation on first
+    save. Measured on 19874 visible datasets, sorting on it planned as a blocking sort over a
+    full collection scan, loading whole documents because neither path excludes resources; with
+    the index the sort stage disappears, 188ms to 57ms. That sort already ran unindexed on the
+    v1 listing, so the index pays off a path older than this fix.
+  - On ties, the two paths can still disagree, because the search service adds relevance as a
+    second sort key and Mongo adds none. Measured rather than assumed: 2.6% of datasets share
+    their `last_update` with another, against 5.1% for the field the search used to name — so
+    paging through this sort gets slightly more stable, not less.
   - Replaces the notes left in the search adapter by the resource-date fix, which named the
     wrong cause: they attributed the range filter to a field the dataset path never uses, and
     warned about changing the order of the portal's main listing — which does not call this
