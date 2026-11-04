@@ -9,6 +9,28 @@
 
 ## Unreleased
 
+- **fix(rdf): HVD categories written as the Implementing Regulation writes them are now recognised, so `dcatap:hvdCategory` stops being dropped from the catalogue**
+  - DCAT-AP HVD 2.2.0 requires every HVD dataset and data service to carry at least one
+    `dcatap:hvdCategory`. Records that left it out were invalid for data.europa.eu, and 8 of
+    the 40 production datasets missing it were missing it for this reason alone.
+  - The category is resolved from the dataset's tags, and only the plural spelling was
+    accepted. Directive (EU) 2019/1024 Annex I, its Portuguese transposition and the EU BNA
+    vocabulary all write the six categories in the plural; the Annex of Implementing
+    Regulation (EU) 2023/138 — the legislation the record itself declares in
+    `dcatap:applicableLegislation` — writes them in the singular. A publisher following the
+    Regulation tagged a dataset `geoespacial`, the lookup missed, and the property was never
+    emitted. Only three of the six categories differ, and only in grammatical number.
+  - The alternative spellings are recognised when reading tags and never written when
+    harvesting: the canonical plural stays the only label produced, and no stored tag
+    changes. Tags that merely resemble a category but appear in no legal text are
+    deliberately left out.
+  - The category now reaches all three places it belongs: the dataset, the `dcat:accessService`
+    built for OGC resources, and the data service that serves it. A dataset carrying both
+    spellings of one category still yields a single property, not two.
+  - **What does not change:** with no data migration, `geoespacial` and `geoespaciais` remain
+    two separate entries in the portal's tag facet. The catalogue is corrected; the browsing
+    experience is untouched.
+
 - **fix(search): `last_update` on the dataset search now means the date it names, and its range filter works at all**
   - Two defects on the same parameter of `/api/2/datasets/search/`, both on the MongoDB path —
     which is the path that answers, because no Elasticsearch service is configured.
