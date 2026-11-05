@@ -9,6 +9,31 @@
 
 ## Unreleased
 
+- **fix(organization): the date on an organisation's card means an edit again, not activity around it**
+  - `Organization` carries the `Datetimed` mixin, whose `pre_save` hook stamps `last_modified` on
+    every write of the document. Six methods write it for reasons that are not edits: a dataset,
+    reuse or dataservice of the organisation changed, somebody followed it, a discussion was
+    opened, a member was counted. The card showed that date, and the listing sorts by it when the
+    visitor picks no ordering, so both tracked activity around the organisation rather than
+    changes to it.
+  - The six now write only the field they changed, through an atomic update. That keeps
+    `last_modified` out of the write entirely rather than suppressing the hook — so it cannot be
+    rewritten from a stale in-memory copy either, which a hook-suppressing version would have
+    allowed and which could have moved the date backwards. It also stops a metrics recount
+    rewriting the whole document, description included, for one counter.
+  - Removing a member now stamps the date explicitly. It is written with an atomic update that
+    never reached the hook, so until now it depended on the recount that followed it; adding a
+    member saves the document and always stamped. The ticket counts members among the things
+    that make an edit, so the two halves had to agree.
+  - **No backfill is possible.** The date of the last real edit was never recorded anywhere, so
+    there is nothing to reconstruct it from. Existing values stay as they are until each
+    organisation is edited, and are an upper bound on the real date — the stamp could only ever
+    have been at or after it.
+  - Measured before and after: of 100 production organisations, none carried a date under a day
+    old and 96 were between one and twelve months. The symptom is real but far less visible than
+    "every harvested organisation shows a few hours" — a harvest that only touches files does not
+    reach this path at all.
+
 - **fix(rdf): HVD categories written as the Implementing Regulation writes them are now recognised, so `dcatap:hvdCategory` stops being dropped from the catalogue**
   - DCAT-AP HVD 2.2.0 requires every HVD dataset and data service to carry at least one
     `dcatap:hvdCategory`. Records that left it out were invalid for data.europa.eu, and 8 of

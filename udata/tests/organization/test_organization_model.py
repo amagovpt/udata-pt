@@ -7,6 +7,7 @@ import udata.core.organization.constants as org_constants
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.factories import DatasetFactory, HiddenDatasetFactory
+from udata.core.discussions.factories import DiscussionFactory
 from udata.core.followers.signals import on_follow, on_unfollow
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.organization.models import Organization, OrganizationBadge
@@ -20,7 +21,62 @@ from udata.tests.helpers import assert_emit
 class OrganizationModelTest(DBTestCase):
     # Load metrics
     import udata.core.organization.metrics  # noqa
+    import udata.core.discussions.metrics  # noqa
     import udata.core.followers.metrics  # noqa
+
+    def test_metrics_recount_preserves_last_modified(self):
+        """Recounting metrics must not move the date the organisation's card shows.
+
+        None of these recounts is someone editing the organisation: a dataset was
+        published, a reuse was created, somebody followed it, a discussion was
+        opened, a member was counted. Saving the whole document for any of them
+        used to run the `Datetimed` pre_save hook and stamp `last_modified`, so the
+        card — and the listing's default ordering — tracked activity instead of edits.
+
+        Both assertions are needed: without the metrics one, a helper that wrote
+        nothing at all would pass.
+        """
+        pinned = datetime(2020, 1, 1)
+        org = OrganizationFactory(members=[Member(user=UserFactory(), role="admin")])
+        # Queryset write: it does not go through pre_save, so it pins the date
+        # without the hook rewriting it on the way in.
+        Organization.objects(id=org.id).update(set__last_modified=pinned)
+        org.reload()
+
+        DatasetFactory(organization=org)
+        VisibleReuseFactory(organization=org)
+        DataserviceFactory(organization=org)
+        Follow.objects.create(following=org, follower=UserFactory(), since=datetime.now(UTC))
+        DiscussionFactory(subject=org, user=UserFactory())
+        # These two recount through their own method rather than a signal: the
+        # discussion receiver drags in notification senders that need the API
+        # blueprint, and members are only ever counted from the API. The method is
+        # what this test is about either way.
+        org.count_discussions()
+        org.count_members()
+
+        # The receivers fetch their own instance, so read the stored document back.
+        stored = Organization.objects(id=org.id).first()
+        assert stored.get_metrics()["datasets"] == 1
+        assert stored.get_metrics()["reuses"] == 1
+        assert stored.get_metrics()["dataservices"] == 1
+        assert stored.get_metrics()["followers"] == 1
+        assert stored.get_metrics()["discussions"] == 1
+        assert stored.get_metrics()["members"] == 1
+        assert stored.last_modified == pinned
+
+    def test_real_edit_stamps_last_modified(self):
+        """The other half of the rule: editing the organisation still moves the date."""
+        pinned = datetime(2020, 1, 1)
+        org = OrganizationFactory()
+        Organization.objects(id=org.id).update(set__last_modified=pinned)
+        org.reload()
+
+        org.description = "A new description"
+        org.save()
+
+        org.reload()
+        assert org.last_modified > pinned
 
     def test_organization_metrics(self):
         # Members count update are in API calls, thus being tested in API dedicated tests

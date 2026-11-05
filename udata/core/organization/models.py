@@ -457,9 +457,29 @@ class Organization(
         self.save()
         MembershipRequest.after_create.send(membership_request, org=self)
 
+    def _save_metrics(self):
+        """Persist the metrics without touching anything else on the document.
+
+        These counts are recomputed whenever a dataset, reuse, dataservice,
+        follower, discussion or member of this organisation changes — none of
+        which is someone editing the organisation. Saving the whole document
+        for them ran the `Datetimed` pre_save hook, which stamps
+        `last_modified` on every write, so the date the organisation's card
+        shows (and the order the listing sorts by) tracked activity around the
+        organisation rather than edits to it.
+
+        An atomic write of the one field that changed avoids that, and avoids
+        it without suppressing the hook: `last_modified` is never part of the
+        update, so it cannot be rewritten from a stale in-memory copy either.
+        Same approach as the resource mutators on `Dataset` and the download
+        metrics task, both of which write their field directly for the same
+        reason.
+        """
+        Organization.objects(id=self.id).update(set__metrics=self.metrics)
+
     def count_members(self):
         self.metrics["members"] = len(self.members)
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics()
 
     def count_datasets(self):
         from udata.models import Dataset, Follow, Reuse
@@ -476,7 +496,7 @@ class Organization(
                 Reuse.objects(datasets__in=Dataset.objects(organization=self)).visible()
             )
 
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics()
 
     def count_reuses(self):
         from udata.models import Follow, Reuse
@@ -488,7 +508,7 @@ class Organization(
         self.metrics["reuses_followers_by_months"] = get_stock_metrics(
             Follow.objects(following__in=Reuse.objects(organization=self)), date_label="since"
         )
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics()
 
     def count_dataservices(self):
         from udata.models import Dataservice
@@ -497,20 +517,20 @@ class Organization(
         self.metrics["dataservices_by_months"] = get_stock_metrics(
             Dataservice.objects(organization=self).visible(), date_label="created_at"
         )
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics()
 
     def count_followers(self):
         from udata.models import Follow
 
         self.metrics["followers"] = Follow.objects(until=None).followers(self).count()
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics()
 
     def count_discussions(self):
         from udata.models import Discussion
 
         self.metrics["discussions"] = Discussion.objects(subject=self).count()
         self.metrics["discussions_open"] = Discussion.objects(subject=self, closed=None).count()
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics()
 
 
 pre_save.connect(Organization.pre_save, sender=Organization)
