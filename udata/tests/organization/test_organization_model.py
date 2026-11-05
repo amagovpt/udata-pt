@@ -29,33 +29,35 @@ class OrganizationModelTest(DBTestCase):
 
         None of these recounts is someone editing the organisation: a dataset was
         published, a reuse was created, somebody followed it, a discussion was
-        opened, a member was counted. Saving the whole document for any of them
-        used to run the `Datetimed` pre_save hook and stamp `last_modified`, so the
-        card — and the listing's default ordering — tracked activity instead of edits.
+        opened, a member was counted. Persisting them with `save()` ran the
+        `Datetimed` pre_save hook and stamped `last_modified`, so the card — and
+        the listing's default ordering — tracked activity instead of edits.
 
-        Both assertions are needed: without the metrics one, a helper that wrote
-        nothing at all would pass.
+        Each recount runs from its own instance, loaded before the others wrote.
+        That is what production looks like — the DCAT harvester holds organisations
+        for a whole crawl and counts them at the end — and it is what makes the
+        metric assertions mean something: with a single shared instance they would
+        pass even if each write clobbered the previous one.
         """
         pinned = datetime(2020, 1, 1)
         org = OrganizationFactory(members=[Member(user=UserFactory(), role="admin")])
         # Queryset write: it does not go through pre_save, so it pins the date
         # without the hook rewriting it on the way in.
         Organization.objects(id=org.id).update(set__last_modified=pinned)
-        org.reload()
 
         DatasetFactory(organization=org)
         VisibleReuseFactory(organization=org)
         DataserviceFactory(organization=org)
         Follow.objects.create(following=org, follower=UserFactory(), since=datetime.now(UTC))
         DiscussionFactory(subject=org, user=UserFactory())
-        # These two recount through their own method rather than a signal: the
-        # discussion receiver drags in notification senders that need the API
-        # blueprint, and members are only ever counted from the API. The method is
-        # what this test is about either way.
-        org.count_discussions()
-        org.count_members()
 
-        # The receivers fetch their own instance, so read the stored document back.
+        # Discussions and members recount through their own method rather than a
+        # signal: the discussion receiver drags in notification senders that need
+        # the API blueprint, and members are only ever counted from the API. Each
+        # gets a freshly loaded instance, so neither can carry the other's writes.
+        Organization.objects(id=org.id).first().count_discussions()
+        Organization.objects(id=org.id).first().count_members()
+
         stored = Organization.objects(id=org.id).first()
         assert stored.get_metrics()["datasets"] == 1
         assert stored.get_metrics()["reuses"] == 1
@@ -64,6 +66,24 @@ class OrganizationModelTest(DBTestCase):
         assert stored.get_metrics()["discussions"] == 1
         assert stored.get_metrics()["members"] == 1
         assert stored.last_modified == pinned
+
+    def test_metrics_recount_does_not_clobber_other_counters(self):
+        """A recount writes its own counters and leaves everyone else's alone.
+
+        These run from instances loaded long before they are used, so persisting
+        the whole `metrics` dict would roll back whatever another process wrote in
+        between — the view and download counters are written that way by their own
+        task — or drop keys the stale instance never loaded.
+        """
+        org = OrganizationFactory()
+        stale = Organization.objects(id=org.id).first()
+
+        Organization.objects(id=org.id).update(set__metrics__views=99)
+        stale.count_followers()
+
+        stored = Organization.objects(id=org.id).first()
+        assert stored.get_metrics()["views"] == 99
+        assert stored.get_metrics()["followers"] == 0
 
     def test_real_edit_stamps_last_modified(self):
         """The other half of the rule: editing the organisation still moves the date."""

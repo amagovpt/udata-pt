@@ -16,19 +16,27 @@
     opened, a member was counted. The card showed that date, and the listing sorts by it when the
     visitor picks no ordering, so both tracked activity around the organisation rather than
     changes to it.
-  - The six now write only the field they changed, through an atomic update. That keeps
-    `last_modified` out of the write entirely rather than suppressing the hook — so it cannot be
-    rewritten from a stale in-memory copy either, which a hook-suppressing version would have
-    allowed and which could have moved the date backwards. It also stops a metrics recount
-    rewriting the whole document, description included, for one counter.
+  - The six now write their counters directly, one key per counter, so `last_modified` is never
+    part of the update and the hook never runs. One key at a time rather than the whole `metrics`
+    dict, because these recounts run from instances that may have been loaded long before — the
+    DCAT harvester collects organisations for a whole crawl and counts them at the end — and
+    writing the dict wholesale would roll back counters another process set meanwhile. `save()`
+    wrote a per-key delta for the same reason; this keeps that property, and matches how the view
+    and download counters are already written.
+  - One consequence worth stating: these writes do not emit `post_save`, so they no longer queue
+    a search reindex. The counter tasks never did either, so this aligns the two — but counts in
+    the search index now refresh on a real edit or a full reindex, not on every recount.
   - Removing a member now stamps the date explicitly. It is written with an atomic update that
     never reached the hook, so until now it depended on the recount that followed it; adding a
     member saves the document and always stamped. The ticket counts members among the things
     that make an edit, so the two halves had to agree.
-  - **No backfill is possible.** The date of the last real edit was never recorded anywhere, so
-    there is nothing to reconstruct it from. Existing values stay as they are until each
-    organisation is edited, and are an upper bound on the real date — the stamp could only ever
-    have been at or after it.
+  - **No backfill ships here.** Existing values stay as they are until each organisation is
+    edited, and are an upper bound on the real date — the stamp could only ever have been at or
+    after it. A partial reconstruction is possible and was considered: the activity log records
+    an entry per real edit, because the recounts suppressed the signal that writes it. It covers
+    only edits by signed-in users, leaving harvested and CLI changes unrecorded, so it would
+    produce a date that is right for some organisations and silently wrong for others. Left out
+    deliberately rather than for lack of a source.
   - Measured before and after: of 100 production organisations, none carried a date under a day
     old and 96 were between one and twelve months. The symptom is real but far less visible than
     "every harvested organisation shows a few hours" — a harvest that only touches files does not
