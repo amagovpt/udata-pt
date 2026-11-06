@@ -354,31 +354,38 @@ class Reuse(
 
         These counts are recomputed whenever a dataset is attached, a discussion
         is opened or closed, or somebody follows the reuse — none of which is
-        someone editing it. They used to be persisted with `save()`, which runs
-        the `Datetimed` pre_save hook; that hook stamps `last_modified` on any
-        write of such a document, so every recount moved the date the reuse's
-        card shows and the listing sorts by when no ordering is picked.
+        someone editing it. They used to be persisted with `save()`, and the
+        `Datetimed` pre_save hook stamps `last_modified` on any `save()` of such
+        a document whose field is not already marked as changed. So every
+        recount moved the date the reuse's card shows and the listing sorts by
+        when no ordering is picked. A queryset update never reaches that hook,
+        which is what this method relies on.
 
         Attaching a dataset is the one that looks like an edit, and it is — but
         the recount is not what records it. `count_datasets()` runs from
-        `on_update`, which fires after *any* auditable field changes, so it
-        always follows a `save()` that has already stamped the document. Its own
-        stamp was the second one, never the only one. The other callers are
-        backfill migrations, where stamping would put today's date on every
-        historical reuse.
+        `on_create` and `on_update`, and `on_update` fires after *any* auditable
+        field changes, so it always follows a `save()` that has already stamped
+        the document. Its own stamp was the second one, never the only one. The
+        remaining callers are two backfill migrations and the `udata metrics
+        update` command, and none of them is an edit either.
 
-        One key per argument, never the whole `metrics` dict: `metrics.views` is
-        written key-by-key by `udata.core.metrics.tasks`, and writing the dict
-        wholesale from an instance loaded earlier would roll that counter back,
-        or drop keys this instance never loaded. `save()` wrote a per-key delta
-        for the same reason; this keeps that property.
+        Assigned one key at a time, and that is load-bearing twice over. The
+        write itself must be per key, because `metrics.views` is written that
+        way by the counter tasks and a wholesale write from an instance loaded
+        earlier would roll it back. And the *assignment* must be per key too:
+        `dict.update` marks the whole `metrics` field as changed, so a later
+        `save()` on this same instance would write the dict in one piece and
+        lose those counters anyway — the same defect, moved one step later.
+        Assigning the key marks `metrics.<key>`, which is what `save()` did
+        before this method existed.
 
         Unlike `save()`, this does not emit `post_save`, so it does not queue a
         search reindex. That matches the counter tasks, which never reindexed
         either: counts in the search index now refresh on a real edit or a full
         reindex, not on every recount.
         """
-        self.metrics.update(values)
+        for key, value in values.items():
+            self.metrics[key] = value
         Reuse.objects(id=self.id).update(
             **{f"set__metrics__{key}": value for key, value in values.items()}
         )

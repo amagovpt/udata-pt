@@ -140,20 +140,29 @@ class ReuseModelTest(DBTestCase):
         assert stored.last_modified == pinned
 
     def test_metrics_recount_does_not_clobber_other_counters(self):
-        """A recount writes its own counters and leaves everyone else's alone.
+        """A recount must not cost another process its counters — not even later.
 
-        `metrics.views` is written key-by-key by the counter tasks, so persisting
-        the whole `metrics` dict from an instance loaded earlier would roll it back.
+        `metrics.views` is written key-by-key by the counter tasks. Two ways of
+        losing it: writing the whole dict in the recount, and marking the whole
+        `metrics` field so that the *next* `save()` on the same instance writes it
+        in one piece. The second is the subtler one, and it is why the recount
+        assigns the key rather than updating the dict.
+
+        The `save()` below is what makes this test able to tell the two apart —
+        without it, both forms pass. It mirrors what the metrics command and the
+        signal receivers do: recount, then carry on with the same instance.
         """
         reuse = ReuseFactory()
         stale = Reuse.objects(id=reuse.id).first()
 
         Reuse.objects(id=reuse.id).update(set__metrics__views=99)
         stale.count_followers()
+        stale.description = "edited afterwards"
+        stale.save()
 
         stored = Reuse.objects(id=reuse.id).first()
-        assert stored.get_metrics()["views"] == 99
-        assert stored.get_metrics()["followers"] == 0
+        assert stored.metrics["views"] == 99
+        assert stored.metrics["followers"] == 0
 
     def test_real_edit_stamps_last_modified(self):
         """The other half of the rule: editing the reuse still moves the date."""

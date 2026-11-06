@@ -16,15 +16,18 @@
     closed, somebody followed it. The card shows that date, and the listing sorts by it when the
     visitor picks no ordering, so following a reuse pushed it to the top of "most recent".
   - Attaching a dataset is the one that looks like an edit, and it is — but the recount is not
-    what records it. `count_datasets()` runs from `on_update`, which fires after *any* auditable
-    field changes, so it always follows a save that has already stamped the document. Its own
-    stamp was the second one, never the only one. The remaining callers are backfill migrations,
-    where stamping would put today's date on every historical reuse.
-  - The three now write their counters directly, one key per counter, so `last_modified` is
-    never part of the update. One key at a time rather than the whole `metrics` dict, because
-    `metrics.views` is written key-by-key by the counter tasks and writing the dict from an
-    instance loaded earlier would roll it back — the regression the organisation fix had to
-    correct, now pinned by a test here.
+    what records it. `count_datasets()` runs from `on_create` and `on_update`, and `on_update`
+    fires after *any* auditable field changes, so it always follows a save that has already
+    stamped the document. Its own stamp was the second one, never the only one. The remaining
+    callers are two backfill migrations and the `udata metrics update` command, where stamping
+    would put today's date on every historical reuse.
+  - The three now write their counters directly, one key at a time, so `last_modified` is never
+    part of the update. Per key in two senses, and both matter: the *write* must be per key
+    because `metrics.views` is written that way by the counter tasks, and a wholesale write from
+    an instance loaded earlier rolls it back; and the *assignment* must be per key too, because
+    updating the dict marks the whole `metrics` field as changed and the next `save()` on that
+    instance would write it in one piece — losing the same counters one step later. A test pins
+    the second, which is the one that slipped through on organisations.
   - Same consequence as on organisations: these writes do not emit `post_save`, so they no
     longer queue a search reindex. The counter tasks never did either. Inert while no
     Elasticsearch service is configured.
