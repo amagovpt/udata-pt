@@ -10,7 +10,7 @@
 ## Unreleased
 
 - **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
-  - The same defect LEDG-2600 fixed on organisations. `Reuse` carries the `Datetimed` mixin,
+  - The same defect that was just fixed on organisations. `Reuse` carries the `Datetimed` mixin,
     whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods
     write it for reasons that are not edits: a dataset was attached, a discussion was opened or
     closed, somebody followed it. The card shows that date, and the listing sorts by it when the
