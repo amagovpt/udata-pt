@@ -33,6 +33,10 @@
     Elasticsearch service is configured.
   - No backfill. Existing values stay as they are until each reuse is edited, and are an upper
     bound on the real date.
+  - `udata metrics update --drop` clears the counters for real again. It cleared them in memory
+    and relied on the save that followed to persist that; with the recounts writing their own
+    keys atomically, nothing did, and the option had quietly become a no-op for reuses and
+    organisations. It now writes the reset before recounting.
 
 - **fix(organization): the date on an organisation's card means an edit again, not activity around it**
   - `Organization` carries the `Datetimed` mixin, whose `pre_save` hook stamps `last_modified` on
