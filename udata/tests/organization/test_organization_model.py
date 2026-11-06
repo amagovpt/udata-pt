@@ -68,22 +68,29 @@ class OrganizationModelTest(DBTestCase):
         assert stored.last_modified == pinned
 
     def test_metrics_recount_does_not_clobber_other_counters(self):
-        """A recount writes its own counters and leaves everyone else's alone.
+        """A recount must not cost another process its counters — not even later.
 
-        These run from instances loaded long before they are used, so persisting
-        the whole `metrics` dict would roll back whatever another process wrote in
-        between — the view and download counters are written that way by their own
-        task — or drop keys the stale instance never loaded.
+        The view and download counters are written key-by-key by their own task.
+        Two ways of losing them: writing the whole dict in the recount, and marking
+        the whole `metrics` field so that the *next* `save()` on the same instance
+        writes it in one piece. The second is the subtler one, and it is why the
+        recount assigns the key rather than updating the dict.
+
+        The `save()` below is what makes this test able to tell the two apart —
+        without it, both forms pass. It mirrors what the metrics command and the
+        signal receivers do: recount, then carry on with the same instance.
         """
         org = OrganizationFactory()
         stale = Organization.objects(id=org.id).first()
 
         Organization.objects(id=org.id).update(set__metrics__views=99)
         stale.count_followers()
+        stale.description = "edited afterwards"
+        stale.save()
 
         stored = Organization.objects(id=org.id).first()
-        assert stored.get_metrics()["views"] == 99
-        assert stored.get_metrics()["followers"] == 0
+        assert stored.metrics["views"] == 99
+        assert stored.metrics["followers"] == 0
 
     def test_real_edit_stamps_last_modified(self):
         """The other half of the rule: editing the organisation still moves the date."""
