@@ -473,21 +473,26 @@ class Organization(
         entirely, so the hook never runs and the date cannot be rewritten from
         this instance either.
 
-        One key per argument, never the whole `metrics` dict: these recounts
-        run from instances that may have been loaded long before — the DCAT
-        harvester collects organisations for the length of a crawl and counts
-        them at the end — and writing the dict wholesale would roll back
-        counters another process set meanwhile, or drop keys this instance
-        never loaded. `save()` wrote a per-key delta for the same reason; this
-        keeps that property. Same shape as `udata.core.metrics.tasks`, which
-        writes `set__metrics__<key>` for the view and download counters.
+        Assigned one key at a time, and that is load-bearing twice over. The
+        write must be per key because these recounts run from instances that may
+        have been loaded long before — the DCAT harvester collects organisations
+        for the length of a crawl and counts them at the end — and a wholesale
+        write would roll back counters another process set meanwhile, or drop
+        keys this instance never loaded. And the *assignment* must be per key
+        too: `dict.update` marks the whole `metrics` field as changed, so a later
+        `save()` on this same instance would write the dict in one piece and lose
+        those counters anyway — the same defect, moved one step later. Assigning
+        the key marks `metrics.<key>`, which is what `save()` did before this
+        method existed. Same shape as `udata.core.metrics.tasks`, which writes
+        `set__metrics__<key>` for the view and download counters.
 
         Unlike `save()`, this does not emit `post_save`, so it does not queue a
         search reindex. That matches `udata.core.metrics.tasks`, whose counter
         writes never reindexed either: counts in the search index now refresh
         on a real edit or a full reindex, not on every recount.
         """
-        self.metrics.update(values)
+        for key, value in values.items():
+            self.metrics[key] = value
         Organization.objects(id=self.id).update(
             **{f"set__metrics__{key}": value for key, value in values.items()}
         )
