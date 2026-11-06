@@ -98,6 +98,76 @@ class ReuseModelTest(DBTestCase):
         dataset.reload()
         assert dataset.get_metrics()["reuses"] == 0
 
+    def test_metrics_recount_preserves_last_modified(self):
+        """Recounting metrics must not move the date the reuse's card shows.
+
+        None of these is someone editing the reuse: a dataset is attached, a
+        discussion is opened, somebody follows it. Persisting them with `save()`
+        ran the `Datetimed` pre_save hook and stamped `last_modified`, so the card
+        — and the listing's default ordering — tracked activity instead of edits.
+
+        Order matters. The reuse is created with its dataset already attached,
+        because that list lives on the reuse document: attaching one after pinning
+        the date would need a `save()`, which stamps, and the test would fail for a
+        reason it is not testing.
+
+        Each recount runs from its own instance, because the follower receiver
+        recounts on the very object it was handed. With one shared instance the
+        metric assertions would hold even if each write clobbered the last.
+        """
+        from udata.models import Follow
+
+        pinned = datetime(2020, 1, 1)
+        reuse = VisibleReuseFactory()
+        # Queryset write: it does not go through pre_save, so it pins the date
+        # without the hook rewriting it on the way in.
+        Reuse.objects(id=reuse.id).update(set__last_modified=pinned)
+
+        Follow.objects.create(following=reuse, follower=UserFactory(), since=datetime.now(UTC))
+        DiscussionFactory(subject=reuse, user=UserFactory())
+
+        # Called directly rather than through their signals: the discussion
+        # receiver drags in notification senders that need the API blueprint, and
+        # a fresh instance each time is what makes the assertions mean something.
+        Reuse.objects(id=reuse.id).first().count_datasets()
+        Reuse.objects(id=reuse.id).first().count_discussions()
+        Reuse.objects(id=reuse.id).first().count_followers()
+
+        stored = Reuse.objects(id=reuse.id).first()
+        assert stored.get_metrics()["datasets"] == 1
+        assert stored.get_metrics()["discussions"] == 1
+        assert stored.get_metrics()["followers"] == 1
+        assert stored.last_modified == pinned
+
+    def test_metrics_recount_does_not_clobber_other_counters(self):
+        """A recount writes its own counters and leaves everyone else's alone.
+
+        `metrics.views` is written key-by-key by the counter tasks, so persisting
+        the whole `metrics` dict from an instance loaded earlier would roll it back.
+        """
+        reuse = ReuseFactory()
+        stale = Reuse.objects(id=reuse.id).first()
+
+        Reuse.objects(id=reuse.id).update(set__metrics__views=99)
+        stale.count_followers()
+
+        stored = Reuse.objects(id=reuse.id).first()
+        assert stored.get_metrics()["views"] == 99
+        assert stored.get_metrics()["followers"] == 0
+
+    def test_real_edit_stamps_last_modified(self):
+        """The other half of the rule: editing the reuse still moves the date."""
+        pinned = datetime(2020, 1, 1)
+        reuse = ReuseFactory()
+        Reuse.objects(id=reuse.id).update(set__last_modified=pinned)
+        reuse.reload()
+
+        reuse.description = "A new description"
+        reuse.save()
+
+        reuse.reload()
+        assert reuse.last_modified > pinned
+
     def test_reuse_type(self):
         reuse = ReuseFactory(type="api")
         self.assertEqual(reuse.type, "api")

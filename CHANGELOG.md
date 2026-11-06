@@ -9,6 +9,28 @@
 
 ## Unreleased
 
+- **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
+  - The same defect LEDG-2600 fixed on organisations. `Reuse` carries the `Datetimed` mixin,
+    whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods
+    write it for reasons that are not edits: a dataset was attached, a discussion was opened or
+    closed, somebody followed it. The card shows that date, and the listing sorts by it when the
+    visitor picks no ordering, so following a reuse pushed it to the top of "most recent".
+  - Attaching a dataset is the one that looks like an edit, and it is — but the recount is not
+    what records it. `count_datasets()` runs from `on_update`, which fires after *any* auditable
+    field changes, so it always follows a save that has already stamped the document. Its own
+    stamp was the second one, never the only one. The remaining callers are backfill migrations,
+    where stamping would put today's date on every historical reuse.
+  - The three now write their counters directly, one key per counter, so `last_modified` is
+    never part of the update. One key at a time rather than the whole `metrics` dict, because
+    `metrics.views` is written key-by-key by the counter tasks and writing the dict from an
+    instance loaded earlier would roll it back — the regression the organisation fix had to
+    correct, now pinned by a test here.
+  - Same consequence as on organisations: these writes do not emit `post_save`, so they no
+    longer queue a search reindex. The counter tasks never did either. Inert while no
+    Elasticsearch service is configured.
+  - No backfill. Existing values stay as they are until each reuse is edited, and are an upper
+    bound on the real date.
+
 - **fix(organization): the date on an organisation's card means an edit again, not activity around it**
   - `Organization` carries the `Datetimed` mixin, whose `pre_save` hook stamps `last_modified` on
     every write of the document. Six methods write it for reasons that are not edits: a dataset,

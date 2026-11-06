@@ -349,25 +349,60 @@ class Reuse(
     def views_count(self):
         return self.metrics.get("views", 0)
 
+    def _save_metrics(self, **values):
+        """Persist the named counters, and nothing else.
+
+        These counts are recomputed whenever a dataset is attached, a discussion
+        is opened or closed, or somebody follows the reuse — none of which is
+        someone editing it. They used to be persisted with `save()`, which runs
+        the `Datetimed` pre_save hook; that hook stamps `last_modified` on any
+        write of such a document, so every recount moved the date the reuse's
+        card shows and the listing sorts by when no ordering is picked.
+
+        Attaching a dataset is the one that looks like an edit, and it is — but
+        the recount is not what records it. `count_datasets()` runs from
+        `on_update`, which fires after *any* auditable field changes, so it
+        always follows a `save()` that has already stamped the document. Its own
+        stamp was the second one, never the only one. The other callers are
+        backfill migrations, where stamping would put today's date on every
+        historical reuse.
+
+        One key per argument, never the whole `metrics` dict: `metrics.views` is
+        written key-by-key by `udata.core.metrics.tasks`, and writing the dict
+        wholesale from an instance loaded earlier would roll that counter back,
+        or drop keys this instance never loaded. `save()` wrote a per-key delta
+        for the same reason; this keeps that property.
+
+        Unlike `save()`, this does not emit `post_save`, so it does not queue a
+        search reindex. That matches the counter tasks, which never reindexed
+        either: counts in the search index now refresh on a real edit or a full
+        reindex, not on every recount.
+        """
+        self.metrics.update(values)
+        Reuse.objects(id=self.id).update(
+            **{f"set__metrics__{key}": value for key, value in values.items()}
+        )
+
     def count_datasets(self):
-        self.metrics["datasets"] = len(self.datasets)
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(datasets=len(self.datasets))
 
     def count_discussions(self):
         from udata.models import Discussion
 
-        self.metrics["discussions"] = Discussion.objects(subject=self).count()
-        self.metrics["discussions_open"] = Discussion.objects(subject=self, closed=None).count()
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(
+            discussions=Discussion.objects(subject=self).count(),
+            discussions_open=Discussion.objects(subject=self, closed=None).count(),
+        )
 
     def count_followers(self):
         from udata.models import Follow
 
-        self.metrics["followers"] = Follow.objects(until=None).followers(self).count()
-        self.metrics["followers_by_months"] = get_stock_metrics(
-            Follow.objects(following=self), date_label="since"
+        self._save_metrics(
+            followers=Follow.objects(until=None).followers(self).count(),
+            followers_by_months=get_stock_metrics(
+                Follow.objects(following=self), date_label="since"
+            ),
         )
-        self.save(signal_kwargs={"ignores": ["post_save"]})
 
 
 pre_save.connect(Reuse.pre_save, sender=Reuse)
