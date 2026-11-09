@@ -7,6 +7,7 @@ import udata.core.organization.constants as org_constants
 from udata.core.dataservices.factories import DataserviceFactory
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.factories import DatasetFactory, HiddenDatasetFactory
+from udata.core.discussions.factories import DiscussionFactory
 from udata.core.followers.signals import on_follow, on_unfollow
 from udata.core.organization.factories import OrganizationFactory
 from udata.core.organization.models import Organization, OrganizationBadge
@@ -20,7 +21,89 @@ from udata.tests.helpers import assert_emit
 class OrganizationModelTest(DBTestCase):
     # Load metrics
     import udata.core.organization.metrics  # noqa
+    import udata.core.discussions.metrics  # noqa
     import udata.core.followers.metrics  # noqa
+
+    def test_metrics_recount_preserves_last_modified(self):
+        """Recounting metrics must not move the date the organisation's card shows.
+
+        None of these recounts is someone editing the organisation: a dataset was
+        published, a reuse was created, somebody followed it, a discussion was
+        opened, a member was counted. Persisting them with `save()` ran the
+        `Datetimed` pre_save hook and stamped `last_modified`, so the card — and
+        the listing's default ordering — tracked activity instead of edits.
+
+        Each recount runs from its own instance, loaded before the others wrote.
+        That is what production looks like — the DCAT harvester holds organisations
+        for a whole crawl and counts them at the end — and it is what makes the
+        metric assertions mean something: with a single shared instance they would
+        pass even if each write clobbered the previous one.
+        """
+        pinned = datetime(2020, 1, 1)
+        org = OrganizationFactory(members=[Member(user=UserFactory(), role="admin")])
+        # Queryset write: it does not go through pre_save, so it pins the date
+        # without the hook rewriting it on the way in.
+        Organization.objects(id=org.id).update(set__last_modified=pinned)
+
+        DatasetFactory(organization=org)
+        VisibleReuseFactory(organization=org)
+        DataserviceFactory(organization=org)
+        Follow.objects.create(following=org, follower=UserFactory(), since=datetime.now(UTC))
+        DiscussionFactory(subject=org, user=UserFactory())
+
+        # Discussions and members recount through their own method rather than a
+        # signal: the discussion receiver drags in notification senders that need
+        # the API blueprint, and members are only ever counted from the API. Each
+        # gets a freshly loaded instance, so neither can carry the other's writes.
+        Organization.objects(id=org.id).first().count_discussions()
+        Organization.objects(id=org.id).first().count_members()
+
+        stored = Organization.objects(id=org.id).first()
+        assert stored.get_metrics()["datasets"] == 1
+        assert stored.get_metrics()["reuses"] == 1
+        assert stored.get_metrics()["dataservices"] == 1
+        assert stored.get_metrics()["followers"] == 1
+        assert stored.get_metrics()["discussions"] == 1
+        assert stored.get_metrics()["members"] == 1
+        assert stored.last_modified == pinned
+
+    def test_metrics_recount_does_not_clobber_other_counters(self):
+        """A recount must not cost another process its counters — not even later.
+
+        The view and download counters are written key-by-key by their own task.
+        Two ways of losing them: writing the whole dict in the recount, and marking
+        the whole `metrics` field so that the *next* `save()` on the same instance
+        writes it in one piece. The second is the subtler one, and it is why the
+        recount assigns the key rather than updating the dict.
+
+        The `save()` below is what makes this test able to tell the two apart —
+        without it, both forms pass. It mirrors what the metrics command and the
+        signal receivers do: recount, then carry on with the same instance.
+        """
+        org = OrganizationFactory()
+        stale = Organization.objects(id=org.id).first()
+
+        Organization.objects(id=org.id).update(set__metrics__views=99)
+        stale.count_followers()
+        stale.description = "edited afterwards"
+        stale.save()
+
+        stored = Organization.objects(id=org.id).first()
+        assert stored.metrics["views"] == 99
+        assert stored.metrics["followers"] == 0
+
+    def test_real_edit_stamps_last_modified(self):
+        """The other half of the rule: editing the organisation still moves the date."""
+        pinned = datetime(2020, 1, 1)
+        org = OrganizationFactory()
+        Organization.objects(id=org.id).update(set__last_modified=pinned)
+        org.reload()
+
+        org.description = "A new description"
+        org.save()
+
+        org.reload()
+        assert org.last_modified > pinned
 
     def test_organization_metrics(self):
         # Members count update are in API calls, thus being tested in API dedicated tests

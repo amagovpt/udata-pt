@@ -9,6 +9,68 @@
 
 ## Unreleased
 
+- **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
+  - The same defect that was just fixed on organisations. `Reuse` carries the `Datetimed` mixin,
+    whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods
+    write it for reasons that are not edits: a dataset was attached, a discussion was opened or
+    closed, somebody followed it. The card shows that date, and the listing sorts by it when the
+    visitor picks no ordering, so following a reuse pushed it to the top of "most recent".
+  - Attaching a dataset is the one that looks like an edit, and it is — but the recount is not
+    what records it. `count_datasets()` runs from `on_create` and `on_update`, and `on_update`
+    fires after *any* auditable field changes, so it always follows a save that has already
+    stamped the document. Its own stamp was the second one, never the only one. The remaining
+    callers are two backfill migrations and the `udata metrics update` command, where stamping
+    would put today's date on every historical reuse.
+  - The three now write their counters directly, one key at a time, so `last_modified` is never
+    part of the update. Per key in two senses, and both matter: the *write* must be per key
+    because `metrics.views` is written that way by the counter tasks, and a wholesale write from
+    an instance loaded earlier rolls it back; and the *assignment* must be per key too, because
+    updating the dict marks the whole `metrics` field as changed and the next `save()` on that
+    instance would write it in one piece — losing the same counters one step later. A test pins
+    the second, which is the one that slipped through on organisations.
+  - Same consequence as on organisations: these writes do not emit `post_save`, so they no
+    longer queue a search reindex. The counter tasks never did either. Inert while no
+    Elasticsearch service is configured.
+  - No backfill. Existing values stay as they are until each reuse is edited, and are an upper
+    bound on the real date.
+  - `udata metrics update --drop` clears the counters for real again. It cleared them in memory
+    and relied on the save that followed to persist that; with the recounts writing their own
+    keys atomically, nothing did, and the option had quietly become a no-op for reuses and
+    organisations. It now writes the reset before recounting.
+
+- **fix(organization): the date on an organisation's card means an edit again, not activity around it**
+  - `Organization` carries the `Datetimed` mixin, whose `pre_save` hook stamps `last_modified` on
+    every write of the document. Six methods write it for reasons that are not edits: a dataset,
+    reuse or dataservice of the organisation changed, somebody followed it, a discussion was
+    opened, a member was counted. The card showed that date, and the listing sorts by it when the
+    visitor picks no ordering, so both tracked activity around the organisation rather than
+    changes to it.
+  - The six now write their counters directly, one key per counter, so `last_modified` is never
+    part of the update and the hook never runs. One key at a time rather than the whole `metrics`
+    dict, because these recounts run from instances that may have been loaded long before — the
+    DCAT harvester collects organisations for a whole crawl and counts them at the end — and
+    writing the dict wholesale would roll back counters another process set meanwhile. `save()`
+    wrote a per-key delta for the same reason; this keeps that property, and matches how the view
+    and download counters are already written.
+  - One consequence worth stating: these writes do not emit `post_save`, so they no longer queue
+    a search reindex. The counter tasks never did either, so this aligns the two — but counts in
+    the search index now refresh on a real edit or a full reindex, not on every recount.
+  - Removing a member now stamps the date explicitly. It is written with an atomic update that
+    never reached the hook, so until now it depended on the recount that followed it; adding a
+    member saves the document and always stamped. The ticket counts members among the things
+    that make an edit, so the two halves had to agree.
+  - **No backfill ships here.** Existing values stay as they are until each organisation is
+    edited, and are an upper bound on the real date — the stamp could only ever have been at or
+    after it. A partial reconstruction is possible and was considered: the activity log records
+    an entry per real edit, because the recounts suppressed the signal that writes it. It covers
+    only edits by signed-in users, leaving harvested and CLI changes unrecorded, so it would
+    produce a date that is right for some organisations and silently wrong for others. Left out
+    deliberately rather than for lack of a source.
+  - Measured before and after: of 100 production organisations, none carried a date under a day
+    old and 96 were between one and twelve months. The symptom is real but far less visible than
+    "every harvested organisation shows a few hours" — a harvest that only touches files does not
+    reach this path at all.
+
 - **fix(rdf): HVD categories written as the Implementing Regulation writes them are now recognised, so `dcatap:hvdCategory` stops being dropped from the catalogue**
   - DCAT-AP HVD 2.2.0 requires every HVD dataset and data service to carry at least one
     `dcatap:hvdCategory`. Records that left it out were invalid for data.europa.eu, and 8 of

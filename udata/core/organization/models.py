@@ -457,60 +457,99 @@ class Organization(
         self.save()
         MembershipRequest.after_create.send(membership_request, org=self)
 
+    def _save_metrics(self, **values):
+        """Persist the named metrics, and nothing else.
+
+        These counts are recomputed whenever a dataset, reuse, dataservice,
+        follower, discussion or member of this organisation changes — none of
+        which is someone editing the organisation. They used to be persisted
+        with `save()`, which runs the `Datetimed` pre_save hook; that hook
+        stamps `last_modified` unless the field is already marked as changed,
+        so every recount moved the date the organisation's card shows and the
+        listing sorts by. The date tracked activity around the organisation
+        rather than changes to it.
+
+        Writing the counters directly keeps `last_modified` out of the update
+        entirely, so the hook never runs and the date cannot be rewritten from
+        this instance either.
+
+        Assigned one key at a time, and that is load-bearing twice over. The
+        write must be per key because these recounts run from instances that may
+        have been loaded long before — the DCAT harvester collects organisations
+        for the length of a crawl and counts them at the end — and a wholesale
+        write would roll back counters another process set meanwhile, or drop
+        keys this instance never loaded. And the *assignment* must be per key
+        too: `dict.update` marks the whole `metrics` field as changed, so a later
+        `save()` on this same instance would write the dict in one piece and lose
+        those counters anyway — the same defect, moved one step later. Assigning
+        the key marks `metrics.<key>`, which is what `save()` did before this
+        method existed. Same shape as `udata.core.metrics.tasks`, which writes
+        `set__metrics__<key>` for the view and download counters.
+
+        Unlike `save()`, this does not emit `post_save`, so it does not queue a
+        search reindex. That matches `udata.core.metrics.tasks`, whose counter
+        writes never reindexed either: counts in the search index now refresh
+        on a real edit or a full reindex, not on every recount.
+        """
+        for key, value in values.items():
+            self.metrics[key] = value
+        Organization.objects(id=self.id).update(
+            **{f"set__metrics__{key}": value for key, value in values.items()}
+        )
+
     def count_members(self):
-        self.metrics["members"] = len(self.members)
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(members=len(self.members))
 
     def count_datasets(self):
         from udata.models import Dataset, Follow, Reuse
 
-        self.metrics["datasets"] = Dataset.objects(organization=self).visible().count()
+        values = {"datasets": Dataset.objects(organization=self).visible().count()}
         if self.compute_aggregate_metrics:
-            self.metrics["datasets_by_months"] = get_stock_metrics(
+            values["datasets_by_months"] = get_stock_metrics(
                 Dataset.objects(organization=self).visible(), date_label="created_at_internal"
             )
-            self.metrics["datasets_followers_by_months"] = get_stock_metrics(
+            values["datasets_followers_by_months"] = get_stock_metrics(
                 Follow.objects(following__in=Dataset.objects(organization=self)), date_label="since"
             )
-            self.metrics["datasets_reuses_by_months"] = get_stock_metrics(
+            values["datasets_reuses_by_months"] = get_stock_metrics(
                 Reuse.objects(datasets__in=Dataset.objects(organization=self)).visible()
             )
 
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(**values)
 
     def count_reuses(self):
         from udata.models import Follow, Reuse
 
-        self.metrics["reuses"] = Reuse.objects(organization=self).visible().count()
-        self.metrics["reuses_by_months"] = get_stock_metrics(
-            Reuse.objects(organization=self).visible()
+        self._save_metrics(
+            reuses=Reuse.objects(organization=self).visible().count(),
+            reuses_by_months=get_stock_metrics(Reuse.objects(organization=self).visible()),
+            reuses_followers_by_months=get_stock_metrics(
+                Follow.objects(following__in=Reuse.objects(organization=self)), date_label="since"
+            ),
         )
-        self.metrics["reuses_followers_by_months"] = get_stock_metrics(
-            Follow.objects(following__in=Reuse.objects(organization=self)), date_label="since"
-        )
-        self.save(signal_kwargs={"ignores": ["post_save"]})
 
     def count_dataservices(self):
         from udata.models import Dataservice
 
-        self.metrics["dataservices"] = Dataservice.objects(organization=self).visible().count()
-        self.metrics["dataservices_by_months"] = get_stock_metrics(
-            Dataservice.objects(organization=self).visible(), date_label="created_at"
+        self._save_metrics(
+            dataservices=Dataservice.objects(organization=self).visible().count(),
+            dataservices_by_months=get_stock_metrics(
+                Dataservice.objects(organization=self).visible(), date_label="created_at"
+            ),
         )
-        self.save(signal_kwargs={"ignores": ["post_save"]})
 
     def count_followers(self):
         from udata.models import Follow
 
-        self.metrics["followers"] = Follow.objects(until=None).followers(self).count()
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(followers=Follow.objects(until=None).followers(self).count())
 
     def count_discussions(self):
         from udata.models import Discussion
 
-        self.metrics["discussions"] = Discussion.objects(subject=self).count()
-        self.metrics["discussions_open"] = Discussion.objects(subject=self, closed=None).count()
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(
+            discussions=Discussion.objects(subject=self).count(),
+            discussions_open=Discussion.objects(subject=self, closed=None).count(),
+        )
 
 
 pre_save.connect(Organization.pre_save, sender=Organization)
