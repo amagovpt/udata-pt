@@ -2,6 +2,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 from enum import StrEnum, auto
 
+from dateutil.relativedelta import relativedelta
 from flask_babel import LazyString
 
 from udata.i18n import lazy_gettext as _
@@ -260,3 +261,21 @@ def get_format_family(format_str: str | None) -> FormatFamily:
         if fmt in get_family_formats(family):
             return family
     return FormatFamily.OTHER
+
+
+# The windows the `last_update_range` search filter accepts, and how far back each
+# reaches. Declared once and consumed by both sides that need it: the choices the
+# search adapter advertises, and the Mongo filter that applies them.
+#
+# `relativedelta` rather than `timedelta`, because a year is not 365 days and a month
+# is not 30 — the filter would drift by a day on every leap year.
+#
+# The search service keeps its own copy of this vocabulary (`now-30d/d`, `now-12M/d`,
+# `now-3y/d`); that trailing `/d` is Elasticsearch rounding the boundary down to
+# midnight, and it is why the Mongo side truncates too. Keeping the two in step is
+# manual, which is the cost of the service holding a second copy.
+LAST_UPDATE_RANGES: dict[str, relativedelta] = {
+    "last_30_days": relativedelta(days=30),
+    "last_12_months": relativedelta(months=12),
+    "last_3_years": relativedelta(years=3),
+}

@@ -58,6 +58,7 @@ from udata.core.access_type.constants import AccessType
 from udata.core.badges import api as badges_api
 from udata.core.badges.models import Badge
 from udata.core.dataservices.models import Dataservice
+from udata.core.dataset.constants import LAST_UPDATE_RANGES
 from udata.core.dataset.models import CHECKSUM_TYPES
 from udata.core.followers.api import FollowAPI
 from udata.core.followers.models import Follow
@@ -360,6 +361,14 @@ class DatasetApiParser(ModelApiParser):
             if current_user.is_anonymous:
                 abort(401)
             datasets = datasets.filter(private=args["private"])
+        if args.get("last_update_range"):
+            # The window reaches back from midnight today, not from this instant: the
+            # search service rounds its own boundary down to the day (`now-30d/d`), and
+            # the two sides have to select the same documents. Naive, because
+            # `last_update` is written through `to_naive_datetime`.
+            today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            since = today - LAST_UPDATE_RANGES[args["last_update_range"]]
+            datasets = datasets.filter(last_update__gte=since.replace(tzinfo=None))
         if args.get("modified_since"):
             try:
                 since = datetime.fromisoformat(args["modified_since"]).replace(tzinfo=UTC)
