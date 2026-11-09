@@ -9,6 +9,35 @@
 
 ## Unreleased
 
+- **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
+  - The same defect that was just fixed on organisations. `Reuse` carries the `Datetimed` mixin,
+    whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods
+    write it for reasons that are not edits: a dataset was attached, a discussion was opened or
+    closed, somebody followed it. The card shows that date, and the listing sorts by it when the
+    visitor picks no ordering, so following a reuse pushed it to the top of "most recent".
+  - Attaching a dataset is the one that looks like an edit, and it is — but the recount is not
+    what records it. `count_datasets()` runs from `on_create` and `on_update`, and `on_update`
+    fires after *any* auditable field changes, so it always follows a save that has already
+    stamped the document. Its own stamp was the second one, never the only one. The remaining
+    callers are two backfill migrations and the `udata metrics update` command, where stamping
+    would put today's date on every historical reuse.
+  - The three now write their counters directly, one key at a time, so `last_modified` is never
+    part of the update. Per key in two senses, and both matter: the *write* must be per key
+    because `metrics.views` is written that way by the counter tasks, and a wholesale write from
+    an instance loaded earlier rolls it back; and the *assignment* must be per key too, because
+    updating the dict marks the whole `metrics` field as changed and the next `save()` on that
+    instance would write it in one piece — losing the same counters one step later. A test pins
+    the second, which is the one that slipped through on organisations.
+  - Same consequence as on organisations: these writes do not emit `post_save`, so they no
+    longer queue a search reindex. The counter tasks never did either. Inert while no
+    Elasticsearch service is configured.
+  - No backfill. Existing values stay as they are until each reuse is edited, and are an upper
+    bound on the real date.
+  - `udata metrics update --drop` clears the counters for real again. It cleared them in memory
+    and relied on the save that followed to persist that; with the recounts writing their own
+    keys atomically, nothing did, and the option had quietly become a no-op for reuses and
+    organisations. It now writes the reset before recounting.
+
 - **fix(organization): the date on an organisation's card means an edit again, not activity around it**
   - `Organization` carries the `Datetimed` mixin, whose `pre_save` hook stamps `last_modified` on
     every write of the document. Six methods write it for reasons that are not edits: a dataset,
