@@ -44,6 +44,10 @@ bower
 venv
 .venv
 .env
+.env.local
+
+# Personal reference notes, not part of the official docs
+docs/api-endpoints.md
 
 # Installer logs
 pip-log.txt
