@@ -632,10 +632,21 @@ class Dataset(
         ),
         auditable=False,
     )
+    # No `default` here, and that is the point. MongoEngine applies a field default when
+    # the stored value is absent or null, and it applies it **on load**, not on write. A
+    # document missing this field therefore answers every read with a different timestamp,
+    # each one equal to the instant of the request — not a stale date a reader might
+    # distrust, but a fresh one that looks authoritative. Worse, the sort runs on the
+    # indexed value while the response shows the fabricated one, so the dataset lands in a
+    # position its displayed date does not justify (LEDG-2732: one dataset sat first under
+    # `?sort=last_update` ascending, dated 2026, ahead of datasets from 2007).
+    #
+    # `clean()` assigns the field on every `save()`, so a dataset written through any
+    # normal path still carries a value. Reading `None` now means the document genuinely
+    # has none — which is the honest answer, and what the backfill migration looks for.
     last_update = field(
         DateTimeField(
             verbose_name=_("Last update of the dataset resources"),
-            default=lambda: datetime.now(UTC),
             required=True,
         ),
         auditable=False,
@@ -884,7 +895,11 @@ class Dataset(
         Ex: the next update for a threeTimesAday freq is not
         every 8 hours, but is maximum 24 hours later.
         """
-        return self.frequency.next_update(self.last_update) if self.has_frequency else None
+        # `last_update` can be None on a document that predates the backfill migration;
+        # `frequency.next_update()` would raise on `None + delta`.
+        if not self.has_frequency or self.last_update is None:
+            return None
+        return self.frequency.next_update(self.last_update)
 
     @property
     def quality(self):
