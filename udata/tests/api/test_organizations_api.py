@@ -1049,6 +1049,27 @@ class MembershipAPITest(PytestOnlyAPITestCase):
         assert not organization.is_member(deleted_user)
         assert organization.get_metrics()["members"] == 1
 
+    def test_delete_member_stamps_last_modified(self):
+        """Removing a member is an edit, so it moves the date the card shows.
+
+        Adding one already did, because those paths save the document and the
+        `Datetimed` hook stamps it. Removal is an atomic update that never reaches
+        the hook, and until the metric recounts stopped stamping it rode on those.
+        """
+        user = self.login()
+        deleted_user = UserFactory()
+        organization = OrganizationFactory(
+            members=[Member(user=user, role="admin"), Member(user=deleted_user, role="editor")]
+        )
+        pinned = datetime(2020, 1, 1)
+        Organization.objects(id=organization.id).update(set__last_modified=pinned)
+
+        response = self.delete(url_for("api.member", org=organization, user=deleted_user))
+        assert204(response)
+
+        organization.reload()
+        assert organization.last_modified > pinned
+
     def test_only_admin_can_delete_member(self):
         user = self.login()
         deleted_user = UserFactory()

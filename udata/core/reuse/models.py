@@ -349,25 +349,67 @@ class Reuse(
     def views_count(self):
         return self.metrics.get("views", 0)
 
+    def _save_metrics(self, **values):
+        """Persist the named counters, and nothing else.
+
+        These counts are recomputed whenever a dataset is attached, a discussion
+        is opened or closed, or somebody follows the reuse — none of which is
+        someone editing it. They used to be persisted with `save()`, and the
+        `Datetimed` pre_save hook stamps `last_modified` on any `save()` of such
+        a document whose field is not already marked as changed. So every
+        recount moved the date the reuse's card shows and the listing sorts by
+        when no ordering is picked. A queryset update never reaches that hook,
+        which is what this method relies on.
+
+        Attaching a dataset is the one that looks like an edit, and it is — but
+        the recount is not what records it. `count_datasets()` runs from
+        `on_create` and `on_update`, and `on_update` fires after *any* auditable
+        field changes, so it always follows a `save()` that has already stamped
+        the document. Its own stamp was the second one, never the only one. The
+        remaining callers are two backfill migrations and the `udata metrics
+        update` command, and none of them is an edit either.
+
+        Assigned one key at a time, and that is load-bearing twice over. The
+        write itself must be per key, because `metrics.views` is written that
+        way by the counter tasks and a wholesale write from an instance loaded
+        earlier would roll it back. And the *assignment* must be per key too:
+        `dict.update` marks the whole `metrics` field as changed, so a later
+        `save()` on this same instance would write the dict in one piece and
+        lose those counters anyway — the same defect, moved one step later.
+        Assigning the key marks `metrics.<key>`, which is what `save()` did
+        before this method existed.
+
+        Unlike `save()`, this does not emit `post_save`, so it does not queue a
+        search reindex. That matches the counter tasks, which never reindexed
+        either: counts in the search index now refresh on a real edit or a full
+        reindex, not on every recount.
+        """
+        for key, value in values.items():
+            self.metrics[key] = value
+        Reuse.objects(id=self.id).update(
+            **{f"set__metrics__{key}": value for key, value in values.items()}
+        )
+
     def count_datasets(self):
-        self.metrics["datasets"] = len(self.datasets)
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(datasets=len(self.datasets))
 
     def count_discussions(self):
         from udata.models import Discussion
 
-        self.metrics["discussions"] = Discussion.objects(subject=self).count()
-        self.metrics["discussions_open"] = Discussion.objects(subject=self, closed=None).count()
-        self.save(signal_kwargs={"ignores": ["post_save"]})
+        self._save_metrics(
+            discussions=Discussion.objects(subject=self).count(),
+            discussions_open=Discussion.objects(subject=self, closed=None).count(),
+        )
 
     def count_followers(self):
         from udata.models import Follow
 
-        self.metrics["followers"] = Follow.objects(until=None).followers(self).count()
-        self.metrics["followers_by_months"] = get_stock_metrics(
-            Follow.objects(following=self), date_label="since"
+        self._save_metrics(
+            followers=Follow.objects(until=None).followers(self).count(),
+            followers_by_months=get_stock_metrics(
+                Follow.objects(following=self), date_label="since"
+            ),
         )
-        self.save(signal_kwargs={"ignores": ["post_save"]})
 
 
 pre_save.connect(Reuse.pre_save, sender=Reuse)
