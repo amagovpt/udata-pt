@@ -46,15 +46,20 @@ from udata.rdf import (
     DCAT,
     DCATAP,
     DCT,
+    EU_HVD_CATEGORY_ALIASES,
     EU_HVD_CATEGORY_TAGS,
     EUFREQ,
     FREQ,
     GEODCAT,
+    HVD_CATEGORY_GEOSPATIAL,
+    HVD_CATEGORY_METEOROLOGICAL,
     HVD_CATEGORY_MOBILITY,
+    HVD_CATEGORY_STATISTICS,
     HVD_LEGISLATION,
     SCHEMA,
     SKOS,
     SPDX,
+    TAG_TO_EU_HVD_CATEGORIES,
     VCARD,
     default_lang_value,
     primary_topic_identifier_from_rdf,
@@ -372,6 +377,76 @@ class DatasetToRdfTest(PytestOnlyAPITestCase):
             HVD_LEGISLATION
         )
         assert dataservice_as_distribution.value(DCAT.accessService).identifier == dataservice_uri
+
+    # The singular spellings are written out instead of being read from
+    # EU_HVD_CATEGORY_ALIASES: what is being pinned here is the wording of the Annex of
+    # Implementing Regulation (EU) 2023/138, and a test that derived it from the table it
+    # is testing would assert nothing.
+    @pytest.mark.parametrize(
+        "tag,category",
+        [
+            ("geoespacial", HVD_CATEGORY_GEOSPATIAL),
+            ("meteorologica", HVD_CATEGORY_METEOROLOGICAL),
+            ("estatistica", HVD_CATEGORY_STATISTICS),
+        ],
+    )
+    def test_hvd_dataset_with_regulation_spelling(self, tag, category):
+        """A category spelled as the Regulation spells it still maps to its URI"""
+        dataset = DatasetFactory(tags=["hvd", tag, "test"])
+        dataset.add_badge(HVD)
+
+        d = dataset_to_rdf(dataset)
+
+        assert d.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
+        assert d.value(DCATAP.hvdCategory).identifier == URIRef(category)
+
+    def test_hvd_dataset_with_both_category_spellings(self):
+        """Both spellings of one category yield a single hvdCategory, not two"""
+        dataset = DatasetFactory(
+            tags=["hvd", EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_GEOSPATIAL], "geoespacial"]
+        )
+        dataset.add_badge(HVD)
+
+        d = dataset_to_rdf(dataset)
+
+        categories = [category.identifier for category in d.objects(DCATAP.hvdCategory)]
+        assert categories == [URIRef(HVD_CATEGORY_GEOSPATIAL)]
+
+    def test_hvd_dataset_ogc_access_service_with_regulation_spelling(self):
+        """The dataservice built on the fly for an OGC resource carries the category too"""
+        resource = ResourceFactory(
+            format="ogc:wms", url="https://services.data.shom.fr/INSPIRE/wms/"
+        )
+        dataset = DatasetFactory(resources=[resource], tags=["hvd", "geoespacial", "test"])
+        dataset.add_badge(HVD)
+
+        r = resource_to_rdf(resource, dataset, is_hvd=True)
+        service = r.value(DCAT.accessService)
+
+        assert service is not None
+        assert service.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
+        assert service.value(DCATAP.hvdCategory).identifier == URIRef(HVD_CATEGORY_GEOSPATIAL)
+
+    def test_hvd_category_aliases_are_read_only(self):
+        """
+        The alternative spellings are recognised when reading tags and never written when
+        harvesting. Nothing in the language stops someone from later feeding the forward
+        map from the alias table; that would split one category across two tags in the
+        portal's facets, so the invariant is asserted rather than left to a comment.
+
+        The exact set is pinned on purpose: the aliases are what the legal texts write, and
+        widening them to tags that merely look close is a decision, not a tidy-up.
+        """
+        written_tags = set(EU_HVD_CATEGORY_TAGS.values())
+        accepted_tags = set(TAG_TO_EU_HVD_CATEGORIES)
+        alias_tags = accepted_tags - written_tags
+
+        assert alias_tags == {"geoespacial", "meteorologica", "estatistica"}
+        for tag in alias_tags:
+            category = TAG_TO_EU_HVD_CATEGORIES[tag]
+            assert category in EU_HVD_CATEGORY_ALIASES
+            # The canonical tag for the same category stays accepted alongside the alias.
+            assert EU_HVD_CATEGORY_TAGS[category] in accepted_tags
 
 
 class RdfToDatasetTest(PytestOnlyDBTestCase):

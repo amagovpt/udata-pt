@@ -109,7 +109,11 @@ def update(
             for reuse in reuses_bar:
                 try:
                     if drop:
+                        # Persisted, not just cleared in memory: the recounts
+                        # below write their own keys atomically and would leave
+                        # every other counter standing.
                         reuse.metrics.clear()
+                        Reuse.objects(id=reuse.id).update(set__metrics={})
                     reuse.count_discussions()
                     reuse.count_followers()
                 except Exception as e:
@@ -123,7 +127,11 @@ def update(
             for organization in org_bar:
                 try:
                     if drop:
+                        # Persisted, not just cleared in memory: the recounts
+                        # below write their own keys atomically and would leave
+                        # every other counter standing.
                         organization.metrics.clear()
+                        Organization.objects(id=organization.id).update(set__metrics={})
                     organization.count_datasets()
                     organization.count_reuses()
                     organization.count_dataservices()

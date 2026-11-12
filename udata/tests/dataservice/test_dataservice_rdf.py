@@ -94,6 +94,51 @@ class DataserviceToRdfTest(PytestOnlyAPITestCase):
         for distrib in d.objects(DCAT.distribution):
             assert distrib.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
 
+    def test_hvd_dataservice_with_regulation_spelling(self):
+        """A dataservice tagged as the Regulation spells it still maps to the category URI"""
+        dataservice = DataserviceFactory(tags=["hvd", "geoespacial", "test"])
+        dataservice.add_badge(HVD)
+
+        d = dataservice_to_rdf(dataservice)
+
+        assert d.value(DCATAP.applicableLegislation).identifier == URIRef(HVD_LEGISLATION)
+        assert d.value(DCATAP.hvdCategory).identifier == URIRef(HVD_CATEGORY_GEOSPATIAL)
+
+    def test_hvd_dataservice_with_hvd_dataset_using_regulation_spelling(self):
+        """A dataservice inherits a category its dataset spells as the Regulation does"""
+        # The inheritance probe selects datasets by the `hvd` tag, not by the badge, so the
+        # fixture carries both -- as a dataset does in production, where the badge job
+        # derives one from the other.
+        dataset = DatasetFactory(tags=["hvd", "geoespacial"])
+        dataset.add_badge(HVD)
+        dataservice = DataserviceFactory(datasets=[dataset], tags=["hvd"])
+        dataservice.add_badge(HVD)
+
+        d = dataservice_to_rdf(dataservice)
+
+        categories = [category.identifier for category in d.objects(DCATAP.hvdCategory)]
+        assert categories == [URIRef(HVD_CATEGORY_GEOSPATIAL)]
+
+    def test_hvd_dataservice_with_both_category_spellings(self):
+        """
+        Both spellings of one category yield a single hvdCategory here too.
+
+        This is the path where that is least obvious: the categories are accumulated as
+        tags rather than URIs, so two spellings of one category add the same triple twice
+        and only the graph being a set of triples collapses them. Asserted because nothing
+        in that loop would stop a refactor from emitting the duplicate.
+        """
+        geospatial = EU_HVD_CATEGORY_TAGS[HVD_CATEGORY_GEOSPATIAL]
+        dataset = DatasetFactory(tags=["hvd", geospatial, "geoespacial"])
+        dataset.add_badge(HVD)
+        dataservice = DataserviceFactory(datasets=[dataset], tags=["hvd"])
+        dataservice.add_badge(HVD)
+
+        d = dataservice_to_rdf(dataservice)
+
+        categories = [category.identifier for category in d.objects(DCATAP.hvdCategory)]
+        assert categories == [URIRef(HVD_CATEGORY_GEOSPATIAL)]
+
 
 class DataserviceRdfViewsTest(PytestOnlyAPITestCase):
     def test_rdf_default_to_jsonld(self, client):

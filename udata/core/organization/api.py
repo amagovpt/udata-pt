@@ -830,7 +830,13 @@ class MemberAPI(API):
                         "Promova outro membro a administrador primeiro."
                     ),
                 )
-            Organization.objects(id=org.id).update_one(pull__members=member)
+            # The membership list is part of the organisation, so removing from it is
+            # an edit and moves the date its card shows. Stamped here because this is
+            # an atomic update: it never reaches the `Datetimed` pre_save hook that
+            # does it for the add paths, which save the document instead.
+            Organization.objects(id=org.id).update_one(
+                pull__members=member, set__last_modified=datetime.now(UTC)
+            )
             Assignment.objects(user=user, organization=org).delete()
             org.reload()
             org.count_members()
