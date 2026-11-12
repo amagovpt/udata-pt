@@ -9,6 +9,18 @@
 
 ## Unreleased
 
+- **fix(migrations): the `last_update` backfill no longer depends on `save()`**
+  - The documents missing the field are, as a population, exactly the ones that cannot be saved
+    — that is how they came to miss it. The production log of `2025-07-18-compute-last-update`,
+    the migration that introduced the field, records fifteen failures: fourteen on an owner
+    `User` still carrying `apikey` after a dump restore, and one on a resource whose `filetype`
+    is the legacy value `api`, which the model no longer accepts.
+  - A backfill built on `save()` therefore fails on precisely the documents it exists to repair.
+    It now falls back to an atomic update, which skips validation and writes the one field it
+    came for. Deliberately narrow: it corrects the date, it does not pretend to correct the
+    document. The final log line counts the two paths separately, so the number written
+    directly is the measure of how many documents are invalid for other reasons.
+
 ## 16.0.0.13 (2026-11-12)
 
 - **fix(dataset): `last_update` stopped being invented on every read**

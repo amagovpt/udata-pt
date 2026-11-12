@@ -58,6 +58,7 @@ def migrate(db):
 
     total = candidates.count()
     healed = 0
+    forced = 0
 
     log.info(f"{total} datasets have no stored last_update")
 
@@ -71,9 +72,33 @@ def migrate(db):
                     log.warning(f"Cannot compute a last_update for dataset {dataset.id}, skipped")
                     continue
 
-                dataset.save()
-                healed += 1
+                try:
+                    dataset.save()
+                    healed += 1
+                except Exception as save_err:
+                    # The documents missing this field are, as a population, the ones that
+                    # cannot be saved — that is how they came to miss it. The production log
+                    # of `2025-07-18-compute-last-update`, the migration that introduced the
+                    # field, records fifteen failures: fourteen on an owner `User` still
+                    # carrying `apikey` after a dump restore, and one on a resource whose
+                    # `filetype` is the legacy value `api`, which the model no longer accepts.
+                    #
+                    # So a backfill built on `save()` fails on exactly the documents it
+                    # exists to repair, and that is what the 2026-10-30 migration does. The
+                    # atomic update skips validation and writes the one field we came for.
+                    # Deliberately narrow: it corrects the date, it does not pretend to
+                    # correct the document — `quality_cached` stays as stale as it was, and
+                    # the underlying invalidity is still there to be fixed at its source.
+                    Dataset.objects(id=dataset.id).update(set__last_update=expected)
+                    forced += 1
+                    log.warning(
+                        f"Dataset {dataset.id} cannot be saved ({save_err}); "
+                        f"wrote last_update directly"
+                    )
             except Exception as err:
                 log.error(f"Cannot backfill last_update for dataset {dataset.id} {err}")
 
-    log.info(f"Done: {healed} of {total} datasets had no last_update and were given one")
+    log.info(
+        f"Done: {healed + forced} of {total} datasets had no last_update and were given one "
+        f"({healed} through save, {forced} written directly because the document is invalid)"
+    )
