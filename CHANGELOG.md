@@ -9,6 +9,8 @@
 
 ## Unreleased
 
+## 16.0.0.13 (2026-11-12)
+
 - **fix(dataset): `last_update` stopped being invented on every read**
   - Two consecutive reads of the same dataset returned different dates, each equal to the instant
     of the request, and the list sorted on the indexed value while the response showed the
