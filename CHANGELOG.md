@@ -9,6 +9,25 @@
 
 ## Unreleased
 
+## 16.0.0.13 (2026-11-12)
+
+- **fix(dataset): `last_update` stopped being invented on every read**
+  - Two consecutive reads of the same dataset returned different dates, each equal to the instant
+    of the request, and the list sorted on the indexed value while the response showed the
+    fabricated one. One dataset therefore sat first under `?sort=last_update` ascending, dated
+    2026, ahead of datasets from 2007. It reproduced in production as well as in tst and dev.
+  - The cause was neither a write during the request nor the serializer: the field carried
+    `default=lambda: datetime.now(UTC)`, and MongoEngine applies a field default when the stored
+    value is absent or null — on load, not on write. Nothing was ever persisted, which is why the
+    condition never healed and why the document in Mongo looked innocent.
+  - The default is gone. `clean()` still assigns the field on every save, so a dataset written
+    through any normal path keeps a value, and `None` now means the document genuinely has none.
+    `next_update` gained a guard, being the one consumer that would raise on it.
+  - A second migration backfills the documents already in that state, computing each real date.
+    It is deliberately separate from the one added for the resource-mutator fix: that one heals
+    documents whose date *disagrees* with their resources and skips anything reading `None`,
+    which is exactly this population. Both have to run, in either order.
+
 - **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
   - The same defect that was just fixed on organisations. `Reuse` carries the `Datetimed` mixin,
     whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods
