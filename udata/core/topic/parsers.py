@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from bson.objectid import ObjectId
 from flask import abort
 from flask_restx.inputs import boolean
@@ -6,6 +8,7 @@ from mongoengine import Q
 
 from udata.api import api
 from udata.api.parsers import ModelApiParser, normalize_search_query
+from udata.core.dataset.constants import LAST_UPDATE_RANGES
 from udata.core.topic import DEFAULT_PAGE_SIZE
 from udata.core.topic.models import TopicElement
 
@@ -117,4 +120,14 @@ class TopicApiParser(ModelApiParser):
             if not ObjectId.is_valid(args["owner"]):
                 api.abort(400, "Owner arg must be an identifier")
             topics = topics.filter(owner=args["owner"])
+        if args.get("last_update_range"):
+            # `last_modified`, from the `Datetimed` mixin: a topic has no resources and
+            # no date of its own beyond creation and modification.
+            #
+            # The window reaches back from midnight today, not from this instant: the
+            # search service rounds its own boundary down to the day (`now-30d/d`), and
+            # the two sides have to select the same documents.
+            today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            since = today - LAST_UPDATE_RANGES[args["last_update_range"]]
+            topics = topics.filter(last_modified__gte=since)
         return topics
