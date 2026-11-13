@@ -1,3 +1,6 @@
+from datetime import UTC, datetime
+
+from udata.core.dataset.constants import LAST_UPDATE_RANGES
 from udata.core.post.models import Post
 from udata.search import Filter, ListFilter, ModelSearchAdapter, register
 
@@ -26,8 +29,21 @@ class PostSearch(ModelSearchAdapter):
     def mongo_search(cls, args):
         """Fallback search implementation when search service is not available"""
         posts = Post.objects()
-        posts = posts.order_by("-created_at")
-        return posts
+        if args.get("last_update_range"):
+            # `last_modified`, from the `Datetimed` mixin — not `published`, which is the
+            # publication date. The filter is named after the last update, and a post
+            # edited today was last updated today whenever it first went out.
+            #
+            # The window reaches back from midnight today, not from this instant: the
+            # search service rounds its own boundary down to the day (`now-30d/d`), and
+            # the two sides have to select the same documents.
+            today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            since = today - LAST_UPDATE_RANGES[args["last_update_range"]]
+            posts = posts.filter(last_modified__gte=since)
+        # `.paginate()` is what the search framework needs: it reads `.total` off the
+        # result, and a bare queryset does not carry one. Without it this endpoint
+        # answered 500 to every request, filter or no filter (LEDG-2713).
+        return posts.order_by("-created_at").paginate(args["page"], args["page_size"])
 
     @classmethod
     def serialize(cls, post):

@@ -7,6 +7,7 @@ from flask_restx.inputs import boolean
 from udata.api import api
 from udata.api.parsers import ModelApiParser, normalize_search_query
 from udata.core.access_type.constants import AccessType
+from udata.core.dataset.constants import LAST_UPDATE_RANGES
 from udata.core.organization.constants import PRODUCER_TYPES
 from udata.core.organization.helpers import get_producer_type
 from udata.core.topic.models import Topic, TopicElement
@@ -68,6 +69,19 @@ class DataserviceApiParser(ModelApiParser):
             )
         if args.get("featured"):
             dataservices = dataservices.filter(featured=args["featured"])
+        if args.get("last_update_range"):
+            # `metadata_modified_at` is already the field behind this model's
+            # `sortable="last_modified"` and its `modified_since` filter. Picking any
+            # other date here would leave two fields answering to the same name.
+            #
+            # The window reaches back from midnight today, not from this instant: the
+            # search service rounds its own boundary down to the day (`now-30d/d`), and
+            # the two sides have to select the same documents.
+            today = datetime.datetime.now(datetime.UTC).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            since = today - LAST_UPDATE_RANGES[args["last_update_range"]]
+            dataservices = dataservices.filter(metadata_modified_at__gte=since)
         return dataservices
 
 
