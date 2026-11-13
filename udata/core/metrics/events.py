@@ -17,7 +17,15 @@ def anonymize_ip(ip):
 
 
 EVENT_TYPES = ("view", "download", "search", "click", "api_call", "custom")
-OBJECT_TYPES = ("dataset", "resource", "reuse", "organization", "dataservice", "page")
+OBJECT_TYPES = (
+    "dataset",
+    "resource",
+    "reuse",
+    "organization",
+    "dataservice",
+    "page",
+    "datastory",
+)
 
 
 class MetricEvent(db.Document):

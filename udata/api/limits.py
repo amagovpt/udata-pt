@@ -85,6 +85,16 @@ FEED_LIMIT = "120 per minute; 2400 per hour"
 # IP-collapse a daily cap becomes a site-wide daily block). Suggest/typeahead
 # reuses PUBLIC_SEARCH_LIMIT (it is search-backed); this covers the rest.
 PUBLIC_READ_LIMIT = "300 per minute; 6000 per hour"
+# Public, anonymous view tracking (`POST /datastories/<slug>/views/`): the
+# browser fires it once per page visit, so it scales with public browsing exactly
+# like the detail reads above, even though it writes an event. A write-shaped
+# ceiling (CONTENT_CREATE_LIMIT) would 429 every visitor behind the F5/WAF after
+# a handful of visits, and the IP-keyed `RATELIMIT_DEFAULT` ("200 per hour")
+# collapses to a site-wide bucket there too (docs/infra-adc-waf-impact-ppr-prd.md).
+# Same shape as PUBLIC_READ_LIMIT, kept as its own constant because it rations
+# inflated counters rather than read load and may need calibrating separately.
+# Keyed by `user_or_ip`; no per-day cap (see RESOURCE_DOWNLOAD_LIMIT).
+VIEW_TRACKING_LIMIT = "300 per minute; 6000 per hour"
 CONTENT_CREATE_LIMIT = "5 per minute; 30 per hour; 100 per day"
 HEAVY_CREATE_LIMIT = "2 per minute; 5 per hour; 10 per day"
 # Harvest preview, both routes (`POST /harvest/source/preview/` for a config that
