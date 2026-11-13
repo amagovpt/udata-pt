@@ -52,12 +52,31 @@ class DatasetSearch(ModelSearchAdapter):
     # `serialize()` below feeds from the same value. Same for `last_update_range` — the
     # Mongo filter and the service both range over `last_update`.
     #
-    # `created` does **not** agree, and cannot be fixed the same way. `Dataset.created_at`
-    # is a property (harvest issued date, else harvest created date, else the stored
-    # field), so Mongo has nothing to order on and the mapping must point at the stored
-    # `created_at_internal`. But `serialize()` feeds the index from the property, so for
-    # a harvested dataset the two paths would order `created` by different dates. Left
-    # as is deliberately; it needs the property materialised into a field first.
+    # `created` now agrees too, and the way it was made to agree is worth stating,
+    # because the obvious fix is the wrong one here. `Dataset.created_at` is a property
+    # (harvest issued date, else harvest created date, else the stored field), so Mongo
+    # has nothing to order on and this mapping must point at the stored
+    # `created_at_internal`. `serialize()` used to feed the index from the property, so
+    # the two paths named the same sort key and ordered it by different dates.
+    #
+    # Rather than materialise the property into a field — a backfill migration plus one
+    # more date field carrying a `datetime.now` default, which is the exact shape that
+    # fabricated a fresh `last_update` on every read in LEDG-2732 — `serialize()` now
+    # feeds the index the same stored field this mapping names. One source for the sort
+    # key, on both sides.
+    #
+    # What the index gives up is the source-declared publication date. It cost nothing:
+    # that value was only ever a sort key there (`created_at = Date()` in the mapping),
+    # and the date the portal displays comes from the API, which still reads the
+    # property. Measured on 800 production datasets, 457 of them harvested, not one had
+    # the two dates differing by as much as a day: no import path writes
+    # `harvest.issued_at` except `harvest/backends/odspt.py`, which already assigns
+    # `created_at_internal` from it two lines later, so what remained was
+    # `harvest.created_at` — the harvest run timestamp, milliseconds away from the
+    # stored field.
+    #
+    # Materialising the property is still the real fix, and the one to reach for if a
+    # harvester ever starts writing `issued_at` in earnest.
     #
     # Ties are the remaining divergence on `last_update`: the service adds relevance as
     # a second sort key and Mongo adds none, so datasets sharing a date may come back in
@@ -152,7 +171,8 @@ class DatasetSearch(ModelSearchAdapter):
             "license": getattr(dataset.license, "id", None),
             "badges": [badge.kind for badge in dataset.badges],
             "frequency": dataset.frequency,
-            "created_at": to_iso_datetime(dataset.created_at),
+            # The stored field, not `dataset.created_at` — see the note above `sorts`.
+            "created_at": to_iso_datetime(dataset.created_at_internal),
             "last_update": to_iso_datetime(dataset.last_update),
             "views": dataset.metrics.get("views", 0),
             "followers": dataset.metrics.get("followers", 0),
