@@ -9,6 +9,37 @@
 
 ## Unreleased
 
+- **fix(migrations): the `last_update` backfill no longer depends on `save()`**
+  - The documents missing the field are, as a population, exactly the ones that cannot be saved
+    — that is how they came to miss it. The production log of `2025-07-18-compute-last-update`,
+    the migration that introduced the field, records fifteen failures: fourteen on an owner
+    `User` still carrying `apikey` after a dump restore, and one on a resource whose `filetype`
+    is the legacy value `api`, which the model no longer accepts.
+  - A backfill built on `save()` therefore fails on precisely the documents it exists to repair.
+    It now falls back to an atomic update, which skips validation and writes the one field it
+    came for. Deliberately narrow: it corrects the date, it does not pretend to correct the
+    document. The final log line counts the two paths separately, so the number written
+    directly is the measure of how many documents are invalid for other reasons.
+
+## 16.0.0.13 (2026-11-12)
+
+- **fix(dataset): `last_update` stopped being invented on every read**
+  - Two consecutive reads of the same dataset returned different dates, each equal to the instant
+    of the request, and the list sorted on the indexed value while the response showed the
+    fabricated one. One dataset therefore sat first under `?sort=last_update` ascending, dated
+    2026, ahead of datasets from 2007. It reproduced in production as well as in tst and dev.
+  - The cause was neither a write during the request nor the serializer: the field carried
+    `default=lambda: datetime.now(UTC)`, and MongoEngine applies a field default when the stored
+    value is absent or null — on load, not on write. Nothing was ever persisted, which is why the
+    condition never healed and why the document in Mongo looked innocent.
+  - The default is gone. `clean()` still assigns the field on every save, so a dataset written
+    through any normal path keeps a value, and `None` now means the document genuinely has none.
+    `next_update` gained a guard, being the one consumer that would raise on it.
+  - A second migration backfills the documents already in that state, computing each real date.
+    It is deliberately separate from the one added for the resource-mutator fix: that one heals
+    documents whose date *disagrees* with their resources and skips anything reading `None`,
+    which is exactly this population. Both have to run, in either order.
+
 - **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
   - The same defect that was just fixed on organisations. `Reuse` carries the `Datetimed` mixin,
     whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods

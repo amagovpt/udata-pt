@@ -155,6 +155,81 @@ class DatasetModelTest(PytestOnlyDBTestCase):
         dataset = DatasetFactory(owner=user)
         assert_equal_dates(dataset.last_update, dataset.last_modified)
 
+    def test_last_update_is_stable_when_absent_in_mongo(self):
+        """A document with no stored `last_update` must not grow a new date on each read.
+
+        MongoEngine applies a field default when the stored value is absent or null, and
+        it applies it on load rather than on write. While this field carried a default of
+        "now", every read of such a document produced the instant of that read: two
+        consecutive calls to the same dataset endpoint returned different dates, the sort
+        ran on the indexed value while the response showed the fabricated one, and the
+        dataset surfaced first under `?sort=last_update` ascending with a date years ahead
+        of datasets that genuinely were older (LEDG-2732).
+
+        Reading `None` is the honest answer for a document that has no value, and it is
+        what the backfill migration looks for.
+        """
+        dataset = DatasetFactory()
+        Dataset.objects(id=dataset.id).update(unset__last_update=True)
+
+        first = Dataset.objects.get(id=dataset.id).last_update
+        second = Dataset.objects.get(id=dataset.id).last_update
+
+        assert first == second
+
+        # The API serializes this attribute directly, so what the reader is shown has to
+        # be what the document holds — the second half of the defect, and the reason the
+        # displayed date disagreed with the position in the list.
+        stored = Dataset.objects(id=dataset.id).as_pymongo().first()
+        assert stored.get("last_update") == first
+
+    def test_backfill_migration_heals_unsaveable_dataset(self):
+        """The backfill must not depend on `save()`, because its targets cannot be saved.
+
+        The documents missing `last_update` are, as a population, exactly the ones that
+        failed to save when `2025-07-18-compute-last-update` introduced the field. The
+        production log of that migration records fifteen failures, one of them a resource
+        whose `filetype` is the legacy value `api`, which the model no longer accepts. A
+        backfill built on `save()` therefore fails on precisely the documents it exists to
+        repair.
+
+        This is the only test in the suite that executes a migration. It earns the
+        exception because the defect it pins is not in the model — the model is fine — but
+        in the migration's choice of write, and nothing else would catch that choice
+        regressing.
+        """
+        import importlib.util
+        from pathlib import Path
+
+        import udata
+
+        dataset = DatasetFactory(
+            resources=[ResourceFactory(last_modified_internal=datetime(2018, 6, 27, 12, 32, 7))]
+        )
+        # Reproduce the production document: a legacy filetype the model refuses, and no
+        # stored date. Written straight to Mongo because the model would reject it.
+        Dataset.objects(id=dataset.id).update(
+            set__resources__0__filetype="api", unset__last_update=True
+        )
+
+        broken = Dataset.objects.get(id=dataset.id)
+        with pytest.raises(MongoEngineValidationError):
+            broken.save()
+
+        path = (
+            Path(udata.__file__).parent
+            / "migrations"
+            / "2026-11-10-backfill-missing-dataset-last-update.py"
+        )
+        spec = importlib.util.spec_from_file_location("backfill_last_update", path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        migration.migrate(None)
+
+        stored = Dataset.objects(id=dataset.id).as_pymongo().first()
+        assert stored.get("last_update") == datetime(2018, 6, 27, 12, 32, 7)
+        assert Dataset.objects.get(id=dataset.id).last_update == datetime(2018, 6, 27, 12, 32, 7)
+
     def test_community_resource(self):
         user = UserFactory()
         dataset = DatasetFactory(owner=user)
