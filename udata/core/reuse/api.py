@@ -23,6 +23,7 @@ from udata.core.badges import api as badges_api
 from udata.core.badges.models import Badge
 from udata.core.dataservices.models import Dataservice
 from udata.core.dataset.api_fields import dataset_ref_fields
+from udata.core.dataset.constants import LAST_UPDATE_RANGES
 from udata.core.followers.api import FollowAPI
 from udata.core.legal.mails import add_send_legal_notice_argument, send_legal_notice_on_deletion
 from udata.core.organization.models import Organization
@@ -117,6 +118,17 @@ class ReuseApiParser(ModelApiParser):
             if not ObjectId.is_valid(args["owner"]):
                 api.abort(400, "Owner arg must be an identifier")
             reuses = reuses.filter(owner=args["owner"])
+        if args.get("last_update_range"):
+            # `last_modified` is the date the card shows and the date the listing orders
+            # by when the visitor picks no sorting. Since LEDG-2726 it is no longer
+            # stamped by metric recounts, so it means an edit again.
+            #
+            # The window reaches back from midnight today, not from this instant: the
+            # search service rounds its own boundary down to the day (`now-30d/d`), and
+            # the two sides have to select the same documents.
+            today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            since = today - LAST_UPDATE_RANGES[args["last_update_range"]]
+            reuses = reuses.filter(last_modified__gte=since)
         if args.get("modified_since"):
             try:
                 since = datetime.fromisoformat(args["modified_since"]).replace(tzinfo=UTC)
