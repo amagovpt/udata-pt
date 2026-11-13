@@ -9,6 +9,25 @@
 
 ## Unreleased
 
+- **fix(search): the index is fed the created date the sort mapping actually names**
+  - `sorts["created"]` points at `created_at_internal`, because Mongo cannot order by a Python
+    property. `serialize()` fed the index from `Dataset.created_at`, which *is* a property —
+    harvest issued date, else harvest created date, else the stored field. So the two search
+    paths named one sort key and ordered it by two different dates, and for a harvested dataset
+    those can be years apart.
+  - The fix feeds the index the same stored field the mapping names, rather than materialising
+    the property into a field. Materialising means a backfill migration plus one more date field
+    carrying a `datetime.now` default — the exact shape that fabricated a fresh `last_update` on
+    every read in LEDG-2732 — and the measured divergence does not justify it: across 800
+    production datasets, 457 of them harvested, not one had the two dates differing by as much
+    as a day.
+  - What the index gives up is the source-declared publication date, which cost nothing: there
+    it was only ever a sort key, and the date the portal displays comes from the API, which
+    still reads the property. Materialising stays the real fix if a harvester ever starts
+    writing `harvest.issued_at` in earnest; the note above `sorts` says so.
+  - Checked while there: `created_at` is a property only on datasets. Reuses, organizations,
+    dataservices and topics all carry it as a stored field, so none of them has this divergence.
+
 - **fix(search): `last_update_range` filters in the five models that advertised it and ignored it**
   - Follow-up to the dataset fix. All six search adapters declared the filter, so the parser
     accepted and validated it — an unknown value already answered 400 — while the Mongo path,
