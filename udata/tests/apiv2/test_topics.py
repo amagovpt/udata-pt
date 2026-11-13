@@ -1,4 +1,7 @@
+from datetime import UTC, datetime
+
 import pytest
+from dateutil.relativedelta import relativedelta
 from flask import url_for
 
 from udata.core.dataservices.factories import DataserviceFactory
@@ -944,3 +947,29 @@ class TopicElementAPITest(APITestCase):
         assert element.tags == ["baz"]
         assert element.extras == {"foo": "bar"}
         assert element.element is None
+
+
+class TopicSearchLastUpdateRangeTest(APITestCase):
+    def test_search_topic_last_update_range(self):
+        """The three windows must select three different sets, not everything.
+
+        `last_update_range` was advertised by the search adapter — an unknown value is
+        already rejected with 400 — while the Mongo path never applied it, so all three
+        windows answered with the whole collection (LEDG-2713, following LEDG-2686 which
+        fixed the same defect for datasets). The dates below sit far from every boundary,
+        so the counts do not drift with the day the suite runs.
+        """
+        now = datetime.now(UTC).replace(tzinfo=None)
+        for topic, age in (
+            (TopicFactory(), relativedelta(days=10)),
+            (TopicFactory(), relativedelta(months=6)),
+            (TopicFactory(), relativedelta(years=2)),
+            (TopicFactory(), relativedelta(years=10)),
+        ):
+            Topic.objects(id=topic.id).update(set__last_modified=now - age)
+
+        expected = {"last_30_days": 1, "last_12_months": 2, "last_3_years": 3}
+        for window, count in expected.items():
+            response = self.get(f"/api/2/topics/search/?last_update_range={window}")
+            self.assert200(response)
+            assert response.json["total"] == count, window
