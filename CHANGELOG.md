@@ -9,6 +9,43 @@
 
 ## Unreleased
 
+- **fix(search): the index is fed the created date the sort mapping actually names**
+  - `sorts["created"]` points at `created_at_internal`, because Mongo cannot order by a Python
+    property. `serialize()` fed the index from `Dataset.created_at`, which *is* a property —
+    harvest issued date, else harvest created date, else the stored field. So the two search
+    paths named one sort key and ordered it by two different dates, and for a harvested dataset
+    those can be years apart.
+  - The fix feeds the index the same stored field the mapping names, rather than materialising
+    the property into a field. Materialising means a backfill migration plus one more date field
+    carrying a `datetime.now` default — the exact shape that fabricated a fresh `last_update` on
+    every read in LEDG-2732 — and the measured divergence does not justify it: across 800
+    production datasets, 457 of them harvested, not one had the two dates differing by as much
+    as a day.
+  - What the index gives up is the source-declared publication date, which cost nothing: there
+    it was only ever a sort key, and the date the portal displays comes from the API, which
+    still reads the property. Materialising stays the real fix if a harvester ever starts
+    writing `harvest.issued_at` in earnest; the note above `sorts` says so.
+  - Checked while there: `created_at` is a property only on datasets. Reuses, organizations,
+    dataservices and topics all carry it as a stored field, so none of them has this divergence.
+
+- **fix(search): `last_update_range` filters in the five models that advertised it and ignored it**
+  - Follow-up to the dataset fix. All six search adapters declared the filter, so the parser
+    accepted and validated it — an unknown value already answered 400 — while the Mongo path,
+    which is what serves these requests, never applied it. The three windows returned the whole
+    collection: the caller picked an interval and got everything, with nothing to warn them.
+  - The date had to be decided per model, not assumed. Reuses and topics use `last_modified`
+    from the `Datetimed` mixin; dataservices use `metadata_modified_at`, already the field
+    behind their `last_modified` sortable and their `modified_since` filter; posts use
+    `last_modified` rather than `published`, because the filter is named after the last update.
+  - A discussion is the one model with no last-modified date at all — it carries `created` and
+    `closed`, and neither is an update. Its last update is its last message, so the window
+    matches a discussion when any of its messages falls inside it.
+  - **Two of the five endpoints were answering 500 to every request**, filter or not:
+    `mongo_search` returned a bare queryset for posts and discussions, and the search framework
+    reads `.total` off the result. They now paginate like the other three. The symptom the
+    ticket describes never got a chance to appear on those two, because nothing was returned
+    at all.
+
 - **fix(migrations): the `last_update` backfill no longer depends on `save()`**
   - The documents missing the field are, as a population, exactly the ones that cannot be saved
     — that is how they came to miss it. The production log of `2025-07-18-compute-last-update`,

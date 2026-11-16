@@ -7,6 +7,7 @@ import requests
 from flask import current_app
 
 from udata.core.dataservices.models import Dataservice
+from udata.core.datastories.models import DatastoryMetrics
 from udata.core.metrics.aggregations import MetricAggregation
 from udata.core.metrics.events import MetricEvent
 from udata.core.metrics.signals import on_site_metrics_computed
@@ -252,6 +253,18 @@ def update_metrics_from_internal():
     for row in MetricEvent.objects.aggregate(*pipeline):
         if row["_id"]:
             save_model_by_id_or_slug(Dataservice, row["_id"], {"views": row["views"]})
+
+    # Aggregate views per datastory. Datastories live in Squidex, so there is no
+    # document to update by id or slug: upsert, as the metrics_etl DAG does.
+    pipeline = [
+        {"$match": {"event_type": "view", "object_type": "datastory"}},
+        {"$group": {"_id": "$object_id", "views": {"$sum": 1}}},
+    ]
+    for row in MetricEvent.objects.aggregate(*pipeline):
+        if row["_id"]:
+            DatastoryMetrics.objects(slug=row["_id"]).update_one(
+                set__metrics__views=row["views"], upsert=True
+            )
 
 
 @job("aggregate-metrics", route="low.metrics")
