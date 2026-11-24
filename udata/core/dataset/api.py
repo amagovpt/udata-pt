@@ -778,12 +778,31 @@ def _serve_hosted_resource(resource):
 
 
 def _proxy_remote_resource(resource):
-    """Pipe a remote-URL resource through the SSRF-guarded download proxy."""
+    """Pipe a remote-URL resource through the SSRF-guarded download proxy.
+
+    When the origin cannot be reached at all, the visitor is sent to it
+    instead of being handed a dead end: their own network very often reaches
+    what this server cannot. Both environments stopped opening TCP to
+    `www.ine.pt` and `apambiente.pt` while those hosts kept answering
+    everybody else, which turned thousands of perfectly accessible resources
+    into 502s (LEDG-2772). This is the same carve-out `_is_ogc_service` makes
+    above, widened from "it is a service" to "we could not get there".
+
+    The split is deliberate: an origin that *answers* is still authoritative.
+    `requests.exceptions.HTTPError` -- what `raise_for_status` turns a 404 or
+    a 500 into -- subclasses neither of the two caught below, so it keeps
+    falling through to the 502. A redirect to an error page would just move
+    the error somewhere the portal can no longer describe it.
+    """
     filename_hint = _ensure_extension(resource.title, resource.format) if resource.title else None
     try:
         return stream_as_attachment(resource.url.strip(), filename_hint=filename_hint)
     except ProxyDownloadForbidden as e:
+        # Raised by the SSRF guard before any request leaves: a denied host is
+        # never announced to the browser as a redirect either.
         api.abort(403, str(e))
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return redirect(resource.url.strip())
     except requests.RequestException as e:
         api.abort(502, f"Upstream fetch failed: {e}")
 

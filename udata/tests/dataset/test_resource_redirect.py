@@ -246,7 +246,37 @@ class ResourceRedirectForceDownloadTest(APITestCase):
 
         assert response.status_code == 403
 
-    def test_remote_resource_502_when_upstream_fails(self):
+    def test_blocked_host_is_not_redirected(self):
+        """A denied host is not announced to the browser either — LEDG-2772.
+
+        The unreachable-origin carve-out below hands the visitor the origin
+        URL. That must never become a way around the SSRF guard: a denylisted
+        host is refused outright, with no `Location` for the browser to follow.
+        """
+        resource = ResourceFactory(
+            url="http://canary.s.inty.io/probe",
+            filetype="remote",
+            fs_filename=None,
+        )
+        DatasetFactory(resources=[resource])
+
+        response = self._hit(resource.id)
+
+        assert response.status_code == 403
+        assert "Location" not in response.headers
+
+    # ------------------------------------------------------------------
+    # Unreachable origin — 302 to the origin, not a dead end (LEDG-2772)
+    # ------------------------------------------------------------------
+
+    def test_remote_resource_redirects_when_origin_unreachable(self):
+        """We could not reach the origin; the visitor's own network may.
+
+        Replaces the pre-LEDG-2772 contract, where the same `ConnectionError`
+        produced a 502. Both environments stopped opening TCP to `www.ine.pt`
+        and `apambiente.pt` while those hosts kept answering everybody else,
+        so the portal was refusing downloads the visitor could perform.
+        """
         resource = ResourceFactory(
             url="https://example.com/big.zip",
             filetype="remote",
@@ -260,7 +290,59 @@ class ResourceRedirectForceDownloadTest(APITestCase):
         ):
             response = self._hit(resource.id)
 
+        assert response.status_code == 302
+        assert response.headers["Location"] == "https://example.com/big.zip"
+
+    def test_remote_resource_redirects_on_connect_timeout(self):
+        """The shape the incident actually takes: a connect timeout.
+
+        `ConnectTimeout` is what `DOWNLOAD_PROXY_CONNECT_TIMEOUT_S` produces
+        against a host that drops packets, and it is the exact exception the
+        ppr and prd logs carry for both blocked origins.
+        """
+        resource = ResourceFactory(
+            url="https://www.ine.pt/ine/json_indicador/pindica.jsp?op=2&varcd=0015013",
+            filetype="remote",
+            fs_filename=None,
+        )
+        DatasetFactory(resources=[resource])
+
+        with patch(
+            "udata.core.dataset.download_proxy.requests.get",
+            side_effect=requests.exceptions.ConnectTimeout("timed out"),
+        ):
+            response = self._hit(resource.id)
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == resource.url
+
+    def test_remote_resource_still_502_on_origin_http_error(self):
+        """An origin that *answers* stays authoritative — no redirect.
+
+        `raise_for_status` turns a 404 or a 500 into `HTTPError`, which
+        subclasses neither `ConnectionError` nor `Timeout`. Redirecting there
+        would hand the visitor an error page the portal can no longer explain.
+        """
+        resource = ResourceFactory(
+            url="https://example.com/missing.csv",
+            filetype="remote",
+            fs_filename=None,
+        )
+        DatasetFactory(resources=[resource])
+
+        failing_upstream = _build_mock_upstream()
+        failing_upstream.raise_for_status = MagicMock(
+            side_effect=requests.exceptions.HTTPError("404 Client Error")
+        )
+
+        with patch(
+            "udata.core.dataset.download_proxy.requests.get",
+            return_value=failing_upstream,
+        ):
+            response = self._hit(resource.id)
+
         assert response.status_code == 502
+        assert "Location" not in response.headers
 
     # ------------------------------------------------------------------
     # OGC service path — 302, no proxy (LEDG-2248)
