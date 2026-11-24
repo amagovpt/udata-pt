@@ -9,6 +9,74 @@
 
 ## Unreleased
 
+- **fix(search): the index is fed the created date the sort mapping actually names**
+  - `sorts["created"]` points at `created_at_internal`, because Mongo cannot order by a Python
+    property. `serialize()` fed the index from `Dataset.created_at`, which *is* a property —
+    harvest issued date, else harvest created date, else the stored field. So the two search
+    paths named one sort key and ordered it by two different dates, and for a harvested dataset
+    those can be years apart.
+  - The fix feeds the index the same stored field the mapping names, rather than materialising
+    the property into a field. Materialising means a backfill migration plus one more date field
+    carrying a `datetime.now` default — the exact shape that fabricated a fresh `last_update` on
+    every read in LEDG-2732 — and the measured divergence does not justify it: across 800
+    production datasets, 457 of them harvested, not one had the two dates differing by as much
+    as a day.
+  - What the index gives up is the source-declared publication date, which cost nothing: there
+    it was only ever a sort key, and the date the portal displays comes from the API, which
+    still reads the property. Materialising stays the real fix if a harvester ever starts
+    writing `harvest.issued_at` in earnest; the note above `sorts` says so.
+  - Checked while there: `created_at` is a property only on datasets. Reuses, organizations,
+    dataservices and topics all carry it as a stored field, so none of them has this divergence.
+
+- **fix(search): `last_update_range` filters in the five models that advertised it and ignored it**
+  - Follow-up to the dataset fix. All six search adapters declared the filter, so the parser
+    accepted and validated it — an unknown value already answered 400 — while the Mongo path,
+    which is what serves these requests, never applied it. The three windows returned the whole
+    collection: the caller picked an interval and got everything, with nothing to warn them.
+  - The date had to be decided per model, not assumed. Reuses and topics use `last_modified`
+    from the `Datetimed` mixin; dataservices use `metadata_modified_at`, already the field
+    behind their `last_modified` sortable and their `modified_since` filter; posts use
+    `last_modified` rather than `published`, because the filter is named after the last update.
+  - A discussion is the one model with no last-modified date at all — it carries `created` and
+    `closed`, and neither is an update. Its last update is its last message, so the window
+    matches a discussion when any of its messages falls inside it.
+  - **Two of the five endpoints were answering 500 to every request**, filter or not:
+    `mongo_search` returned a bare queryset for posts and discussions, and the search framework
+    reads `.total` off the result. They now paginate like the other three. The symptom the
+    ticket describes never got a chance to appear on those two, because nothing was returned
+    at all.
+
+- **fix(migrations): the `last_update` backfill no longer depends on `save()`**
+  - The documents missing the field are, as a population, exactly the ones that cannot be saved
+    — that is how they came to miss it. The production log of `2025-07-18-compute-last-update`,
+    the migration that introduced the field, records fifteen failures: fourteen on an owner
+    `User` still carrying `apikey` after a dump restore, and one on a resource whose `filetype`
+    is the legacy value `api`, which the model no longer accepts.
+  - A backfill built on `save()` therefore fails on precisely the documents it exists to repair.
+    It now falls back to an atomic update, which skips validation and writes the one field it
+    came for. Deliberately narrow: it corrects the date, it does not pretend to correct the
+    document. The final log line counts the two paths separately, so the number written
+    directly is the measure of how many documents are invalid for other reasons.
+
+## 16.0.0.13 (2026-11-12)
+
+- **fix(dataset): `last_update` stopped being invented on every read**
+  - Two consecutive reads of the same dataset returned different dates, each equal to the instant
+    of the request, and the list sorted on the indexed value while the response showed the
+    fabricated one. One dataset therefore sat first under `?sort=last_update` ascending, dated
+    2026, ahead of datasets from 2007. It reproduced in production as well as in tst and dev.
+  - The cause was neither a write during the request nor the serializer: the field carried
+    `default=lambda: datetime.now(UTC)`, and MongoEngine applies a field default when the stored
+    value is absent or null — on load, not on write. Nothing was ever persisted, which is why the
+    condition never healed and why the document in Mongo looked innocent.
+  - The default is gone. `clean()` still assigns the field on every save, so a dataset written
+    through any normal path keeps a value, and `None` now means the document genuinely has none.
+    `next_update` gained a guard, being the one consumer that would raise on it.
+  - A second migration backfills the documents already in that state, computing each real date.
+    It is deliberately separate from the one added for the resource-mutator fix: that one heals
+    documents whose date *disagrees* with their resources and skips anything reading `None`,
+    which is exactly this population. Both have to run, in either order.
+
 - **fix(reuse): the date on a reuse's card means an edit again, not activity around it**
   - The same defect that was just fixed on organisations. `Reuse` carries the `Datetimed` mixin,
     whose `pre_save` hook stamps `last_modified` on any write of the document, and three methods
