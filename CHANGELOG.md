@@ -9,6 +9,25 @@
 
 ## Unreleased
 
+- **fix(dataset): an origin the server cannot reach is handed to the visitor instead of a 502**
+  - `/api/1/datasets/r/<id>` proxies remote resources, and answered 502 whenever it could not
+    open a connection to the origin. The portal was therefore refusing downloads the visitor
+    could perform themselves: both environments stopped opening TCP to `www.ine.pt` and
+    `apambiente.pt` — ports 80 and 443, DNS resolving correctly to the right address — while
+    those hosts kept answering every other network in 27 ms.
+  - Connection errors and timeouts now return a 302 to the origin. This is the carve-out
+    `_is_ogc_service` already made for service endpoints, widened from "it is a service" to
+    "we could not get there"; the reasoning is the one written there, that a slow or absent
+    third party does not belong on the critical path of a click.
+  - An origin that *answers* stays authoritative. `HTTPError` — what `raise_for_status` turns a
+    404 or a 500 into — subclasses neither caught exception, so it still surfaces as 502: a
+    redirect would hand over an error page the portal can no longer describe. The SSRF guard
+    runs before any of this, so a denylisted host gets no `Location` either.
+  - What the redirect path gives up is the server-built `Content-Disposition`, so the browser
+    names the file from the URL. A download with an ugly name beats no download.
+  - Does not restore the SNIAmb harvester, which has no browser to delegate to and stays
+    blocked until the network path is reopened.
+
 - **fix(search): the index is fed the created date the sort mapping actually names**
   - `sorts["created"]` points at `created_at_internal`, because Mongo cannot order by a Python
     property. `serialize()` fed the index from `Dataset.created_at`, which *is* a property —
